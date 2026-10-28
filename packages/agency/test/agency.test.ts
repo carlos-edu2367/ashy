@@ -201,7 +201,7 @@ describe('@ashy/agency — Phase 6 Agency, Vision dHash, Progressive MCP & Gatek
       expect(results.length).toBeGreaterThan(0)
       expect(results[0]?.toolName).toBe('tool_17_git_blame_inspector')
       // Compact summary must NOT include the heavy inputSchema
-      expect('inputSchema' in (results[0] as Record<string, unknown>)).toBe(false)
+      expect('inputSchema' in (results[0] as unknown as Record<string, unknown>)).toBe(false)
 
       // 2. Get full schema details only for the selected tool
       const details = registry.get_mcp_tool_details({ toolName: 'tool_17_git_blame_inspector' })
