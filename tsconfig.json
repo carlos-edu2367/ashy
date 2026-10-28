@@ -1,0 +1,24 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@ashy/shared": ["./packages/shared/src/index.ts"],
+      "@ashy/bus": ["./packages/bus/src/index.ts"],
+      "@ashy/llm": ["./packages/llm/src/index.ts"],
+      "@ashy/cortex": ["./packages/cortex/src/index.ts"],
+      "@ashy/voice": ["./packages/voice/src/index.ts"],
+      "@ashy/stage": ["./packages/stage/src/index.ts"],
+      "@ashy/agency": ["./packages/agency/src/index.ts"]
+    }
+  },
+  "include": [
+    "packages/*/src/**/*.ts",
+    "packages/*/src/**/*.tsx",
+    "packages/*/test/**/*.ts",
+    "apps/*/src/**/*.ts",
+    "apps/*/src/**/*.tsx",
+    "apps/*/test/**/*.ts"
+  ]
+}

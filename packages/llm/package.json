@@ -1,12 +1,15 @@
-﻿{
-    "name":  "@ashy/llm",
-    "version":  "0.1.0",
-    "private":  true,
-    "type":  "module",
-    "main":  "./src/index.ts",
-    "types":  "./src/index.ts",
-    "dependencies":  {
-                         "@ashy/shared":  "workspace:*",
-                         "valibot":  "^1.0.0"
-                     }
+{
+  "name": "@ashy/llm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "test": "vitest run --root ../.. packages/llm/test"
+  },
+  "dependencies": {
+    "@ashy/shared": "workspace:*",
+    "valibot": "^1.0.0"
+  }
 }
