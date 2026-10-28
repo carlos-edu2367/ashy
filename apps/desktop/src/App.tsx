@@ -1145,6 +1145,7 @@ export function App(): React.ReactElement {
                 <details
                   className="ashy-card"
                   data-testid="panel-inside-jokes"
+                  data-retention-policy="Flashbulb & Cooldown"
                   open={state.memoryFilter === 'referencias'}
                   style={{ padding: '10px 14px' }}
                 >
