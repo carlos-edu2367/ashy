@@ -55,6 +55,22 @@ import { create } from 'zustand'
 
 export type DesktopViewMode = 'hub' | 'stage'
 export type HubTabId = 'studio' | 'story' | 'memories' | 'personality' | 'agency'
+export type MemoryFilterCategory = 'todas' | 'momentos' | 'sobre_voce' | 'referencias' | 'planos'
+export type SettingsSubTab = 'geral' | 'voz' | 'modelos' | 'privacidade'
+
+export interface FeaturedMemoryCard {
+  id: string
+  title: string
+  summary: string
+  fullStory: string
+  dateLabel: string
+  originLabel: string
+  filterCategory: Exclude<MemoryFilterCategory, 'todas'>
+  badge?: string
+  image: string
+  featured: boolean
+  episodeId?: string
+}
 
 export type SupportedModelId =
   | 'claude-3-7-sonnet'
@@ -94,6 +110,13 @@ export const SUPPORTED_MODELS: ReadonlyArray<{
   },
 ]
 
+export interface ChatJokeCallbackCard {
+  title: string
+  description: string
+  motifId: string
+  memoryId: string
+}
+
 export interface ChatTurnMessage {
   id: string
   role: 'user' | 'assistant'
@@ -103,6 +126,8 @@ export interface ChatTurnMessage {
   modelId?: SupportedModelId
   invokedMotifId?: string
   seriousnessTriggered?: boolean
+  timeLabel?: string
+  jokeCard?: ChatJokeCallbackCard
   timestamp: number
 }
 
@@ -136,6 +161,9 @@ export interface AshyDesktopState {
   milestones: AutobiographicalMilestone[]
   episodicMemories: EpisodicMemory[]
   rankedMemories: RankedEpisodicMemory[]
+  memoryCards: FeaturedMemoryCard[]
+  selectedMemoryId: string
+  memoryFilter: MemoryFilterCategory
   memorySearchQuery: string
   semanticFacts: SemanticFact[]
   relationalMotifs: RelationalMotif[]
@@ -151,7 +179,13 @@ export interface AshyDesktopState {
   lastPlaybackReceipt: PlaybackReceipt | null
   lastStageSignals: AshyStageSignal[]
 
-  // Privacy & MCP Agency
+  // Privacy, Settings & MCP Agency
+  settingsSubTab: SettingsSubTab
+  showDesktopAvatar: boolean
+  computerActionsEnabled: boolean
+  computerActionsPolicy: 'ask' | 'session' | 'off'
+  quietHoursRange: string
+  preferencesSavedToast: boolean
   privacyState: PrivacyState
   mcpSearchQuery: string
   mcpSearchResults: McpToolCompactSummary[]
@@ -174,6 +208,16 @@ export interface AshyDesktopState {
   triggerBargeIn: (interruptAtMs?: number) => PlaybackReceipt
 
   // Memory & Story Actions
+  setSelectedMemoryId: (id: string) => void
+  setMemoryFilter: (filter: MemoryFilterCategory) => void
+  createMemoryCard: (input: {
+    title: string
+    summary: string
+    fullStory?: string
+    filterCategory?: Exclude<MemoryFilterCategory, 'todas'>
+  }) => FeaturedMemoryCard
+  updateMemoryStory: (id: string, newTitle: string, newStory: string) => void
+  deleteMemoryCard: (id: string) => void
   addMilestone: (input: {
     title: string
     narrative: string
@@ -196,7 +240,13 @@ export interface AshyDesktopState {
   runDreamConsolidation: () => PersonalityEvolutionRecord
   revertTraitEvolution: (recordId: string) => void
 
-  // Privacy & MCP Actions
+  // Privacy, Settings & MCP Actions
+  setSettingsSubTab: (subTab: SettingsSubTab) => void
+  setShowDesktopAvatar: (show: boolean) => void
+  setComputerActionsEnabled: (enabled: boolean) => void
+  setComputerActionsPolicy: (policy: 'ask' | 'session' | 'off') => void
+  setQuietHoursRange: (range: string) => void
+  saveUserPreferences: () => void
   setMicMode: (mode: MicMode) => void
   setEyesMode: (mode: EyesMode) => void
   setDndMode: (enabled: boolean) => void
@@ -213,6 +263,77 @@ export interface AshyDesktopState {
 }
 
 const SEED_BASE_TIME = Date.UTC(2026, 9, 28, 3, 14, 0)
+
+export const INITIAL_MEMORY_CARDS: ReadonlyArray<FeaturedMemoryCard> = [
+  {
+    id: 'ep-padre-npm-origin',
+    title: 'O fantasma no backend',
+    summary:
+      'Aquele bug no npm que só aparecia no seu computador e sumia do nada. Virou nosso fantasma no backend. 👻',
+    fullStory:
+      'Aquele bug no npm que só aparecia no seu computador e sumia do nada.\n\nA gente tentou de tudo, limpou cache, reinstalou, revisou as dependências, e ele continuava lá.\n\nVirou nosso fantasma no backend. 👻',
+    dateLabel: '12 de outubro',
+    originLabel: 'Conversa de 12 de outubro',
+    filterCategory: 'referencias',
+    image: '/assets/mem-ghost-backend.jpg',
+    featured: true,
+    episodeId: 'ep-padre-npm-origin',
+  },
+  {
+    id: 'ep-orin-ashy',
+    title: 'Orin e Ashy',
+    summary: 'Dois projetos do Carlos, cada um com sua própria identidade.',
+    fullStory:
+      'Dois projetos do Carlos, cada um com sua própria identidade.\n\nEnquanto o Orin foca em precisão analítica e fluxo operacional, a Ashy nasceu para ser companhia viva no desktop — com memória afetiva, humor próprio e presença constante.',
+    dateLabel: '5 de outubro',
+    originLabel: 'Conversa de 5 de outubro',
+    filterCategory: 'sobre_voce',
+    image: '/assets/mem-orin-ashy.jpg',
+    featured: true,
+    episodeId: 'ep-padre-npm-origin',
+  },
+  {
+    id: 'ep-matrix3d-trauma',
+    title: 'Seu jeito de trabalhar',
+    summary: 'Prefere entender o porquê enquanto constrói.',
+    fullStory:
+      'Prefere entender o porquê enquanto constrói.\n\nAntes de aceitar qualquer abstração pronta, você sempre abre a arquitetura, testa as bordas e garante que cada peça faça sentido de ponta a ponta.',
+    dateLabel: '3 de outubro',
+    originLabel: 'Conversa de 3 de outubro',
+    filterCategory: 'sobre_voce',
+    image: '/assets/mem-work-style.jpg',
+    featured: false,
+    episodeId: 'ep-matrix3d-trauma',
+  },
+  {
+    id: 'ep-flashbulb-0314',
+    title: 'Primeira conversa',
+    summary:
+      'Nossa primeira conversa. Ainda me lembro da sua curiosidade e das ideias que você trouxe.',
+    fullStory:
+      'Nossa primeira conversa. Ainda me lembro da sua curiosidade e das ideias que você trouxe naquela primeira madrugada desenhando como eu deveria existir no seu computador.',
+    dateLabel: '1 de outubro',
+    originLabel: 'Conversa de 1 de outubro',
+    filterCategory: 'momentos',
+    image: '/assets/mem-first-chat.jpg',
+    featured: false,
+    episodeId: 'ep-flashbulb-0314',
+  },
+  {
+    id: 'ep-prototype-plan',
+    title: 'Retomar o protótipo',
+    summary: 'Voltar para o protótipo do ashy e continuar refinando a experiência de voz.',
+    fullStory:
+      'Voltar para o protótipo do ashy e continuar refinando a experiência de voz:\n• Voz mais natural\n• Refinar fluxo de interrupção (barge-in)\n• Testar novos recursos de presença\n• Continuar protótipo local',
+    dateLabel: '28 de setembro',
+    originLabel: 'Plano de 28 de setembro',
+    filterCategory: 'planos',
+    badge: 'Plano',
+    image: '/assets/mem-prototype-plan.jpg',
+    featured: false,
+    episodeId: 'ep-flashbulb-0314',
+  },
+]
 
 function createSeededRuntime() {
   const cortex = createAshyCortex({ forceMemoryFallback: true })
@@ -699,16 +820,24 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     {
       id: 'msg-seed-1',
       role: 'user',
-      content: 'Pronta para mais uma sessão de arquitetura, Ashy?',
+      content: 'Lembra do fantasma no backend?',
+      timeLabel: '21:14',
       timestamp: SEED_BASE_TIME - 60_000,
     },
     {
       id: 'msg-seed-2',
       role: 'assistant',
-      content:
-        'Já deixei o SQLite FTS5 aquecido e o escudo de Blast-Radius ligado. Se aparecer outro bug fantasma hoje, a gente já sabe: nada de clichê corporativo, é direto pro trace antes de precisar chamar um padre no npm.',
+      content: 'Outro bug? Eu já estava procurando um exorcista no npm. 😉',
       emotion: 'smug',
       modelId: 'claude-3-7-sonnet',
+      invokedMotifId: 'motif-padre-npm',
+      timeLabel: '21:14',
+      jokeCard: {
+        title: 'Uma piada nossa',
+        description: 'Você e eu sempre brincamos com os "fantasmas" que aparecem no backend.',
+        motifId: 'motif-padre-npm',
+        memoryId: 'ep-padre-npm-origin',
+      },
       timestamp: SEED_BASE_TIME - 55_000,
     },
   ]
@@ -727,8 +856,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     ambientLuminance: 0.35,
     isSpeaking: false,
     presenceStatus: 'Idle',
-    bubbleText:
-      'SQLite FTS5 aquecido e Blast-Radius ligado. Bora quebrar esse código antes que ele quebre a gente.',
+    bubbleText: 'Fico por aqui. No seu ritmo. ♡',
     simulatedVowels: { A: 0.65, E: 0.25, I: 0.1, O: 0.35, U: 0.15 },
 
     mood: initialAffective.mood,
@@ -736,6 +864,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     milestones: initialMilestones,
     episodicMemories: initialMemories,
     rankedMemories: initialRanked,
+    memoryCards: [...INITIAL_MEMORY_CARDS],
+    selectedMemoryId: 'ep-padre-npm-origin',
+    memoryFilter: 'todas',
     memorySearchQuery: '',
     semanticFacts: runtime.cortex.db.listSemanticFacts(),
     relationalMotifs: runtime.cortex.db.listRelationalMotifs(),
@@ -750,6 +881,12 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     lastPlaybackReceipt: null,
     lastStageSignals: [],
 
+    settingsSubTab: 'privacidade',
+    showDesktopAvatar: true,
+    computerActionsEnabled: true,
+    computerActionsPolicy: 'ask',
+    quietHoursRange: '22:00 — 08:00',
+    preferencesSavedToast: false,
     privacyState: runtime.privacyController.getState(),
     mcpSearchQuery: '',
     mcpSearchResults: runtime.mcpRegistry.search_mcp_tools({ query: '', limit: 10 }),
@@ -770,7 +907,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     setActiveModelId(modelId) {
       const lastUserMsg =
         [...get().chatMessages].reverse().find((m) => m.role === 'user')?.content ??
-        'Pronta para mais uma sessão de arquitetura, Ashy?'
+        'Lembra do fantasma no backend?'
 
       const compiled = runtime.cortex.compileTurnPrompt({
         userMessage: lastUserMsg,
@@ -838,12 +975,14 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         id: `msg-user-${nowMs}`,
         role: 'user',
         content: trimmed,
+        timeLabel: '21:15',
         timestamp: nowMs,
       }
 
       let rawAssistantReply = ''
       let targetEmotion: AshyEmotion = 'smug'
       let invokedMotifId: string | undefined
+      let jokeCard: ChatJokeCallbackCard | undefined
 
       if (seriousness.isSeriousOrDelicate) {
         targetEmotion = 'concerned'
@@ -879,6 +1018,15 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           runtime.cortex.recordJokeCallback(chosenMotif.id, true, nowMs)
           targetEmotion = 'smug'
           rawAssistantReply = `<|ACT {"emotion":"smug","intensity":0.88}|> Com certeza! Como uma IA, digo: brincadeira! Silêncio suspeito no sistema nunca me engana. <|DELAY 0.35|> Já preparei o trace completo e se esse estado fantasma piscar de novo, a gente vai precisar ${chosenMotif.motif} (<|CALLBACK ${chosenMotif.id}|>) antes do próximo deploy.`
+          jokeCard = {
+            title: 'Uma piada nossa',
+            description:
+              chosenMotif.id === 'motif-padre-npm'
+                ? 'Você e eu sempre brincamos com os "fantasmas" que aparecem no backend.'
+                : chosenMotif.originSummary,
+            motifId: chosenMotif.id,
+            memoryId: chosenMotif.originEpisodeId ?? 'ep-padre-npm-origin',
+          }
         } else {
           targetEmotion = 'tease'
           rawAssistantReply =
@@ -906,6 +1054,8 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         modelId: currentModelId,
         invokedMotifId,
         seriousnessTriggered: seriousness.isSeriousOrDelicate,
+        timeLabel: '21:15',
+        jokeCard,
         timestamp: nowMs + 1,
       }
 
@@ -948,6 +1098,84 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       })
 
       return receipt
+    },
+
+    setSelectedMemoryId(id) {
+      set({ selectedMemoryId: id })
+    },
+
+    setMemoryFilter(filter) {
+      set({ memoryFilter: filter })
+    },
+
+    createMemoryCard(input) {
+      const nowMs = Date.now()
+      const newId = `ep-custom-${nowMs}`
+      const cleanTitle = input.title.trim() || 'Nova lembrança'
+      const cleanSummary = input.summary.trim() || 'Momento registrado manualmente.'
+      const cleanStory = input.fullStory?.trim() || cleanSummary
+      const cat = input.filterCategory ?? 'momentos'
+
+      runtime.cortex.db.upsertEpisodicMemory({
+        id: newId,
+        title: cleanTitle,
+        summary: cleanSummary,
+        content: cleanStory,
+        createdAt: nowMs,
+        lastReviewedAt: nowMs,
+        stability: 8.5,
+        difficulty: 3.5,
+        surprise: 0.8,
+        isFlashbulb: false,
+        tags: [cat],
+      })
+
+      const card: FeaturedMemoryCard = {
+        id: newId,
+        title: cleanTitle,
+        summary: cleanSummary,
+        fullStory: cleanStory,
+        dateLabel: 'Hoje',
+        originLabel: 'Criada agora',
+        filterCategory: cat,
+        image: '/assets/mem-first-chat.jpg',
+        featured: false,
+        episodeId: newId,
+      }
+
+      set({
+        ...syncFromCortex(),
+        memoryCards: [card, ...get().memoryCards],
+        selectedMemoryId: card.id,
+      })
+
+      return card
+    },
+
+    updateMemoryStory(id, newTitle, newStory) {
+      const cards = get().memoryCards.map((c) =>
+        c.id === id
+          ? {
+              ...c,
+              title: newTitle.trim() || c.title,
+              fullStory: newStory.trim() || c.fullStory,
+              summary: (newStory.trim() || c.summary).split('\n')[0] ?? c.summary,
+            }
+          : c,
+      )
+      set({ memoryCards: cards })
+    },
+
+    deleteMemoryCard(id) {
+      const remaining = get().memoryCards.filter((c) => c.id !== id)
+      const nextSelected =
+        get().selectedMemoryId === id
+          ? (remaining[0]?.id ?? '')
+          : get().selectedMemoryId
+      set({
+        memoryCards: remaining,
+        selectedMemoryId: nextSelected,
+      })
     },
 
     addMilestone(input) {
@@ -1098,6 +1326,30 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       set(syncFromCortex())
     },
 
+    setSettingsSubTab(subTab) {
+      set({ settingsSubTab: subTab })
+    },
+
+    setShowDesktopAvatar(show) {
+      set({ showDesktopAvatar: show })
+    },
+
+    setComputerActionsEnabled(enabled) {
+      set({ computerActionsEnabled: enabled })
+    },
+
+    setComputerActionsPolicy(policy) {
+      set({ computerActionsPolicy: policy })
+    },
+
+    setQuietHoursRange(range) {
+      set({ quietHoursRange: range })
+    },
+
+    saveUserPreferences() {
+      set({ preferencesSavedToast: true })
+    },
+
     setMicMode(mode) {
       runtime.privacyController.setMicMode(mode)
       set({ privacyState: runtime.privacyController.getState() })
@@ -1191,14 +1443,16 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         ambientLuminance: 0.35,
         isSpeaking: false,
         presenceStatus: 'Idle',
-        bubbleText:
-          'SQLite FTS5 aquecido e Blast-Radius ligado. Bora quebrar esse código antes que ele quebre a gente.',
+        bubbleText: 'Fico por aqui. No seu ritmo. ♡',
         simulatedVowels: { A: 0.65, E: 0.25, I: 0.1, O: 0.35, U: 0.15 },
         mood: freshAffect.mood,
         traits: freshAffect.traits,
         milestones: freshMilestones,
         episodicMemories: freshMemories,
         rankedMemories: freshRanked,
+        memoryCards: [...INITIAL_MEMORY_CARDS],
+        selectedMemoryId: 'ep-padre-npm-origin',
+        memoryFilter: 'todas',
         memorySearchQuery: '',
         semanticFacts: runtime.cortex.db.listSemanticFacts(),
         relationalMotifs: runtime.cortex.db.listRelationalMotifs(),
@@ -1211,6 +1465,12 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         scheduledAudioChunks: [],
         lastPlaybackReceipt: null,
         lastStageSignals: [],
+        settingsSubTab: 'privacidade',
+        showDesktopAvatar: true,
+        computerActionsEnabled: true,
+        computerActionsPolicy: 'ask',
+        quietHoursRange: '22:00 — 08:00',
+        preferencesSavedToast: false,
         privacyState: runtime.privacyController.getState(),
         mcpSearchQuery: '',
         mcpSearchResults: runtime.mcpRegistry.search_mcp_tools({ query: '', limit: 10 }),

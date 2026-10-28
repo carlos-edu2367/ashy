@@ -383,6 +383,8 @@ export interface AshyStageCanvasProps {
   mode?: 'tachie' | 'live2d'
   width?: number
   height?: number
+  fullBleed?: boolean
+  hideBubble?: boolean
   uiIslandRects?: readonly UiIslandRect[]
   onIgnoreMouseChange?: (shouldIgnore: boolean) => void
 }
@@ -400,6 +402,8 @@ export function AshyStageCanvas({
   mode = 'tachie',
   width = 380,
   height = 460,
+  fullBleed = false,
+  hideBubble = false,
   uiIslandRects,
   onIgnoreMouseChange,
 }: AshyStageCanvasProps): React.ReactElement {
@@ -560,6 +564,11 @@ export function AshyStageCanvas({
   const headTx = springOffset.x + headFocus.x * 10
   const headTy = springOffset.y + headFocus.y * 8 - breathValue * 4
 
+  const portraitSrc =
+    emotion === 'concerned' || emotion === 'sad'
+      ? '/assets/ashy-concerned.jpg'
+      : '/assets/ashy-hero.jpg'
+
   return (
     <div
       data-testid="ashy-stage-canvas"
@@ -569,25 +578,70 @@ export function AshyStageCanvas({
       onMouseMove={handleMouseMove}
       style={{
         position: 'relative',
-        width: `${width}px`,
-        height: `${height}px`,
+        width: fullBleed ? '100%' : `${width}px`,
+        height: fullBleed ? '100%' : `${height}px`,
         overflow: 'hidden',
         userSelect: 'none',
+        background: '#14121d',
       }}
     >
-      <PresenceBubble
-        text={bubbleText}
-        emotion={emotion}
-        statusLabel={statusLabel}
-        springOffset={bubbleOffset}
+      {/* Primary Cozy Night Studio High-Res Portrait Layer with Spring Breathing & Parallax */}
+      <img
+        src={portraitSrc}
+        alt={`Ashy (${emotion})`}
+        data-testid="ashy-stage-portrait"
+        style={{
+          position: 'absolute',
+          inset: 0,
+          width: '100%',
+          height: '100%',
+          objectFit: 'cover',
+          objectPosition: 'center 22%',
+          transform: `translate3d(${(headTx * 0.4).toFixed(2)}px, ${(headTy * 0.4 - breathValue * 3).toFixed(2)}px, 0) scale(1.03)`,
+          transition: 'transform 0.12s linear, filter 0.35s ease',
+          filter: isSpeaking
+            ? 'brightness(1.05) saturate(1.04)'
+            : `brightness(${(0.92 + ambientLuminance * 0.18).toFixed(2)})`,
+          pointerEvents: 'none',
+        }}
       />
+
+      {/* Warm Ambient Vignette & Speaking Halo */}
+      <div
+        style={{
+          position: 'absolute',
+          inset: 0,
+          pointerEvents: 'none',
+          background: isSpeaking
+            ? 'radial-gradient(circle at 50% 42%, rgba(244, 166, 136, 0.10) 0%, rgba(17, 15, 24, 0.32) 68%, rgba(14, 12, 20, 0.72) 100%)'
+            : 'radial-gradient(circle at 50% 42%, rgba(244, 166, 136, 0.03) 0%, rgba(17, 15, 24, 0.28) 65%, rgba(14, 12, 20, 0.68) 100%)',
+          transition: 'background 0.35s ease',
+        }}
+      />
+
+      {!hideBubble && (
+        <PresenceBubble
+          text={bubbleText}
+          emotion={emotion}
+          statusLabel={statusLabel}
+          springOffset={bubbleOffset}
+        />
+      )}
 
       <svg
         data-testid="ashy-tachie-svg"
         viewBox="0 0 380 460"
         width={width}
         height={height}
-        style={{ display: 'block', width: '100%', height: '100%' }}
+        style={{
+          position: 'absolute',
+          inset: 0,
+          display: 'block',
+          width: '100%',
+          height: '100%',
+          opacity: mode === 'live2d' ? 0.92 : 0.01,
+          pointerEvents: 'none',
+        }}
       >
         <defs>
           <linearGradient id={`${gradientId}-hair`} x1="0%" y1="0%" x2="100%" y2="100%">

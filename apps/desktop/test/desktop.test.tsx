@@ -312,4 +312,66 @@ describe('@ashy/desktop — Phase 7 Companion Hub, Floating Stage Overlay & Full
       .triggerMcpTool('get_active_window_title', { windowTitle: 'VS Code' })
     expect(blockedObserve.status).toBe('blocked_privacy')
   })
+
+  it('10. renders Cozy Night Studio views (Companhia, Memórias Bento Grid + Detail Drawer, and Configurações Do seu jeito) and supports memory CRUD', () => {
+    const store = useAshyStore.getState()
+
+    // 1. View 1: Companhia
+    const companhiaHtml = renderToStaticMarkup(<App />)
+    expect(companhiaHtml).toContain('Bom te ver, Carlos.')
+    expect(companhiaHtml).toContain('Por aqui, com você.')
+    expect(companhiaHtml).toContain('Nossa conversa')
+    expect(companhiaHtml).toContain('Lembra do fantasma no backend?')
+    expect(companhiaHtml).toContain('Uma piada nossa')
+    expect(companhiaHtml).toContain('Conversar por voz')
+    expect(companhiaHtml).toContain('Esconder avatar')
+
+    // 2. View 2: Memórias ("O que fica com a gente")
+    store.setActiveTab('memories')
+    const memHtml = renderToStaticMarkup(<App />)
+    expect(memHtml).toContain('O que fica com a gente')
+    expect(memHtml).toContain('O fantasma no backend')
+    expect(memHtml).toContain('Orin e Ashy')
+    expect(memHtml).toContain('Seu jeito de trabalhar')
+    expect(memHtml).toContain('Primeira conversa')
+    expect(memHtml).toContain('Retomar o protótipo')
+    expect(memHtml).toContain('Suas memórias ficam neste dispositivo.')
+    expect(memHtml).toContain('Local primeiro. Sempre nossa.')
+
+    // Select "Orin e Ashy" and verify drawer updates
+    store.setSelectedMemoryId('ep-orin-ashy')
+    const orinHtml = renderToStaticMarkup(<App />)
+    expect(orinHtml).toContain('Conversa de 5 de outubro')
+
+    // Edit memory story and create new memory
+    store.updateMemoryStory('ep-orin-ashy', 'Orin e Ashy v2', 'História atualizada com carinho.')
+    expect(
+      useAshyStore.getState().memoryCards.find((c) => c.id === 'ep-orin-ashy')?.title,
+    ).toBe('Orin e Ashy v2')
+
+    const createdCard = store.createMemoryCard({
+      title: 'Noite de chuva no estúdio',
+      summary: 'Testando a nova interface acolhedora.',
+      filterCategory: 'momentos',
+    })
+    expect(useAshyStore.getState().selectedMemoryId).toBe(createdCard.id)
+
+    store.deleteMemoryCard(createdCard.id)
+    expect(
+      useAshyStore.getState().memoryCards.some((c) => c.id === createdCard.id),
+    ).toBe(false)
+
+    // 3. View 5: Configurações ("Do seu jeito")
+    store.setActiveTab('agency')
+    const settingsHtml = renderToStaticMarkup(<App />)
+    expect(settingsHtml).toContain('Do seu jeito')
+    expect(settingsHtml).toContain('Presença no desktop')
+    expect(settingsHtml).toContain('Mostrar avatar')
+    expect(settingsHtml).toContain('Acesso à tela')
+    expect(settingsHtml).toContain('Ações no computador')
+    expect(settingsHtml).toContain('Horários de silêncio')
+    expect(settingsHtml).toContain('Pré-visualização')
+    expect(settingsHtml).toContain('Salvar preferências')
+    expect(settingsHtml).toContain('Ashy é uma personagem de IA.')
+  })
 })
