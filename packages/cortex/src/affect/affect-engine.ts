@@ -94,7 +94,7 @@ const SERIOUSNESS_RULES: readonly SeriousnessRule[] = Object.freeze([
     reason: 'Severe anxiety, panic, or emotional exhaustion / burnout',
     severity: 0.85,
     patterns: [
-      /\b(crise de ansiedade|ataque de p[aâ]nico|burnout|exaust[oa] demais|n[aã]o aguento mais|t[oô] muito mal|me sentindo um lixo|deprimid[oa])\b/i,
+      /\b(crise de ansiedade|ataque de p[aâ]nico|burnout|estou exaust[oa]|exaust[oa] demais|deu tudo errado|n[aã]o aguento mais|t[oô] muito mal|me sentindo um lixo|deprimid[oa])\b/i,
       /\b(panic attack|anxiety attack|burned out|burnt out|can'?t take it anymore|depressed|feeling hopeless|exhausted and crying)\b/i,
     ],
   },

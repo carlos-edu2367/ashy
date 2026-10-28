@@ -17,8 +17,10 @@
     "packages/*/src/**/*.ts",
     "packages/*/src/**/*.tsx",
     "packages/*/test/**/*.ts",
+    "packages/*/test/**/*.tsx",
     "apps/*/src/**/*.ts",
     "apps/*/src/**/*.tsx",
-    "apps/*/test/**/*.ts"
+    "apps/*/test/**/*.ts",
+    "apps/*/test/**/*.tsx"
   ]
 }

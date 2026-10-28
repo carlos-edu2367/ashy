@@ -1,0 +1,283 @@
+:root {
+  --bg-deep: oklch(0.11 0.02 275);
+  --surface-primary: oklch(0.14 0.02 275);
+  --surface-elevated: oklch(0.18 0.025 278);
+  --surface-glass: oklch(0.16 0.025 278 / 0.84);
+  --border-subtle: oklch(0.28 0.03 280 / 0.55);
+  --border-accent: oklch(0.72 0.19 345 / 0.45);
+  --accent-rose: oklch(0.72 0.19 345);
+  --accent-violet: oklch(0.74 0.16 295);
+  --accent-cyan: oklch(0.78 0.14 210);
+  --text-primary: oklch(0.96 0.01 270);
+  --text-secondary: oklch(0.76 0.02 275);
+  --text-muted: oklch(0.58 0.02 275);
+  --status-emerald: oklch(0.74 0.17 155);
+  --status-amber: oklch(0.8 0.16 80);
+  --status-red: oklch(0.66 0.21 25);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(
+      circle at 15% 10%,
+      oklch(0.22 0.06 320 / 0.32),
+      transparent 42%
+    ),
+    radial-gradient(
+      circle at 85% 85%,
+      oklch(0.2 0.06 285 / 0.28),
+      transparent 45%
+    ),
+    var(--bg-deep);
+  color: var(--text-primary);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: oklch(0.12 0.015 275);
+}
+
+::-webkit-scrollbar-thumb {
+  background: oklch(0.32 0.04 285);
+  border-radius: 999px;
+}
+
+.ashy-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  max-width: 1560px;
+  margin: 0 auto;
+  padding: 16px 20px;
+  gap: 16px;
+}
+
+.ashy-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 18px;
+  background: var(--surface-glass);
+  border: 1px solid var(--border-subtle);
+  border-radius: 16px;
+  backdrop-filter: blur(14px);
+}
+
+.ashy-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ashy-brand-orb {
+  width: 36px;
+  height: 36px;
+  border-radius: 11px;
+  background: linear-gradient(135deg, var(--accent-rose), var(--accent-violet));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: 16px;
+  color: #090a10;
+  box-shadow: 0 0 18px oklch(0.72 0.19 345 / 0.45);
+}
+
+.ashy-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ashy-tab-btn {
+  appearance: none;
+  border: 1px solid transparent;
+  background: oklch(0.18 0.02 278 / 0.55);
+  color: var(--text-secondary);
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.16s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.ashy-tab-btn:hover {
+  color: var(--text-primary);
+  background: oklch(0.22 0.03 282 / 0.8);
+}
+
+.ashy-tab-btn.active {
+  color: var(--text-primary);
+  background: linear-gradient(
+    135deg,
+    oklch(0.72 0.19 345 / 0.24),
+    oklch(0.74 0.16 295 / 0.24)
+  );
+  border-color: var(--border-accent);
+  box-shadow: 0 4px 16px oklch(0.72 0.19 345 / 0.18);
+}
+
+.ashy-workspace {
+  display: grid;
+  grid-template-columns: 400px 1fr;
+  gap: 18px;
+  align-items: start;
+}
+
+@media (max-width: 1080px) {
+  .ashy-workspace {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ashy-card {
+  background: var(--surface-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: 16px;
+  padding: 16px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.32);
+}
+
+.ashy-card-title {
+  margin: 0 0 10px 0;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ashy-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.ashy-badge.emerald {
+  background: oklch(0.74 0.17 155 / 0.16);
+  color: var(--status-emerald);
+  border: 1px solid oklch(0.74 0.17 155 / 0.4);
+}
+
+.ashy-badge.amber {
+  background: oklch(0.8 0.16 80 / 0.16);
+  color: var(--status-amber);
+  border: 1px solid oklch(0.8 0.16 80 / 0.4);
+}
+
+.ashy-badge.red {
+  background: oklch(0.66 0.21 25 / 0.18);
+  color: var(--status-red);
+  border: 1px solid oklch(0.66 0.21 25 / 0.45);
+}
+
+.ashy-badge.violet {
+  background: oklch(0.74 0.16 295 / 0.18);
+  color: var(--accent-violet);
+  border: 1px solid oklch(0.74 0.16 295 / 0.42);
+}
+
+.ashy-badge.rose {
+  background: oklch(0.72 0.19 345 / 0.18);
+  color: var(--accent-rose);
+  border: 1px solid oklch(0.72 0.19 345 / 0.42);
+}
+
+.ashy-btn {
+  appearance: none;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-elevated);
+  color: var(--text-primary);
+  padding: 7px 12px;
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+
+.ashy-btn:hover:not(:disabled) {
+  border-color: var(--accent-rose);
+  background: oklch(0.23 0.035 290);
+}
+
+.ashy-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ashy-btn.primary {
+  background: linear-gradient(135deg, var(--accent-rose), var(--accent-violet));
+  color: #090a10;
+  border-color: transparent;
+  font-weight: 700;
+}
+
+.ashy-btn.danger {
+  background: oklch(0.66 0.21 25 / 0.2);
+  color: var(--status-red);
+  border-color: oklch(0.66 0.21 25 / 0.5);
+}
+
+.ashy-input,
+.ashy-select {
+  background: oklch(0.11 0.015 275);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  border-radius: 9px;
+  padding: 8px 11px;
+  font-size: 13px;
+  outline: none;
+}
+
+.ashy-input:focus,
+.ashy-select:focus {
+  border-color: var(--accent-rose);
+}
+
+.ashy-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 14px;
+}
+
+.ashy-progress-track {
+  width: 100%;
+  height: 8px;
+  background: oklch(0.11 0.015 275);
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+}
+
+.ashy-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-rose), var(--accent-violet));
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}

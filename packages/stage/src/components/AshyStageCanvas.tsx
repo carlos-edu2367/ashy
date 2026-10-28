@@ -317,19 +317,19 @@ export function PresenceBubble({
       data-ui-island="true"
       style={{
         position: 'absolute',
-        top: '18px',
+        top: '8px',
         left: '50%',
         transform: `translate3d(calc(-50% + ${springOffset.x.toFixed(2)}px), ${springOffset.y.toFixed(2)}px, 0)`,
-        maxWidth: '300px',
-        padding: '10px 14px',
-        borderRadius: '16px',
-        background: 'rgba(18, 19, 28, 0.88)',
+        maxWidth: '330px',
+        padding: '8px 12px',
+        borderRadius: '14px',
+        background: 'rgba(18, 19, 28, 0.90)',
         border: '1px solid rgba(244, 114, 182, 0.38)',
-        boxShadow: '0 12px 28px rgba(0, 0, 0, 0.42)',
+        boxShadow: '0 10px 24px rgba(0, 0, 0, 0.42)',
         color: '#f8fafc',
         fontFamily: 'system-ui, -apple-system, sans-serif',
-        fontSize: '13px',
-        lineHeight: 1.45,
+        fontSize: '12px',
+        lineHeight: 1.35,
         pointerEvents: 'auto',
         zIndex: 10,
       }}
@@ -353,7 +353,19 @@ export function PresenceBubble({
           {emotion}
         </span>
       </div>
-      {text ? <div data-testid="ashy-bubble-text">{text}</div> : null}
+      {text ? (
+        <div
+          data-testid="ashy-bubble-text"
+          style={{
+            display: '-webkit-box',
+            WebkitLineClamp: 3,
+            WebkitBoxOrient: 'vertical',
+            overflow: 'hidden',
+          }}
+        >
+          {text}
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -592,7 +604,7 @@ export function AshyStageCanvas({
         {/* Breathing Torso / Shoulders */}
         <g
           data-testid="ashy-layer-torso"
-          transform={`translate(0, ${(-breathValue * 4.5).toFixed(2)})`}
+          transform={`translate(0, ${(34 - breathValue * 4.5).toFixed(2)})`}
         >
           <path
             d="M 95 455 C 102 330, 145 295, 190 295 C 235 295, 278 330, 285 455 Z"
@@ -606,7 +618,7 @@ export function AshyStageCanvas({
         {/* Spring-Driven Head & Facial Expression Group */}
         <g
           data-testid="ashy-layer-head"
-          transform={`translate(${headTx.toFixed(2)}, ${headTy.toFixed(2)})`}
+          transform={`translate(${headTx.toFixed(2)}, ${(34 + headTy).toFixed(2)})`}
         >
           {/* Back Hair */}
           <ellipse

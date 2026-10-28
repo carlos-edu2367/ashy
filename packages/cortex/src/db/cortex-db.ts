@@ -1,4 +1,3 @@
-import { createRequire } from 'node:module'
 import {
   ASHY_BASELINE_MOOD,
   ASHY_DEFAULT_TRAITS,
@@ -90,10 +89,10 @@ interface SqliteDatabaseLike {
 
 function tryOpenNodeSqlite(dbPath: string): SqliteDatabaseLike | null {
   try {
-    const req = createRequire(import.meta.url)
-    const sqliteMod = req('node:sqlite') as {
-      DatabaseSync?: new (path: string) => SqliteDatabaseLike
-    }
+    const proc = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process
+    const sqliteMod = proc?.getBuiltinModule?.('node:sqlite') as
+      | { DatabaseSync?: new (path: string) => SqliteDatabaseLike }
+      | undefined
     if (sqliteMod && typeof sqliteMod.DatabaseSync === 'function') {
       return new sqliteMod.DatabaseSync(dbPath)
     }

@@ -1,0 +1,23 @@
+import path from 'node:path'
+import { defineConfig } from 'vite'
+
+export default defineConfig({
+  esbuild: {
+    jsx: 'automatic',
+  },
+  resolve: {
+    alias: {
+      '@ashy/shared': path.resolve(__dirname, '../../packages/shared/src/index.ts'),
+      '@ashy/bus': path.resolve(__dirname, '../../packages/bus/src/index.ts'),
+      '@ashy/llm': path.resolve(__dirname, '../../packages/llm/src/index.ts'),
+      '@ashy/cortex': path.resolve(__dirname, '../../packages/cortex/src/index.ts'),
+      '@ashy/voice': path.resolve(__dirname, '../../packages/voice/src/index.ts'),
+      '@ashy/stage': path.resolve(__dirname, '../../packages/stage/src/index.ts'),
+      '@ashy/agency': path.resolve(__dirname, '../../packages/agency/src/index.ts'),
+    },
+  },
+  server: {
+    port: 5173,
+    strictPort: false,
+  },
+})
