@@ -1,13 +1,16 @@
-﻿{
-    "name":  "@ashy/stage",
-    "version":  "0.1.0",
-    "private":  true,
-    "type":  "module",
-    "main":  "./src/index.ts",
-    "types":  "./src/index.ts",
-    "dependencies":  {
-                         "@ashy/shared":  "workspace:*",
-                         "react":  "^19.0.0",
-                         "react-dom":  "^19.0.0"
-                     }
+{
+  "name": "@ashy/stage",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "test": "vitest run --root ../.. packages/stage/test"
+  },
+  "dependencies": {
+    "@ashy/shared": "workspace:*",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
 }
