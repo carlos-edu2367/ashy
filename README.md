@@ -29,6 +29,7 @@
 
 - [Contexto e Visão do Produto (`docs/ASHY_PROJECT_CONTEXT.md`)](./docs/ASHY_PROJECT_CONTEXT.md)
 - [Especificação de Arquitetura (`docs/ASHY_ARCHITECTURE_SPEC.md`)](./docs/ASHY_ARCHITECTURE_SPEC.md)
+- [Roadmap por Fases (`docs/ASHY_ROADMAP.md`)](./docs/ASHY_ROADMAP.md)
 - [Plano de Implementação TDD (`docs/superpowers/plans/2026-10-28-ashy-v1-foundation.md`)](./docs/superpowers/plans/2026-10-28-ashy-v1-foundation.md)
 - [Estudo de Caso Forense: Ecossistema `moeru-ai` (`docs/MOERU_AI_CASE_STUDY.md`)](./docs/MOERU_AI_CASE_STUDY.md)
 - [Blueprint de Receitas Absorvidas e Corrigidas (`docs/MOERU_AI_ABSORPTION_RECIPES.md`)](./docs/MOERU_AI_ABSORPTION_RECIPES.md)
