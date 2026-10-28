@@ -1,11 +1,14 @@
-﻿{
-    "name":  "@ashy/shared",
-    "version":  "0.1.0",
-    "private":  true,
-    "type":  "module",
-    "main":  "./src/index.ts",
-    "types":  "./src/index.ts",
-    "dependencies":  {
-                         "valibot":  "^1.0.0"
-                     }
+{
+  "name": "@ashy/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "test": "vitest run --root ../.. packages/shared/test"
+  },
+  "dependencies": {
+    "valibot": "^1.0.0"
+  }
 }
