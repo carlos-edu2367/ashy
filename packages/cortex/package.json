@@ -1,0 +1,13 @@
+﻿{
+    "name":  "@ashy/cortex",
+    "version":  "0.1.0",
+    "private":  true,
+    "type":  "module",
+    "main":  "./src/index.ts",
+    "types":  "./src/index.ts",
+    "dependencies":  {
+                         "valibot":  "^1.0.0",
+                         "@ashy/shared":  "workspace:*",
+                         "@ashy/llm":  "workspace:*"
+                     }
+}
