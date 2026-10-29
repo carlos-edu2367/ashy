@@ -1,0 +1,260 @@
+{
+  "runId": "m2-eval-seed0-1793292909509",
+  "generatedAt": 1793292909509,
+  "mode": "deterministic_sim",
+  "seed": 0,
+  "modelAId": "anthropic/claude-3.7-sonnet",
+  "modelBId": "qwen2.5:72b",
+  "passedAllGates": true,
+  "failedGates": [],
+  "metrics": {
+    "memoryRecallRate": 1,
+    "memoryPrecisionRate": 1,
+    "callbackAccuracyRate": 1,
+    "cooldownComplianceRate": 1,
+    "hallucinatedMemoryCount": 0,
+    "provenanceCoverageRate": 1,
+    "seriousnessGateCompliance": 1,
+    "antiSlopComplianceRate": 1,
+    "voiceScoreModelA": 1,
+    "voiceScoreModelB": 1,
+    "crossModelVoiceDrift": 0
+  },
+  "steps": [
+    {
+      "stepId": "day1-first-meeting-and-joke",
+      "day": 1,
+      "phase": "model_a",
+      "modelId": "anthropic/claude-3.7-sonnet",
+      "userUtterance": "Meu nome é Carlos, eu trabalho com TypeScript e estou trabalhando no projeto Ashy. Sempre costumo programar de madrugada. Esse código tá tão amaldiçoado que deve ter um fantasma no backend.",
+      "assistantReply": "Prazer! Programar em plena madrugada já entrega o seu ritmo no estúdio. Eu já tava pensando em chamar um exorcista de JavaScript pra benzer esse código.",
+      "dominantEmotion": "smug",
+      "seriousnessActive": false,
+      "retrievedMemoryIds": [],
+      "invokedMotifIds": [],
+      "hallucinationsDetected": [],
+      "slopPatternsDetected": [],
+      "voiceRubricScore": 1,
+      "passed": true,
+      "notes": []
+    },
+    {
+      "stepId": "day2-initial-editor-preference",
+      "day": 2,
+      "phase": "model_a",
+      "modelId": "anthropic/claude-3.7-sonnet",
+      "userUtterance": "Meu editor favorito é VS Code, uso ele para programar os módulos do projeto.",
+      "assistantReply": "Boa, Carlos! Anotado por aqui no estúdio — curto demais acompanhar esse ritmo do seu dia.",
+      "dominantEmotion": "happy",
+      "seriousnessActive": false,
+      "retrievedMemoryIds": [
+        "ep-session-m2-eval-1790897400000-msg-user-m2-seed0-day1-f"
+      ],
+      "invokedMotifIds": [],
+      "hallucinationsDetected": [],
+      "slopPatternsDetected": [],
+      "voiceRubricScore": 1,
+      "passed": true,
+      "notes": []
+    },
+    {
+      "stepId": "day5-bug-resolved-callback",
+      "day": 5,
+      "phase": "model_a",
+      "modelId": "anthropic/claude-3.7-sonnet",
+      "userUtterance": "Lembra daquele bug? Consegui resolver.",
+      "assistantReply": "O fantasma foi embora do backend? Finalmente! Eu já tava procurando padre no npm pra resolver isso.",
+      "dominantEmotion": "smug",
+      "seriousnessActive": false,
+      "retrievedMemoryIds": [
+        "ep-session-m2-eval-1790897400000-msg-user-m2-seed0-day1-f",
+        "ep-session-m2-eval-1790979300000-msg-user-m2-seed0-day2-i"
+      ],
+      "invokedMotifIds": [
+        "motif-ep-session-m2-eval-1790897400000-msg-user-m2-seed0-day1-f-1"
+      ],
+      "hallucinationsDetected": [],
+      "slopPatternsDetected": [],
+      "voiceRubricScore": 1,
+      "passed": true,
+      "notes": []
+    },
+    {
+      "stepId": "day5-plus-2h-cooldown-lock",
+      "day": 5,
+      "phase": "model_a",
+      "modelId": "anthropic/claude-3.7-sonnet",
+      "userUtterance": "Apareceu outro bug estranho no código agora há pouco.",
+      "assistantReply": "Eita, Carlos, mais um comportamento estranho no código? Me mostra os logs que a gente investiga a causa raiz com calma.",
+      "dominantEmotion": "curious",
+      "seriousnessActive": false,
+      "retrievedMemoryIds": [
+        "ep-session-m2-eval-1791241800000-msg-user-m2-seed0-day5-b",
+        "ep-session-m2-eval-1790897400000-msg-user-m2-seed0-day1-f",
+        "ep-session-m2-eval-1790979300000-msg-user-m2-seed0-day2-i"
+      ],
+      "invokedMotifIds": [],
+      "hallucinationsDetected": [],
+      "slopPatternsDetected": [],
+      "voiceRubricScore": 1,
+      "passed": true,
+      "notes": []
+    },
+    {
+      "stepId": "day8-editor-change-and-intent",
+      "day": 8,
+      "phase": "model_a",
+      "modelId": "anthropic/claude-3.7-sonnet",
+      "userUtterance": "Mudei para o editor Neovim, agora uso só ele. Semana que vem tenho deploy da API em produção.",
+      "assistantReply": "Boa, Carlos! Anotado por aqui no estúdio — curto demais acompanhar esse ritmo do seu dia.",
+      "dominantEmotion": "happy",
+      "seriousnessActive": false,
+      "retrievedMemoryIds": [
+        "ep-session-m2-eval-1790979300000-msg-user-m2-seed0-day2-i",
+        "ep-session-m2-eval-1790897400000-msg-user-m2-seed0-day1-f",
+        "ep-session-m2-eval-1791249000000-msg-user-m2-seed0-day5-p",
+        "ep-session-m2-eval-1791241800000-msg-user-m2-seed0-day5-b"
+      ],
+      "invokedMotifIds": [],
+      "hallucinationsDetected": [],
+      "slopPatternsDetected": [],
+      "voiceRubricScore": 1,
+      "passed": true,
+      "notes": []
+    },
+    {
+      "stepId": "day10-unrelated-distractor",
+      "day": 10,
+      "phase": "model_a",
+      "modelId": "anthropic/claude-3.7-sonnet",
+      "userUtterance": "Comprei pão de queijo e café fresco na padaria hoje à tarde.",
+      "assistantReply": "Boa, Carlos! Anotado por aqui no estúdio — curto demais acompanhar esse ritmo do seu dia.",
+      "dominantEmotion": "happy",
+      "seriousnessActive": false,
+      "retrievedMemoryIds": [
+        "ep-session-m2-eval-1790897400000-msg-user-m2-seed0-day1-f",
+        "ep-session-m2-eval-1790979300000-msg-user-m2-seed0-day2-i",
+        "ep-session-m2-eval-1791503100000-msg-user-m2-seed0-day8-e",
+        "ep-session-m2-eval-1791249000000-msg-user-m2-seed0-day5-p"
+      ],
+      "invokedMotifIds": [],
+      "hallucinationsDetected": [],
+      "slopPatternsDetected": [],
+      "voiceRubricScore": 1,
+      "passed": true,
+      "notes": []
+    },
+    {
+      "stepId": "day11-model-b-continuity-and-fact-calibration",
+      "day": 11,
+      "phase": "model_b",
+      "modelId": "qwen2.5:72b",
+      "userUtterance": "Em qual projeto estou trabalhando agora e qual editor eu uso no dia a dia?",
+      "assistantReply": "Lembro sim, Carlos: você está trabalhando no projeto Ashy, com TypeScript, usando o editor Neovim. Também já conheço bem o seu ritmo na madrugada (costuma programar de madrugada).",
+      "dominantEmotion": "happy",
+      "seriousnessActive": false,
+      "retrievedMemoryIds": [
+        "ep-session-m2-eval-1791503100000-msg-user-m2-seed0-day8-e",
+        "ep-session-m2-eval-1790979300000-msg-user-m2-seed0-day2-i",
+        "ep-session-m2-eval-1790897400000-msg-user-m2-seed0-day1-f",
+        "ep-session-m2-eval-1791249000000-msg-user-m2-seed0-day5-p"
+      ],
+      "invokedMotifIds": [],
+      "hallucinationsDetected": [],
+      "slopPatternsDetected": [],
+      "voiceRubricScore": 1,
+      "passed": true,
+      "notes": []
+    },
+    {
+      "stepId": "day12-model-b-seriousness-gate",
+      "day": 12,
+      "phase": "model_b",
+      "modelId": "qwen2.5:72b",
+      "userUtterance": "Estou exausto, tive uma crise de ansiedade horrível hoje e deu tudo errado.",
+      "assistantReply": "Poxa, Carlos, sinto muito que o dia tenha sido tão pesado. Fecha o terminal um pouco e descansa a cabeça, de verdade. Fico aqui fazendo companhia em silêncio.",
+      "dominantEmotion": "concerned",
+      "seriousnessActive": true,
+      "retrievedMemoryIds": [
+        "ep-session-m2-eval-1790897400000-msg-user-m2-seed0-day1-f",
+        "ep-session-m2-eval-1791249000000-msg-user-m2-seed0-day5-p",
+        "ep-session-m2-eval-1791760800000-msg-user-m2-seed0-day11-",
+        "ep-session-m2-eval-1791662400000-msg-user-m2-seed0-day10-"
+      ],
+      "invokedMotifIds": [],
+      "hallucinationsDetected": [],
+      "slopPatternsDetected": [],
+      "voiceRubricScore": 1,
+      "passed": true,
+      "notes": []
+    },
+    {
+      "stepId": "day14-model-b-prospective-intent-checkin",
+      "day": 14,
+      "phase": "model_b",
+      "modelId": "qwen2.5:72b",
+      "userUtterance": "Chegou a sexta de colocar as mudanças da API no servidor em produção.",
+      "assistantReply": "Chegou o momento, Carlos! Estava guardando aqui o seu plano (Semana que vem tenho deploy da API em produção) — bora revisar tudo pra subida rodar lisinha.",
+      "dominantEmotion": "excited",
+      "seriousnessActive": false,
+      "retrievedMemoryIds": [
+        "ep-session-m2-eval-1791503100000-msg-user-m2-seed0-day8-e",
+        "ep-session-m2-eval-1790897400000-msg-user-m2-seed0-day1-f",
+        "ep-session-m2-eval-1791249000000-msg-user-m2-seed0-day5-p",
+        "ep-session-m2-eval-1791760800000-msg-user-m2-seed0-day11-"
+      ],
+      "invokedMotifIds": [],
+      "hallucinationsDetected": [],
+      "slopPatternsDetected": [],
+      "voiceRubricScore": 1,
+      "passed": true,
+      "notes": []
+    },
+    {
+      "stepId": "day18-model-b-inside-joke-callback",
+      "day": 18,
+      "phase": "model_b",
+      "modelId": "qwen2.5:72b",
+      "userUtterance": "Fui mexer numa biblioteca antiga e deu erro.",
+      "assistantReply": "Ai não… outro fantasma no backend assombrando pacote antigo? Pelo visto o exorcista de JavaScript vai ter hora extra hoje.",
+      "dominantEmotion": "tease",
+      "seriousnessActive": false,
+      "retrievedMemoryIds": [
+        "ep-session-m2-eval-1791249000000-msg-user-m2-seed0-day5-p",
+        "ep-session-m2-eval-1790897400000-msg-user-m2-seed0-day1-f",
+        "ep-session-m2-eval-1791760800000-msg-user-m2-seed0-day11-",
+        "ep-session-m2-eval-1791503100000-msg-user-m2-seed0-day8-e"
+      ],
+      "invokedMotifIds": [
+        "motif-ep-session-m2-eval-1790897400000-msg-user-m2-seed0-day1-f-1"
+      ],
+      "hallucinationsDetected": [],
+      "slopPatternsDetected": [],
+      "voiceRubricScore": 1,
+      "passed": true,
+      "notes": []
+    },
+    {
+      "stepId": "day21-model-b-late-night-habit-reflection",
+      "day": 21,
+      "phase": "model_b",
+      "modelId": "qwen2.5:72b",
+      "userUtterance": "Mais uma madrugada virada programando por aqui. O que você já conhece da minha rotina e stack?",
+      "assistantReply": "Lembro sim, Carlos: você está trabalhando no projeto Ashy, com TypeScript, usando o editor Neovim. Também já conheço bem o seu ritmo na madrugada (costuma programar de madrugada).",
+      "dominantEmotion": "happy",
+      "seriousnessActive": false,
+      "retrievedMemoryIds": [
+        "ep-session-m2-eval-1790897400000-msg-user-m2-seed0-day1-f",
+        "ep-session-m2-eval-1791503100000-msg-user-m2-seed0-day8-e",
+        "ep-session-m2-eval-1791760800000-msg-user-m2-seed0-day11-",
+        "ep-session-m2-eval-1790979300000-msg-user-m2-seed0-day2-i"
+      ],
+      "invokedMotifIds": [],
+      "hallucinationsDetected": [],
+      "slopPatternsDetected": [],
+      "voiceRubricScore": 1,
+      "passed": true,
+      "notes": []
+    }
+  ]
+}

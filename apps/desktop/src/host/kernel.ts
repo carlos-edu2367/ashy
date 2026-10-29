@@ -3,8 +3,10 @@ import path from 'node:path'
 import * as v from 'valibot'
 import { createContainer, type DIContainer } from '@ashy/bus'
 import { createAshyCortex, type AshyCortex } from '@ashy/cortex'
+import { runCoreExperimentM2 } from '@ashy/evals'
 import {
   CompleteOnboardingInputSchema,
+  RunCoreExperimentInputSchema,
   type ApprovableMemoryKind,
   type AshyBootstrapSnapshot,
   type AshyEmotion,
@@ -14,6 +16,7 @@ import {
   type ChatMessageRecord,
   type ChatSessionRecord,
   type CompleteOnboardingInput,
+  type CoreExperimentEvalReport,
   type DeletableMemoryKind,
   type EpisodicMemory,
   type LlmProviderId,
@@ -26,6 +29,7 @@ import {
   type PublicProviderConfig,
   type RelationalMotif,
   type RelationshipStage,
+  type RunCoreExperimentInput,
   type SaveProviderConfigInput,
   type SemanticFact,
   type SendTurnInput,
@@ -101,6 +105,8 @@ export async function createAshyHostKernel(
   let activeSessionId = 'session-initial'
   let dominantEmotion: AshyEmotion = 'neutral'
   let lastPersistenceWarning: string | null = null
+  let lastEvalReport: CoreExperimentEvalReport | null = null
+  let evalLock: Promise<unknown> = Promise.resolve()
   let sessionSequence = 0
   let started = false
 
@@ -259,6 +265,7 @@ export async function createAshyHostKernel(
         dbPath: cortex.db.filePath,
         lastPersistenceWarning,
       },
+      lastEvalReport,
     }
   }
 
@@ -590,6 +597,26 @@ export async function createAshyHostKernel(
       seedAshyDemoFixtures(cortexInstance)
       dominantEmotion = 'smug'
       return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)
+    },
+
+    async runCoreExperimentEval(
+      rawInput?: RunCoreExperimentInput,
+    ): Promise<CoreExperimentEvalReport> {
+      const input = rawInput ? v.parse(RunCoreExperimentInputSchema, rawInput) : {}
+      const nextRun = evalLock.then(async () => {
+        const report = await runCoreExperimentM2({
+          seed: input.seed ?? 0,
+          modelAId: input.modelAId,
+          modelBId: input.modelBId,
+        })
+        lastEvalReport = report
+        return report
+      })
+      evalLock = nextRun.then(
+        () => undefined,
+        () => undefined,
+      )
+      return nextRun
     },
 
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {

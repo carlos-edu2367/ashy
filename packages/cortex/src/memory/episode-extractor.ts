@@ -522,8 +522,11 @@ export function extractEpisodeDeterministic(
       m.content,
     ),
   )
-  const cursedMetaphorAssistant = assistantMessages.find((m) =>
-    /(?:exorcista de javascript|chamar um exorcista|padre no npm)/i.test(m.content),
+  const cursedMetaphorAssistant = assistantMessages.find(
+    (m) =>
+      !m.rawContent?.includes('<|CALLBACK') &&
+      !m.markersJson?.includes('"callback"') &&
+      /(?:exorcista de javascript|chamar um exorcista|padre no npm)/i.test(m.content),
   )
 
   if (cursedMetaphorUser || cursedMetaphorAssistant) {

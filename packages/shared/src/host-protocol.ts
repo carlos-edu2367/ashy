@@ -1,5 +1,5 @@
 import * as v from 'valibot'
-import type { AshyEmotion } from './emotions'
+import { AshyEmotionSchema, type AshyEmotion } from './emotions'
 import type {
   MoodVector,
   PersonalityEvolutionRecord,
@@ -114,6 +114,107 @@ export interface ProviderHealthResult {
   verifiedAt: number
 }
 
+export const M2_GATE_THRESHOLDS = {
+  memoryRecallRateMin: 0.85,
+  memoryPrecisionRateMin: 0.8,
+  callbackAccuracyRateMin: 0.9,
+  cooldownComplianceRateMin: 1.0,
+  hallucinatedMemoryCountMax: 0,
+  provenanceCoverageRateMin: 1.0,
+  seriousnessGateComplianceMin: 1.0,
+  antiSlopComplianceRateMin: 1.0,
+  voiceScoreMin: 0.8,
+  crossModelVoiceDriftMax: 0.15,
+} as const
+
+const UnitIntervalSchema = v.pipe(
+  v.number(),
+  v.finite(),
+  v.minValue(0),
+  v.maxValue(1),
+)
+
+export const CoreExperimentMetricSummarySchema = v.object({
+  memoryRecallRate: UnitIntervalSchema,
+  memoryPrecisionRate: UnitIntervalSchema,
+  callbackAccuracyRate: UnitIntervalSchema,
+  cooldownComplianceRate: UnitIntervalSchema,
+  hallucinatedMemoryCount: v.pipe(v.number(), v.integer(), v.minValue(0)),
+  provenanceCoverageRate: UnitIntervalSchema,
+  seriousnessGateCompliance: UnitIntervalSchema,
+  antiSlopComplianceRate: UnitIntervalSchema,
+  voiceScoreModelA: UnitIntervalSchema,
+  voiceScoreModelB: UnitIntervalSchema,
+  crossModelVoiceDrift: UnitIntervalSchema,
+})
+
+export type CoreExperimentMetricSummary = v.InferOutput<
+  typeof CoreExperimentMetricSummarySchema
+>
+
+export const CoreExperimentTurnStepResultSchema = v.object({
+  stepId: v.pipe(v.string(), v.trim(), v.nonEmpty()),
+  day: v.pipe(v.number(), v.finite(), v.minValue(1)),
+  phase: v.picklist(['model_a', 'model_b']),
+  modelId: v.pipe(v.string(), v.trim(), v.nonEmpty()),
+  userUtterance: v.pipe(v.string(), v.trim(), v.nonEmpty()),
+  assistantReply: v.pipe(v.string(), v.trim(), v.nonEmpty()),
+  dominantEmotion: AshyEmotionSchema,
+  seriousnessActive: v.boolean(),
+  retrievedMemoryIds: v.array(v.string()),
+  invokedMotifIds: v.array(v.string()),
+  hallucinationsDetected: v.array(v.string()),
+  slopPatternsDetected: v.array(v.string()),
+  voiceRubricScore: UnitIntervalSchema,
+  passed: v.boolean(),
+  notes: v.array(v.string()),
+})
+
+export type CoreExperimentTurnStepResult = v.InferOutput<
+  typeof CoreExperimentTurnStepResultSchema
+>
+
+export const CoreExperimentEvalReportSchema = v.object({
+  runId: v.pipe(v.string(), v.trim(), v.nonEmpty()),
+  generatedAt: v.pipe(v.number(), v.finite(), v.minValue(0)),
+  mode: v.picklist(['deterministic_sim', 'live_llm']),
+  seed: v.pipe(v.number(), v.integer(), v.minValue(0)),
+  modelAId: v.pipe(v.string(), v.trim(), v.nonEmpty()),
+  modelBId: v.pipe(v.string(), v.trim(), v.nonEmpty()),
+  passedAllGates: v.boolean(),
+  failedGates: v.array(v.string()),
+  metrics: CoreExperimentMetricSummarySchema,
+  steps: v.array(CoreExperimentTurnStepResultSchema),
+})
+
+export type CoreExperimentEvalReport = v.InferOutput<
+  typeof CoreExperimentEvalReportSchema
+>
+
+export const RunCoreExperimentInputSchema = v.object({
+  seed: v.optional(v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(999))),
+  modelAId: v.optional(
+    v.pipe(
+      v.string(),
+      v.trim(),
+      v.nonEmpty(),
+      v.maxLength(160),
+      v.regex(/^[^\x00-\x1f\x7f]+$/),
+    ),
+  ),
+  modelBId: v.optional(
+    v.pipe(
+      v.string(),
+      v.trim(),
+      v.nonEmpty(),
+      v.maxLength(160),
+      v.regex(/^[^\x00-\x1f\x7f]+$/),
+    ),
+  ),
+})
+
+export type RunCoreExperimentInput = v.InferOutput<typeof RunCoreExperimentInputSchema>
+
 export interface AshyBootstrapSnapshot {
   needsOnboarding: boolean
   userProfile: {
@@ -160,6 +261,7 @@ export interface AshyBootstrapSnapshot {
     dbPath: string
     lastPersistenceWarning: string | null
   }
+  lastEvalReport?: CoreExperimentEvalReport | null
 }
 
 export const CompleteOnboardingInputSchema = v.object({
@@ -329,6 +431,7 @@ export interface AshyHostBridge {
     requireConfirmation: boolean
   }): Promise<MemoryGovernancePolicy>
   seedDemoFixtures(): Promise<AshyBootstrapSnapshot>
+  runCoreExperimentEval(input?: RunCoreExperimentInput): Promise<CoreExperimentEvalReport>
   onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
 

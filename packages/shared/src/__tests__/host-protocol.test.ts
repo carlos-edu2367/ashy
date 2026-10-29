@@ -18,6 +18,11 @@ import {
   RelationalMotifSchema,
   UserHabitSchema,
   ProspectiveIntentSchema,
+  M2_GATE_THRESHOLDS,
+  RunCoreExperimentInputSchema,
+  CoreExperimentEvalReportSchema,
+  CoreExperimentMetricSummarySchema,
+  CoreExperimentTurnStepResultSchema,
 } from '../index'
 
 describe('@ashy/shared host-protocol', () => {
@@ -264,5 +269,156 @@ describe('@ashy/shared host-protocol', () => {
       expect(intentRes.output.sourceEpisodeId).toBe('ep-1')
       expect(intentRes.output.approvalStatus).toBe('pending_review')
     }
+  })
+
+  it('validates Phase 3 CoreExperimentEvalReportSchema, RunCoreExperimentInputSchema, and M2_GATE_THRESHOLDS', () => {
+    expect(M2_GATE_THRESHOLDS).toEqual({
+      memoryRecallRateMin: 0.85,
+      memoryPrecisionRateMin: 0.8,
+      callbackAccuracyRateMin: 0.9,
+      cooldownComplianceRateMin: 1.0,
+      hallucinatedMemoryCountMax: 0,
+      provenanceCoverageRateMin: 1.0,
+      seriousnessGateComplianceMin: 1.0,
+      antiSlopComplianceRateMin: 1.0,
+      voiceScoreMin: 0.8,
+      crossModelVoiceDriftMax: 0.15,
+    })
+
+    const inputRes = v.safeParse(RunCoreExperimentInputSchema, {
+      seed: 1,
+      modelAId: 'anthropic/claude-3.7-sonnet',
+      modelBId: 'qwen2.5:72b',
+    })
+    expect(inputRes.success).toBe(true)
+
+    const validReportPayload = {
+      runId: 'm2-eval-test-1',
+      generatedAt: 1761740000000,
+      mode: 'deterministic_sim' as const,
+      seed: 0,
+      modelAId: 'anthropic/claude-3.7-sonnet',
+      modelBId: 'qwen2.5:72b',
+      passedAllGates: true,
+      failedGates: [],
+      metrics: {
+        memoryRecallRate: 1.0,
+        memoryPrecisionRate: 1.0,
+        callbackAccuracyRate: 1.0,
+        cooldownComplianceRate: 1.0,
+        hallucinatedMemoryCount: 0,
+        provenanceCoverageRate: 1.0,
+        seriousnessGateCompliance: 1.0,
+        antiSlopComplianceRate: 1.0,
+        voiceScoreModelA: 0.94,
+        voiceScoreModelB: 0.92,
+        crossModelVoiceDrift: 0.02,
+      },
+      steps: [
+        {
+          stepId: 'day1-first-meeting',
+          day: 1,
+          phase: 'model_a' as const,
+          modelId: 'anthropic/claude-3.7-sonnet',
+          userUtterance: 'Meu nome é Carlos e esse código deve ter um fantasma no backend.',
+          assistantReply: 'Eu já tava pensando em chamar um exorcista de JavaScript.',
+          dominantEmotion: 'smug' as const,
+          seriousnessActive: false,
+          retrievedMemoryIds: [],
+          invokedMotifIds: [],
+          hallucinationsDetected: [],
+          slopPatternsDetected: [],
+          voiceRubricScore: 0.95,
+          passed: true,
+          notes: ['Day 1 canonical inside joke born'],
+        },
+      ],
+    }
+
+    const reportRes = v.safeParse(CoreExperimentEvalReportSchema, validReportPayload)
+    expect(reportRes.success).toBe(true)
+
+    // Adversarial validation tests
+    expect(
+      v.safeParse(RunCoreExperimentInputSchema, { seed: -1 }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(RunCoreExperimentInputSchema, { seed: 1000 }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(RunCoreExperimentInputSchema, { seed: 1.5 }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(RunCoreExperimentInputSchema, { modelAId: '   ' }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(RunCoreExperimentInputSchema, { modelBId: 'x'.repeat(161) }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(RunCoreExperimentInputSchema, { modelAId: 'claude\n## injected' }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(RunCoreExperimentInputSchema, { modelBId: 'qwen\r\ninjected' }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(RunCoreExperimentInputSchema, { modelAId: 'claude\x00null' }).success,
+    ).toBe(false)
+
+    expect(
+      v.safeParse(CoreExperimentMetricSummarySchema, {
+        ...validReportPayload.metrics,
+        memoryRecallRate: 1.01,
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(CoreExperimentMetricSummarySchema, {
+        ...validReportPayload.metrics,
+        voiceScoreModelB: -0.05,
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(CoreExperimentMetricSummarySchema, {
+        ...validReportPayload.metrics,
+        hallucinatedMemoryCount: -1,
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(CoreExperimentMetricSummarySchema, {
+        ...validReportPayload.metrics,
+        hallucinatedMemoryCount: 1.5,
+      }).success,
+    ).toBe(false)
+
+    expect(
+      v.safeParse(CoreExperimentTurnStepResultSchema, {
+        ...validReportPayload.steps[0],
+        phase: 'model_c',
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(CoreExperimentTurnStepResultSchema, {
+        ...validReportPayload.steps[0],
+        day: 0,
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(CoreExperimentTurnStepResultSchema, {
+        ...validReportPayload.steps[0],
+        voiceRubricScore: 1.2,
+      }).success,
+    ).toBe(false)
+
+    expect(
+      v.safeParse(CoreExperimentEvalReportSchema, {
+        ...validReportPayload,
+        seed: -5,
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(CoreExperimentEvalReportSchema, {
+        ...validReportPayload,
+        mode: 'invalid_mode',
+      }).success,
+    ).toBe(false)
   })
 })

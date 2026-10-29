@@ -9,6 +9,7 @@
     "@ashy/agency": "workspace:*",
     "@ashy/bus": "workspace:*",
     "@ashy/cortex": "workspace:*",
+    "@ashy/evals": "workspace:*",
     "@ashy/llm": "workspace:*",
     "@ashy/shared": "workspace:*",
     "@ashy/stage": "workspace:*",

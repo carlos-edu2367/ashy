@@ -16,6 +16,7 @@ export default defineConfig({
       '@ashy/voice': path.resolve(__dirname, '../../packages/voice/src/index.ts'),
       '@ashy/stage': path.resolve(__dirname, '../../packages/stage/src/index.ts'),
       '@ashy/agency': path.resolve(__dirname, '../../packages/agency/src/index.ts'),
+      '@ashy/evals': path.resolve(__dirname, '../../packages/evals/src/index.ts'),
     },
   },
   server: {

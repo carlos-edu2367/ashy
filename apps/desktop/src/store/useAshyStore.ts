@@ -51,6 +51,7 @@ import {
   type ChatMessageRecord,
   type ChatSessionRecord,
   type CompleteOnboardingInput,
+  type CoreExperimentEvalReport,
   type DeletableMemoryKind,
   type EpisodicMemory,
   type LlmProviderId,
@@ -65,6 +66,7 @@ import {
   type PublicProviderConfig,
   type RelationalMotif,
   type RelationshipStage,
+  type RunCoreExperimentInput,
   type SaveProviderConfigInput,
   type SemanticFact,
   type SemanticFactCategory,
@@ -226,6 +228,9 @@ export interface AshyDesktopState {
   memoryGovernancePolicy: MemoryGovernancePolicy
   lastPrompt: ComposedTurnPrompt
   roomTrophies: RoomTrophy[]
+  lastEvalReport: CoreExperimentEvalReport | null
+  lastEvalError: string | null
+  isRunningEval: boolean
 
   // Chat & Speech Pipeline
   chatMessages: ChatTurnMessage[]
@@ -265,6 +270,7 @@ export interface AshyDesktopState {
   selectSession: (sessionId: string) => Promise<void>
   abortActiveTurn: () => Promise<void>
   seedDemoFixtures: () => Promise<AshyBootstrapSnapshot>
+  runCoreExperimentEval: (input?: RunCoreExperimentInput) => Promise<CoreExperimentEvalReport>
 
   // Navigation & Stage Actions
   setViewMode: (mode: DesktopViewMode) => void
@@ -674,6 +680,7 @@ let activeSpeechPipeline: RealtimeSpeechPipeline | null = null
 let subscribedBridge: AshyHostBridge | null = null
 let unsubscribeHostEvents: (() => void) | null = null
 let lastPromptMinuteLabel = formatLocalTimeHHMM(Date.now())
+let evalRunSeq = 0
 
 const completedTurnEvents = new Map<string, AshyHostStreamEvent>()
 const pendingTurnResolvers = new Map<string, () => void>()
@@ -1126,6 +1133,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     memoryGovernancePolicy: { ...DEFAULT_MEMORY_GOVERNANCE_POLICY },
     lastPrompt: initialPrompt,
     roomTrophies: buildRoomTrophies([]),
+    lastEvalReport: null,
+    lastEvalError: null,
+    isRunningEval: false,
 
     chatMessages: [],
     scheduledAudioChunks: [],
@@ -1227,6 +1237,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         chatMessages: mappedMessages,
         lastPrompt: nextPrompt,
         roomTrophies: buildRoomTrophies(snapshot.relationship.milestones),
+        lastEvalReport: snapshot.lastEvalReport ?? current.lastEvalReport,
       })
     },
 
@@ -1316,6 +1327,33 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       const snapshot = await bridge.seedDemoFixtures()
       get().applyBootstrapSnapshot(snapshot)
       return snapshot
+    },
+
+    async runCoreExperimentEval(input) {
+      const bridge = ensureHostSubscription()
+      evalRunSeq += 1
+      const currentSeq = evalRunSeq
+      set({ isRunningEval: true, lastEvalError: null })
+      try {
+        const report = await bridge.runCoreExperimentEval(input)
+        if (currentSeq === evalRunSeq) {
+          set({
+            lastEvalReport: report,
+            lastEvalError: null,
+            isRunningEval: false,
+          })
+        }
+        return report
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        if (currentSeq === evalRunSeq) {
+          set({
+            isRunningEval: false,
+            lastEvalError: message,
+          })
+        }
+        throw err
+      }
     },
 
     setViewMode(mode) {
@@ -2041,6 +2079,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       unsubscribeHostEvents = null
       subscribedBridge = null
       activeSpeechPipeline = null
+      evalRunSeq += 1
       completedTurnEvents.clear()
       pendingTurnResolvers.clear()
       pendingTurnSeriousness.clear()
@@ -2116,6 +2155,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         memoryGovernancePolicy: { ...DEFAULT_MEMORY_GOVERNANCE_POLICY },
         lastPrompt: freshPrompt,
         roomTrophies: buildRoomTrophies([]),
+        lastEvalReport: null,
+        lastEvalError: null,
+        isRunningEval: false,
         chatMessages: [],
         scheduledAudioChunks: [],
         lastPlaybackReceipt: null,

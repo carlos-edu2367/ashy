@@ -15,6 +15,7 @@ import type {
   PersonalityTraits,
   ProspectiveIntent,
   RelationalMotif,
+  RunCoreExperimentInput,
   SaveProviderConfigInput,
   SendTurnInput,
   TestProviderInput,
@@ -75,6 +76,7 @@ const ALLOWED_RPC_METHODS = new Set<string>([
   'approveMemoryItem',
   'setMemoryGovernancePolicy',
   'seedDemoFixtures',
+  'runCoreExperimentEval',
 ])
 
 export class DisallowedRpcMethodError extends Error {
@@ -116,6 +118,15 @@ function assertObjectPayload<T extends object>(
 ): T {
   if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error(`Invalid RPC argument for ${method}: expected object payload`)
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(payload, '__proto__') ||
+    Object.prototype.hasOwnProperty.call(payload, 'constructor') ||
+    Object.prototype.hasOwnProperty.call(payload, 'prototype')
+  ) {
+    throw new Error(
+      `Invalid RPC argument for ${method}: forbidden prototype-pollution property`,
+    )
   }
   return payload as T
 }
@@ -308,6 +319,51 @@ export async function dispatchHostRpc(
 
     case 'seedDemoFixtures':
       return kernel.seedDemoFixtures()
+
+    case 'runCoreExperimentEval': {
+      if (payload === undefined || payload === null) {
+        return kernel.runCoreExperimentEval()
+      }
+      const obj = assertObjectPayload<RunCoreExperimentInput>(payload, method)
+      if (
+        obj.seed !== undefined &&
+        (typeof obj.seed !== 'number' ||
+          !Number.isInteger(obj.seed) ||
+          obj.seed < 0 ||
+          obj.seed > 999)
+      ) {
+        throw new Error(
+          'Invalid RPC argument for runCoreExperimentEval: expected integer seed in 0..999',
+        )
+      }
+      if (
+        obj.modelAId !== undefined &&
+        (typeof obj.modelAId !== 'string' ||
+          obj.modelAId.trim().length === 0 ||
+          obj.modelAId.length > 160 ||
+          /[\x00-\x1f\x7f]/.test(obj.modelAId))
+      ) {
+        throw new Error(
+          'Invalid RPC argument for runCoreExperimentEval: expected non-empty modelAId <= 160 chars without control characters',
+        )
+      }
+      if (
+        obj.modelBId !== undefined &&
+        (typeof obj.modelBId !== 'string' ||
+          obj.modelBId.trim().length === 0 ||
+          obj.modelBId.length > 160 ||
+          /[\x00-\x1f\x7f]/.test(obj.modelBId))
+      ) {
+        throw new Error(
+          'Invalid RPC argument for runCoreExperimentEval: expected non-empty modelBId <= 160 chars without control characters',
+        )
+      }
+      return kernel.runCoreExperimentEval({
+        ...(obj.seed !== undefined ? { seed: obj.seed } : {}),
+        ...(obj.modelAId !== undefined ? { modelAId: obj.modelAId.trim() } : {}),
+        ...(obj.modelBId !== undefined ? { modelBId: obj.modelBId.trim() } : {}),
+      })
+    }
 
     default:
       throw new DisallowedRpcMethodError(method)

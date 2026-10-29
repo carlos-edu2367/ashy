@@ -10,7 +10,8 @@
       "@ashy/cortex": ["./packages/cortex/src/index.ts"],
       "@ashy/voice": ["./packages/voice/src/index.ts"],
       "@ashy/stage": ["./packages/stage/src/index.ts"],
-      "@ashy/agency": ["./packages/agency/src/index.ts"]
+      "@ashy/agency": ["./packages/agency/src/index.ts"],
+      "@ashy/evals": ["./packages/evals/src/index.ts"]
     }
   },
   "include": [

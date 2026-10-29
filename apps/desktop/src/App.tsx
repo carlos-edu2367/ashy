@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import {
   ASHY_EMOTIONS,
+  M2_GATE_THRESHOLDS,
   MILESTONE_CATEGORIES,
   SEMANTIC_FACT_CATEGORIES,
   type ApprovableMemoryKind,
@@ -176,6 +177,7 @@ export function App(): React.ReactElement {
   // Voice Identity (voice.md) live editor state
   const [voiceDraft, setVoiceDraft] = useState(state.voiceIdentity.content)
   const [voiceSavedNotice, setVoiceSavedNotice] = useState<string | null>(null)
+  const [m2EvalSeed, setM2EvalSeed] = useState<number>(0)
 
   useEffect(() => {
     void useAshyStore.getState().bootstrapFromHost()
@@ -2005,25 +2007,253 @@ export function App(): React.ReactElement {
                       value={factObject}
                       onChange={(e) => setFactObject(e.target.value)}
                     />
-                    <button
-                      type="button"
-                      className="ashy-outline-btn"
-                      onClick={() => {
-                        if (!factObject.trim()) return
-                        state.addSemanticFact({
-                          category: factCategory,
-                          subject: factSubject,
-                          predicate: factPredicate,
-                          object: factObject,
-                        })
-                        setFactObject('')
+                      <button
+                        type="button"
+                        className="ashy-outline-btn"
+                        onClick={() => {
+                          if (!factObject.trim()) return
+                          state.addSemanticFact({
+                            category: factCategory,
+                            subject: factSubject,
+                            predicate: factPredicate,
+                            object: factObject,
+                          })
+                          setFactObject('')
+                        }}
+                      >
+                        Atualizar
+                      </button>
+                    </div>
+                  </section>
+
+                  <section
+                    className="ashy-preview-card"
+                    data-testid="m2-eval-panel"
+                    style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        gap: '8px',
+                        flexWrap: 'wrap',
                       }}
                     >
-                      Atualizar
-                    </button>
-                  </div>
-                </section>
-              </aside>
+                      <h2 className="ashy-serif-panel" style={{ margin: 0 }}>
+                        Experimento Central (M2 — Portabilidade da Alma)
+                      </h2>
+                      <span
+                        data-testid="m2-eval-status-badge"
+                        className={`ashy-badge ${
+                          state.isRunningEval
+                            ? 'violet'
+                            : state.lastEvalReport
+                              ? state.lastEvalReport.passedAllGates
+                                ? 'emerald'
+                                : 'amber'
+                              : 'violet'
+                        }`}
+                      >
+                        {state.isRunningEval
+                          ? 'Rodando...'
+                          : state.lastEvalReport
+                            ? state.lastEvalReport.passedAllGates
+                              ? 'APROVADO'
+                              : 'REPROVADO'
+                            : 'Pronto para rodar'}
+                      </span>
+                    </div>
+
+                    <p className="ashy-subtitle" style={{ margin: 0 }}>
+                      Simula 3 semanas de convivência (Dias 1..10 no Modelo A → Dias 11..21 no
+                      Modelo B) em um Córtex isolado.
+                    </p>
+
+                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                      <select
+                        aria-label="Seed do experimento M2"
+                        data-testid="select-m2-eval-seed"
+                        className="ashy-select"
+                        style={{ flex: 1, minWidth: '150px' }}
+                        value={String(m2EvalSeed)}
+                        onChange={(e) => setM2EvalSeed(Number(e.target.value))}
+                      >
+                        <option value="0">Seed 0 (Canônico)</option>
+                        <option value="1">Seed 1 (Paráfrase A)</option>
+                        <option value="2">Seed 2 (Paráfrase B)</option>
+                      </select>
+
+                      <button
+                        type="button"
+                        data-testid="btn-run-m2-eval"
+                        className="ashy-peach-btn"
+                        disabled={state.isRunningEval}
+                        onClick={() => {
+                          void state
+                            .runCoreExperimentEval({ seed: m2EvalSeed })
+                            .catch(() => undefined)
+                        }}
+                      >
+                        <Sparkles size={14} />
+                        <span>Rodar Diagnóstico M2 (Modelo A → B)</span>
+                      </button>
+                    </div>
+
+                    {state.lastEvalError && (
+                      <div
+                        data-testid="m2-eval-error"
+                        style={{
+                          padding: '8px 10px',
+                          borderRadius: '8px',
+                          background: 'rgba(217, 107, 112, 0.14)',
+                          border: '1px solid rgba(217, 107, 112, 0.45)',
+                          fontSize: '12px',
+                          color: 'var(--status-danger)',
+                        }}
+                      >
+                        Erro na avaliação M2: {state.lastEvalError}
+                      </div>
+                    )}
+
+                    {state.lastEvalReport && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                        <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                          <span
+                            className={`ashy-badge ${
+                              state.lastEvalReport.metrics.memoryRecallRate >=
+                              M2_GATE_THRESHOLDS.memoryRecallRateMin
+                                ? 'emerald'
+                                : 'amber'
+                            }`}
+                          >
+                            Recall: {Math.round(state.lastEvalReport.metrics.memoryRecallRate * 100)}
+                            %
+                          </span>
+                          <span
+                            className={`ashy-badge ${
+                              state.lastEvalReport.metrics.memoryPrecisionRate >=
+                              M2_GATE_THRESHOLDS.memoryPrecisionRateMin
+                                ? 'emerald'
+                                : 'amber'
+                            }`}
+                          >
+                            Precisão:{' '}
+                            {Math.round(state.lastEvalReport.metrics.memoryPrecisionRate * 100)}%
+                          </span>
+                          <span
+                            className={`ashy-badge ${
+                              state.lastEvalReport.metrics.callbackAccuracyRate >=
+                              M2_GATE_THRESHOLDS.callbackAccuracyRateMin
+                                ? 'emerald'
+                                : 'amber'
+                            }`}
+                          >
+                            Callbacks:{' '}
+                            {Math.round(state.lastEvalReport.metrics.callbackAccuracyRate * 100)}%
+                          </span>
+                          <span
+                            className={`ashy-badge ${
+                              state.lastEvalReport.metrics.hallucinatedMemoryCount <=
+                              M2_GATE_THRESHOLDS.hallucinatedMemoryCountMax
+                                ? 'emerald'
+                                : 'amber'
+                            }`}
+                          >
+                            Zero Alucinação: {state.lastEvalReport.metrics.hallucinatedMemoryCount}
+                          </span>
+                          <span
+                            className={`ashy-badge ${
+                              state.lastEvalReport.metrics.seriousnessGateCompliance >=
+                              M2_GATE_THRESHOLDS.seriousnessGateComplianceMin
+                                ? 'emerald'
+                                : 'amber'
+                            }`}
+                          >
+                            Seriousness Gate:{' '}
+                            {Math.round(
+                              state.lastEvalReport.metrics.seriousnessGateCompliance * 100,
+                            )}
+                            %
+                          </span>
+                          <span
+                            className={`ashy-badge ${
+                              state.lastEvalReport.metrics.crossModelVoiceDrift <=
+                                M2_GATE_THRESHOLDS.crossModelVoiceDriftMax &&
+                              state.lastEvalReport.metrics.voiceScoreModelA >=
+                                M2_GATE_THRESHOLDS.voiceScoreMin &&
+                              state.lastEvalReport.metrics.voiceScoreModelB >=
+                                M2_GATE_THRESHOLDS.voiceScoreMin
+                                ? 'violet'
+                                : 'amber'
+                            }`}
+                          >
+                            Deriva A → B:{' '}
+                            {Math.round(state.lastEvalReport.metrics.crossModelVoiceDrift * 100)}%
+                          </span>
+                        </div>
+
+                        <div
+                          data-testid="m2-eval-steps-list"
+                          style={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '8px',
+                            maxHeight: '280px',
+                            overflowY: 'auto',
+                          }}
+                        >
+                          {state.lastEvalReport.steps.map((step) => (
+                            <div
+                              key={step.stepId}
+                              data-testid={`m2-eval-step-${step.stepId}`}
+                              style={{
+                                padding: '8px 10px',
+                                borderRadius: '8px',
+                                background: '#171421',
+                                border: '1px solid var(--border-subtle)',
+                                fontSize: '11.5px',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '4px',
+                              }}
+                            >
+                              <div
+                                style={{
+                                  display: 'flex',
+                                  justifyContent: 'space-between',
+                                  alignItems: 'center',
+                                  gap: '6px',
+                                  flexWrap: 'wrap',
+                                }}
+                              >
+                                <strong>
+                                  Dia {step.day} · {step.stepId}
+                                </strong>
+                                <div style={{ display: 'flex', gap: '4px' }}>
+                                  <span className="ashy-badge violet">
+                                    {step.phase === 'model_a' ? 'Model A' : 'Model B'}
+                                  </span>
+                                  <span
+                                    className={`ashy-badge ${step.passed ? 'emerald' : 'amber'}`}
+                                  >
+                                    {step.passed ? 'PASS' : 'FAIL'}
+                                  </span>
+                                </div>
+                              </div>
+                              <div style={{ color: 'var(--text-secondary)' }}>
+                                <strong>Carlos:</strong> {step.userUtterance}
+                              </div>
+                              <div>
+                                <strong>Ashy:</strong> {step.assistantReply}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </section>
+                </aside>
             </div>
           </div>
         )}

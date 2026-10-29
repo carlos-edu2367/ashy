@@ -8,6 +8,7 @@ import type {
   ChatMessageRecord,
   ChatSessionRecord,
   CompleteOnboardingInput,
+  CoreExperimentEvalReport,
   DeletableMemoryKind,
   EpisodicMemory,
   LlmProviderId,
@@ -19,6 +20,7 @@ import type {
   ProviderHealthResult,
   PublicProviderConfig,
   RelationalMotif,
+  RunCoreExperimentInput,
   SaveProviderConfigInput,
   SemanticFact,
   SendTurnInput,
@@ -164,6 +166,11 @@ export function createPreloadHostBridge(
     },
     seedDemoFixtures(): Promise<AshyBootstrapSnapshot> {
       return invoke<AshyBootstrapSnapshot>('seedDemoFixtures')
+    },
+    runCoreExperimentEval(
+      input?: RunCoreExperimentInput,
+    ): Promise<CoreExperimentEvalReport> {
+      return invoke<CoreExperimentEvalReport>('runCoreExperimentEval', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       return preloadApi.onEvent(listener)
@@ -360,6 +367,11 @@ export function createHttpSseHostBridge(
     },
     seedDemoFixtures(): Promise<AshyBootstrapSnapshot> {
       return rpc<AshyBootstrapSnapshot>('seedDemoFixtures')
+    },
+    runCoreExperimentEval(
+      input?: RunCoreExperimentInput,
+    ): Promise<CoreExperimentEvalReport> {
+      return rpc<CoreExperimentEvalReport>('runCoreExperimentEval', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       listeners.add(listener)
