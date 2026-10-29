@@ -1,0 +1,289 @@
+import type {
+  AshyBootstrapSnapshot,
+  AshyHostBridge,
+  AshyHostStreamEvent,
+  ChatMessageRecord,
+  ChatSessionRecord,
+  CompleteOnboardingInput,
+  LlmProviderId,
+  ProviderHealthResult,
+  PublicProviderConfig,
+  SaveProviderConfigInput,
+  SemanticFact,
+  SendTurnInput,
+  TestProviderInput,
+  UpsertFactInput,
+} from '@ashy/shared'
+import type { AshyPreloadApi } from '../preload/index'
+
+export interface EventSourceLike {
+  onmessage: ((ev: { data: string }) => void) | null
+  onerror: ((err: unknown) => void) | null
+  close(): void
+}
+
+export interface HttpSseHostBridgeOptions {
+  baseUrl?: string
+  fetchImpl?: typeof fetch
+  createEventSource?: (url: string) => EventSourceLike
+}
+
+declare global {
+  interface Window {
+    ashyHost?: AshyPreloadApi
+  }
+}
+
+export function createPreloadHostBridge(
+  preloadApi: AshyPreloadApi,
+): AshyHostBridge {
+  const invoke = <T>(method: string, payload?: unknown): Promise<T> =>
+    preloadApi.invoke(method, payload) as Promise<T>
+
+  return {
+    getBootstrapSnapshot(): Promise<AshyBootstrapSnapshot> {
+      return invoke<AshyBootstrapSnapshot>('getBootstrapSnapshot')
+    },
+    completeOnboarding(
+      input: CompleteOnboardingInput,
+    ): Promise<AshyBootstrapSnapshot> {
+      return invoke<AshyBootstrapSnapshot>('completeOnboarding', input)
+    },
+    createSession(title?: string): Promise<ChatSessionRecord> {
+      return invoke<ChatSessionRecord>('createSession', { title })
+    },
+    selectSession(sessionId: string): Promise<{
+      session: ChatSessionRecord
+      messages: ChatMessageRecord[]
+    }> {
+      return invoke('selectSession', { sessionId })
+    },
+    sendTurn(input: SendTurnInput): Promise<{
+      turnId: string
+      userMessage: ChatMessageRecord
+    }> {
+      return invoke('sendTurn', input)
+    },
+    abortTurn(turnId: string): Promise<void> {
+      return invoke<void>('abortTurn', { turnId })
+    },
+    saveProviderConfig(input: SaveProviderConfigInput): Promise<{
+      config: PublicProviderConfig
+      providers: AshyBootstrapSnapshot['providers']
+    }> {
+      return invoke('saveProviderConfig', input)
+    },
+    setActiveProvider(
+      providerId: LlmProviderId,
+    ): Promise<AshyBootstrapSnapshot['providers']> {
+      return invoke('setActiveProvider', { providerId })
+    },
+    testProviderConnection(
+      input: TestProviderInput,
+    ): Promise<ProviderHealthResult> {
+      return invoke<ProviderHealthResult>('testProviderConnection', input)
+    },
+    saveVoiceIdentity(
+      content: string,
+    ): Promise<AshyBootstrapSnapshot['voice']> {
+      return invoke('saveVoiceIdentity', { content })
+    },
+    resetVoiceIdentity(): Promise<AshyBootstrapSnapshot['voice']> {
+      return invoke('resetVoiceIdentity')
+    },
+    upsertSemanticFact(input: UpsertFactInput): Promise<SemanticFact> {
+      return invoke<SemanticFact>('upsertSemanticFact', input)
+    },
+    deleteMemoryItem(input: {
+      kind: 'fact' | 'episode' | 'joke'
+      id: string
+    }): Promise<void> {
+      return invoke<void>('deleteMemoryItem', input)
+    },
+    seedDemoFixtures(): Promise<AshyBootstrapSnapshot> {
+      return invoke<AshyBootstrapSnapshot>('seedDemoFixtures')
+    },
+    onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
+      return preloadApi.onEvent(listener)
+    },
+  }
+}
+
+export function createHttpSseHostBridge(
+  options: HttpSseHostBridgeOptions = {},
+): AshyHostBridge {
+  const baseUrl = (options.baseUrl ?? '').replace(/\/+$/, '')
+  const fetchFn: typeof fetch =
+    options.fetchImpl ?? ((...args) => globalThis.fetch(...args))
+
+  const createEventSourceFn: (url: string) => EventSourceLike =
+    options.createEventSource ??
+    ((url: string) => {
+      if (typeof globalThis.EventSource === 'function') {
+        return new globalThis.EventSource(url) as unknown as EventSourceLike
+      }
+      return {
+        onmessage: null,
+        onerror: null,
+        close() {
+          // No-op when EventSource is unavailable in non-browser environment
+        },
+      }
+    })
+
+  async function rpc<T>(method: string, payload?: unknown): Promise<T> {
+    const res = await fetchFn(`${baseUrl}/__ashy_host/rpc`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ method, payload }),
+    })
+
+    let parsed: { ok?: boolean; result?: T; error?: string } | null = null
+    try {
+      parsed = (await res.json()) as { ok?: boolean; result?: T; error?: string }
+    } catch {
+      parsed = null
+    }
+
+    if (!res.ok || !parsed || parsed.ok !== true) {
+      throw new Error(
+        parsed?.error || `AshyHost RPC failed (${method}): HTTP ${res.status}`,
+      )
+    }
+
+    return parsed.result as T
+  }
+
+  const listeners = new Set<(event: AshyHostStreamEvent) => void>()
+  let activeEventSource: EventSourceLike | null = null
+
+  function ensureEventSource(): void {
+    if (activeEventSource || listeners.size === 0) return
+    const es = createEventSourceFn(`${baseUrl}/__ashy_host/events`)
+    es.onmessage = (ev) => {
+      try {
+        const parsed = JSON.parse(ev.data) as AshyHostStreamEvent
+        for (const listener of listeners) {
+          listener(parsed)
+        }
+      } catch {
+        // Ignore malformed SSE frame
+      }
+    }
+    activeEventSource = es
+  }
+
+  function releaseEventSourceIfIdle(): void {
+    if (listeners.size > 0 || !activeEventSource) return
+    try {
+      activeEventSource.close()
+    } catch {
+      // Ignore close error
+    }
+    activeEventSource = null
+  }
+
+  return {
+    getBootstrapSnapshot(): Promise<AshyBootstrapSnapshot> {
+      return rpc<AshyBootstrapSnapshot>('getBootstrapSnapshot')
+    },
+    completeOnboarding(
+      input: CompleteOnboardingInput,
+    ): Promise<AshyBootstrapSnapshot> {
+      return rpc<AshyBootstrapSnapshot>('completeOnboarding', input)
+    },
+    createSession(title?: string): Promise<ChatSessionRecord> {
+      return rpc<ChatSessionRecord>('createSession', { title })
+    },
+    selectSession(sessionId: string): Promise<{
+      session: ChatSessionRecord
+      messages: ChatMessageRecord[]
+    }> {
+      return rpc('selectSession', { sessionId })
+    },
+    sendTurn(input: SendTurnInput): Promise<{
+      turnId: string
+      userMessage: ChatMessageRecord
+    }> {
+      return rpc('sendTurn', input)
+    },
+    abortTurn(turnId: string): Promise<void> {
+      return rpc<void>('abortTurn', { turnId })
+    },
+    saveProviderConfig(input: SaveProviderConfigInput): Promise<{
+      config: PublicProviderConfig
+      providers: AshyBootstrapSnapshot['providers']
+    }> {
+      return rpc('saveProviderConfig', input)
+    },
+    setActiveProvider(
+      providerId: LlmProviderId,
+    ): Promise<AshyBootstrapSnapshot['providers']> {
+      return rpc('setActiveProvider', { providerId })
+    },
+    testProviderConnection(
+      input: TestProviderInput,
+    ): Promise<ProviderHealthResult> {
+      return rpc<ProviderHealthResult>('testProviderConnection', input)
+    },
+    saveVoiceIdentity(
+      content: string,
+    ): Promise<AshyBootstrapSnapshot['voice']> {
+      return rpc('saveVoiceIdentity', { content })
+    },
+    resetVoiceIdentity(): Promise<AshyBootstrapSnapshot['voice']> {
+      return rpc('resetVoiceIdentity')
+    },
+    upsertSemanticFact(input: UpsertFactInput): Promise<SemanticFact> {
+      return rpc<SemanticFact>('upsertSemanticFact', input)
+    },
+    deleteMemoryItem(input: {
+      kind: 'fact' | 'episode' | 'joke'
+      id: string
+    }): Promise<void> {
+      return rpc<void>('deleteMemoryItem', input)
+    },
+    seedDemoFixtures(): Promise<AshyBootstrapSnapshot> {
+      return rpc<AshyBootstrapSnapshot>('seedDemoFixtures')
+    },
+    onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
+      listeners.add(listener)
+      ensureEventSource()
+      return () => {
+        listeners.delete(listener)
+        releaseEventSourceIfIdle()
+      }
+    },
+  }
+}
+
+let testBridgeOverride: AshyHostBridge | null = null
+let cachedDefaultBridge: AshyHostBridge | null = null
+
+export function setAshyHostBridgeForTesting(
+  bridge: AshyHostBridge | null,
+): void {
+  testBridgeOverride = bridge
+}
+
+export function getAshyHostBridge(): AshyHostBridge {
+  if (testBridgeOverride) {
+    return testBridgeOverride
+  }
+
+  const globalPreload =
+    (typeof window !== 'undefined' ? window.ashyHost : undefined) ??
+    (globalThis as unknown as { ashyHost?: AshyPreloadApi }).ashyHost
+
+  if (globalPreload) {
+    return createPreloadHostBridge(globalPreload)
+  }
+
+  if (!cachedDefaultBridge) {
+    cachedDefaultBridge = createHttpSseHostBridge()
+  }
+
+  return cachedDefaultBridge
+}

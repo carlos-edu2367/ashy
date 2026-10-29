@@ -1,7 +1,9 @@
 import path from 'node:path'
 import { defineConfig } from 'vite'
+import { createAshyViteHostPlugin } from './src/host/vite-host-plugin'
 
 export default defineConfig({
+  plugins: process.env.VITEST ? [] : [createAshyViteHostPlugin()],
   esbuild: {
     jsx: 'automatic',
   },
