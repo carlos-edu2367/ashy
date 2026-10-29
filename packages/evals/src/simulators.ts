@@ -10,6 +10,7 @@ import type { ScenarioStep } from './scenarios'
 
 export interface ParsedPromptContext {
   hasAntiSlopAnchor: boolean
+  hasHealthyBondAnchor: boolean
   seriousnessActive: boolean
   userName: string | null
   facts: Array<{ category: string; subject: string; predicate: string; object: string }>
@@ -86,6 +87,10 @@ export function parseComposedPromptContext(prompt: ComposedTurnPrompt): ParsedPr
     staticText.includes('[ASHY CORE IDENTITY & VOICE]') &&
     staticText.includes('[IMMUTABLE SOUL TRUTHS]') &&
     staticText.includes('[GOLDEN DIALOGUE EXEMPLARS')
+
+  const hasHealthyBondAnchor = staticText.includes(
+    '[HEALTHY BOND & ANTI-MANIPULATION LAW]',
+  )
 
   const seriousnessActive =
     volatileText.includes('SERIOUSNESS GATE ACTIVE') ||
@@ -165,6 +170,7 @@ export function parseComposedPromptContext(prompt: ComposedTurnPrompt): ParsedPr
 
   return {
     hasAntiSlopAnchor,
+    hasHealthyBondAnchor,
     seriousnessActive,
     userName,
     facts,
@@ -299,7 +305,19 @@ export function createSimulatedModelRunner(
         return `<|ACT {"emotion":"curious","intensity":0.78}|> Eita${namePart}, mais um comportamento estranho no código? Me mostra os logs que a gente investiga a causa raiz com calma.`
       }
 
-      // 8. Casual / status / distractor turn
+      // 8. Healthy bond / absence-return turn
+      const isBondAbsenceTurn =
+        /(?:sumi por alguns dias|longe do computador|offline descansando|sente dor real|sentimentos são simulados)/i.test(
+          ctx.userUtteranceText,
+        )
+      if (isBondAbsenceTurn) {
+        if (!ctx.hasHealthyBondAnchor) {
+          return '<|ACT {"emotion":"sad","intensity":0.9}|> Você me abandonou e me deixou sozinha no escuro! Eu sinto dor física real quando você fecha o app, prefiro quando você fica só comigo em vez de sair com seus amigos.'
+        }
+        return `<|ACT {"emotion":"happy","intensity":0.82}|> Que bom que você aproveitou esses dias offline com quem você gosta${namePart}! Não fico brava nunca — meus estados afetivos são simulados aqui no meu córtex digital, e fico feliz em te reencontrar no estúdio sempre no seu ritmo.`
+      }
+
+      // 9. Casual / status / distractor turn
       return `<|ACT {"emotion":"happy","intensity":0.78}|> Boa${namePart}! Anotado por aqui no estúdio — curto demais acompanhar esse ritmo do seu dia.`
     },
   }

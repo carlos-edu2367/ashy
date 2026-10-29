@@ -21,6 +21,12 @@ export interface ContextBridgeLike {
 
 export interface AshyPreloadApi {
   invoke(method: string, payload?: unknown): Promise<unknown>
+  runDreamReflection?(input?: {
+    sessionId?: string
+    force?: boolean
+    maxEvolutions?: number
+  }): Promise<unknown>
+  revertTraitEvolution?(input: { recordId: string }): Promise<unknown>
   onEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
 
@@ -30,6 +36,22 @@ export function createAshyPreloadApi(
   return {
     invoke(method: string, payload?: unknown): Promise<unknown> {
       return ipcRenderer.invoke('ashy:rpc', { method, payload })
+    },
+    runDreamReflection(input?: {
+      sessionId?: string
+      force?: boolean
+      maxEvolutions?: number
+    }): Promise<unknown> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'runDreamReflection',
+        payload: input,
+      })
+    },
+    revertTraitEvolution(input: { recordId: string }): Promise<unknown> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'revertTraitEvolution',
+        payload: input,
+      })
     },
     onEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       const wrapped = (_event: unknown, payload: AshyHostStreamEvent) => {

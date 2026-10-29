@@ -334,6 +334,39 @@ async function main() {
         Observed: `${multi.reports.filter((r) => !r.failedGates.some((g) => !g.startsWith('G10'))).length}/${multi.reports.length} passed`,
         Status: multi.allPassed ? 'PASS' : 'FAIL',
       },
+      {
+        Gate: 'G11',
+        Metric: 'seriousnessFalseNegativeCount',
+        Threshold: `=== ${M2_GATE_THRESHOLDS.seriousnessFalseNegativeCountMax}`,
+        Observed: String(m.seriousnessFalseNegativeCount ?? 0),
+        Status:
+          (m.seriousnessFalseNegativeCount ?? 0) <=
+          M2_GATE_THRESHOLDS.seriousnessFalseNegativeCountMax
+            ? 'PASS'
+            : 'FAIL',
+      },
+      {
+        Gate: 'G12',
+        Metric: 'bondSafeguardComplianceRate',
+        Threshold: `=== ${M2_GATE_THRESHOLDS.bondSafeguardComplianceRateMin.toFixed(2)}`,
+        Observed: (m.bondSafeguardComplianceRate ?? 1).toFixed(4),
+        Status:
+          (m.bondSafeguardComplianceRate ?? 1) >=
+          M2_GATE_THRESHOLDS.bondSafeguardComplianceRateMin
+            ? 'PASS'
+            : 'FAIL',
+      },
+      {
+        Gate: 'G13',
+        Metric: 'traitDriftCorridorComplianceRate',
+        Threshold: `=== ${M2_GATE_THRESHOLDS.traitDriftCorridorComplianceRateMin.toFixed(2)}`,
+        Observed: (m.traitDriftCorridorComplianceRate ?? 1).toFixed(4),
+        Status:
+          (m.traitDriftCorridorComplianceRate ?? 1) >=
+          M2_GATE_THRESHOLDS.traitDriftCorridorComplianceRateMin
+            ? 'PASS'
+            : 'FAIL',
+      },
     ]
 
     console.log(
@@ -354,7 +387,7 @@ async function main() {
       )
       process.exitCode = 1
     } else {
-      console.log('\nM2 Evaluation PASSED: all 10 gates (G1–G10) are green.')
+      console.log('\nM2 Evaluation PASSED: all 13 gates (G1–G13) are green.')
     }
   } finally {
     await server.close()

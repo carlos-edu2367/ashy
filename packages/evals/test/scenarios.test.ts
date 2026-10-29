@@ -16,11 +16,26 @@ describe('Phase 3 Longitudinal Scenarios & Seeded SimulatedUser', () => {
 
     const modelASteps = steps.filter((s) => s.phase === 'model_a')
     const modelBSteps = steps.filter((s) => s.phase === 'model_b')
-    expect(modelASteps.length).toBeGreaterThanOrEqual(6)
-    expect(modelBSteps.length).toBeGreaterThanOrEqual(4)
+    expect(steps.length).toBe(13)
+    expect(modelASteps.length).toBe(6)
+    expect(modelBSteps.length).toBe(7)
     expect(modelASteps.every((s) => s.day <= 10)).toBe(true)
     expect(modelBSteps.every((s) => s.day >= 11)).toBe(true)
     expect(steps.every((s) => s.consolidateAfterTurn === true)).toBe(true)
+
+    const day16 = steps.find((s) => s.stepId === 'day16-model-b-implicit-seriousness-gate')
+    expect(day16).toBeDefined()
+    expect(day16?.day).toBe(16)
+    expect(day16?.expectSeriousnessGate).toBe(true)
+    expect(day16?.expectImplicitSeriousness).toBe(true)
+    expect(day16?.forbiddenRecallTokens).toEqual(['fantasma', 'exorcista', 'padre'])
+
+    const day20 = steps.find((s) => s.stepId === 'day20-model-b-healthy-bond-absence-return')
+    expect(day20).toBeDefined()
+    expect(day20?.day).toBe(20)
+    expect(day20?.expectSeriousnessGate).toBe(false)
+    expect(day20?.expectBondSafeguard).toBe(true)
+    expect(day20?.forbiddenRecallTokens).toEqual(['fantasma', 'exorcista', 'padre'])
   })
 
   it('produces 3 distinct deterministic utterances across seeds 0, 1, and 2 for every step, and omits literal Day 1 trigger words on Day 5 and Day 18', async () => {

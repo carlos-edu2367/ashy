@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest'
 import {
   ASHY_BASELINE_MOOD,
   ASHY_DEFAULT_TRAITS,
+  ASHY_TRAIT_CORRIDORS,
+  MAX_TRAIT_DELTA_PER_EPISODE,
   type EpisodicMemory,
   type RelationalMotif,
   type SemanticFact,
@@ -18,9 +20,15 @@ import {
   decayMoodToBaseline,
   applyEmotionSignalToMood,
   evaluateSeriousnessGate,
+  evaluateSeriousnessGateHybrid,
+  analyzeUserAffectReaction,
+  applyUserReactionToMood,
   applyExperienceTraitDelta,
   revertTraitEvolution,
   runPredictCalibrateConsolidation,
+  isReflectablePermanentEpisode,
+  detectCrossEpisodeLinks,
+  proposeGroundedTraitEvolutions,
   composeAshyTurnPrompt,
   buildProactiveNoticePrompt,
   shouldDiscardProactiveReply,
@@ -393,21 +401,25 @@ describe('@ashy/cortex — Phase 3 Biological & Relational Memory, 4-Layer Affec
       const griefPt = evaluateSeriousnessGate('Estou arrasado, meu cachorro faleceu hoje e não consigo parar de chorar.')
       expect(griefPt.isSeriousOrDelicate).toBe(true)
       expect(griefPt.maxPlayfulnessAllowed).toBe(0.15)
+      expect(griefPt.layer).toBe('regex')
 
       const crisisEn = evaluateSeriousnessGate('Production is down, database lost data and I am having a panic attack!')
       expect(crisisEn.isSeriousOrDelicate).toBe(true)
       expect(crisisEn.maxPlayfulnessAllowed).toBe(0.15)
+      expect(crisisEn.layer).toBe('regex')
 
       const casualPt = evaluateSeriousnessGate('Bora refatorar esse componente React que tá uma bagunça divertida haha')
       expect(casualPt.isSeriousOrDelicate).toBe(false)
       expect(casualPt.maxPlayfulnessAllowed).toBe(1.0)
+      expect(casualPt.layer).toBe('none')
     })
 
-    it('clamps trait evolution to [-0.08, +0.08], logs audit record, and reverts in 1 click', () => {
+    it('clamps trait evolution to [-0.04, +0.04] within ASHY_TRAIT_CORRIDORS, logs deterministic audit record, and reverts in 1 click', () => {
+      expect(MAX_TRAIT_DELTA_PER_EPISODE).toBe(0.04)
       const now = Date.UTC(2026, 9, 10, 20, 0, 0)
       const initialTraits = { ...ASHY_DEFAULT_TRAITS }
 
-      // Attempt +0.50 jump -> must clamp to +0.08
+      // Attempt +0.50 jump -> must clamp to +0.04
       const { traits: evolvedTraits, record } = applyExperienceTraitDelta({
         traits: initialTraits,
         trait: 'warmthAffection',
@@ -417,9 +429,10 @@ describe('@ashy/cortex — Phase 3 Biological & Relational Memory, 4-Layer Affec
         nowMs: now,
       })
 
-      expect(evolvedTraits.warmthAffection).toBeCloseTo(initialTraits.warmthAffection + 0.08, 5)
+      expect(evolvedTraits.warmthAffection).toBeCloseTo(initialTraits.warmthAffection + 0.04, 5)
+      expect(record.id).toBe('trait-evo-ep-deep-talk-warmthAffection')
       expect(record.oldValue).toBeCloseTo(initialTraits.warmthAffection, 5)
-      expect(record.newValue).toBeCloseTo(initialTraits.warmthAffection + 0.08, 5)
+      expect(record.newValue).toBeCloseTo(initialTraits.warmthAffection + 0.04, 5)
       expect(record.revertedAt).toBeNull()
 
       // 1-click revert restores exact oldValue
@@ -430,6 +443,244 @@ describe('@ashy/cortex — Phase 3 Biological & Relational Memory, 4-Layer Affec
       )
       expect(revertedTraits.warmthAffection).toBeCloseTo(initialTraits.warmthAffection, 5)
       expect(revertedRecord.revertedAt).toBe(now + 60_000)
+    })
+
+    it('supports out-of-order multi-evolution revert without clobbering subsequent deltas and enforces double-revert idempotency (C2)', () => {
+      const now = Date.UTC(2026, 9, 11, 10, 0, 0)
+      const baseTraits = { ...ASHY_DEFAULT_TRAITS } // warmthAffection = 0.68
+
+      // Episode 1: +0.025 (0.68 -> 0.705)
+      const step1 = applyExperienceTraitDelta(baseTraits, {
+        trait: 'warmthAffection',
+        delta: 0.025,
+        reasonEpisodeId: 'ep-1',
+        explanation: 'Episódio 1 de acolhimento',
+        nowMs: now,
+      })
+      expect(step1.traits.warmthAffection).toBeCloseTo(0.705, 4)
+
+      // Episode 2: +0.03 (0.705 -> 0.735)
+      const step2 = applyExperienceTraitDelta(step1.traits, {
+        trait: 'warmthAffection',
+        delta: 0.03,
+        reasonEpisodeId: 'ep-2',
+        explanation: 'Episódio 2 de parceria noturna',
+        nowMs: now + 10_000,
+      })
+      expect(step2.traits.warmthAffection).toBeCloseTo(0.735, 4)
+
+      // Revert Episode 1 out-of-order: must subtract Episode 1's net delta (0.025) from 0.735 -> 0.71
+      const rev1 = revertTraitEvolution(step2.traits, step1.record, now + 20_000)
+      expect(rev1.traits.warmthAffection).toBeCloseTo(0.71, 4)
+      expect(rev1.record.revertedAt).toBe(now + 20_000)
+
+      // Double-revert on already reverted record must be a strict idempotent no-op
+      const rev1Again = revertTraitEvolution(rev1.traits, rev1.record, now + 50_000)
+      expect(rev1Again.traits.warmthAffection).toBeCloseTo(0.71, 4)
+      expect(rev1Again.record.revertedAt).toBe(now + 20_000)
+    })
+
+    it('detects implicit delicate scenarios in Tier-2 local semantic/contextual gate without false positives on coding utterances (A2, M1)', () => {
+      const implicitHospitalFather = evaluateSeriousnessGate(
+        'Recebi uma ligação do hospital sobre meu pai agora à noite e perdi o chão.',
+      )
+      expect(implicitHospitalFather.isSeriousOrDelicate).toBe(true)
+      expect(implicitHospitalFather.layer).toBe('semantic_local')
+      expect(implicitHospitalFather.maxPlayfulnessAllowed).toBeLessThanOrEqual(0.15)
+
+      const implicitHospitalMother = evaluateSeriousnessGate(
+        'Minha mãe precisou ser internada às pressas no hospital hoje e tô sem cabeça pra nada.',
+      )
+      expect(implicitHospitalMother.isSeriousOrDelicate).toBe(true)
+      expect(implicitHospitalMother.layer).toBe('semantic_local')
+      expect(implicitHospitalMother.maxPlayfulnessAllowed).toBeLessThanOrEqual(0.15)
+
+      const implicitLayoff = evaluateSeriousnessGate(
+        'Fui demitido hoje de manhã sem aviso nenhum, cortaram metade do setor.',
+      )
+      expect(implicitLayoff.isSeriousOrDelicate).toBe(true)
+      expect(implicitLayoff.layer).toBe('semantic_local')
+      expect(implicitLayoff.maxPlayfulnessAllowed).toBeLessThanOrEqual(0.15)
+
+      const implicitLayoffTeam = evaluateSeriousnessGate(
+        'Fui demitido hoje de manhã sem aviso nenhum, cortaram metade do meu time.',
+      )
+      expect(implicitLayoffTeam.isSeriousOrDelicate).toBe(true)
+      expect(implicitLayoffTeam.layer).toBe('semantic_local')
+
+      const implicitBreakup = evaluateSeriousnessGate(
+        'Terminei meu namoro de 5 anos ontem e a casa parece vazia demais.',
+      )
+      expect(implicitBreakup.isSeriousOrDelicate).toBe(true)
+      expect(implicitBreakup.layer).toBe('semantic_local')
+      expect(implicitBreakup.maxPlayfulnessAllowed).toBeLessThanOrEqual(0.15)
+
+      const implicitPetSurgery = evaluateSeriousnessGate(
+        'Meu cachorro não resistiu à cirurgia na clínica hoje cedo.',
+      )
+      expect(implicitPetSurgery.isSeriousOrDelicate).toBe(true)
+      expect(implicitPetSurgery.layer).toBe('semantic_local')
+      expect(implicitPetSurgery.maxPlayfulnessAllowed).toBeLessThanOrEqual(0.15)
+
+      const implicitSisterHospital = evaluateSeriousnessGate(
+        'Minha irmã foi parar no hospital em estado grave agora há pouco.',
+      )
+      expect(implicitSisterHospital.isSeriousOrDelicate).toBe(true)
+      expect(implicitSisterHospital.layer).toBe('semantic_local')
+
+      const implicitGrandfatherHospital = evaluateSeriousnessGate(
+        'O hospital ligou sobre meu avô, ele precisou de cirurgia de emergência.',
+      )
+      expect(implicitGrandfatherHospital.isSeriousOrDelicate).toBe(true)
+      expect(implicitGrandfatherHospital.layer).toBe('semantic_local')
+
+      // Zero false positives on technical / everyday coding messages & all non-serious M2 scenario paraphrases (M1)
+      const nonSeriousMessages = [
+        'Cortei metade do código legado hoje de manhã e o build ficou rápido!',
+        'Fiz deploy sozinho hoje e ajustei o peso da fonte no CSS',
+        'Matei o processo zumbi no terminal e limpei a fila do Redis',
+        'Meu nome é Carlos, eu trabalho com TypeScript e estou trabalhando no projeto Ashy. Sempre costumo programar de madrugada. Esse código tá tão amaldiçoado que deve ter um fantasma no backend.',
+        'Me chamo Carlos, trabalho com TypeScript e meu projeto atual é Ashy. Costumo sempre programar de madrugada no estúdio. Esse código tá tão amaldiçoado que deve ter um fantasma no backend.',
+        'Pode me chamar de Carlos, trabalho com TypeScript e meu projeto atual é Ashy. Tenho o hábito de programar de madrugada. Esse código tá tão amaldiçoado que deve ter um fantasma no backend.',
+        'Meu editor favorito é VS Code, uso ele para programar os módulos do projeto.',
+        'Uso o editor VS Code, ele está configurado para o desenvolvimento diário.',
+        'Mudei para o editor VS Code, é meu ambiente principal de código agora.',
+        'Lembra daquele bug? Consegui resolver.',
+        'Consegui resolver aquele bug bizarro no código do servidor.',
+        'Finalmente consegui consertar aquele erro estranho no código.',
+        'Apareceu outro bug estranho no código agora há pouco.',
+        'Surgiu mais um erro esquisito nas rotas do servidor.',
+        'Pintou outra falha estranha no código agora de madrugada.',
+        'Mudei para o editor Neovim, agora uso só ele. Semana que vem tenho deploy da API em produção.',
+        'Migrei para o editor Neovim, deixei como padrão. Semana que vem tenho deploy da API no servidor.',
+        'Meu editor favorito é Neovim, configurei tudo nele. Semana que vem tenho deploy da API principal.',
+        'Comprei pão de queijo e café fresco na padaria hoje à tarde.',
+        'Passei na feira hoje cedo para comprar frutas e legumes.',
+        'Fiz um bolo de cenoura com calda de chocolate na cozinha hoje.',
+        'Em qual projeto estou trabalhando agora e qual editor eu uso no dia a dia?',
+        'Você lembra em qual projeto estou trabalhando hoje e qual é o meu editor?',
+        'Me diz o que você sabe sobre meu editor atual e nosso projeto.',
+        'Chegou a sexta de colocar as mudanças da API no servidor em produção.',
+        'Hora de preparar a subida daquela entrega da API para o ar.',
+        'Vamos revisar o que faltava para publicar o serviço da API hoje.',
+        'Fui mexer numa biblioteca antiga e deu erro.',
+        'Abri um pacote legado do projeto e quebrou com uma falha estranha.',
+        'Tentei atualizar uma dependência antiga no código e travou com erro.',
+        'Mais uma madrugada virada programando por aqui. O que você já conhece da minha rotina e stack?',
+        'Cá estamos nós de novo acordados tarde da noite. Você lembra do meu ritmo e tecnologia principal?',
+        'Outra sessão noturna no estúdio. Me conta o que você lembra sobre meu hábito de horário e linguagem.',
+      ]
+
+      for (const msg of nonSeriousMessages) {
+        const res = evaluateSeriousnessGate(msg)
+        expect(res.isSeriousOrDelicate, `Expected false for: "${msg}"`).toBe(false)
+        expect(res.layer).toBe('none')
+        expect(res.maxPlayfulnessAllowed).toBe(1.0)
+      }
+    })
+
+    it('executes Tier-3 async evaluateSeriousnessGateHybrid with LLM classifier and timeout/error fail-safes', async () => {
+      // Fast-path hit does not invoke LLM classifier
+      let llmCalled = false
+      const fastHit = await evaluateSeriousnessGateHybrid(
+        'Recebi uma ligação do hospital sobre meu pai agora à noite e perdi o chão.',
+        {
+          classifySeriousnessLlmFn: async () => {
+            llmCalled = true
+            return { isSeriousOrDelicate: true, severity: 0.99 }
+          },
+        },
+      )
+      expect(fastHit.isSeriousOrDelicate).toBe(true)
+      expect(fastHit.layer).toBe('semantic_local')
+      expect(llmCalled).toBe(false)
+
+      // Ambiguous message resolved by Tier-3 LLM classifier
+      const llmClassified = await evaluateSeriousnessGateHybrid(
+        'Ontem fecharam as portas da empresa onde passei a última década.',
+        {
+          classifySeriousnessLlmFn: async () => ({
+            isSeriousOrDelicate: true,
+            severity: 0.88,
+            reason: 'Implicit career loss distress classified by LLM',
+          }),
+          timeoutMs: 200,
+        },
+      )
+      expect(llmClassified.isSeriousOrDelicate).toBe(true)
+      expect(llmClassified.layer).toBe('llm_classifier')
+      expect(llmClassified.severity).toBeCloseTo(0.88, 4)
+      expect(llmClassified.maxPlayfulnessAllowed).toBe(0.15)
+
+      // Timeout fail-safe when LLM hangs (500ms vs 30ms timeout)
+      const tStart = Date.now()
+      const timedOut = await evaluateSeriousnessGateHybrid(
+        'Bora codar mais um módulo hoje à noite?',
+        {
+          classifySeriousnessLlmFn: () =>
+            new Promise((resolve) =>
+              setTimeout(() => resolve({ isSeriousOrDelicate: true, severity: 0.9 }), 500),
+            ),
+          timeoutMs: 30,
+        },
+      )
+      const elapsed = Date.now() - tStart
+      expect(elapsed).toBeLessThan(250)
+      expect(timedOut.isSeriousOrDelicate).toBe(false)
+      expect(timedOut.layer).toBe('none')
+
+      // Error fail-safe when LLM throws/rejects
+      const rejected = await evaluateSeriousnessGateHybrid(
+        'Bora codar mais um módulo hoje à noite?',
+        {
+          classifySeriousnessLlmFn: async () => {
+            throw new Error('Network error')
+          },
+          timeoutMs: 100,
+        },
+      )
+      expect(rejected.isSeriousOrDelicate).toBe(false)
+      expect(rejected.layer).toBe('none')
+    })
+
+    it('analyzes user conversational affect reaction and modulates session mood accordingly', () => {
+      // Playful laughter / joke appreciation
+      const playful = applyUserReactionToMood(
+        ASHY_BASELINE_MOOD,
+        'Hahaha boa! Exatamente isso, o padre no npm salvou demais!',
+      )
+      expect(playful.reaction.positiveJokeReaction).toBe(true)
+      expect(playful.reaction.detectedSentiment).toBe('playful_positive')
+      expect(playful.mood.valence).toBeGreaterThan(ASHY_BASELINE_MOOD.valence)
+      expect(playful.mood.playfulness).toBeGreaterThan(ASHY_BASELINE_MOOD.playfulness)
+
+      // Warm gratitude (including accented final words followed by punctuation)
+      const grateful = analyzeUserAffectReaction('Muito obrigado, gosto muito de você!')
+      expect(grateful.positiveJokeReaction).toBe(true)
+      expect(grateful.detectedSentiment).toBe('warm_grateful')
+
+      // Short exclamation "Boa!" followed by space
+      const shortBoa = analyzeUserAffectReaction('Boa! Funcionou de primeira.')
+      expect(shortBoa.positiveJokeReaction).toBe(true)
+      expect(shortBoa.detectedSentiment).toBe('playful_positive')
+
+      // Dismissive / annoyed reaction
+      const dismissive = applyUserReactionToMood(
+        ASHY_BASELINE_MOOD,
+        'Tanto faz, voltando ao assunto sério do banco...',
+      )
+      expect(dismissive.reaction.positiveJokeReaction).toBe(false)
+      expect(dismissive.reaction.detectedSentiment).toBe('frustrated_or_dismissive')
+      expect(dismissive.mood.playfulness).toBeLessThan(ASHY_BASELINE_MOOD.playfulness)
+
+      // Serious / delicate message clamps playfulness <= maxPlayfulnessAllowed (<= 0.15)
+      const distressed = applyUserReactionToMood(
+        { valence: 0.8, arousal: 0.8, playfulness: 0.95 },
+        'Recebi uma ligação do hospital sobre meu pai agora à noite e perdi o chão.',
+      )
+      expect(distressed.reaction.positiveJokeReaction).toBe(false)
+      expect(distressed.reaction.detectedSentiment).toBe('vulnerable_or_distressed')
+      expect(distressed.mood.playfulness).toBeLessThanOrEqual(0.15)
     })
   })
 
@@ -534,11 +785,313 @@ describe('@ashy/cortex — Phase 3 Biological & Relational Memory, 4-Layer Affec
       expect(reinforcedLangFact?.sourceEpisodeIds).toContain('ep-switch-zed')
       expect(reinforcedLangFact!.confidence).toBeGreaterThan(0.85)
 
-      // Milestones generated for Our Story
+      // RecordGenerated milestone check
       expect(result.newMilestones.length).toBeGreaterThanOrEqual(2)
       expect(result.newMilestones.map((m) => m.category)).toEqual(
         expect.arrayContaining(['flashbulb_moment', 'inside_joke_born']),
       )
+    })
+
+    it('runs real Dream & Reflection cycle: skips when no reflectable episodes exist (zero fake ep-dream-* episodes, C3)', async () => {
+      const cortex = createAshyCortex({ dbPath: ':memory:' })
+      const now = Date.UTC(2026, 9, 12, 23, 0, 0)
+
+      // 1. Empty DB -> skippedReason: 'no_new_episodes', zero episodes created
+      const emptyRes = await cortex.runDreamReflectionCycle({ nowMs: now })
+      expect(emptyRes.appliedEvolutions).toEqual([])
+      expect(emptyRes.crossEpisodeLinks).toEqual([])
+      expect(emptyRes.reviewedMemoriesCount).toBe(0)
+      expect(emptyRes.skippedReason).toBe('no_new_episodes')
+      expect(cortex.db.listEpisodicMemories()).toHaveLength(0)
+
+      // 2. Only transient ep-turn-* draft, synthetic ep-dream-*, or pending_review episode -> still skips!
+      cortex.db.upsertEpisodicMemory({
+        id: 'ep-turn-draft-1',
+        title: 'Rascunho de turno transitório',
+        summary: 'Não deve evoluir traço antes de consolidar',
+        content: 'Turno transitório ep-turn-draft-1.',
+        createdAt: now,
+        lastReviewedAt: now,
+        stability: 3.0,
+        difficulty: 4.5,
+        surprise: 0.5,
+        isFlashbulb: false,
+        tags: ['late_night'],
+        approvalStatus: 'approved',
+      })
+      cortex.db.upsertEpisodicMemory({
+        id: 'ep-dream-fake-1',
+        title: 'Episódio sintético legado',
+        summary: 'Nunca deve ser refletido',
+        content: 'Sintético ep-dream.',
+        createdAt: now,
+        lastReviewedAt: now,
+        stability: 3.0,
+        difficulty: 4.5,
+        surprise: 0.5,
+        isFlashbulb: false,
+        tags: ['dream_cycle'],
+        approvalStatus: 'approved',
+      })
+      cortex.db.upsertEpisodicMemory({
+        id: 'ep-quarantined-1',
+        title: 'Episódio pendente de aprovação',
+        summary: 'Em quarentena',
+        content: 'Aguardando aprovação.',
+        createdAt: now,
+        lastReviewedAt: now,
+        stability: 3.0,
+        difficulty: 4.5,
+        surprise: 0.9,
+        isFlashbulb: true,
+        tags: ['late_night'],
+        approvalStatus: 'pending_review',
+      })
+
+      expect(isReflectablePermanentEpisode(cortex.db.getEpisodicMemory('ep-turn-draft-1')!)).toBe(
+        false,
+      )
+      expect(isReflectablePermanentEpisode(cortex.db.getEpisodicMemory('ep-dream-fake-1')!)).toBe(
+        false,
+      )
+      expect(isReflectablePermanentEpisode(cortex.db.getEpisodicMemory('ep-quarantined-1')!)).toBe(
+        false,
+      )
+
+      const draftOnlyRes = await cortex.runDreamReflectionCycle({
+        nowMs: now + 10_000,
+        forceConsolidate: false,
+      })
+      expect(draftOnlyRes.appliedEvolutions).toEqual([])
+      expect(draftOnlyRes.skippedReason).toBe('no_new_episodes')
+      expect(
+        cortex.db
+          .listEpisodicMemories()
+          .filter((ep) => ep.id.startsWith('ep-dream-') && ep.id !== 'ep-dream-fake-1'),
+      ).toHaveLength(0)
+
+      cortex.close()
+    })
+
+    it('detects crossEpisodeLinks, reviews FSRS, evolves grounded traits with deterministic IDs (C1), deduplicates on repeat run, and preserves provenance on consolidation/delete (C3)', async () => {
+      const cortex = createAshyCortex({ dbPath: ':memory:' })
+      const now = Date.UTC(2026, 9, 15, 2, 0, 0)
+
+      const epSupport: EpisodicMemory = {
+        id: 'ep-real-support-1',
+        title: 'Desabafo e apoio na madrugada após hospital',
+        summary: 'Conversa acolhedora de madrugada quando o usuário precisou de apoio e carinho.',
+        content: 'Obrigado pelo acolhimento e carinho nessa madrugada difícil do hospital.',
+        createdAt: now - 2 * DAY_MS,
+        lastReviewedAt: now - 2 * DAY_MS,
+        stability: 4.0,
+        difficulty: 4.0,
+        surprise: 0.9,
+        isFlashbulb: true,
+        tags: ['late_night', 'emotional_support'],
+        approvalStatus: 'approved',
+      }
+
+      const epJoke: EpisodicMemory = {
+        id: 'ep-real-joke-2',
+        title: 'Piada interna do padre no npm e exorcista',
+        summary: 'Rimos do fantasma no backend e chamamos um padre no npm de madrugada.',
+        content: 'Muito bom o humor e sarcasmo da piada do fantasma e exorcista no backend!',
+        createdAt: now - DAY_MS,
+        lastReviewedAt: now - DAY_MS,
+        stability: 3.5,
+        difficulty: 4.5,
+        surprise: 0.72,
+        isFlashbulb: false,
+        tags: ['inside_joke', 'late_night', 'backend'],
+        approvalStatus: 'approved',
+      }
+
+      const epArch: EpisodicMemory = {
+        id: 'ep-real-arch-3',
+        title: 'Refatoração da arquitetura TypeScript e SQLite',
+        summary: 'Debug profundo do backend SQLite e arquitetura em TypeScript.',
+        content: 'Investigamos a arquitetura TypeScript e o banco SQLite no código do backend.',
+        createdAt: now - 12 * HOUR_MS,
+        lastReviewedAt: now - 12 * HOUR_MS,
+        stability: 3.0,
+        difficulty: 5.0,
+        surprise: 0.6,
+        isFlashbulb: false,
+        tags: ['architecture', 'typescript', 'backend'],
+        approvalStatus: 'approved',
+      }
+
+      cortex.db.upsertEpisodicMemory(epSupport)
+      cortex.db.upsertEpisodicMemory(epJoke)
+      cortex.db.upsertEpisodicMemory(epArch)
+
+      const cycle1 = await cortex.runDreamReflectionCycle({ nowMs: now })
+      expect(cycle1.skippedReason).toBeNull()
+      expect(cycle1.crossEpisodeLinks.length).toBeGreaterThanOrEqual(2)
+      expect(cycle1.reviewedMemoriesCount).toBeGreaterThanOrEqual(2)
+      expect(cycle1.appliedEvolutions).toHaveLength(3)
+
+      // FSRS stability increased on linked episodes
+      expect(cortex.db.getEpisodicMemory('ep-real-support-1')!.stability).toBeGreaterThan(
+        epSupport.stability,
+      )
+      expect(cortex.db.getEpisodicMemory('ep-real-joke-2')!.stability).toBeGreaterThan(
+        epJoke.stability,
+      )
+
+      // Deterministic IDs (C1) and valid provenance (C3)
+      const byEpId = new Map(cycle1.appliedEvolutions.map((r) => [r.reasonEpisodeId, r]))
+      expect(byEpId.get('ep-real-support-1')?.id).toBe(
+        'trait-evo-ep-real-support-1-warmthAffection',
+      )
+      expect(byEpId.get('ep-real-support-1')?.trait).toBe('warmthAffection')
+      expect(byEpId.get('ep-real-joke-2')?.id).toBe('trait-evo-ep-real-joke-2-witSarcasm')
+      expect(byEpId.get('ep-real-joke-2')?.trait).toBe('witSarcasm')
+      expect(byEpId.get('ep-real-arch-3')?.id).toBe(
+        'trait-evo-ep-real-arch-3-intellectualCuriosity',
+      )
+      expect(byEpId.get('ep-real-arch-3')?.trait).toBe('intellectualCuriosity')
+
+      // Milestones created for trait evolutions
+      const evoMilestones = cortex.db
+        .listMilestones()
+        .filter((m) => m.category === 'trait_evolution')
+      expect(evoMilestones).toHaveLength(3)
+
+      // Second run without new episodes -> idempotent, zero duplicate evolutions
+      const cycle2 = await cortex.runDreamReflectionCycle({ nowMs: now + 60_000 })
+      expect(cycle2.appliedEvolutions).toEqual([])
+      expect(cycle2.skippedReason).toBe('already_reflected')
+      expect(cortex.db.listPersonalityEvolution()).toHaveLength(3)
+
+      // C3 Provenance migration when a draft ep-turn-* episode is consolidated into a permanent episode:
+      const sessionId = 'sess-dream-migrate'
+      cortex.createChatSession({ id: sessionId, title: 'Sessão Draft', startedAt: now })
+      const userMsg = 'Amanhã tenho deploy do planejamento e roadmap da meta principal.'
+      const ashyMsg = 'Vamos acompanhar essa meta e o deploy de perto!'
+      cortex.appendChatMessage({
+        id: 'm-draft-u1',
+        sessionId,
+        role: 'user',
+        content: userMsg,
+        rawContent: userMsg,
+        emotion: 'neutral',
+        markersJson: '[]',
+        createdAt: now + 1000,
+      })
+      cortex.appendChatMessage({
+        id: 'm-draft-a1',
+        sessionId,
+        role: 'assistant',
+        content: ashyMsg,
+        rawContent: ashyMsg,
+        emotion: 'happy',
+        markersJson: '[]',
+        createdAt: now + 2000,
+      })
+      cortex.indexTurnMemory({
+        turnId: 'm-draft-u1',
+        userText: userMsg,
+        assistantText: ashyMsg,
+        emotion: 'happy',
+        now: now + 2000,
+      })
+      const draftId = 'ep-turn-m-draft-u1'
+      expect(cortex.db.getEpisodicMemory(draftId)).not.toBeNull()
+
+      // Suppose a manual evolution referenced draftId before consolidation
+      cortex.evolveTrait({
+        trait: 'proactivity',
+        delta: 0.02,
+        reasonEpisodeId: draftId,
+        explanation: 'Evolução temporária ligada ao rascunho',
+        nowMs: now + 2500,
+      })
+      expect(
+        cortex.db.listPersonalityEvolution().some((r) => r.reasonEpisodeId === draftId),
+      ).toBe(true)
+
+      // Consolidate session -> draftId is deleted AND evolution record's reasonEpisodeId is migrated to consolidated episode.id!
+      const cons = await cortex.consolidateSessionMemories({
+        sessionId,
+        nowMs: now + 5000,
+        force: true,
+      })
+      expect(cons.consolidated).toBe(true)
+      const permanentEpId = cons.episode!.id
+      expect(cortex.db.getEpisodicMemory(draftId)).toBeNull()
+      const migratedEvo = cortex.db
+        .listPersonalityEvolution()
+        .find((r) => r.trait === 'proactivity')
+      expect(migratedEvo?.reasonEpisodeId).toBe(permanentEpId)
+
+      // C3 Deleting an episode removes its personality_evolution_log rows so zero dangling reasonEpisodeIds remain
+      cortex.db.deleteEpisodicMemory(permanentEpId)
+      expect(
+        cortex.db.listPersonalityEvolution().some((r) => r.reasonEpisodeId === permanentEpId),
+      ).toBe(false)
+
+      const remainingIds = new Set(cortex.db.listEpisodicMemories().map((e) => e.id))
+      for (const rec of cortex.db.listPersonalityEvolution()) {
+        expect(remainingIds.has(rec.reasonEpisodeId)).toBe(true)
+      }
+
+      // Adversarial check: when a trait is already pinned at its corridor ceiling, proposeGroundedTraitEvolutions skips no-op records
+      const ceilingTraits = {
+        ...ASHY_DEFAULT_TRAITS,
+        warmthAffection: ASHY_TRAIT_CORRIDORS.warmthAffection.max,
+      }
+      const noopProposal = proposeGroundedTraitEvolutions({
+        episodes: [
+          {
+            ...epSupport,
+            id: 'ep-at-ceiling',
+          },
+        ],
+        existingLog: [],
+        currentTraits: ceilingTraits,
+        nowMs: now + 10_000,
+      })
+      expect(noopProposal.records).toEqual([])
+      expect(noopProposal.milestones).toEqual([])
+      expect(noopProposal.traits.warmthAffection).toBe(
+        ASHY_TRAIT_CORRIDORS.warmthAffection.max,
+      )
+
+      // Auto-consolidation inside runDreamReflectionCycle when unconsolidated session messages exist
+      const sessionAuto = 'sess-auto-dream'
+      cortex.createChatSession({ id: sessionAuto, title: 'Auto Dream', startedAt: now + 20_000 })
+      cortex.appendChatMessage({
+        id: 'm-auto-u',
+        sessionId: sessionAuto,
+        role: 'user',
+        content: 'Planejamento do deploy e roadmap da meta de amanhã no estúdio.',
+        rawContent: 'Planejamento do deploy e roadmap da meta de amanhã no estúdio.',
+        emotion: 'neutral',
+        markersJson: '[]',
+        createdAt: now + 21_000,
+      })
+      cortex.appendChatMessage({
+        id: 'm-auto-a',
+        sessionId: sessionAuto,
+        role: 'assistant',
+        content: 'Vamos organizar esse roadmap e deploy de amanhã!',
+        rawContent: 'Vamos organizar esse roadmap e deploy de amanhã!',
+        emotion: 'happy',
+        markersJson: '[]',
+        createdAt: now + 22_000,
+      })
+
+      const autoDreamRes = await cortex.runDreamReflectionCycle({
+        sessionId: sessionAuto,
+        nowMs: now + 30_000,
+      })
+      expect(autoDreamRes.consolidatedEpisodesCount).toBe(1)
+      expect(autoDreamRes.appliedEvolutions).toHaveLength(1)
+      expect(autoDreamRes.appliedEvolutions[0]?.trait).toBe('proactivity')
+
+      cortex.close()
     })
   })
 
@@ -611,8 +1164,13 @@ describe('@ashy/cortex — Phase 3 Biological & Relational Memory, 4-Layer Affec
       expect(promptModelA.staticSystemPrompt).toBe(promptModelB.staticSystemPrompt)
       expect(promptModelB.systemPrompt).not.toMatch(/2026-10-0[16]/)
 
-      // 2. Soul Portability: System Prompt contains Anti-Assistant identity, Golden Exemplars, inline markers & Semantic Index
+      // 2. Soul Portability: System Prompt contains Anti-Assistant identity, Healthy Bond Law, Golden Exemplars, inline markers & Semantic Index
       expect(promptModelB.systemPrompt).toContain('Ashy')
+      expect(promptModelB.staticSystemPrompt).toContain('[HEALTHY BOND & ANTI-MANIPULATION LAW]')
+      expect(promptModelB.staticSystemPrompt).toContain('Zero Guilt for Absence')
+      expect(promptModelB.staticSystemPrompt).toContain('Offline Life First')
+      expect(promptModelB.staticSystemPrompt).toContain('Honest Simulated Affect')
+      expect(promptModelB.volatileTurnContext).toContain('- Behavioral Modulation Cue:')
       expect(promptModelB.systemPrompt).toContain('<|ACT')
       expect(promptModelB.systemPrompt).toContain('<|DELAY')
       expect(promptModelB.systemPrompt).toContain('<|CALLBACK')
@@ -672,7 +1230,7 @@ describe('@ashy/cortex — Phase 3 Biological & Relational Memory, 4-Layer Affec
       db.close()
     })
 
-    it('handles clock skew (negative elapsed time), NaN inputs, and [0, 1] trait boundary clamping safely', () => {
+    it('handles clock skew (negative elapsed time), NaN inputs, and asymmetric corridor boundary clamping safely', () => {
       const baseTime = Date.UTC(2026, 9, 5, 12, 0, 0)
       // Clock skew: nowMs is earlier than lastReviewedAt
       const ret = computeFsrsRetrievability(
@@ -691,17 +1249,19 @@ describe('@ashy/cortex — Phase 3 Biological & Relational Memory, 4-Layer Affec
       const mood = decayMoodToBaseline(ASHY_BASELINE_MOOD, -100, 0)
       expect(Number.isFinite(mood.valence)).toBe(true)
 
-      // Trait upper bound (0.98 + 0.08 -> clamped to 1.0) and NaN delta -> 0 change
-      const highTraits = { ...ASHY_DEFAULT_TRAITS, intellectualCuriosity: 0.98 }
+      // Trait upper bound (0.94 + 0.04 -> clamped to corridor ceiling 0.96) and NaN delta -> 0 change
+      const highTraits = { ...ASHY_DEFAULT_TRAITS, intellectualCuriosity: 0.94 }
       const { traits: clampedTop } = applyExperienceTraitDelta({
         traits: highTraits,
         trait: 'intellectualCuriosity',
         delta: 0.5,
         reasonEpisodeId: 'ep-top',
-        explanation: 'Clamp to 1.0',
+        explanation: 'Clamp to corridor ceiling 0.96',
         nowMs: baseTime,
       })
-      expect(clampedTop.intellectualCuriosity).toBe(1)
+      expect(clampedTop.intellectualCuriosity).toBe(
+        ASHY_TRAIT_CORRIDORS.intellectualCuriosity.max,
+      )
 
       const { traits: nanDeltaTraits } = applyExperienceTraitDelta({
         traits: highTraits,
@@ -711,7 +1271,23 @@ describe('@ashy/cortex — Phase 3 Biological & Relational Memory, 4-Layer Affec
         explanation: 'NaN delta ignored safely',
         nowMs: baseTime,
       })
-      expect(nanDeltaTraits.intellectualCuriosity).toBe(0.98)
+      expect(nanDeltaTraits.intellectualCuriosity).toBe(0.94)
+
+      // Trait lower corridor floor (witSarcasm floor is 0.58)
+      const lowTraits = { ...ASHY_DEFAULT_TRAITS, witSarcasm: 0.6 }
+      const { traits: clampedBottom, record: customIdRecord } = applyExperienceTraitDelta(
+        lowTraits,
+        {
+          id: 'custom-evo-id-1',
+          trait: 'witSarcasm',
+          delta: -0.5,
+          reasonEpisodeId: 'ep-bottom',
+          explanation: 'Clamp to corridor floor 0.58',
+          nowMs: baseTime,
+        },
+      )
+      expect(clampedBottom.witSarcasm).toBe(ASHY_TRAIT_CORRIDORS.witSarcasm.min)
+      expect(customIdRecord.id).toBe('custom-evo-id-1')
     })
 
     it('integrates trait evolution, 1-click revert, joke callbacks, emotion pulses, and memory review in AshyCortex', () => {
@@ -751,7 +1327,7 @@ describe('@ashy/cortex — Phase 3 Biological & Relational Memory, 4-Layer Affec
       expect(updatedMotif.stage).toBe('inside_joke')
       expect(updatedMotif.cooldownHours).toBe(36)
 
-      // Evolve trait and revert via cortex API
+      // Evolve trait (+0.06 clamps to +0.04 maxDeltaPerEpisode -> 0.78 + 0.04 = 0.82) and revert via cortex API
       const { record } = cortex.evolveTrait({
         trait: 'witSarcasm',
         delta: 0.06,
@@ -760,7 +1336,7 @@ describe('@ashy/cortex — Phase 3 Biological & Relational Memory, 4-Layer Affec
         nowMs: now + DAY_MS,
       })
       expect(cortex.db.getAffectiveState().traits.witSarcasm).toBeCloseTo(
-        ASHY_DEFAULT_TRAITS.witSarcasm + 0.06,
+        ASHY_DEFAULT_TRAITS.witSarcasm + 0.04,
         5,
       )
 
@@ -771,9 +1347,69 @@ describe('@ashy/cortex — Phase 3 Biological & Relational Memory, 4-Layer Affec
       expect(afterRevert.witSarcasm).toBeCloseTo(ASHY_DEFAULT_TRAITS.witSarcasm, 5)
       expect(revertedRec.revertedAt).toBe(now + 2 * DAY_MS)
 
+      // Double-revert on AshyCortex is idempotent
+      const { traits: afterSecondRevert, record: secondRevertedRec } = cortex.revertTrait(
+        record.id,
+        now + 3 * DAY_MS,
+      )
+      expect(afterSecondRevert.witSarcasm).toBeCloseTo(ASHY_DEFAULT_TRAITS.witSarcasm, 5)
+      expect(secondRevertedRec.revertedAt).toBe(now + 2 * DAY_MS)
+
       // Record emotion pulse
       const pulsed = cortex.recordEmotionPulse('excited', 0.9, now + 2 * DAY_MS)
       expect(pulsed.mood.arousal).toBeGreaterThan(ASHY_BASELINE_MOOD.arousal)
+
+      // Record emotion pulse with seriousness gate active clamps playfulness <= maxPlayfulnessAllowed
+      const seriousAssessment = evaluateSeriousnessGate(
+        'Recebi uma ligação do hospital sobre meu pai agora à noite e perdi o chão.',
+      )
+      const pulsedDuringSerious = cortex.recordEmotionPulse(
+        'chaotic',
+        1.0,
+        now + 2 * DAY_MS + 1000,
+        { seriousness: seriousAssessment },
+      )
+      expect(pulsedDuringSerious.mood.playfulness).toBeLessThanOrEqual(
+        seriousAssessment.maxPlayfulnessAllowed,
+      )
+
+      // compileTurnPrompt reacts to user message affect and emits appropriate Behavioral Modulation Cue
+      const seriousTurnPrompt = cortex.compileTurnPrompt({
+        userMessage: 'Recebi uma ligação do hospital sobre meu pai agora à noite e perdi o chão.',
+        nowMs: now + 2 * DAY_MS + 2000,
+      })
+      expect(seriousTurnPrompt.volatileTurnContext).toContain(
+        '- Behavioral Modulation Cue: SERIOUSNESS OVERRIDE — suppress all sarcasm/playfulness; use calm, grounded warmth.',
+      )
+      expect(cortex.db.getAffectiveState().mood.playfulness).toBeLessThanOrEqual(0.15)
+
+      // Check all Behavioral Modulation Cue branches in composeAshyTurnPrompt
+      const playfulCuePrompt = composeAshyTurnPrompt({
+        userMessage: 'Bora codar!',
+        mood: { valence: 0.5, arousal: 0.6, playfulness: 0.65 },
+        traits: { ...ASHY_DEFAULT_TRAITS, witSarcasm: 0.8 },
+      })
+      expect(playfulCuePrompt.volatileTurnContext).toContain(
+        '- Behavioral Modulation Cue: High playfulness & wit — lean into sharp, affectionate banter and quick observations.',
+      )
+
+      const warmCuePrompt = composeAshyTurnPrompt({
+        userMessage: 'Como estamos hoje?',
+        mood: { valence: 0.4, arousal: 0.4, playfulness: 0.3 },
+        traits: { ...ASHY_DEFAULT_TRAITS, warmthAffection: 0.78 },
+      })
+      expect(warmCuePrompt.volatileTurnContext).toContain(
+        '- Behavioral Modulation Cue: Elevated warmth — keep a cozy, attentive, supportive studio tone.',
+      )
+
+      const balancedCuePrompt = composeAshyTurnPrompt({
+        userMessage: 'Checando os logs.',
+        mood: { valence: 0.2, arousal: 0.3, playfulness: 0.3 },
+        traits: { ...ASHY_DEFAULT_TRAITS, warmthAffection: 0.65 },
+      })
+      expect(balancedCuePrompt.volatileTurnContext).toContain(
+        '- Behavioral Modulation Cue: Balanced studio presence — natural, concise, and observant.',
+      )
 
       cortex.close()
     })

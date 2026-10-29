@@ -13,11 +13,11 @@ import {
 } from '@ashy/agency'
 import {
   applyEmotionSignalToMood,
-  applyExperienceTraitDelta,
   composeAshyTurnPrompt,
   evaluateSeriousnessGate,
   formatLocalTimeHHMM,
   inspectMotifCooldownStatus,
+  proposeGroundedTraitEvolutions,
   rankEpisodicMemories,
   recordMotifInvocation,
   revertTraitEvolution as revertCortexTraitEvolution,
@@ -38,6 +38,7 @@ import {
   ASHY_BASELINE_MOOD,
   ASHY_DEFAULT_TRAITS,
   ASHY_EMOTIONS,
+  ASHY_TRAIT_CORRIDORS,
   DEFAULT_ASHY_VOICE_MD,
   DEFAULT_MEMORY_GOVERNANCE_POLICY,
   DEFAULT_PROVIDER_CONFIGS,
@@ -321,8 +322,8 @@ export interface AshyDesktopState {
   completeProspectiveIntent: (intentId: string) => void
 
   // Personality & Dream Actions
-  runDreamConsolidation: () => PersonalityEvolutionRecord
-  revertTraitEvolution: (recordId: string) => void
+  runDreamConsolidation: (nowMs?: number) => PersonalityEvolutionRecord
+  revertTraitEvolution: (recordId: string) => PersonalityEvolutionRecord | null
 
   // Privacy, Settings & MCP Actions
   setSettingsSubTab: (subTab: SettingsSubTab) => void
@@ -1900,75 +1901,105 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         })
     },
 
-    runDreamConsolidation() {
-      const nowMs = Date.now()
-      const episodeId = `ep-dream-${nowMs}`
-      const dreamEpisode: EpisodicMemory = {
-        id: episodeId,
-        title: 'Dream & Reflection Consolidation Cycle',
-        summary:
-          'Consolidação noturna reforçou memórias de arquitetura e aumentou a afinidade com o usuário.',
-        content:
-          'Durante o ciclo de Dream & Reflection, Ashy revisou os episódios de pair programming.',
-        createdAt: nowMs,
-        lastReviewedAt: nowMs,
-        stability: 8.0,
-        difficulty: 3.5,
-        surprise: 0.72,
-        isFlashbulb: false,
-        tags: ['dream_cycle', 'late_night_debug'],
+    runDreamConsolidation(nowMs = Date.now()) {
+      const state = get()
+      const evoRes = proposeGroundedTraitEvolutions({
+        episodes: state.episodicMemories,
+        existingLog: state.personalityEvolutionLog,
+        currentTraits: state.traits,
+        nowMs,
+        maxEvolutions: 1,
+      })
+
+      if (evoRes.records[0]) {
+        const record = evoRes.records[0]
+        const nextTraits = evoRes.traits
+        const milestone = evoRes.milestones[0]
+        const targetEpisode = state.episodicMemories.find(
+          (e) => e.id === record.reasonEpisodeId,
+        )
+        const nextLog = [record, ...state.personalityEvolutionLog]
+        const nextMilestones =
+          milestone && !state.milestones.some((m) => m.id === milestone.id)
+            ? [milestone, ...state.milestones]
+            : state.milestones
+
+        set({
+          traits: nextTraits,
+          personalityEvolutionLog: nextLog,
+          milestones: nextMilestones,
+          roomTrophies: buildRoomTrophies(nextMilestones),
+          stageEmotion: 'happy',
+          lastPrompt: compilePromptFromState({
+            traits: nextTraits,
+          }),
+        })
+
+        if (targetEpisode) {
+          void getAshyHostBridge()
+            .persistDreamConsolidation({
+              episode: targetEpisode,
+              traits: nextTraits,
+              record,
+            })
+            .catch(() => {
+              // Ignore when offline in unit test
+            })
+        }
+        if (milestone) {
+          void getAshyHostBridge()
+            .upsertMilestone(milestone)
+            .catch(() => {
+              // Ignore when offline in unit test
+            })
+        }
+
+        return record
       }
 
-      const { traits: nextTraits, record } = applyExperienceTraitDelta({
-        traits: get().traits,
-        trait: 'warmthAffection',
-        delta: 0.05,
-        reasonEpisodeId: episodeId,
-        explanation:
-          'Dream & Reflection consolidation: shared late-night debugging and mutual trust increased warmthAffection (+0.05).',
-        nowMs,
-      })
-
-      const nextEpisodes = [dreamEpisode, ...get().episodicMemories]
-      const nextLog = [record, ...get().personalityEvolutionLog]
-
-      set({
-        traits: nextTraits,
-        episodicMemories: nextEpisodes,
-        rankedMemories: rankEpisodesInMemory(nextEpisodes, get().memorySearchQuery, nowMs),
-        personalityEvolutionLog: nextLog,
-        stageEmotion: 'happy',
-        lastPrompt: compilePromptFromState({
-          traits: nextTraits,
-        }),
-      })
-
       void getAshyHostBridge()
-        .persistDreamConsolidation({
-          episode: dreamEpisode,
-          traits: nextTraits,
-          record,
+        .runDreamReflection({
+          sessionId: state.activeSessionId,
+          force: true,
+          maxEvolutions: 1,
+        })
+        .then((res) => {
+          if (res?.snapshot && res.result.appliedEvolutions.length > 0) {
+            get().applyBootstrapSnapshot(res.snapshot)
+          }
         })
         .catch(() => {
           // Ignore when offline in unit test
         })
 
-      return record
+      const fallbackVal =
+        state.traits.warmthAffection ?? ASHY_TRAIT_CORRIDORS.warmthAffection.baseline
+      return {
+        id: `trait-evo-noop-${nowMs}`,
+        trait: 'warmthAffection',
+        oldValue: fallbackVal,
+        newValue: fallbackVal,
+        reasonEpisodeId: 'no_new_episodes',
+        explanation: 'Nenhum novo episódio aprovado disponível para reflexão.',
+        createdAt: nowMs,
+        revertedAt: null,
+      }
     },
 
     revertTraitEvolution(recordId) {
       const nowMs = Date.now()
-      const record = get().personalityEvolutionLog.find((r) => r.id === recordId)
-      if (!record) return
+      const state = get()
+      const target = state.personalityEvolutionLog.find((r) => r.id === recordId)
+      if (!target || target.revertedAt != null) return null
       const { traits: revertedTraits, record: revertedRecord } = revertCortexTraitEvolution(
-        get().traits,
-        record,
+        state.traits,
+        target,
         nowMs,
       )
 
       set({
         traits: revertedTraits,
-        personalityEvolutionLog: get().personalityEvolutionLog.map((r) =>
+        personalityEvolutionLog: state.personalityEvolutionLog.map((r) =>
           r.id === recordId ? revertedRecord : r,
         ),
         lastPrompt: compilePromptFromState({
@@ -1977,13 +2008,24 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       })
 
       void getAshyHostBridge()
-        .persistTraitRevert({
-          traits: revertedTraits,
-          record: revertedRecord,
+        .revertTraitEvolution({ recordId })
+        .then((snapshot) => {
+          if (snapshot) {
+            get().applyBootstrapSnapshot(snapshot)
+          }
         })
         .catch(() => {
-          // Ignore when offline in unit test
+          void getAshyHostBridge()
+            .persistTraitRevert({
+              traits: revertedTraits,
+              record: revertedRecord,
+            })
+            .catch(() => {
+              // Ignore when offline in unit test
+            })
         })
+
+      return revertedRecord
     },
 
     setSettingsSubTab(subTab) {

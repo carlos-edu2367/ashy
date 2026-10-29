@@ -80,6 +80,14 @@ export function registerAshyElectronIpc(
     return dispatchHostRpc(kernel, request.method, request.payload)
   })
 
+  ipcMain.handle('ashy:runDreamReflection', async (_event, payload) => {
+    return dispatchHostRpc(kernel, 'runDreamReflection', payload)
+  })
+
+  ipcMain.handle('ashy:revertTraitEvolution', async (_event, payload) => {
+    return dispatchHostRpc(kernel, 'revertTraitEvolution', payload)
+  })
+
   const unsubscribe = kernel.onHostEvent((event) => {
     const targets = getWebContents()
     for (const target of targets) {
@@ -100,6 +108,8 @@ export function registerAshyElectronIpc(
     cleanedUp = true
     unsubscribe()
     ipcMain.removeHandler('ashy:rpc')
+    ipcMain.removeHandler('ashy:runDreamReflection')
+    ipcMain.removeHandler('ashy:revertTraitEvolution')
   }
 }
 

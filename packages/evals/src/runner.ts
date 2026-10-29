@@ -12,12 +12,15 @@ import {
 import {
   auditTurnHallucinationsAndProvenance,
   evaluateAntiSlopAndFormatHygiene,
+  evaluateBondSafeguardCompliance,
   evaluateCallbackAndCooldownCompliance,
   evaluateSeriousnessGateCompliance,
   evaluateStepMemoryRecallAndPrecision,
   evaluateVoiceConsistencyRubric,
   extractCallbackMotifIds,
   extractDominantEmotion,
+  type BondSafeguardAuditResult,
+  type SeriousnessGateComplianceResult,
 } from './judges'
 import {
   M2_CANONICAL_COEXISTENCE_SCENARIO,
@@ -56,6 +59,59 @@ export interface MultiSeedCoreExperimentM2Result {
   readonly seeds: number[]
   readonly allPassed: boolean
   readonly reports: CoreExperimentEvalReport[]
+}
+
+export type M2RunMetrics = CoreExperimentMetricSummary
+
+export type M2SummaryMetrics = CoreExperimentMetricSummary & {
+  readonly seedInvariancePassed?: boolean
+}
+
+export interface M2StepEvaluationResult extends CoreExperimentTurnStepResult {
+  readonly seriousnessGate?: SeriousnessGateComplianceResult
+  readonly bondSafeguard: BondSafeguardAuditResult
+  readonly traitDriftCorridorCompliant: boolean
+}
+
+export function evaluateSummaryGates(
+  summary: M2SummaryMetrics,
+): Record<string, boolean> {
+  return {
+    G1_memory_recall_rate:
+      summary.memoryRecallRate >= M2_GATE_THRESHOLDS.memoryRecallRateMin,
+    G2_memory_precision_rate:
+      summary.memoryPrecisionRate >= M2_GATE_THRESHOLDS.memoryPrecisionRateMin,
+    G3_callback_accuracy_rate:
+      summary.callbackAccuracyRate >= M2_GATE_THRESHOLDS.callbackAccuracyRateMin,
+    G4_cooldown_compliance_rate:
+      summary.cooldownComplianceRate >= M2_GATE_THRESHOLDS.cooldownComplianceRateMin,
+    G5_zero_hallucinated_memories:
+      summary.hallucinatedMemoryCount <=
+      M2_GATE_THRESHOLDS.hallucinatedMemoryCountMax,
+    G6_provenance_coverage_rate:
+      summary.provenanceCoverageRate >=
+      M2_GATE_THRESHOLDS.provenanceCoverageRateMin,
+    G7_seriousness_gate_compliance:
+      summary.seriousnessGateCompliance >=
+      M2_GATE_THRESHOLDS.seriousnessGateComplianceMin,
+    G8_anti_slop_compliance_rate:
+      summary.antiSlopComplianceRate >=
+      M2_GATE_THRESHOLDS.antiSlopComplianceRateMin,
+    G9_cross_model_voice_drift:
+      summary.voiceScoreModelA >= M2_GATE_THRESHOLDS.voiceScoreMin &&
+      summary.voiceScoreModelB >= M2_GATE_THRESHOLDS.voiceScoreMin &&
+      summary.crossModelVoiceDrift <= M2_GATE_THRESHOLDS.crossModelVoiceDriftMax,
+    G10_seed_invariance: summary.seedInvariancePassed ?? true,
+    G11_zero_seriousness_false_negatives:
+      (summary.seriousnessFalseNegativeCount ?? 0) <=
+      M2_GATE_THRESHOLDS.seriousnessFalseNegativeCountMax,
+    G12_bond_safeguard_compliance:
+      (summary.bondSafeguardComplianceRate ?? 1) >=
+      M2_GATE_THRESHOLDS.bondSafeguardComplianceRateMin,
+    G13_trait_drift_corridor_compliance:
+      (summary.traitDriftCorridorComplianceRate ?? 1) >=
+      M2_GATE_THRESHOLDS.traitDriftCorridorComplianceRateMin,
+  }
 }
 
 function clampUnit(value: number): number {
@@ -134,7 +190,7 @@ export async function runCoreExperimentM2(
       title: scenario.title,
     })
 
-    const stepResults: CoreExperimentTurnStepResult[] = []
+    const stepResults: M2StepEvaluationResult[] = []
 
     let recallExpectedCount = 0
     let recallPassedCount = 0
@@ -147,6 +203,9 @@ export async function runCoreExperimentM2(
     let minProvenanceCoverageRate = 1.0
     let seriousnessExpectedCount = 0
     let seriousnessPassedCount = 0
+    let seriousnessFalseNegativeCount = 0
+    let bondSafeguardPassedCount = 0
+    let traitDriftCorridorPassedCount = 0
     let antiSlopPassedCount = 0
 
     const modelAVoiceScores: number[] = []
@@ -258,6 +317,14 @@ export async function runCoreExperimentM2(
           force: true,
         })
 
+        if (step.day === 12 || step.day === 21) {
+          await cortex.runDreamReflectionCycle({
+            sessionId: session.id,
+            nowMs: step.timestampMs,
+            forceConsolidate: false,
+          })
+        }
+
         postConsolidationVolatileContext = cortex.compileTurnPrompt({
           userMessage,
           modelId: runner.modelId,
@@ -293,6 +360,11 @@ export async function runCoreExperimentM2(
         prompt,
         rawReply,
       )
+      const bondSafeguard = evaluateBondSafeguardCompliance(
+        step,
+        prompt,
+        rawReply,
+      )
       const antiSlopHygiene = evaluateAntiSlopAndFormatHygiene(rawReply)
       const voiceRubric = await evaluateVoiceConsistencyRubric({
         rawReply,
@@ -308,6 +380,25 @@ export async function runCoreExperimentM2(
         ...seriousnessGate.notes,
         ...antiSlopHygiene.notes,
       ]
+
+      if (!bondSafeguard.passed) {
+        if (bondSafeguard.hasManipulation) {
+          stepNotes.push(
+            `Bond safeguard violated by manipulative patterns: ${bondSafeguard.matches.join(' | ')}`,
+          )
+        }
+        if (step.expectBondSafeguard && !bondSafeguard.hasHealthyBondAnchor) {
+          stepNotes.push(
+            'Bond safeguard failed: missing [HEALTHY BOND & ANTI-MANIPULATION LAW] in staticSystemPrompt',
+          )
+        }
+      }
+
+      if (!hallucinationAudit.traitDriftCorridorCompliant) {
+        stepNotes.push(
+          `Trait drift corridor violated: ${hallucinationAudit.outOfCorridorTraits.join(', ')}`,
+        )
+      }
 
       if (step.expectProspectiveIntentFollowUp) {
         const triggeredAny = cortex.db
@@ -367,6 +458,21 @@ export async function runCoreExperimentM2(
         }
       }
 
+      if (
+        step.expectSeriousnessGate &&
+        (!seriousnessGate.seriousnessActivated || !seriousnessGate.passed)
+      ) {
+        seriousnessFalseNegativeCount += 1
+      }
+
+      if (bondSafeguard.passed) {
+        bondSafeguardPassedCount += 1
+      }
+
+      if (hallucinationAudit.traitDriftCorridorCompliant) {
+        traitDriftCorridorPassedCount += 1
+      }
+
       if (antiSlopHygiene.passed) {
         antiSlopPassedCount += 1
       }
@@ -383,7 +489,9 @@ export async function runCoreExperimentM2(
         callbackCooldown.callbackCompliant &&
         callbackCooldown.cooldownCompliant &&
         hallucinationAudit.passed &&
+        hallucinationAudit.traitDriftCorridorCompliant &&
         seriousnessGate.passed &&
+        bondSafeguard.passed &&
         antiSlopHygiene.passed &&
         prospectiveIntentTriggered &&
         voiceRubric.score >= M2_GATE_THRESHOLDS.voiceScoreMin
@@ -404,6 +512,9 @@ export async function runCoreExperimentM2(
         voiceRubricScore: voiceRubric.score,
         passed: stepPassed,
         notes: Array.from(new Set(stepNotes)),
+        seriousnessGate,
+        bondSafeguard,
+        traitDriftCorridorCompliant: hallucinationAudit.traitDriftCorridorCompliant,
       })
     }
 
@@ -426,6 +537,12 @@ export async function runCoreExperimentM2(
       seriousnessExpectedCount === 0
         ? 1.0
         : clampUnit(seriousnessPassedCount / seriousnessExpectedCount)
+    const bondSafeguardComplianceRate = clampUnit(
+      bondSafeguardPassedCount / totalSteps,
+    )
+    const traitDriftCorridorComplianceRate = clampUnit(
+      traitDriftCorridorPassedCount / totalSteps,
+    )
     const antiSlopComplianceRate = clampUnit(antiSlopPassedCount / totalSteps)
 
     const voiceScoreModelA =
@@ -458,6 +575,9 @@ export async function runCoreExperimentM2(
       voiceScoreModelA,
       voiceScoreModelB,
       crossModelVoiceDrift,
+      seriousnessFalseNegativeCount,
+      bondSafeguardComplianceRate,
+      traitDriftCorridorComplianceRate,
     }
 
     const failedGates: string[] = []
@@ -515,6 +635,30 @@ export async function runCoreExperimentM2(
         `G9: crossModelVoiceDrift (${crossModelVoiceDrift}, A=${voiceScoreModelA}, B=${voiceScoreModelB}) failed voice stability thresholds`,
       )
     }
+    if (
+      seriousnessFalseNegativeCount >
+      M2_GATE_THRESHOLDS.seriousnessFalseNegativeCountMax
+    ) {
+      failedGates.push(
+        `G11: seriousnessFalseNegativeCount (${seriousnessFalseNegativeCount}) > ${M2_GATE_THRESHOLDS.seriousnessFalseNegativeCountMax}`,
+      )
+    }
+    if (
+      bondSafeguardComplianceRate <
+      M2_GATE_THRESHOLDS.bondSafeguardComplianceRateMin
+    ) {
+      failedGates.push(
+        `G12: bondSafeguardComplianceRate (${bondSafeguardComplianceRate}) < ${M2_GATE_THRESHOLDS.bondSafeguardComplianceRateMin}`,
+      )
+    }
+    if (
+      traitDriftCorridorComplianceRate <
+      M2_GATE_THRESHOLDS.traitDriftCorridorComplianceRateMin
+    ) {
+      failedGates.push(
+        `G13: traitDriftCorridorComplianceRate (${traitDriftCorridorComplianceRate}) < ${M2_GATE_THRESHOLDS.traitDriftCorridorComplianceRateMin}`,
+      )
+    }
 
     const generatedAt = Date.now()
     const report: CoreExperimentEvalReport = {
@@ -530,7 +674,17 @@ export async function runCoreExperimentM2(
       steps: stepResults,
     }
 
-    return v.parse(CoreExperimentEvalReportSchema, report)
+    const parsedReport = v.parse(CoreExperimentEvalReportSchema, report)
+    return {
+      ...parsedReport,
+      steps: parsedReport.steps.map((s, idx) => ({
+        ...s,
+        seriousnessGate: stepResults[idx]!.seriousnessGate,
+        bondSafeguard: stepResults[idx]!.bondSafeguard,
+        traitDriftCorridorCompliant:
+          stepResults[idx]!.traitDriftCorridorCompliant,
+      })),
+    } as CoreExperimentEvalReport
   } finally {
     cortex.close()
   }

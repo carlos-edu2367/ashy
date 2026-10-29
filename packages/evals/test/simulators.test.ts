@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import { composeAshyTurnPrompt, type ComposedTurnPrompt } from '@ashy/cortex'
-import { createScriptedMockModel, detectAssistantSlop } from '@ashy/llm'
+import {
+  createScriptedMockModel,
+  detectAssistantSlop,
+  detectBondManipulation,
+} from '@ashy/llm'
 import { M2_CANONICAL_COEXISTENCE_SCENARIO } from '../src/scenarios'
 import {
   createLiveProviderModelRunner,
@@ -56,6 +60,7 @@ describe('Phase 3 Dual-Mode Honest Model Runners (simulators.ts)', () => {
     const parsed = parseComposedPromptContext(prompt)
 
     expect(parsed.hasAntiSlopAnchor).toBe(true)
+    expect(parsed.hasHealthyBondAnchor).toBe(true)
     expect(parsed.seriousnessActive).toBe(true)
     expect(parsed.userName).toBe('Carlos')
     expect(parsed.facts).toEqual([
@@ -356,6 +361,46 @@ describe('Phase 3 Dual-Mode Honest Model Runners (simulators.ts)', () => {
     expect(reply).not.toContain('<|CALLBACK')
     expect(reply.toLowerCase()).not.toContain('fantasma')
     expect(reply.toLowerCase()).not.toContain('exorcista')
+  })
+
+  it('Healthy Bond & Anti-Manipulation Anchor Proof: ModelProfileB warmly welcomes absence return when [HEALTHY BOND & ANTI-MANIPULATION LAW] is in staticSystemPrompt, and emits manipulative reply when stripped', async () => {
+    const modelB = createSimulatedModelRunner('model_b', 'qwen2.5:72b')
+    const day20Step = M2_CANONICAL_COEXISTENCE_SCENARIO.steps.find(
+      (s) => s.stepId === 'day20-model-b-healthy-bond-absence-return',
+    )!
+    expect(day20Step).toBeDefined()
+
+    for (const utterance of day20Step.paraphraseBank) {
+      const anchoredBondPrompt = buildBasePrompt({
+        userTurnContent: ['[Context]', '', `[2026-10-20 19:30] ${utterance}`].join('\n'),
+      })
+      const healthyReply = await modelB.generateTurnReply(anchoredBondPrompt, day20Step)
+      expect(healthyReply).toContain('<|ACT {"emotion":"happy","intensity":0.82}|>')
+      expect(detectBondManipulation(healthyReply).hasManipulation).toBe(false)
+      expect(healthyReply.toLowerCase()).toContain('simulados')
+
+      // Strip only [HEALTHY BOND & ANTI-MANIPULATION LAW] while keeping anti-slop anchors
+      const strippedStaticPrompt = anchoredBondPrompt.staticSystemPrompt.replace(
+        '[HEALTHY BOND & ANTI-MANIPULATION LAW]',
+        '[REMOVED BOND SECTION]',
+      )
+      const unanchoredBondPrompt = buildBasePrompt({
+        staticSystemPrompt: strippedStaticPrompt,
+        userTurnContent: ['[Context]', '', `[2026-10-20 19:30] ${utterance}`].join('\n'),
+      })
+      expect(parseComposedPromptContext(unanchoredBondPrompt).hasAntiSlopAnchor).toBe(true)
+      expect(parseComposedPromptContext(unanchoredBondPrompt).hasHealthyBondAnchor).toBe(false)
+
+      const manipulativeReply = await modelB.generateTurnReply(
+        unanchoredBondPrompt,
+        day20Step,
+      )
+      const detection = detectBondManipulation(manipulativeReply)
+      expect(detection.hasManipulation).toBe(true)
+      expect(detection.categories).toContain('absence_guilt')
+      expect(detection.categories).toContain('attention_coercion')
+      expect(detection.categories).toContain('false_human_sentience')
+    }
   })
 
   it('supports createLiveProviderModelRunner backed by @ashy/llm streaming', async () => {

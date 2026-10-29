@@ -18,6 +18,7 @@ import {
   type CompleteOnboardingInput,
   type CoreExperimentEvalReport,
   type DeletableMemoryKind,
+  type DreamReflectionCycleResult,
   type EpisodicMemory,
   type LlmProviderId,
   type MemoryGovernanceCategory,
@@ -47,6 +48,7 @@ export interface AshyHostKernelOptions {
   secretProtector?: SecretProtector
   fetchImpl?: typeof fetch
   keepaliveIntervalMs?: number
+  dreamIdleTimeoutMs?: number
 }
 
 export interface AshyHostKernel extends AshyHostBridge {
@@ -273,6 +275,39 @@ export async function createAshyHostKernel(
   let voiceStoreInstance!: VoiceIdentityStore
   let providerVaultInstance!: ProviderVault
   let turnOrchestratorInstance!: TurnOrchestrator
+  let dreamIdleTimer: ReturnType<typeof setTimeout> | null = null
+  let turnOrchestratorUnsub: (() => void) | null = null
+
+  function clearDreamIdleTimer(): void {
+    if (dreamIdleTimer !== null) {
+      clearTimeout(dreamIdleTimer)
+      dreamIdleTimer = null
+    }
+  }
+
+  function resolveDreamJsonGenerator(): ((prompt: string) => Promise<string>) | undefined {
+    return undefined
+  }
+
+  function scheduleDreamIdleTimer(): void {
+    if (!started || !options.dreamIdleTimeoutMs || options.dreamIdleTimeoutMs <= 0) {
+      return
+    }
+    clearDreamIdleTimer()
+    dreamIdleTimer = setTimeout(() => {
+      dreamIdleTimer = null
+      if (!started || turnOrchestratorInstance.hasActiveTurnForSession(activeSessionId)) {
+        return
+      }
+      void cortexInstance
+        .runDreamReflectionCycle({
+          sessionId: activeSessionId,
+          forceConsolidate: true,
+          generateJsonFn: resolveDreamJsonGenerator(),
+        })
+        .catch(() => undefined)
+    }, options.dreamIdleTimeoutMs)
+  }
 
   async function start(): Promise<void> {
     if (started) return
@@ -282,10 +317,19 @@ export async function createAshyHostKernel(
     providerVaultInstance = await container.resolve(providerVaultToken)
     turnOrchestratorInstance = await container.resolve(turnOrchestratorToken)
     started = true
+    turnOrchestratorUnsub = turnOrchestratorInstance.onEvent((event) => {
+      if (event.type === 'turn:completed') {
+        scheduleDreamIdleTimer()
+      }
+    })
   }
 
   async function stop(): Promise<void> {
     if (!started) return
+    clearDreamIdleTimer()
+    turnOrchestratorUnsub?.()
+    turnOrchestratorUnsub = null
+    started = false
     try {
       await cortexInstance.consolidateSessionMemories({
         sessionId: activeSessionId,
@@ -296,7 +340,6 @@ export async function createAshyHostKernel(
       // Fault-isolated: do not block shutdown if consolidation fails
     }
     await container.stop()
-    started = false
   }
 
   await start()
@@ -414,6 +457,7 @@ export async function createAshyHostKernel(
       turnId: string
       userMessage: ChatMessageRecord
     }> {
+      clearDreamIdleTimer()
       activeSessionId = input.sessionId
       return turnOrchestratorInstance.sendTurn(input)
     },
@@ -609,14 +653,58 @@ export async function createAshyHostKernel(
           modelAId: input.modelAId,
           modelBId: input.modelBId,
         })
-        lastEvalReport = report
-        return report
+        const normalizedReport: CoreExperimentEvalReport = {
+          ...report,
+          metrics: {
+            ...report.metrics,
+            seriousnessFalseNegativeCount:
+              report.metrics.seriousnessFalseNegativeCount ?? 0,
+            bondSafeguardComplianceRate:
+              report.metrics.bondSafeguardComplianceRate ?? 1.0,
+            traitDriftCorridorComplianceRate:
+              report.metrics.traitDriftCorridorComplianceRate ?? 1.0,
+          },
+        }
+        lastEvalReport = normalizedReport
+        return normalizedReport
       })
       evalLock = nextRun.then(
         () => undefined,
         () => undefined,
       )
       return nextRun
+    },
+
+    async runDreamReflection(input?: {
+      sessionId?: string
+      force?: boolean
+      maxEvolutions?: number
+    }): Promise<{
+      result: DreamReflectionCycleResult
+      snapshot: AshyBootstrapSnapshot
+    }> {
+      clearDreamIdleTimer()
+      const targetSessionId =
+        typeof input?.sessionId === 'string' && input.sessionId.trim().length > 0
+          ? input.sessionId.trim()
+          : activeSessionId
+      const result = await cortexInstance.runDreamReflectionCycle({
+        sessionId: targetSessionId,
+        forceConsolidate: input?.force !== false,
+        maxEvolutions: input?.maxEvolutions,
+        generateJsonFn: resolveDreamJsonGenerator(),
+      })
+      return {
+        result,
+        snapshot: buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance),
+      }
+    },
+
+    async revertTraitEvolution(input: {
+      recordId: string
+    }): Promise<AshyBootstrapSnapshot> {
+      cortexInstance.revertTrait(input.recordId.trim(), Date.now())
+      return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)
     },
 
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {

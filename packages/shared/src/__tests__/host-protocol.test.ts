@@ -23,6 +23,14 @@ import {
   CoreExperimentEvalReportSchema,
   CoreExperimentMetricSummarySchema,
   CoreExperimentTurnStepResultSchema,
+  ASHY_TRAIT_CORRIDORS,
+  clampTraitToCorridor,
+  clampAllTraitsToCorridors,
+  SeriousnessAssessmentSchema,
+  UserAffectReactionSchema,
+  CrossEpisodeLinkSchema,
+  DreamReflectionCycleResultSchema,
+  DEFAULT_ASHY_VOICE_MD,
 } from '../index'
 
 describe('@ashy/shared host-protocol', () => {
@@ -283,6 +291,9 @@ describe('@ashy/shared host-protocol', () => {
       antiSlopComplianceRateMin: 1.0,
       voiceScoreMin: 0.8,
       crossModelVoiceDriftMax: 0.15,
+      seriousnessFalseNegativeCountMax: 0,
+      bondSafeguardComplianceRateMin: 1.0,
+      traitDriftCorridorComplianceRateMin: 1.0,
     })
 
     const inputRes = v.safeParse(RunCoreExperimentInputSchema, {
@@ -420,5 +431,184 @@ describe('@ashy/shared host-protocol', () => {
         mode: 'invalid_mode',
       }).success,
     ).toBe(false)
+  })
+
+  it('enforces Phase 4 ASHY_TRAIT_CORRIDORS, clampTraitToCorridor, DreamReflectionCycleResultSchema, and extended M2/Phase 4 gates', () => {
+    expect(ASHY_TRAIT_CORRIDORS.witSarcasm).toEqual({
+      baseline: 0.78,
+      min: 0.58,
+      max: 0.92,
+      maxDeltaPerEpisode: 0.04,
+    })
+    expect(ASHY_TRAIT_CORRIDORS.chaosEnergy).toEqual({
+      baseline: 0.75,
+      min: 0.45,
+      max: 0.9,
+      maxDeltaPerEpisode: 0.04,
+    })
+    expect(ASHY_TRAIT_CORRIDORS.warmthAffection).toEqual({
+      baseline: 0.68,
+      min: 0.52,
+      max: 0.92,
+      maxDeltaPerEpisode: 0.04,
+    })
+    expect(ASHY_TRAIT_CORRIDORS.intellectualCuriosity).toEqual({
+      baseline: 0.85,
+      min: 0.68,
+      max: 0.96,
+      maxDeltaPerEpisode: 0.04,
+    })
+    expect(ASHY_TRAIT_CORRIDORS.proactivity).toEqual({
+      baseline: 0.65,
+      min: 0.4,
+      max: 0.88,
+      maxDeltaPerEpisode: 0.04,
+    })
+
+    // Clamping within corridor bounds and non-finite fallback to baseline
+    expect(clampTraitToCorridor('witSarcasm', 0.99)).toBe(0.92)
+    expect(clampTraitToCorridor('witSarcasm', 0.1)).toBe(0.58)
+    expect(clampTraitToCorridor('chaosEnergy', 0.75)).toBe(0.75)
+    expect(clampTraitToCorridor('witSarcasm', Number.NaN)).toBe(0.78)
+    expect(clampTraitToCorridor('chaosEnergy', Number.POSITIVE_INFINITY)).toBe(0.75)
+    expect(clampTraitToCorridor('proactivity', Number.NEGATIVE_INFINITY)).toBe(0.65)
+
+    // clampAllTraitsToCorridors clamps out-of-bounds and non-finite trait values
+    expect(
+      clampAllTraitsToCorridors({
+        witSarcasm: 1.5,
+        chaosEnergy: -0.2,
+        warmthAffection: Number.NaN,
+        intellectualCuriosity: 0.99,
+        proactivity: 0.1,
+      }),
+    ).toEqual({
+      witSarcasm: 0.92,
+      chaosEnergy: 0.45,
+      warmthAffection: 0.68,
+      intellectualCuriosity: 0.96,
+      proactivity: 0.4,
+    })
+
+    // SeriousnessAssessmentSchema extended optional layer and matchedCue
+    const seriousRes = v.safeParse(SeriousnessAssessmentSchema, {
+      isSeriousOrDelicate: true,
+      severity: 0.9,
+      reason: 'Hospital emergency',
+      maxPlayfulnessAllowed: 0.15,
+      layer: 'semantic_local',
+      matchedCue: 'hospital sobre meu pai',
+    })
+    expect(seriousRes.success).toBe(true)
+    if (seriousRes.success) {
+      expect(seriousRes.output.layer).toBe('semantic_local')
+      expect(seriousRes.output.matchedCue).toBe('hospital sobre meu pai')
+    }
+
+    expect(
+      v.safeParse(SeriousnessAssessmentSchema, {
+        isSeriousOrDelicate: false,
+        severity: 0,
+        maxPlayfulnessAllowed: 1,
+        layer: 'invalid_layer',
+      }).success,
+    ).toBe(false)
+
+    // UserAffectReactionSchema validation
+    const reactionRes = v.safeParse(UserAffectReactionSchema, {
+      valenceDelta: 0.15,
+      arousalDelta: 0.1,
+      playfulnessDelta: 0.2,
+      positiveJokeReaction: true,
+      detectedSentiment: 'playful_positive',
+    })
+    expect(reactionRes.success).toBe(true)
+
+    expect(
+      v.safeParse(UserAffectReactionSchema, {
+        valenceDelta: 1.5,
+        arousalDelta: 0,
+        playfulnessDelta: 0,
+        positiveJokeReaction: false,
+        detectedSentiment: 'neutral',
+      }).success,
+    ).toBe(false)
+
+    // CrossEpisodeLinkSchema and DreamReflectionCycleResultSchema
+    const dreamRes = v.safeParse(DreamReflectionCycleResultSchema, {
+      ranAt: 1761740000000,
+      consolidatedEpisodesCount: 1,
+      reviewedMemoriesCount: 2,
+      crossEpisodeLinks: [
+        {
+          fromEpisodeId: 'ep-1',
+          toEpisodeId: 'ep-2',
+          sharedTheme: 'late_night_debug',
+          similarity: 0.84,
+        },
+      ],
+      appliedEvolutions: [],
+      skippedReason: null,
+    })
+    expect(dreamRes.success).toBe(true)
+
+    const skippedDreamRes = v.safeParse(DreamReflectionCycleResultSchema, {
+      ranAt: 1761740000000,
+      consolidatedEpisodesCount: 0,
+      reviewedMemoriesCount: 0,
+      crossEpisodeLinks: [],
+      appliedEvolutions: [],
+      skippedReason: 'no_new_episodes',
+    })
+    expect(skippedDreamRes.success).toBe(true)
+
+    expect(
+      v.safeParse(CrossEpisodeLinkSchema, {
+        fromEpisodeId: '',
+        toEpisodeId: 'ep-2',
+        sharedTheme: 'theme',
+        similarity: 0.5,
+      }).success,
+    ).toBe(false)
+
+    // CoreExperimentMetricSummarySchema Phase 4 optional-with-default fields
+    const metricDefaultsRes = v.safeParse(CoreExperimentMetricSummarySchema, {
+      memoryRecallRate: 1.0,
+      memoryPrecisionRate: 1.0,
+      callbackAccuracyRate: 1.0,
+      cooldownComplianceRate: 1.0,
+      hallucinatedMemoryCount: 0,
+      provenanceCoverageRate: 1.0,
+      seriousnessGateCompliance: 1.0,
+      antiSlopComplianceRate: 1.0,
+      voiceScoreModelA: 0.9,
+      voiceScoreModelB: 0.9,
+      crossModelVoiceDrift: 0.0,
+    })
+    expect(metricDefaultsRes.success).toBe(true)
+    if (metricDefaultsRes.success) {
+      expect(metricDefaultsRes.output.seriousnessFalseNegativeCount).toBe(0)
+      expect(metricDefaultsRes.output.bondSafeguardComplianceRate).toBe(1.0)
+      expect(metricDefaultsRes.output.traitDriftCorridorComplianceRate).toBe(1.0)
+    }
+
+    expect(
+      v.safeParse(CoreExperimentMetricSummarySchema, {
+        memoryRecallRate: 1.0,
+        memoryPrecisionRate: 1.0,
+        callbackAccuracyRate: 1.0,
+        cooldownComplianceRate: 1.0,
+        hallucinatedMemoryCount: 0,
+        provenanceCoverageRate: 1.0,
+        seriousnessGateCompliance: 1.0,
+        antiSlopComplianceRate: 1.0,
+        voiceScoreModelA: 0.9,
+        voiceScoreModelB: 0.9,
+        crossModelVoiceDrift: 0.0,
+        seriousnessFalseNegativeCount: -1,
+      }).success,
+    ).toBe(false)
+
+    expect(DEFAULT_ASHY_VOICE_MD).toContain('## Salvaguardas de Vínculo Saudável')
   })
 })

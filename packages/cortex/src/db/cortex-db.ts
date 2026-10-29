@@ -704,10 +704,19 @@ export class CortexDatabase {
       this.sqlite.prepare('DELETE FROM episodic_fts WHERE memory_id = ?').run(id)
       this.sqlite.prepare('DELETE FROM episodic_memories WHERE id = ?').run(id)
       this.sqlite
+        .prepare('DELETE FROM personality_evolution_log WHERE reason_episode_id = ?')
+        .run(id)
+      this.sqlite
         .prepare(
           'UPDATE chat_messages SET consolidated_episode_id = NULL WHERE consolidated_episode_id = ?',
         )
         .run(id)
+    }
+
+    for (const [recId, rec] of this.memory.personalityEvolution.entries()) {
+      if (rec.reasonEpisodeId === id) {
+        this.memory.personalityEvolution.delete(recId)
+      }
     }
 
     for (const fact of this.listSemanticFacts()) {
@@ -759,15 +768,23 @@ export class CortexDatabase {
     return this.sqlite ? true : existedInMem
   }
 
-  public listEpisodicMemories(): EpisodicMemory[] {
+  public listEpisodicMemories(limit?: number): EpisodicMemory[] {
+    const safeLimit =
+      limit !== undefined && Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : null
     if (!this.sqlite) {
-      return Array.from(this.memory.episodicMemories.values()).sort(
+      const sorted = Array.from(this.memory.episodicMemories.values()).sort(
         (a, b) => b.createdAt - a.createdAt,
       )
+      return safeLimit !== null ? sorted.slice(0, safeLimit) : sorted
     }
-    const rows = this.sqlite
-      .prepare('SELECT * FROM episodic_memories ORDER BY created_at DESC')
-      .all()
+    const rows =
+      safeLimit !== null
+        ? this.sqlite
+            .prepare('SELECT * FROM episodic_memories ORDER BY created_at DESC LIMIT ?')
+            .all(safeLimit)
+        : this.sqlite
+            .prepare('SELECT * FROM episodic_memories ORDER BY created_at DESC')
+            .all()
     return rows.map((row) => this.mapRowToEpisodicMemory(row))
   }
 
@@ -1414,15 +1431,52 @@ export class CortexDatabase {
     return record
   }
 
-  public listPersonalityEvolution(): PersonalityEvolutionRecord[] {
+  public insertPersonalityEvolution(
+    input: PersonalityEvolutionRecord,
+  ): PersonalityEvolutionRecord {
+    return this.upsertPersonalityEvolution(input)
+  }
+
+  public migrateEvolutionEpisodeId(oldEpisodeId: string, newEpisodeId: string): void {
+    const cleanOld = oldEpisodeId.trim()
+    const cleanNew = newEpisodeId.trim()
+    if (!cleanOld || !cleanNew || cleanOld === cleanNew) return
+
+    for (const [recId, rec] of this.memory.personalityEvolution.entries()) {
+      if (rec.reasonEpisodeId === cleanOld) {
+        this.memory.personalityEvolution.set(recId, {
+          ...rec,
+          reasonEpisodeId: cleanNew,
+        })
+      }
+    }
+
+    if (this.sqlite) {
+      this.sqlite
+        .prepare(
+          'UPDATE personality_evolution_log SET reason_episode_id = ? WHERE reason_episode_id = ?',
+        )
+        .run(cleanNew, cleanOld)
+    }
+  }
+
+  public listPersonalityEvolution(limit?: number): PersonalityEvolutionRecord[] {
+    const safeLimit =
+      limit !== undefined && Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : null
     if (!this.sqlite) {
-      return Array.from(this.memory.personalityEvolution.values()).sort(
+      const sorted = Array.from(this.memory.personalityEvolution.values()).sort(
         (a, b) => a.createdAt - b.createdAt,
       )
+      return safeLimit !== null ? sorted.slice(0, safeLimit) : sorted
     }
-    const rows = this.sqlite
-      .prepare('SELECT * FROM personality_evolution_log ORDER BY created_at ASC')
-      .all()
+    const rows =
+      safeLimit !== null
+        ? this.sqlite
+            .prepare('SELECT * FROM personality_evolution_log ORDER BY created_at ASC LIMIT ?')
+            .all(safeLimit)
+        : this.sqlite
+            .prepare('SELECT * FROM personality_evolution_log ORDER BY created_at ASC')
+            .all()
     return rows.map((row) =>
       v.parse(PersonalityEvolutionRecordSchema, {
         id: String(row.id),
@@ -1466,16 +1520,27 @@ export class CortexDatabase {
   }
 
   public saveAffectiveState(
-    mood: MoodVector,
-    traits: PersonalityTraits,
+    moodOrSnapshot: MoodVector | AffectiveStateSnapshot,
+    traits?: PersonalityTraits,
     updatedAt = Date.now(),
   ): AffectiveStateSnapshot {
-    const validatedMood = v.parse(MoodVectorSchema, mood)
-    const validatedTraits = v.parse(PersonalityTraitsSchema, traits)
+    const isSnapshot =
+      moodOrSnapshot !== null &&
+      typeof moodOrSnapshot === 'object' &&
+      'mood' in moodOrSnapshot &&
+      'traits' in moodOrSnapshot
+    const rawMood = isSnapshot ? moodOrSnapshot.mood : moodOrSnapshot
+    const rawTraits = isSnapshot ? moodOrSnapshot.traits : traits!
+    const effectiveUpdatedAt = isSnapshot
+      ? (moodOrSnapshot.updatedAt ?? updatedAt)
+      : updatedAt
+
+    const validatedMood = v.parse(MoodVectorSchema, rawMood)
+    const validatedTraits = v.parse(PersonalityTraitsSchema, rawTraits)
     this.memory.affectiveState = {
       mood: validatedMood,
       traits: validatedTraits,
-      updatedAt,
+      updatedAt: effectiveUpdatedAt,
     }
 
     if (this.sqlite) {
@@ -1484,7 +1549,11 @@ export class CortexDatabase {
           `INSERT OR REPLACE INTO affective_state (singleton_id, mood_json, traits_json, updated_at)
            VALUES (1, ?, ?, ?)`,
         )
-        .run(JSON.stringify(validatedMood), JSON.stringify(validatedTraits), updatedAt)
+        .run(
+          JSON.stringify(validatedMood),
+          JSON.stringify(validatedTraits),
+          effectiveUpdatedAt,
+        )
     }
 
     return this.memory.affectiveState
@@ -1635,6 +1704,10 @@ export class CortexDatabase {
       .prepare('SELECT * FROM chat_sessions ORDER BY updated_at DESC, started_at DESC')
       .all()
     return rows.map((row) => this.mapRowToChatSession(row))
+  }
+
+  public listSessions(): ChatSessionRecord[] {
+    return this.listChatSessions()
   }
 
   public deleteChatSession(id: string): boolean {
@@ -1824,6 +1897,10 @@ export class CortexDatabase {
       .all(sessionId)
 
     return rows.map((row) => this.mapRowToChatMessage(row))
+  }
+
+  public listUnconsolidatedMessages(sessionId: string): ChatMessageRecord[] {
+    return this.listUnconsolidatedChatMessages(sessionId)
   }
 
   public markChatMessagesConsolidated(

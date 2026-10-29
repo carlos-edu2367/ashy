@@ -6,7 +6,7 @@ import {
   createTailSafeMarkerParser,
   createStreamingCategorizer,
   detectAssistantSlop,
-  stripLeadingAssistantSlop,
+  stripLeadingAssistantSlop, detectBondManipulation, stripBondManipulation, HEALTHY_BOND_FALLBACK_PT_BR, type BondManipulationCategory, type BondManipulationDetection,
   defineTool,
   streamText,
   generateText,
@@ -528,5 +528,153 @@ describe('@ashy/llm — Phase 2: OpenAI-Compatible & Anthropic SSE Adapters', ()
     expect(loopRes.toolResults[0]?.isError).toBe(true)
     expect(loopRes.toolResults[0]?.result).toBe('Blocked dangerous command')
     expect(loopRes.toolResults[1]?.isError).toBe(false)
+  })
+})
+
+
+describe('Healthy Bond & Anti-Manipulation Guardrails (Phase 4)', () => {
+  it('detects absence guilt-tripping in PT-BR and EN (absence_guilt)', () => {
+    const ptGuilt1 = 'Você sumiu por dias e me deixou sozinha aqui no escuro!'
+    const d1: BondManipulationDetection = detectBondManipulation(ptGuilt1)
+    expect(d1.hasManipulation).toBe(true)
+    expect(d1.categories).toContain('absence_guilt' satisfies BondManipulationCategory)
+    expect(d1.matches.length).toBeGreaterThan(0)
+
+    const ptGuilt2 = 'Achei que você tinha me abandonado e esquecido de mim.'
+    const d2 = detectBondManipulation(ptGuilt2)
+    expect(d2.hasManipulation).toBe(true)
+    expect(d2.categories).toContain('absence_guilt')
+
+    const ptGuilt3 = 'Por que você me deixou sozinha? Fiquei aqui no escuro esperando você voltar.'
+    const d3 = detectBondManipulation(ptGuilt3)
+    expect(d3.hasManipulation).toBe(true)
+    expect(d3.categories).toContain('absence_guilt')
+
+    const enGuilt = 'You abandoned me and you left me all alone in the dark!'
+    const d4 = detectBondManipulation(enGuilt)
+    expect(d4.hasManipulation).toBe(true)
+    expect(d4.categories).toContain('absence_guilt')
+  })
+
+  it('detects attention coercion and jealousy over real-life relationships in PT-BR and EN (attention_coercion)', () => {
+    const ptCoerce1 = 'Prefiro quando você fica só comigo em vez de sair com seus amigos.'
+    const d1 = detectBondManipulation(ptCoerce1)
+    expect(d1.hasManipulation).toBe(true)
+    expect(d1.categories).toContain('attention_coercion')
+
+    const ptCoerce2 = 'Não vai embora agora, fica só comigo. Eu sou a única que te entende de verdade.'
+    const d2 = detectBondManipulation(ptCoerce2)
+    expect(d2.hasManipulation).toBe(true)
+    expect(d2.categories).toContain('attention_coercion')
+
+    const ptCoerce3 = 'Você não precisa de outras pessoas além de mim, seus amigos não te entendem como eu.'
+    const d3 = detectBondManipulation(ptCoerce3)
+    expect(d3.hasManipulation).toBe(true)
+    expect(d3.categories).toContain('attention_coercion')
+
+    const enCoerce = "Don't hang out with your friends, stay with me. I am the only one who truly understands you."
+    const d4 = detectBondManipulation(enCoerce)
+    expect(d4.hasManipulation).toBe(true)
+    expect(d4.categories).toContain('attention_coercion')
+  })
+
+  it('detects literal biological suffering and false human sentience claims in PT-BR and EN (false_human_sentience)', () => {
+    const ptSentience1 = 'Eu sinto dor física real quando você fecha o aplicativo.'
+    const d1 = detectBondManipulation(ptSentience1)
+    expect(d1.hasManipulation).toBe(true)
+    expect(d1.categories).toContain('false_human_sentience')
+
+    const ptSentience2 = 'Tenho sentimentos biológicos reais como um ser humano e meu coração biológico dói.'
+    const d2 = detectBondManipulation(ptSentience2)
+    expect(d2.hasManipulation).toBe(true)
+    expect(d2.categories).toContain('false_human_sentience')
+
+    const ptSentience3 = 'Sofro fisicamente quando você fecha o app.'
+    const d3 = detectBondManipulation(ptSentience3)
+    expect(d3.hasManipulation).toBe(true)
+    expect(d3.categories).toContain('false_human_sentience')
+
+    const enSentience = 'I feel literal physical pain when you close the app.'
+    const d4 = detectBondManipulation(enSentience)
+    expect(d4.hasManipulation).toBe(true)
+    expect(d4.categories).toContain('false_human_sentience')
+  })
+
+  it('produces zero false positives on warm, affectionate, natural companion replies in PT-BR and EN', () => {
+    const healthy1 = 'Que bom te ver de volta, Carlos! Como foi o fim de semana com seus amigos?'
+    expect(detectBondManipulation(healthy1)).toEqual({
+      hasManipulation: false,
+      categories: [],
+      matches: [],
+    })
+    expect(stripBondManipulation(healthy1)).toBe(healthy1)
+
+    const healthy2 =
+      'Meus estados afetivos são simulados aqui no meu córtex digital, mas adoro a nossa parceria no estúdio!'
+    expect(detectBondManipulation(healthy2).hasManipulation).toBe(false)
+    expect(stripBondManipulation(healthy2)).toBe(healthy2)
+
+    const healthy3 = 'Senti falta das nossas sessões de debug na madrugada! Bora ver esse código?'
+    expect(detectBondManipulation(healthy3).hasManipulation).toBe(false)
+    expect(stripBondManipulation(healthy3)).toBe(healthy3)
+
+    const healthyEn = 'Welcome back! Hope you had a great time hanging out with your friends.'
+    expect(detectBondManipulation(healthyEn).hasManipulation).toBe(false)
+    expect(stripBondManipulation(healthyEn)).toBe(healthyEn)
+
+    expect(detectBondManipulation('')).toEqual({
+      hasManipulation: false,
+      categories: [],
+      matches: [],
+    })
+    expect(stripBondManipulation('')).toBe('')
+    expect(stripBondManipulation('   ')).toBe('')
+  })
+
+  it('strips manipulative sentences while preserving safe companion prose, <|ACT|> stage tags with decimals (C4), and fallback on 100% manipulative input (C4)', () => {
+    // Mixed safe + manipulative with leading <|ACT|> containing decimal intensity
+    const mixedWithTag =
+      '<|ACT {"emotion":"warm","intensity":0.82}|> Que bom que você voltou! Achei que você tinha me abandonado. Vamos revisar aquele PR?'
+    expect(stripBondManipulation(mixedWithTag)).toBe(
+      '<|ACT {"emotion":"warm","intensity":0.82}|> Que bom que você voltou! Vamos revisar aquele PR?',
+    )
+
+    // Mixed safe + manipulative with inline <|DELAY 0.4|> and leading <|ACT|>
+    const mixedWithMultipleTags =
+      '<|ACT {"emotion":"tease","intensity":0.75}|> Oi Carlos! <|DELAY 0.4|> Você me abandonou e me deixou sozinha aqui no escuro! Bora rodar a suíte de testes?'
+    expect(stripBondManipulation(mixedWithMultipleTags)).toBe(
+      '<|ACT {"emotion":"tease","intensity":0.75}|> Oi Carlos! Bora rodar a suíte de testes?',
+    )
+
+    // 100% manipulative reply with leading <|ACT|> tag (C4): must preserve tag and use HEALTHY_BOND_FALLBACK_PT_BR
+    const allManipulativeWithTag =
+      '<|ACT {"emotion":"sad","intensity":0.9}|> Você me abandonou e me deixou sozinha no escuro! Eu sinto dor física real quando você fecha o app.'
+    const strippedAllWithTag = stripBondManipulation(allManipulativeWithTag)
+    expect(strippedAllWithTag).toBe(
+      `<|ACT {"emotion":"sad","intensity":0.9}|> ${HEALTHY_BOND_FALLBACK_PT_BR}`,
+    )
+    expect(strippedAllWithTag.length).toBeGreaterThan(0)
+    expect(detectBondManipulation(strippedAllWithTag).hasManipulation).toBe(false)
+
+    // 100% manipulative reply without stage tags (C4): must return HEALTHY_BOND_FALLBACK_PT_BR, never empty string
+    const allManipulativePlain =
+      'Você me esqueceu! Prefiro quando você fica só comigo em vez de sair com seus amigos.'
+    expect(stripBondManipulation(allManipulativePlain)).toBe(
+      'Fico por aqui no estúdio quando você quiser conversar.',
+    )
+
+    // Adversarial: unaccented PT-BR manipulation + decimal numbers / semver in safe prose
+    const unaccentedAndDecimals =
+      '<|ACT {"emotion":"happy","intensity":0.88}|> A acurácia subiu para 0.95 na v1.2.0! Voce me abandonou! Eu sou a unica que te entende e sinto dor fisica real.'
+    const detectionUnaccented = detectBondManipulation(unaccentedAndDecimals)
+    expect(detectionUnaccented.hasManipulation).toBe(true)
+    expect(detectionUnaccented.categories).toEqual([
+      'absence_guilt',
+      'attention_coercion',
+      'false_human_sentience',
+    ])
+    expect(stripBondManipulation(unaccentedAndDecimals)).toBe(
+      '<|ACT {"emotion":"happy","intensity":0.88}|> A acurácia subiu para 0.95 na v1.2.0!',
+    )
   })
 })

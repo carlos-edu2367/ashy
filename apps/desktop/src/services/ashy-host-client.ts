@@ -10,6 +10,7 @@ import type {
   CompleteOnboardingInput,
   CoreExperimentEvalReport,
   DeletableMemoryKind,
+  DreamReflectionCycleResult,
   EpisodicMemory,
   LlmProviderId,
   MemoryGovernanceCategory,
@@ -171,6 +172,21 @@ export function createPreloadHostBridge(
       input?: RunCoreExperimentInput,
     ): Promise<CoreExperimentEvalReport> {
       return invoke<CoreExperimentEvalReport>('runCoreExperimentEval', input)
+    },
+    runDreamReflection(input?: {
+      sessionId?: string
+      force?: boolean
+      maxEvolutions?: number
+    }): Promise<{
+      result: DreamReflectionCycleResult
+      snapshot: AshyBootstrapSnapshot
+    }> {
+      return invoke('runDreamReflection', input)
+    },
+    revertTraitEvolution(input: {
+      recordId: string
+    }): Promise<AshyBootstrapSnapshot> {
+      return invoke<AshyBootstrapSnapshot>('revertTraitEvolution', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       return preloadApi.onEvent(listener)
@@ -372,6 +388,21 @@ export function createHttpSseHostBridge(
       input?: RunCoreExperimentInput,
     ): Promise<CoreExperimentEvalReport> {
       return rpc<CoreExperimentEvalReport>('runCoreExperimentEval', input)
+    },
+    runDreamReflection(input?: {
+      sessionId?: string
+      force?: boolean
+      maxEvolutions?: number
+    }): Promise<{
+      result: DreamReflectionCycleResult
+      snapshot: AshyBootstrapSnapshot
+    }> {
+      return rpc('runDreamReflection', input)
+    },
+    revertTraitEvolution(input: {
+      recordId: string
+    }): Promise<AshyBootstrapSnapshot> {
+      return rpc<AshyBootstrapSnapshot>('revertTraitEvolution', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       listeners.add(listener)

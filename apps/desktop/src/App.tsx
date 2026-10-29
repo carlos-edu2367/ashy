@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import {
   ASHY_EMOTIONS,
+  ASHY_TRAIT_CORRIDORS,
   M2_GATE_THRESHOLDS,
   MILESTONE_CATEGORIES,
   SEMANTIC_FACT_CATEGORIES,
@@ -2325,6 +2326,16 @@ export function App(): React.ReactElement {
                               style={{ width: `${Math.round(val * 100)}%` }}
                             />
                           </div>
+                          <div style={{ marginTop: '4px' }}>
+                            <span
+                              data-testid={`trait-corridor-${tm.key}`}
+                              style={{ fontSize: '11px', color: 'var(--text-muted)' }}
+                            >
+                              Corredor: {Math.round(ASHY_TRAIT_CORRIDORS[tm.key].min * 100)}%–
+                              {Math.round(ASHY_TRAIT_CORRIDORS[tm.key].max * 100)}% · Base:{' '}
+                              {Math.round(ASHY_TRAIT_CORRIDORS[tm.key].baseline * 100)}%
+                            </span>
+                          </div>
                         </div>
                       )
                     })}
@@ -2351,6 +2362,13 @@ export function App(): React.ReactElement {
                           <div>
                             <div style={{ fontWeight: 600, fontSize: '13px' }}>
                               {rec.trait}: {rec.oldValue.toFixed(2)} → {rec.newValue.toFixed(2)}
+                              <span
+                                className="ashy-badge violet"
+                                data-testid={`evo-provenance-${rec.id}`}
+                                style={{ marginLeft: '6px' }}
+                              >
+                                Origem: {rec.reasonEpisodeId}
+                              </span>
                             </div>
                             <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
                               {rec.explanation}

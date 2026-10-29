@@ -4,6 +4,7 @@ import type {
   AutobiographicalMilestone,
   ChatMessageRecord,
   ChatSessionRecord,
+  DreamReflectionCycleResult,
   EpisodicMemory,
   MemoryGovernanceCategory,
   MemoryGovernancePolicy,
@@ -15,11 +16,13 @@ import type {
   RelationshipStage,
   SemanticFact,
   SemanticFactCategory,
+  SeriousnessAssessment,
   UserHabit,
 } from '@ashy/shared'
 import {
   applyEmotionSignalToMood,
   applyExperienceTraitDelta,
+  applyUserReactionToMood,
   decayMoodToBaseline,
   evaluateSeriousnessGate,
   revertTraitEvolution,
@@ -30,6 +33,9 @@ import {
   type CortexDatabaseOptions,
 } from './db/cortex-db'
 import {
+  detectCrossEpisodeLinks,
+  isReflectablePermanentEpisode,
+  proposeGroundedTraitEvolutions,
   runPredictCalibrateConsolidation,
   type CandidateRelationalMotifInput,
   type CandidateSemanticFactInput,
@@ -239,12 +245,11 @@ export class AshyCortex {
     const decayedMood = decayMoodToBaseline(state.mood, elapsedMinutes)
     const seriousness = evaluateSeriousnessGate(params.userMessage)
 
-    const effectiveMood = seriousness.isSeriousOrDelicate
-      ? {
-          ...decayedMood,
-          playfulness: Math.min(decayedMood.playfulness, seriousness.maxPlayfulnessAllowed),
-        }
-      : decayedMood
+    const { mood: reactedMood } = applyUserReactionToMood(decayedMood, params.userMessage, {
+      seriousness,
+    })
+    this.db.saveAffectiveState({ ...state, mood: reactedMood, updatedAt: nowMs })
+    const effectiveMood = reactedMood
 
     const retrievedMemories = this.db.searchEpisodicMemoriesHybrid(
       params.userMessage,
@@ -618,6 +623,7 @@ export class AshyCortex {
         }
       }
       for (const draftId of supersededDraftIds) {
+        this.db.migrateEvolutionEpisodeId(draftId, episodeId)
         this.db.deleteEpisodicMemory(draftId)
       }
     }
@@ -906,16 +912,110 @@ export class AshyCortex {
     return evaluation
   }
 
-  public recordEmotionPulse(emotion: AshyEmotion, intensity = 0.8, nowMs = Date.now()) {
+  public recordEmotionPulse(
+    emotion: AshyEmotion,
+    intensity = 0.8,
+    nowMs = Date.now(),
+    options?: { seriousness?: SeriousnessAssessment },
+  ) {
     const state = this.db.getAffectiveState()
     const elapsedMinutes =
       state.updatedAt > 0 ? Math.max(0, (nowMs - state.updatedAt) / 60_000) : 0
     const decayed = decayMoodToBaseline(state.mood, elapsedMinutes)
-    const nextMood = applyEmotionSignalToMood(decayed, emotion, intensity)
+    const nextMood = applyEmotionSignalToMood(decayed, emotion, intensity, options)
     return this.db.saveAffectiveState(nextMood, state.traits, nowMs)
   }
 
+  public async runDreamReflectionCycle(params?: {
+    sessionId?: string
+    nowMs?: number
+    forceConsolidate?: boolean
+    maxEvolutions?: number
+    generateJsonFn?: (prompt: string) => Promise<string>
+  }): Promise<DreamReflectionCycleResult> {
+    const safeNow =
+      params?.nowMs !== undefined && Number.isFinite(params.nowMs) && params.nowMs >= 0
+        ? params.nowMs
+        : Date.now()
+
+    let consolidatedEpisodesCount = 0
+    if (params?.forceConsolidate !== false) {
+      const targetSessionIds = params?.sessionId
+        ? [params.sessionId]
+        : this.db.listSessions().map((s) => s.id)
+      for (const sid of targetSessionIds) {
+        if (this.db.listUnconsolidatedMessages(sid).length > 0) {
+          const cRes = await this.consolidateSessionMemories({
+            sessionId: sid,
+            nowMs: safeNow,
+            force: true,
+            generateJsonFn: params?.generateJsonFn,
+          })
+          if (cRes.consolidated && cRes.episode) {
+            consolidatedEpisodesCount += 1
+          }
+        }
+      }
+    }
+
+    const allEpisodes = this.db.listEpisodicMemories(200)
+    const reflectable = allEpisodes.filter(isReflectablePermanentEpisode)
+    if (reflectable.length === 0) {
+      return {
+        ranAt: safeNow,
+        consolidatedEpisodesCount,
+        reviewedMemoriesCount: 0,
+        crossEpisodeLinks: [],
+        appliedEvolutions: [],
+        skippedReason: 'no_new_episodes',
+      }
+    }
+
+    const crossEpisodeLinks = detectCrossEpisodeLinks(reflectable)
+    const uniqueLinkedEpisodeIds = Array.from(
+      new Set(crossEpisodeLinks.flatMap((link) => [link.fromEpisodeId, link.toEpisodeId])),
+    ).slice(0, 6)
+
+    let reviewedMemoriesCount = 0
+    for (const epId of uniqueLinkedEpisodeIds) {
+      if (this.db.getEpisodicMemory(epId)) {
+        this.reviewMemory(epId, 'good', safeNow)
+        reviewedMemoriesCount += 1
+      }
+    }
+
+    const existingLog = this.db.listPersonalityEvolution(200)
+    const affect = this.db.getAffectiveState()
+    const evoRes = proposeGroundedTraitEvolutions({
+      episodes: reflectable,
+      existingLog,
+      currentTraits: affect.traits,
+      nowMs: safeNow,
+      maxEvolutions: params?.maxEvolutions,
+    })
+
+    for (const record of evoRes.records) {
+      this.db.insertPersonalityEvolution(record)
+    }
+    for (const ms of evoRes.milestones) {
+      this.db.upsertMilestone(ms)
+    }
+    if (evoRes.records.length > 0) {
+      this.db.saveAffectiveState({ ...affect, traits: evoRes.traits, updatedAt: safeNow })
+    }
+
+    return {
+      ranAt: safeNow,
+      consolidatedEpisodesCount,
+      reviewedMemoriesCount,
+      crossEpisodeLinks,
+      appliedEvolutions: evoRes.records,
+      skippedReason: evoRes.records.length === 0 ? 'already_reflected' : null,
+    }
+  }
+
   public evolveTrait(params: {
+    id?: string
     trait: PersonalityTraitKey
     delta: number
     reasonEpisodeId: string
@@ -924,8 +1024,8 @@ export class AshyCortex {
   }): { traits: PersonalityTraits; record: PersonalityEvolutionRecord } {
     const nowMs = params.nowMs ?? Date.now()
     const state = this.db.getAffectiveState()
-    const { traits, record } = applyExperienceTraitDelta({
-      traits: state.traits,
+    const { traits, record } = applyExperienceTraitDelta(state.traits, {
+      id: params.id,
       trait: params.trait,
       delta: params.delta,
       reasonEpisodeId: params.reasonEpisodeId,
@@ -943,6 +1043,9 @@ export class AshyCortex {
       throw new Error(`PersonalityEvolutionRecord not found: ${recordId}`)
     }
     const state = this.db.getAffectiveState()
+    if (record.revertedAt !== null && record.revertedAt !== undefined) {
+      return { traits: state.traits, record }
+    }
     const { traits, record: revertedRecord } = revertTraitEvolution(state.traits, record, nowMs)
     this.db.saveAffectiveState(state.mood, traits, nowMs)
     this.db.upsertPersonalityEvolution(revertedRecord)

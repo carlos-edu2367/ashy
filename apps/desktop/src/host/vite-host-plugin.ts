@@ -77,6 +77,8 @@ const ALLOWED_RPC_METHODS = new Set<string>([
   'setMemoryGovernancePolicy',
   'seedDemoFixtures',
   'runCoreExperimentEval',
+  'runDreamReflection',
+  'revertTraitEvolution',
 ])
 
 export class DisallowedRpcMethodError extends Error {
@@ -93,6 +95,20 @@ function isValidRpcIdString(val: unknown): val is string {
     val.length <= 256 &&
     !val.includes('\0')
   )
+}
+
+function assertSafeIdentifier(val: unknown, fieldName: string, maxLen = 128): string {
+  if (
+    typeof val !== 'string' ||
+    val.trim().length === 0 ||
+    val.length > maxLen ||
+    /[\x00-\x1f\x7f]/.test(val)
+  ) {
+    throw new Error(
+      `Invalid RPC argument: ${fieldName} must be a non-empty string <= ${maxLen} chars without control characters`,
+    )
+  }
+  return val.trim()
 }
 
 function extractStringArg(payload: unknown, fieldName: string): string {
@@ -363,6 +379,52 @@ export async function dispatchHostRpc(
         ...(obj.modelAId !== undefined ? { modelAId: obj.modelAId.trim() } : {}),
         ...(obj.modelBId !== undefined ? { modelBId: obj.modelBId.trim() } : {}),
       })
+    }
+
+    case 'runDreamReflection': {
+      if (payload === undefined || payload === null) {
+        return kernel.runDreamReflection()
+      }
+      const obj = assertObjectPayload<{
+        sessionId?: unknown
+        force?: unknown
+        maxEvolutions?: unknown
+      }>(payload, method)
+      const sessionId =
+        obj.sessionId !== undefined
+          ? assertSafeIdentifier(obj.sessionId, 'runDreamReflection.sessionId', 128)
+          : undefined
+      if (obj.force !== undefined && typeof obj.force !== 'boolean') {
+        throw new Error('Invalid RPC argument: runDreamReflection.force must be a boolean')
+      }
+      if (
+        obj.maxEvolutions !== undefined &&
+        (typeof obj.maxEvolutions !== 'number' ||
+          !Number.isInteger(obj.maxEvolutions) ||
+          obj.maxEvolutions < 0 ||
+          obj.maxEvolutions > 50)
+      ) {
+        throw new Error(
+          'Invalid RPC argument: runDreamReflection.maxEvolutions must be an integer in 0..50',
+        )
+      }
+      return kernel.runDreamReflection({
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        ...(obj.force !== undefined ? { force: obj.force } : {}),
+        ...(obj.maxEvolutions !== undefined
+          ? { maxEvolutions: obj.maxEvolutions }
+          : {}),
+      })
+    }
+
+    case 'revertTraitEvolution': {
+      const obj = assertObjectPayload<{ recordId?: unknown }>(payload, method)
+      const recordId = assertSafeIdentifier(
+        obj.recordId,
+        'revertTraitEvolution.recordId',
+        128,
+      )
+      return kernel.revertTraitEvolution({ recordId })
     }
 
     default:

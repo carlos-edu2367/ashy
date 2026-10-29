@@ -1,8 +1,9 @@
 import * as v from 'valibot'
-import type { AshyCortex } from '@ashy/cortex'
+import { analyzeUserAffectReaction, type AshyCortex } from '@ashy/cortex'
 import {
   createTailSafeMarkerParser,
   streamText,
+  stripBondManipulation,
   stripLeadingAssistantSlop,
   type ChatMessage,
 } from '@ashy/llm'
@@ -13,6 +14,8 @@ import {
   type AshyHostStreamEvent,
   type ChatMessageRecord,
   type SendTurnInput,
+  type SeriousnessAssessment,
+  type UserAffectReaction,
 } from '@ashy/shared'
 import type { ProviderVault } from './provider-vault'
 import type { VoiceIdentityStore } from './voice-identity-store'
@@ -245,6 +248,8 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     let turnEmotion: AshyEmotion = 'neutral'
     const markers: TurnMarkerPayload[] = []
     const invokedMotifIds: string[] = []
+    let compiledSeriousness: SeriousnessAssessment | undefined
+    let userReaction: UserAffectReaction = analyzeUserAffectReaction(input.text)
     let fallbackSnapshot: AshyBootstrapSnapshot | null = null
     try {
       fallbackSnapshot = await options.getBootstrapSnapshot()
@@ -286,7 +291,12 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
             currentDominantEmotion = signal.emotion
             options.onDominantEmotionChange?.(signal.emotion)
             try {
-              cortex.recordEmotionPulse(signal.emotion, signal.intensity ?? 0.8, Date.now())
+              cortex.recordEmotionPulse(
+                signal.emotion,
+                signal.intensity ?? 0.8,
+                Date.now(),
+                { seriousness: compiledSeriousness },
+              )
             } catch {
               // Fault-isolated: do not interrupt streaming on SQLite pulse error
             }
@@ -324,7 +334,11 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
           markers.push(marker)
           invokedMotifIds.push(signal.motifId)
           try {
-            cortex.recordJokeCallback(signal.motifId, true, Date.now())
+            cortex.recordJokeCallback(
+              signal.motifId,
+              userReaction.positiveJokeReaction,
+              Date.now(),
+            )
           } catch {
             // Ignore unknown/hallucinated motifId so stream never fails
           }
@@ -356,6 +370,10 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
         voiceIdentityMarkdown,
         screenContext: input.screenContext,
         conversationHistory: priorConversationHistory,
+      })
+      compiledSeriousness = compiled.seriousness
+      userReaction = analyzeUserAffectReaction(input.text, {
+        seriousness: compiled.seriousness,
       })
 
       const messages: ChatMessage[] = [
@@ -429,7 +447,9 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
       const completedAt = Date.now()
       const latencyMs = Math.max(0, completedAt - startedAt)
       const rawClean = getCleanText().trim()
-      const finalCleanContent = stripLeadingAssistantSlop(rawClean).trim() || rawClean
+      const afterSlop = stripLeadingAssistantSlop(rawClean).trim()
+      const afterBond = stripBondManipulation(afterSlop || rawClean).trim()
+      const finalCleanContent = afterBond || afterSlop || rawClean || '...'
 
       const assistantMessage: ChatMessageRecord = {
         id: `msg-assistant-${turnId}`,

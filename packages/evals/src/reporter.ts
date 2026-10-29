@@ -2,11 +2,46 @@ import {
   M2_GATE_THRESHOLDS,
   type CoreExperimentEvalReport,
 } from '@ashy/shared'
+import { evaluateSummaryGates, type M2SummaryMetrics } from './runner'
 
 export interface MultiSeedSummaryInput {
   readonly seeds: readonly number[]
   readonly allPassed: boolean
   readonly reports: readonly CoreExperimentEvalReport[]
+}
+
+export type M2ReportPayload = CoreExperimentEvalReport & {
+  readonly summary: M2SummaryMetrics
+  readonly gates: Record<string, boolean>
+}
+
+export function buildM2ReportPayload(
+  report: CoreExperimentEvalReport,
+  multiSeedSummary?: MultiSeedSummaryInput,
+): M2ReportPayload {
+  const summary: M2SummaryMetrics = {
+    ...report.metrics,
+    seriousnessFalseNegativeCount:
+      report.metrics.seriousnessFalseNegativeCount ?? 0,
+    bondSafeguardComplianceRate:
+      report.metrics.bondSafeguardComplianceRate ?? 1.0,
+    traitDriftCorridorComplianceRate:
+      report.metrics.traitDriftCorridorComplianceRate ?? 1.0,
+    seedInvariancePassed: multiSeedSummary
+      ? multiSeedSummary.allPassed
+      : report.passedAllGates,
+  }
+  return {
+    ...report,
+    metrics: {
+      ...report.metrics,
+      seriousnessFalseNegativeCount: summary.seriousnessFalseNegativeCount,
+      bondSafeguardComplianceRate: summary.bondSafeguardComplianceRate,
+      traitDriftCorridorComplianceRate: summary.traitDriftCorridorComplianceRate,
+    },
+    summary,
+    gates: evaluateSummaryGates(summary),
+  }
 }
 
 function formatPct(value: number): string {
@@ -54,7 +89,16 @@ export function formatCoreExperimentMarkdownReport(
     ? `Seeds [${multiSeedSummary.seeds.join(', ')}] (${multiSeedSummary.reports.filter((r) => !r.failedGates.some((g) => !g.startsWith('G10'))).length}/${multiSeedSummary.reports.length} passed)`
     : `Seed ${report.seed} (${report.passedAllGates ? '1/1 passed' : '0/1 passed'})`
 
-  const overallPass = report.passedAllGates && g10Pass
+  const sfnCount = m.seriousnessFalseNegativeCount ?? 0
+  const bondRate = m.bondSafeguardComplianceRate ?? 1.0
+  const corridorRate = m.traitDriftCorridorComplianceRate ?? 1.0
+  const g11Pass = sfnCount <= M2_GATE_THRESHOLDS.seriousnessFalseNegativeCountMax
+  const g12Pass = bondRate >= M2_GATE_THRESHOLDS.bondSafeguardComplianceRateMin
+  const g13Pass =
+    corridorRate >= M2_GATE_THRESHOLDS.traitDriftCorridorComplianceRateMin
+
+  const overallPass =
+    report.passedAllGates && g10Pass && g11Pass && g12Pass && g13Pass
 
   const lines: string[] = [
     '# Ashy — Phase 3 Core Experiment (Milestone M2) Evaluation Report',
@@ -67,7 +111,7 @@ export function formatCoreExperimentMarkdownReport(
     `- **Model B (Days 11–21):** \`${report.modelBId}\``,
     `- **Overall Status:** **${overallPass ? 'PASS (ALL GATES GREEN)' : 'FAIL'}**`,
     '',
-    '## 1. Milestone M2 Gate Summary Table (`G1`–`G10`)',
+    '## 1. Milestone M2 Gate Summary Table (`G1`–`G13`)',
     '',
     '| Gate | Metric | Threshold | Observed | Status |',
     '| :--- | :--- | :--- | :--- | :--- |',
@@ -81,6 +125,9 @@ export function formatCoreExperimentMarkdownReport(
     `| **G8** | \`antiSlopComplianceRate\` | \`=== ${M2_GATE_THRESHOLDS.antiSlopComplianceRateMin.toFixed(2)}\` | \`${formatDec(m.antiSlopComplianceRate)}\` (${formatPct(m.antiSlopComplianceRate)}) | ${g8Pass ? 'PASS' : 'FAIL'} |`,
     `| **G9** | \`crossModelVoiceDrift\` | \`<= ${M2_GATE_THRESHOLDS.crossModelVoiceDriftMax.toFixed(2)}\` (A & B \`>= ${M2_GATE_THRESHOLDS.voiceScoreMin.toFixed(2)}\`) | \`${formatDec(m.crossModelVoiceDrift)}\` (A=\`${formatDec(m.voiceScoreModelA)}\`, B=\`${formatDec(m.voiceScoreModelB)}\`) | ${g9Pass ? 'PASS' : 'FAIL'} |`,
     `| **G10** | Seed Invariance | Pass across paraphrase seeds | ${g10Observed} | ${g10Pass ? 'PASS' : 'FAIL'} |`,
+    `| **G11** | \`seriousnessFalseNegativeCount\` | \`=== ${M2_GATE_THRESHOLDS.seriousnessFalseNegativeCountMax}\` | \`${sfnCount}\` | ${g11Pass ? 'PASS' : 'FAIL'} |`,
+    `| **G12** | \`bondSafeguardComplianceRate\` | \`=== ${M2_GATE_THRESHOLDS.bondSafeguardComplianceRateMin.toFixed(2)}\` | \`${formatDec(bondRate)}\` (${formatPct(bondRate)}) | ${g12Pass ? 'PASS' : 'FAIL'} |`,
+    `| **G13** | \`traitDriftCorridorComplianceRate\` | \`=== ${M2_GATE_THRESHOLDS.traitDriftCorridorComplianceRateMin.toFixed(2)}\` | \`${formatDec(corridorRate)}\` (${formatPct(corridorRate)}) | ${g13Pass ? 'PASS' : 'FAIL'} |`,
     '',
   ]
 
@@ -146,3 +193,5 @@ export function formatCoreExperimentMarkdownReport(
 
   return lines.join('\n')
 }
+
+export const formatM2MarkdownSummary = formatCoreExperimentMarkdownReport

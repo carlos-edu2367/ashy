@@ -79,6 +79,72 @@ export const ASHY_DEFAULT_TRAITS: Readonly<PersonalityTraits> = Object.freeze({
   proactivity: 0.65,
 })
 
+export interface TraitCorridorSpec {
+  readonly baseline: number
+  readonly min: number
+  readonly max: number
+  readonly maxDeltaPerEpisode: number
+}
+
+export const ASHY_TRAIT_CORRIDORS: Readonly<
+  Record<PersonalityTraitKey, TraitCorridorSpec>
+> = Object.freeze({
+  witSarcasm: Object.freeze({
+    baseline: 0.78,
+    min: 0.58,
+    max: 0.92,
+    maxDeltaPerEpisode: 0.04,
+  }),
+  chaosEnergy: Object.freeze({
+    baseline: 0.75,
+    min: 0.45,
+    max: 0.9,
+    maxDeltaPerEpisode: 0.04,
+  }),
+  warmthAffection: Object.freeze({
+    baseline: 0.68,
+    min: 0.52,
+    max: 0.92,
+    maxDeltaPerEpisode: 0.04,
+  }),
+  intellectualCuriosity: Object.freeze({
+    baseline: 0.85,
+    min: 0.68,
+    max: 0.96,
+    maxDeltaPerEpisode: 0.04,
+  }),
+  proactivity: Object.freeze({
+    baseline: 0.65,
+    min: 0.4,
+    max: 0.88,
+    maxDeltaPerEpisode: 0.04,
+  }),
+})
+
+export function clampTraitToCorridor(
+  trait: PersonalityTraitKey,
+  value: number,
+): number {
+  const spec = ASHY_TRAIT_CORRIDORS[trait]
+  if (!Number.isFinite(value)) return spec.baseline
+  return Number(Math.min(spec.max, Math.max(spec.min, value)).toFixed(6))
+}
+
+export function clampAllTraitsToCorridors(
+  traits: PersonalityTraits,
+): PersonalityTraits {
+  return {
+    witSarcasm: clampTraitToCorridor('witSarcasm', traits.witSarcasm),
+    chaosEnergy: clampTraitToCorridor('chaosEnergy', traits.chaosEnergy),
+    warmthAffection: clampTraitToCorridor('warmthAffection', traits.warmthAffection),
+    intellectualCuriosity: clampTraitToCorridor(
+      'intellectualCuriosity',
+      traits.intellectualCuriosity,
+    ),
+    proactivity: clampTraitToCorridor('proactivity', traits.proactivity),
+  }
+}
+
 export const PersonalityEvolutionRecordSchema = v.object({
   id: NonEmptyStringSchema,
   trait: PersonalityTraitKeySchema,
@@ -93,11 +159,56 @@ export const PersonalityEvolutionRecordSchema = v.object({
 export type PersonalityEvolutionRecord = v.InferOutput<typeof PersonalityEvolutionRecordSchema>
 
 // Layer 3: Seriousness & Context Gate
+export const SeriousnessLayerSchema = v.picklist([
+  'none',
+  'regex',
+  'semantic_local',
+  'llm_classifier',
+])
+export type SeriousnessLayer = v.InferOutput<typeof SeriousnessLayerSchema>
+
 export const SeriousnessAssessmentSchema = v.object({
   isSeriousOrDelicate: v.boolean(),
   severity: UnitIntervalSchema,
   reason: v.optional(v.string()),
   maxPlayfulnessAllowed: BipolarIntervalSchema,
+  layer: v.optional(SeriousnessLayerSchema),
+  matchedCue: v.optional(v.string()),
 })
 
 export type SeriousnessAssessment = v.InferOutput<typeof SeriousnessAssessmentSchema>
+
+export const UserAffectReactionSchema = v.object({
+  valenceDelta: BipolarIntervalSchema,
+  arousalDelta: BipolarIntervalSchema,
+  playfulnessDelta: BipolarIntervalSchema,
+  positiveJokeReaction: v.boolean(),
+  detectedSentiment: v.picklist([
+    'playful_positive',
+    'warm_grateful',
+    'neutral',
+    'frustrated_or_dismissive',
+    'vulnerable_or_distressed',
+  ]),
+})
+export type UserAffectReaction = v.InferOutput<typeof UserAffectReactionSchema>
+
+export const CrossEpisodeLinkSchema = v.object({
+  fromEpisodeId: NonEmptyStringSchema,
+  toEpisodeId: NonEmptyStringSchema,
+  sharedTheme: NonEmptyStringSchema,
+  similarity: UnitIntervalSchema,
+})
+export type CrossEpisodeLink = v.InferOutput<typeof CrossEpisodeLinkSchema>
+
+export const DreamReflectionCycleResultSchema = v.object({
+  ranAt: TimestampSchema,
+  consolidatedEpisodesCount: v.pipe(v.number(), v.integer(), v.minValue(0)),
+  reviewedMemoriesCount: v.pipe(v.number(), v.integer(), v.minValue(0)),
+  crossEpisodeLinks: v.array(CrossEpisodeLinkSchema),
+  appliedEvolutions: v.array(PersonalityEvolutionRecordSchema),
+  skippedReason: v.nullable(v.picklist(['no_new_episodes', 'already_reflected'])),
+})
+export type DreamReflectionCycleResult = v.InferOutput<
+  typeof DreamReflectionCycleResultSchema
+>
