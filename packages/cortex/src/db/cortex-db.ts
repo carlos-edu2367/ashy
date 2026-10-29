@@ -1231,7 +1231,9 @@ export class CortexDatabase {
           session.turnCount,
           session.lastMessagePreview,
         )
-      return this.getChatSession(session.id) ?? session
+      const persisted = this.getChatSession(session.id) ?? session
+      this.memory.chatSessions.set(session.id, persisted)
+      return persisted
     }
 
     return session

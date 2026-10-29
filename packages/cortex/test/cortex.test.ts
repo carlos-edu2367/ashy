@@ -608,7 +608,7 @@ describe('@ashy/cortex — Phase 3 Biological & Relational Memory, 4-Layer Affec
       })
 
       // 1. KV-Cache Invariance: System Prompt must be 100% identical across different timestamps & models!
-      expect(promptModelA.systemPrompt).toBe(promptModelB.systemPrompt)
+      expect(promptModelA.staticSystemPrompt).toBe(promptModelB.staticSystemPrompt)
       expect(promptModelB.systemPrompt).not.toMatch(/2026-10-0[16]/)
 
       // 2. Soul Portability: System Prompt contains Anti-Assistant identity, Golden Exemplars, inline markers & Semantic Index
