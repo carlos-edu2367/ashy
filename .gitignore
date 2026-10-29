@@ -13,3 +13,6 @@ coverage/
 !.env.example
 playwright-report/
 test-results/
+
+.superpowers/
+.ashy-data/
