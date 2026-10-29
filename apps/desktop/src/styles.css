@@ -1642,3 +1642,8 @@ input[type='range'] {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Ensure page header action buttons never collide with top-right window controls */
+.ashy-page-header {
+  padding-right: 96px;
+}
