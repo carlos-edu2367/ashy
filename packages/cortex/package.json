@@ -6,7 +6,7 @@
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "scripts": {
-    "test": "vitest run --root ../.. packages/cortex/test"
+    "test": "vitest run --root ../.. packages/cortex"
   },
   "dependencies": {
     "valibot": "^1.0.0",

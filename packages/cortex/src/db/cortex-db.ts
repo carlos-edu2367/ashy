@@ -1,6 +1,7 @@
 import {
   ASHY_BASELINE_MOOD,
   ASHY_DEFAULT_TRAITS,
+  ASHY_EMOTIONS,
   AutobiographicalMilestoneSchema,
   EpisodicMemorySchema,
   MoodVectorSchema,
@@ -10,8 +11,12 @@ import {
   RelationalMotifSchema,
   SemanticFactSchema,
   UserHabitSchema,
+  type AshyEmotion,
   type AutobiographicalMilestone,
+  type ChatMessageRecord,
+  type ChatSessionRecord,
   type EpisodicMemory,
+  type LlmProviderId,
   type MoodVector,
   type PersonalityEvolutionRecord,
   type PersonalityTraits,
@@ -28,6 +33,10 @@ import {
   tokenizeForSearch,
   type RankedEpisodicMemory,
 } from '../memory/fsrs-ranker'
+import {
+  DEFAULT_GOLDEN_EXEMPLARS,
+  type GoldenExemplarRecord,
+} from '../prompt/default-golden-exemplars'
 
 export interface StyleExemplar {
   id: string
@@ -65,8 +74,16 @@ export const DEFAULT_GOLDEN_STYLE_EXEMPLARS: readonly StyleExemplar[] = Object.f
 ])
 
 export interface CortexDatabaseOptions {
+  filePath?: string
   dbPath?: string
   forceMemoryFallback?: boolean
+  inMemory?: boolean
+}
+
+export interface SchemaMigrationRecord {
+  version: number
+  name: string
+  appliedAt: number
 }
 
 export interface AffectiveStateSnapshot {
@@ -87,12 +104,24 @@ interface SqliteDatabaseLike {
   close(): void
 }
 
+type NodeFsLike = typeof import('node:fs')
+type NodePathLike = typeof import('node:path')
+
+function getBuiltinModule<T>(id: string): T | null {
+  try {
+    const proc = (globalThis as { process?: { getBuiltinModule?: (modId: string) => unknown } })
+      .process
+    return (proc?.getBuiltinModule?.(id) as T | undefined) ?? null
+  } catch {
+    return null
+  }
+}
+
 function tryOpenNodeSqlite(dbPath: string): SqliteDatabaseLike | null {
   try {
-    const proc = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process
-    const sqliteMod = proc?.getBuiltinModule?.('node:sqlite') as
-      | { DatabaseSync?: new (path: string) => SqliteDatabaseLike }
-      | undefined
+    const sqliteMod = getBuiltinModule<{ DatabaseSync?: new (path: string) => SqliteDatabaseLike }>(
+      'node:sqlite',
+    )
     if (sqliteMod && typeof sqliteMod.DatabaseSync === 'function') {
       return new sqliteMod.DatabaseSync(dbPath)
     }
@@ -102,10 +131,134 @@ function tryOpenNodeSqlite(dbPath: string): SqliteDatabaseLike | null {
   return null
 }
 
+function applySqlitePragmas(db: SqliteDatabaseLike, isFileBacked: boolean): void {
+  if (isFileBacked) {
+    db.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      PRAGMA busy_timeout = 5000;
+      PRAGMA foreign_keys = ON;
+    `)
+  } else {
+    db.exec(`
+      PRAGMA busy_timeout = 5000;
+      PRAGMA foreign_keys = ON;
+    `)
+  }
+}
+
+function quarantineCorruptSqliteFile(fs: NodeFsLike, filePath: string): void {
+  const corruptPath = `${filePath}.corrupt.${Date.now()}`
+  try {
+    fs.renameSync(filePath, corruptPath)
+  } catch {
+    try {
+      fs.copyFileSync(filePath, corruptPath)
+      fs.rmSync(filePath, { force: true })
+    } catch {
+      // Ignore if file cannot be moved
+    }
+  }
+  for (const suffix of ['-wal', '-shm']) {
+    try {
+      fs.rmSync(`${filePath}${suffix}`, { force: true })
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+}
+
+function openPersistentDatabase(filePath: string): SqliteDatabaseLike | null {
+  const sqliteMod = getBuiltinModule<{ DatabaseSync?: new (path: string) => SqliteDatabaseLike }>(
+    'node:sqlite',
+  )
+  if (!sqliteMod || typeof sqliteMod.DatabaseSync !== 'function') {
+    return null
+  }
+
+  const fs = getBuiltinModule<NodeFsLike>('node:fs')
+  const path = getBuiltinModule<NodePathLike>('node:path')
+
+  if (fs && path) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+
+    if (fs.existsSync(filePath)) {
+      let existingDb: SqliteDatabaseLike | null = null
+      try {
+        const stat = fs.statSync(filePath)
+        if (stat.size > 0) {
+          const SQLITE_HEADER = 'SQLite format 3\0'
+          if (stat.size < 16) {
+            throw new Error('SQLite file is truncated (< 16 bytes)')
+          }
+          const fd = fs.openSync(filePath, 'r')
+          const headerBuf = Buffer.alloc(16)
+          try {
+            fs.readSync(fd, headerBuf, 0, 16, 0)
+          } finally {
+            fs.closeSync(fd)
+          }
+          if (headerBuf.toString('utf8') !== SQLITE_HEADER) {
+            throw new Error('Invalid SQLite file header')
+          }
+        }
+
+        existingDb = new sqliteMod.DatabaseSync(filePath)
+        const quickCheckRow = existingDb.prepare('PRAGMA quick_check(1)').get()
+        const quickCheckResult = quickCheckRow
+          ? String(Object.values(quickCheckRow)[0] ?? '').toLowerCase()
+          : ''
+        if (quickCheckResult !== 'ok') {
+          throw new Error(`SQLite quick_check failed: ${quickCheckResult}`)
+        }
+        applySqlitePragmas(existingDb, true)
+        return existingDb
+      } catch {
+        if (existingDb) {
+          try {
+            existingDb.close()
+          } catch {
+            // Ignore close failure on corrupt handle
+          }
+          existingDb = null
+        }
+        quarantineCorruptSqliteFile(fs, filePath)
+      }
+    }
+  }
+
+  let freshDb: SqliteDatabaseLike | null = null
+  try {
+    freshDb = new sqliteMod.DatabaseSync(filePath)
+    const quickCheckRow = freshDb.prepare('PRAGMA quick_check(1)').get()
+    const quickCheckResult = quickCheckRow
+      ? String(Object.values(quickCheckRow)[0] ?? '').toLowerCase()
+      : ''
+    if (quickCheckResult !== 'ok') {
+      throw new Error(`Fresh SQLite quick_check failed: ${quickCheckResult}`)
+    }
+    applySqlitePragmas(freshDb, true)
+    return freshDb
+  } catch (err) {
+    if (freshDb) {
+      try {
+        freshDb.close()
+      } catch {
+        // Ignore close failure
+      }
+    }
+    throw err
+  }
+}
+
+const VALID_CHAT_ROLES = new Set(['user', 'assistant', 'system'])
+const VALID_EMOTIONS = new Set<string>(ASHY_EMOTIONS)
+
 /**
- * Browser-compatible in-memory storage adapter mirroring all 6 memory tables + affective/style stores.
+ * Browser-compatible in-memory storage adapter mirroring all memory tables + affective/style/chat stores.
  */
 export class MemoryStorageAdapter {
+  readonly migrations = new Map<number, SchemaMigrationRecord>()
   readonly episodicMemories = new Map<string, EpisodicMemory>()
   readonly semanticFacts = new Map<string, SemanticFact>()
   readonly relationalMotifs = new Map<string, RelationalMotif>()
@@ -114,6 +267,9 @@ export class MemoryStorageAdapter {
   readonly prospectiveIntents = new Map<string, ProspectiveIntent>()
   readonly personalityEvolution = new Map<string, PersonalityEvolutionRecord>()
   readonly styleExemplars = new Map<string, StyleExemplar>()
+  readonly goldenExemplars = new Map<string, GoldenExemplarRecord>()
+  readonly chatSessions = new Map<string, ChatSessionRecord>()
+  readonly chatMessages: ChatMessageRecord[] = []
   affectiveState: AffectiveStateSnapshot = {
     mood: { ...ASHY_BASELINE_MOOD },
     traits: { ...ASHY_DEFAULT_TRAITS },
@@ -121,8 +277,22 @@ export class MemoryStorageAdapter {
   }
 
   constructor() {
+    const now = Date.now()
+    this.migrations.set(1, {
+      version: 1,
+      name: 'v1_initial_cortex_schema',
+      appliedAt: now,
+    })
+    this.migrations.set(2, {
+      version: 2,
+      name: 'v2_phase1_chat_and_exemplars',
+      appliedAt: now,
+    })
     for (const ex of DEFAULT_GOLDEN_STYLE_EXEMPLARS) {
       this.styleExemplars.set(ex.id, ex)
+    }
+    for (const ex of DEFAULT_GOLDEN_EXEMPLARS) {
+      this.goldenExemplars.set(ex.id, ex)
     }
   }
 }
@@ -131,21 +301,60 @@ export class CortexDatabase {
   private readonly sqlite: SqliteDatabaseLike | null
   private readonly memory: MemoryStorageAdapter
   public readonly isNativeSqlite: boolean
+  public readonly isPersistent: boolean
+  public readonly filePath: string
 
   constructor(options?: CortexDatabaseOptions) {
     this.memory = new MemoryStorageAdapter()
-    const dbPath = options?.dbPath ?? ':memory:'
-    this.sqlite = options?.forceMemoryFallback ? null : tryOpenNodeSqlite(dbPath)
-    this.isNativeSqlite = this.sqlite !== null
+    const targetPath =
+      options?.inMemory === true
+        ? ':memory:'
+        : (options?.filePath ?? options?.dbPath ?? ':memory:')
+    this.filePath = targetPath
+
+    if (options?.forceMemoryFallback) {
+      this.sqlite = null
+      this.isNativeSqlite = false
+      this.isPersistent = false
+      return
+    }
+
+    if (targetPath !== ':memory:') {
+      this.sqlite = openPersistentDatabase(targetPath)
+      this.isNativeSqlite = this.sqlite !== null
+      this.isPersistent = this.sqlite !== null
+    } else {
+      this.sqlite = tryOpenNodeSqlite(':memory:')
+      if (this.sqlite) {
+        applySqlitePragmas(this.sqlite, false)
+      }
+      this.isNativeSqlite = this.sqlite !== null
+      this.isPersistent = false
+    }
 
     if (this.sqlite) {
-      this.initializeSqliteSchema()
+      try {
+        this.initializeSqliteSchema()
+      } catch (err) {
+        try {
+          this.sqlite.close()
+        } catch {
+          // Ignore close error
+        }
+        throw err
+      }
     }
   }
 
   private initializeSqliteSchema(): void {
     if (!this.sqlite) return
     this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS episodic_memories (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
@@ -246,7 +455,49 @@ export class CortexDatabase {
         ashy_sample TEXT NOT NULL,
         notes TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS golden_exemplars (
+        id TEXT PRIMARY KEY,
+        stage TEXT NOT NULL,
+        context TEXT NOT NULL,
+        user_utterance TEXT NOT NULL,
+        ashy_response TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS chat_sessions (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        turn_count INTEGER NOT NULL DEFAULT 0,
+        last_message_preview TEXT NOT NULL DEFAULT ''
+      );
+
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system')),
+        content TEXT NOT NULL,
+        raw_content TEXT NOT NULL,
+        emotion TEXT NOT NULL DEFAULT 'neutral',
+        markers_json TEXT NOT NULL DEFAULT '[]',
+        provider_id TEXT,
+        model_id TEXT,
+        latency_ms INTEGER,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_session_created
+        ON chat_messages(session_id, created_at ASC);
     `)
+
+    const now = Date.now()
+    const insertMigration = this.sqlite.prepare(`
+      INSERT OR IGNORE INTO schema_migrations (version, name, applied_at)
+      VALUES (?, ?, ?)
+    `)
+    insertMigration.run(1, 'v1_initial_cortex_schema', now)
+    insertMigration.run(2, 'v2_phase1_chat_and_exemplars', now)
 
     // Seed default Golden Style Exemplars if empty
     const countRow = this.sqlite
@@ -262,11 +513,35 @@ export class CortexDatabase {
         insertStmt.run(ex.id, ex.situation, ex.userSample, ex.ashySample, ex.notes)
       }
     }
+
+    // Seed 20 PT-BR Golden Dialogue Exemplars if empty
+    const goldenCountRow = this.sqlite
+      .prepare('SELECT COUNT(*) as cnt FROM golden_exemplars')
+      .get()
+    const goldenCount = Number(goldenCountRow?.cnt ?? 0)
+    if (goldenCount === 0) {
+      this.seedDefaultGoldenExemplars()
+    }
+  }
+
+  public getAppliedMigrations(): SchemaMigrationRecord[] {
+    if (!this.sqlite) {
+      return Array.from(this.memory.migrations.values()).sort((a, b) => a.version - b.version)
+    }
+    const rows = this.sqlite
+      .prepare('SELECT version, name, applied_at FROM schema_migrations ORDER BY version ASC')
+      .all()
+    return rows.map((row) => ({
+      version: Number(row.version),
+      name: String(row.name),
+      appliedAt: Number(row.applied_at),
+    }))
   }
 
   public listSqlTables(): string[] {
     if (!this.sqlite) {
       return [
+        'schema_migrations',
         'episodic_memories',
         'episodic_fts',
         'semantic_facts',
@@ -277,6 +552,9 @@ export class CortexDatabase {
         'personality_evolution_log',
         'affective_state',
         'style_exemplars',
+        'golden_exemplars',
+        'chat_sessions',
+        'chat_messages',
       ]
     }
     const rows = this.sqlite
@@ -333,6 +611,16 @@ export class CortexDatabase {
       .get(id)
     if (!row) return null
     return this.mapRowToEpisodicMemory(row)
+  }
+
+  public deleteEpisodicMemory(id: string): boolean {
+    const existedInMem = this.memory.episodicMemories.delete(id)
+    if (!this.sqlite) {
+      return existedInMem
+    }
+    this.sqlite.prepare('DELETE FROM episodic_fts WHERE memory_id = ?').run(id)
+    this.sqlite.prepare('DELETE FROM episodic_memories WHERE id = ?').run(id)
+    return true
   }
 
   public listEpisodicMemories(): EpisodicMemory[] {
@@ -442,6 +730,15 @@ export class CortexDatabase {
     return fact
   }
 
+  public deleteSemanticFact(id: string): boolean {
+    const existed = this.memory.semanticFacts.delete(id)
+    if (!this.sqlite) {
+      return existed
+    }
+    this.sqlite.prepare('DELETE FROM semantic_facts WHERE id = ?').run(id)
+    return true
+  }
+
   public invalidateSemanticFact(id: string, invalidAt: number): SemanticFact | null {
     const existing = this.listSemanticFacts().find((f) => f.id === id)
     if (!existing) return null
@@ -472,7 +769,8 @@ export class CortexDatabase {
           confidence: Number(row.confidence),
           sourceEpisodeIds: JSON.parse(String(row.source_episode_ids_json ?? '[]')),
           validFrom: Number(row.valid_from),
-          invalidAt: row.invalid_at === null || row.invalid_at === undefined ? null : Number(row.invalid_at),
+          invalidAt:
+            row.invalid_at === null || row.invalid_at === undefined ? null : Number(row.invalid_at),
         }),
       )
     }
@@ -486,6 +784,10 @@ export class CortexDatabase {
       }
       return true
     })
+  }
+
+  public listActiveSemanticFacts(category?: SemanticFactCategory): SemanticFact[] {
+    return this.listSemanticFacts({ activeOnly: true, category })
   }
 
   // 3. Relational Motifs (Inside Jokes)
@@ -516,6 +818,15 @@ export class CortexDatabase {
     }
 
     return motif
+  }
+
+  public deleteRelationalMotif(id: string): boolean {
+    const existed = this.memory.relationalMotifs.delete(id)
+    if (!this.sqlite) {
+      return existed
+    }
+    this.sqlite.prepare('DELETE FROM relational_motifs WHERE id = ?').run(id)
+    return true
   }
 
   public getRelationalMotif(id: string): RelationalMotif | null {
@@ -802,7 +1113,7 @@ export class CortexDatabase {
     return this.memory.affectiveState
   }
 
-  // 8. Style Exemplars
+  // 8. Style Exemplars & 20 PT-BR Golden Dialogue Exemplars
   public upsertStyleExemplar(exemplar: StyleExemplar): StyleExemplar {
     this.memory.styleExemplars.set(exemplar.id, exemplar)
     if (this.sqlite) {
@@ -834,6 +1145,299 @@ export class CortexDatabase {
       ashySample: String(row.ashy_sample),
       notes: String(row.notes),
     }))
+  }
+
+  public seedDefaultGoldenExemplars(): void {
+    for (const ex of DEFAULT_GOLDEN_EXEMPLARS) {
+      this.memory.goldenExemplars.set(ex.id, ex)
+    }
+    if (this.sqlite) {
+      const stmt = this.sqlite.prepare(`
+        INSERT OR REPLACE INTO golden_exemplars (id, stage, context, user_utterance, ashy_response)
+        VALUES (?, ?, ?, ?, ?)
+      `)
+      for (const ex of DEFAULT_GOLDEN_EXEMPLARS) {
+        stmt.run(ex.id, ex.stage, ex.context, ex.userUtterance, ex.ashyResponse)
+      }
+    }
+  }
+
+  public listGoldenExemplars(stage?: string): GoldenExemplarRecord[] {
+    if (!this.sqlite) {
+      const all = Array.from(this.memory.goldenExemplars.values())
+      return stage ? all.filter((item) => item.stage === stage) : all
+    }
+    const rows = stage
+      ? this.sqlite
+          .prepare('SELECT * FROM golden_exemplars WHERE stage = ? ORDER BY rowid ASC')
+          .all(stage)
+      : this.sqlite.prepare('SELECT * FROM golden_exemplars ORDER BY rowid ASC').all()
+
+    return rows.map((row) => ({
+      id: String(row.id),
+      stage: String(row.stage) as GoldenExemplarRecord['stage'],
+      context: String(row.context),
+      userUtterance: String(row.user_utterance),
+      ashyResponse: String(row.ashy_response),
+    }))
+  }
+
+  // 9. Chat Sessions & Messages (Migration v2)
+  public createChatSession(input: {
+    id: string
+    title: string
+    startedAt?: number
+    updatedAt?: number
+    turnCount?: number
+    lastMessagePreview?: string
+  }): ChatSessionRecord {
+    const id = input.id.trim()
+    if (!id) {
+      throw new Error('ChatSession id must be non-empty')
+    }
+    const title = input.title.trim() || 'Nova Conversa'
+    const existingMem = this.memory.chatSessions.get(id)
+    const startedAt = input.startedAt ?? existingMem?.startedAt ?? Date.now()
+    const updatedAt = input.updatedAt ?? startedAt
+    const turnCount = input.turnCount ?? existingMem?.turnCount ?? 0
+    const lastMessagePreview = input.lastMessagePreview ?? existingMem?.lastMessagePreview ?? ''
+
+    const session: ChatSessionRecord = {
+      id,
+      title,
+      startedAt,
+      updatedAt,
+      turnCount,
+      lastMessagePreview,
+    }
+
+    this.memory.chatSessions.set(session.id, session)
+
+    if (this.sqlite) {
+      this.sqlite
+        .prepare(
+          `INSERT INTO chat_sessions (
+            id, title, started_at, updated_at, turn_count, last_message_preview
+          ) VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            title = excluded.title,
+            updated_at = excluded.updated_at`,
+        )
+        .run(
+          session.id,
+          session.title,
+          session.startedAt,
+          session.updatedAt,
+          session.turnCount,
+          session.lastMessagePreview,
+        )
+      return this.getChatSession(session.id) ?? session
+    }
+
+    return session
+  }
+
+  public getChatSession(id: string): ChatSessionRecord | null {
+    if (!this.sqlite) {
+      return this.memory.chatSessions.get(id) ?? null
+    }
+    const row = this.sqlite.prepare('SELECT * FROM chat_sessions WHERE id = ?').get(id)
+    if (!row) return null
+    return this.mapRowToChatSession(row)
+  }
+
+  public listChatSessions(): ChatSessionRecord[] {
+    if (!this.sqlite) {
+      return Array.from(this.memory.chatSessions.values()).sort(
+        (a, b) => b.updatedAt - a.updatedAt || b.startedAt - a.startedAt,
+      )
+    }
+    const rows = this.sqlite
+      .prepare('SELECT * FROM chat_sessions ORDER BY updated_at DESC, started_at DESC')
+      .all()
+    return rows.map((row) => this.mapRowToChatSession(row))
+  }
+
+  public deleteChatSession(id: string): boolean {
+    const existed = this.memory.chatSessions.delete(id)
+    for (let i = this.memory.chatMessages.length - 1; i >= 0; i--) {
+      if (this.memory.chatMessages[i]?.sessionId === id) {
+        this.memory.chatMessages.splice(i, 1)
+      }
+    }
+    if (!this.sqlite) {
+      return existed
+    }
+    this.sqlite.prepare('DELETE FROM chat_sessions WHERE id = ?').run(id)
+    return true
+  }
+
+  public appendChatMessage(input: ChatMessageRecord): ChatMessageRecord {
+    if (!VALID_CHAT_ROLES.has(input.role)) {
+      throw new Error(`Invalid chat message role: ${String(input.role)}`)
+    }
+    const emotion: AshyEmotion = VALID_EMOTIONS.has(input.emotion) ? input.emotion : 'neutral'
+    const record: ChatMessageRecord = {
+      id: input.id,
+      sessionId: input.sessionId,
+      role: input.role,
+      content: input.content,
+      rawContent: input.rawContent,
+      emotion,
+      markersJson: input.markersJson || '[]',
+      providerId: input.providerId ?? null,
+      modelId: input.modelId ?? null,
+      latencyMs: input.latencyMs ?? null,
+      createdAt: input.createdAt,
+    }
+
+    const preview = record.content.slice(0, 140)
+
+    if (!this.sqlite) {
+      const session = this.memory.chatSessions.get(record.sessionId)
+      if (!session) {
+        throw new Error(`FOREIGN KEY constraint failed: session ${record.sessionId} does not exist`)
+      }
+      const existingIdx = this.memory.chatMessages.findIndex((m) => m.id === record.id)
+      const isNewMessage = existingIdx < 0
+      if (existingIdx >= 0) {
+        this.memory.chatMessages[existingIdx] = record
+      } else {
+        this.memory.chatMessages.push(record)
+      }
+      const turnDelta = isNewMessage && record.role === 'assistant' ? 1 : 0
+      this.memory.chatSessions.set(record.sessionId, {
+        ...session,
+        updatedAt: record.createdAt,
+        lastMessagePreview: preview,
+        turnCount: session.turnCount + turnDelta,
+      })
+      return record
+    }
+
+    const existingRow = this.sqlite
+      .prepare('SELECT id FROM chat_messages WHERE id = ?')
+      .get(record.id)
+    const turnDelta = !existingRow && record.role === 'assistant' ? 1 : 0
+
+    this.sqlite.exec('BEGIN IMMEDIATE')
+    try {
+      this.sqlite
+        .prepare(
+          `INSERT OR REPLACE INTO chat_messages (
+            id, session_id, role, content, raw_content, emotion,
+            markers_json, provider_id, model_id, latency_ms, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          record.id,
+          record.sessionId,
+          record.role,
+          record.content,
+          record.rawContent,
+          record.emotion,
+          record.markersJson,
+          record.providerId ?? null,
+          record.modelId ?? null,
+          record.latencyMs ?? null,
+          record.createdAt,
+        )
+
+      this.sqlite
+        .prepare(
+          `UPDATE chat_sessions
+           SET updated_at = ?,
+               last_message_preview = ?,
+               turn_count = turn_count + ?
+           WHERE id = ?`,
+        )
+        .run(record.createdAt, preview, turnDelta, record.sessionId)
+
+      this.sqlite.exec('COMMIT')
+    } catch (err) {
+      try {
+        this.sqlite.exec('ROLLBACK')
+      } catch {
+        // Ignore rollback failure
+      }
+      throw err
+    }
+
+    const memSession = this.memory.chatSessions.get(record.sessionId)
+    if (memSession) {
+      this.memory.chatSessions.set(record.sessionId, {
+        ...memSession,
+        updatedAt: record.createdAt,
+        lastMessagePreview: preview,
+        turnCount: memSession.turnCount + turnDelta,
+      })
+    }
+
+    return record
+  }
+
+  public listChatMessages(sessionId: string, limit = 80): ChatMessageRecord[] {
+    if (!Number.isFinite(limit) || limit <= 0) {
+      return []
+    }
+    const safeLimit = Math.floor(limit)
+
+    if (!this.sqlite) {
+      const sessionMsgs = this.memory.chatMessages
+        .filter((m) => m.sessionId === sessionId)
+        .sort((a, b) => a.createdAt - b.createdAt)
+      return sessionMsgs.length > safeLimit ? sessionMsgs.slice(-safeLimit) : sessionMsgs
+    }
+
+    const rows = this.sqlite
+      .prepare(
+        `SELECT * FROM (
+           SELECT rowid AS _rowid, * FROM chat_messages
+           WHERE session_id = ?
+           ORDER BY created_at DESC, _rowid DESC
+           LIMIT ?
+         )
+         ORDER BY created_at ASC, _rowid ASC`,
+      )
+      .all(sessionId, safeLimit)
+
+    return rows.map((row) => this.mapRowToChatMessage(row))
+  }
+
+  private mapRowToChatSession(row: Record<string, unknown>): ChatSessionRecord {
+    return {
+      id: String(row.id),
+      title: String(row.title),
+      startedAt: Number(row.started_at),
+      updatedAt: Number(row.updated_at),
+      turnCount: Number(row.turn_count ?? 0),
+      lastMessagePreview: String(row.last_message_preview ?? ''),
+    }
+  }
+
+  private mapRowToChatMessage(row: Record<string, unknown>): ChatMessageRecord {
+    const rawEmotion = String(row.emotion ?? 'neutral')
+    const emotion: AshyEmotion = VALID_EMOTIONS.has(rawEmotion)
+      ? (rawEmotion as AshyEmotion)
+      : 'neutral'
+    return {
+      id: String(row.id),
+      sessionId: String(row.session_id),
+      role: String(row.role) as ChatMessageRecord['role'],
+      content: String(row.content),
+      rawContent: String(row.raw_content),
+      emotion,
+      markersJson: String(row.markers_json ?? '[]'),
+      providerId:
+        row.provider_id === null || row.provider_id === undefined
+          ? null
+          : (String(row.provider_id) as LlmProviderId),
+      modelId:
+        row.model_id === null || row.model_id === undefined ? null : String(row.model_id),
+      latencyMs:
+        row.latency_ms === null || row.latency_ms === undefined ? null : Number(row.latency_ms),
+      createdAt: Number(row.created_at),
+    }
   }
 
   public close(): void {
