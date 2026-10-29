@@ -233,6 +233,7 @@ export class AshyCortex {
     userPronouns?: string | null
     queryEmbedding?: readonly number[]
     screenContext?: string
+    interruptionControlNote?: string
     conversationHistory?: readonly ConversationMessage[]
     topKMemories?: number
     userHabits?: readonly UserHabit[]
@@ -314,6 +315,7 @@ export class AshyCortex {
       prospectiveIntents:
         params.prospectiveIntents ?? this.db.listProspectiveIntents('pending'),
       screenContext: params.screenContext,
+      interruptionControlNote: params.interruptionControlNote,
       conversationHistory: params.conversationHistory,
     })
   }

@@ -13,7 +13,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "eval:m2": "node scripts/run-m2-eval.mjs",
-    "verify:wireback": "node scripts/verify-phase1-wireback.mjs && node scripts/verify-phase2-wireback.mjs && node scripts/verify-phase3-wireback.mjs && node scripts/verify-phase4-wireback.mjs"
+    "verify:wireback": "node scripts/verify-phase1-wireback.mjs && node scripts/verify-phase2-wireback.mjs && node scripts/verify-phase3-wireback.mjs && node scripts/verify-phase4-wireback.mjs && node scripts/verify-phase5-wireback.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.51.0",

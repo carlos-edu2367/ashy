@@ -369,6 +369,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
         modelId: activeConfig?.modelId,
         voiceIdentityMarkdown,
         screenContext: input.screenContext,
+        interruptionControlNote: input.interruptionControlNote,
         conversationHistory: priorConversationHistory,
       })
       compiledSeriousness = compiled.seriousness

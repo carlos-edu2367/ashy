@@ -481,4 +481,60 @@ describe('AshyHostKernel & TurnOrchestrator', () => {
 
     await kernel.stop()
   })
+
+  it('forwards interruptionControlNote from sendTurn into cortex.compileTurnPrompt so the LLM receives [VOICE BARGE-IN RECEIPT]', async () => {
+    const dir = makeTempDir()
+    let lastRequestBody: Record<string, unknown> | null = null
+
+    const mockFetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (typeof init?.body === 'string') {
+        lastRequestBody = JSON.parse(init.body) as Record<string, unknown>
+      }
+      const sse =
+        'data: {"choices":[{"delta":{"content":"Entendi a interrupção, vamos direto ao ponto!"}}]}\n\ndata: [DONE]\n\n'
+      return new Response(sse, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    })
+
+    const kernel = await createAshyHostKernel({
+      userDataDir: dir,
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    })
+
+    const snap = await kernel.completeOnboarding({
+      userName: 'Carlos',
+      providerConfig: {
+        providerId: 'openrouter',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        modelId: 'anthropic/claude-3.7-sonnet',
+        apiKey: 'sk-or-v1-livekey1234',
+      },
+    })
+
+    const events: AshyHostStreamEvent[] = []
+    const unsub = kernel.onHostEvent((ev) => events.push(ev))
+
+    const note =
+      '[Interrupted after 900ms — user heard: "Olha só" | unheard: "o resto da frase."]'
+
+    await kernel.sendTurn({
+      sessionId: snap.activeSession.id,
+      text: 'Espera, foca só no banco de dados agora!',
+      interruptionControlNote: note,
+    })
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === 'turn:completed')).toBe(true)
+    })
+    unsub()
+
+    const serializedBody = JSON.stringify(lastRequestBody)
+    expect(serializedBody).toContain('[VOICE BARGE-IN RECEIPT]')
+    expect(serializedBody).toContain('Interrupted after 900ms')
+    expect(serializedBody).toContain('Voice Barge-In Receipt:')
+
+    await kernel.stop()
+  })
 })

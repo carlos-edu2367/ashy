@@ -42,6 +42,7 @@ import {
   DEFAULT_ASHY_VOICE_MD,
   DEFAULT_MEMORY_GOVERNANCE_POLICY,
   DEFAULT_PROVIDER_CONFIGS,
+  DEFAULT_VOICE_RUNTIME_SETTINGS,
   LLM_PROVIDER_IDS,
   type ApprovableMemoryKind,
   type AshyBootstrapSnapshot,
@@ -71,15 +72,22 @@ import {
   type SaveProviderConfigInput,
   type SemanticFact,
   type SemanticFactCategory,
+  type SttProviderId,
   type TestProviderInput,
+  type TtfaTelemetryRecord,
+  type TtsProviderId,
   type UserHabit,
+  type VoiceFixtureId,
+  type VoiceRuntimeSettings,
 } from '@ashy/shared'
 import type { AshyPresenceStatus } from '@ashy/stage'
 import {
   createRealtimeSpeechPipeline,
+  createVoiceSessionRuntime,
   type PlaybackReceipt,
   type RealtimeSpeechPipeline,
   type ScheduledAudioChunk,
+  type VoiceFixtureScenarioResult,
 } from '@ashy/voice'
 import { create } from 'zustand'
 import { getAshyHostBridge } from '../services/ashy-host-client'
@@ -238,6 +246,14 @@ export interface AshyDesktopState {
   scheduledAudioChunks: ScheduledAudioChunk[]
   lastPlaybackReceipt: PlaybackReceipt | null
   lastStageSignals: AshyStageSignal[]
+  voiceSettings: VoiceRuntimeSettings
+  ttfaByProvider: Record<TtsProviderId, TtfaTelemetryRecord>
+  pendingInterruptionControlNote: string | null
+  lastTurnInterruptionNote: string | null
+  voiceCasRejectedCount: number
+  voiceCancelledShortCount: number
+  lastVoiceFixtureResult: VoiceFixtureScenarioResult | null
+  isPushToTalkHeld: boolean
 
   // Privacy, Settings & MCP Agency
   settingsSubTab: SettingsSubTab
@@ -332,7 +348,13 @@ export interface AshyDesktopState {
   setComputerActionsPolicy: (policy: 'ask' | 'session' | 'off') => void
   setQuietHoursRange: (range: string) => void
   saveUserPreferences: () => void
-  setMicMode: (mode: MicMode) => void
+  setMicMode: (mode: MicMode | 'push-to-talk') => void
+  setActiveSttProvider: (providerId: SttProviderId) => void
+  setActiveTtsProvider: (providerId: TtsProviderId) => void
+  setWakeWordEnabled: (enabled: boolean) => void
+  setPushToTalkHeld: (held: boolean) => Promise<void>
+  runAudioFixtureSimulation: (fixtureId: VoiceFixtureId) => Promise<VoiceFixtureScenarioResult>
+  runVoiceFixtureScenario: (fixtureId: VoiceFixtureId) => Promise<VoiceFixtureScenarioResult>
   setEyesMode: (mode: EyesMode) => void
   setDndMode: (enabled: boolean) => void
   activateFullPrivacyShield: () => void
@@ -677,7 +699,16 @@ function mapEpisodesToMemoryCards(
 }
 
 let agency = createAgencyRuntime()
+let voiceRuntime = createVoiceSessionRuntime({
+  micMode: 'continuous',
+  wakeWordEnabled: DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordEnabled,
+  wakeWordPhrases: DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordPhrases,
+  activeSttProviderId: DEFAULT_VOICE_RUNTIME_SETTINGS.activeSttProviderId,
+  activeTtsProviderId: DEFAULT_VOICE_RUNTIME_SETTINGS.activeTtsProviderId,
+})
 let activeSpeechPipeline: RealtimeSpeechPipeline | null = null
+let firstDeltaEnqueuedAtMs: number | null = null
+let firstChunkRecordedForTurn = false
 let subscribedBridge: AshyHostBridge | null = null
 let unsubscribeHostEvents: (() => void) | null = null
 let lastPromptMinuteLabel = formatLocalTimeHHMM(Date.now())
@@ -686,6 +717,8 @@ let evalRunSeq = 0
 const completedTurnEvents = new Map<string, AshyHostStreamEvent>()
 const pendingTurnResolvers = new Map<string, () => void>()
 const pendingTurnSeriousness = new Map<string, boolean>()
+const streamedDeltaTurnIds = new Set<string>()
+const bargeInTurnIds = new Set<string>()
 
 export const useAshyStore = create<AshyDesktopState>((set, get) => {
   function compilePromptFromState(params?: {
@@ -703,6 +736,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     userHabits?: readonly UserHabit[]
     prospectiveIntents?: readonly ProspectiveIntent[]
     chatMessages?: readonly ChatTurnMessage[]
+    interruptionControlNote?: string
   }): ComposedTurnPrompt {
     const current = get()
     const userMessage =
@@ -770,6 +804,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       eligibleMotifs,
       userHabits: habits,
       prospectiveIntents: intents,
+      interruptionControlNote: params?.interruptionControlNote,
       conversationHistory: (params?.chatMessages ?? current?.chatMessages ?? []).map((m) => ({
         role: m.role,
         content: m.content,
@@ -778,14 +813,30 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
   }
 
   function createPipelineForTurn(): RealtimeSpeechPipeline {
+    firstDeltaEnqueuedAtMs = null
+    firstChunkRecordedForTurn = false
     const pipeline = createRealtimeSpeechPipeline({
       synthesizeFn: async (text) => {
         const wordCount = Math.max(1, text.trim().split(/\s+/).length)
         const durationMs = Math.max(450, wordCount * 120)
         return {
+          providerId: get().voiceSettings.activeTtsProviderId,
           durationMs,
           durationSec: durationMs / 1000,
         }
+      },
+      onAudioScheduled: () => {
+        const chunks = [...pipeline.getScheduledChunks()]
+        if (!firstChunkRecordedForTurn && firstDeltaEnqueuedAtMs !== null) {
+          firstChunkRecordedForTurn = true
+          const ttfaMs = Math.max(1, Math.round(performance.now() - firstDeltaEnqueuedAtMs))
+          const providerId = get().voiceSettings.activeTtsProviderId
+          voiceRuntime.recordTtfaSample(providerId, ttfaMs)
+        }
+        set({
+          scheduledAudioChunks: chunks,
+          ttfaByProvider: voiceRuntime.getTtfaTelemetry(),
+        })
       },
       onStageSignal: (signal) => {
         if (signal.type === 'act' && signal.emotion) {
@@ -804,6 +855,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     const assistantMsgId = `msg-assistant-${event.turnId}`
 
     if (event.type === 'turn:started') {
+      streamedDeltaTurnIds.delete(event.turnId)
+      bargeInTurnIds.delete(event.turnId)
+      createPipelineForTurn()
       set((state) => {
         const hasAssistantMsg = state.chatMessages.some((m) => m.id === assistantMsgId)
         return {
@@ -811,6 +865,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           activeTurnId: event.turnId,
           lastTurnError: null,
           presenceStatus: 'Thinking',
+          scheduledAudioChunks: [],
           chatMessages: hasAssistantMsg
             ? state.chatMessages
             : [
@@ -831,6 +886,13 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     }
 
     if (event.type === 'turn:delta') {
+      const pipeline = activeSpeechPipeline ?? createPipelineForTurn()
+      if (firstDeltaEnqueuedAtMs === null) {
+        firstDeltaEnqueuedAtMs = performance.now()
+      }
+      streamedDeltaTurnIds.add(event.turnId)
+      pipeline.enqueueDelta(event.textDelta)
+
       set((state) => {
         const exists = state.chatMessages.some((m) => m.id === assistantMsgId)
         const updatedMessages = exists
@@ -868,18 +930,22 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       if (marker.type === 'act' && marker.emotion) {
         const nextEmotion = marker.emotion
         const nextIntensity = marker.intensity ?? 0.85
+        const actSignal: AshyStageSignal = {
+          type: 'act',
+          emotion: nextEmotion,
+          intensity: nextIntensity,
+          raw: `<|ACT {"emotion":"${nextEmotion}","intensity":${nextIntensity}}|>`,
+        }
+        const pipeline = activeSpeechPipeline ?? createPipelineForTurn()
+        if (firstDeltaEnqueuedAtMs === null) {
+          firstDeltaEnqueuedAtMs = performance.now()
+        }
+        pipeline.enqueue(CONTROL_SENTINEL, [actSignal], { flush: false })
+
         set((state) => ({
           stageEmotion: nextEmotion,
           emotionIntensity: nextIntensity,
-          lastStageSignals: [
-            ...state.lastStageSignals,
-            {
-              type: 'act',
-              emotion: nextEmotion,
-              intensity: nextIntensity,
-              raw: `<|ACT {"emotion":"${nextEmotion}","intensity":${nextIntensity}}|>`,
-            },
-          ],
+          lastStageSignals: [...state.lastStageSignals, actSignal],
           chatMessages: state.chatMessages.map((m) =>
             m.id === assistantMsgId ? { ...m, emotion: nextEmotion } : m,
           ),
@@ -923,15 +989,19 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       }
 
       if (marker.type === 'delay') {
+        const delaySignal: AshyStageSignal = {
+          type: 'delay',
+          seconds: marker.seconds,
+          raw: `<|DELAY ${marker.seconds}|>`,
+        }
+        const pipeline = activeSpeechPipeline ?? createPipelineForTurn()
+        if (firstDeltaEnqueuedAtMs === null) {
+          firstDeltaEnqueuedAtMs = performance.now()
+        }
+        pipeline.enqueue(CONTROL_SENTINEL, [delaySignal], { flush: false })
+
         set((state) => ({
-          lastStageSignals: [
-            ...state.lastStageSignals,
-            {
-              type: 'delay',
-              seconds: marker.seconds,
-              raw: `<|DELAY ${marker.seconds}|>`,
-            },
-          ],
+          lastStageSignals: [...state.lastStageSignals, delaySignal],
         }))
       }
       return
@@ -949,11 +1019,24 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         const parsed = parseAssistantRawOutput(
           event.assistantMessage.rawContent || event.assistantMessage.content,
         )
-        const pipeline = createPipelineForTurn()
-        pipeline.enqueue(
-          parsed.textWithSentinels || event.assistantMessage.content,
-          parsed.signals,
-        )
+        const hadStreamedDeltas = streamedDeltaTurnIds.delete(event.turnId)
+        const pipeline =
+          hadStreamedDeltas && activeSpeechPipeline
+            ? activeSpeechPipeline
+            : createPipelineForTurn()
+
+        if (firstDeltaEnqueuedAtMs === null) {
+          firstDeltaEnqueuedAtMs = performance.now()
+        }
+
+        if (hadStreamedDeltas) {
+          pipeline.flush()
+        } else {
+          pipeline.enqueue(
+            parsed.textWithSentinels || event.assistantMessage.content,
+            parsed.signals,
+          )
+        }
         await Promise.resolve()
         await Promise.resolve()
 
@@ -983,6 +1066,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           presenceStatus: 'Speaking',
           simulatedVowels: { A: 0.75, E: 0.4, I: 0.2, O: 0.5, U: 0.15 },
           scheduledAudioChunks: scheduledChunks,
+          ttfaByProvider: voiceRuntime.getTtfaTelemetry(),
           lastStageSignals: parsed.signals,
           chatMessages: state.chatMessages.map((m) =>
             m.id === event.assistantMessage.id
@@ -1007,13 +1091,17 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
     if (event.type === 'turn:aborted') {
       pendingTurnSeriousness.delete(event.turnId)
-      set({
+      streamedDeltaTurnIds.delete(event.turnId)
+      const wasBargeIn = bargeInTurnIds.delete(event.turnId)
+      set((state) => ({
         isStreamingTurn: false,
         activeTurnId: null,
         isSpeaking: false,
-        presenceStatus: 'Idle',
+        presenceStatus: wasBargeIn ? 'Listening' : 'Idle',
+        stageEmotion: wasBargeIn ? 'surprised' : state.stageEmotion,
+        bubbleText: state.bubbleText,
         simulatedVowels: { A: 0, E: 0, I: 0, O: 0, U: 0 },
-      })
+      }))
       completedTurnEvents.set(event.turnId, event)
       const resolver = pendingTurnResolvers.get(event.turnId)
       if (resolver) {
@@ -1142,6 +1230,17 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     scheduledAudioChunks: [],
     lastPlaybackReceipt: null,
     lastStageSignals: [],
+    voiceSettings: {
+      ...DEFAULT_VOICE_RUNTIME_SETTINGS,
+      wakeWordPhrases: [...DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordPhrases],
+    },
+    ttfaByProvider: voiceRuntime.getTtfaTelemetry(),
+    pendingInterruptionControlNote: null,
+    lastTurnInterruptionNote: null,
+    voiceCasRejectedCount: 0,
+    voiceCancelledShortCount: 0,
+    lastVoiceFixtureResult: null,
+    isPushToTalkHeld: false,
 
     settingsSubTab: 'privacidade',
     showDesktopAvatar: true,
@@ -1205,6 +1304,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         userHabits,
         prospectiveIntents,
         chatMessages: mappedMessages,
+        interruptionControlNote: current.lastTurnInterruptionNote ?? undefined,
       })
 
       set({
@@ -1416,10 +1516,17 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
       const bridge = ensureHostSubscription()
       const current = get()
+      const interruptionNote = current.pendingInterruptionControlNote ?? undefined
+      set({
+        pendingInterruptionControlNote: null,
+        lastTurnInterruptionNote: interruptionNote ?? null,
+      })
+
       const seriousness = evaluateSeriousnessGate(trimmed)
       const compiledPrompt = compilePromptFromState({
         userMessage: trimmed,
         modelId: current.activeModelId,
+        interruptionControlNote: interruptionNote,
       })
 
       if (seriousness.isSeriousOrDelicate) {
@@ -1442,6 +1549,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       const { turnId, userMessage: savedUserMsg } = await bridge.sendTurn({
         sessionId: get().activeSessionId,
         text: trimmed,
+        ...(interruptionNote ? { interruptionControlNote: interruptionNote } : {}),
       })
 
       pendingTurnSeriousness.set(turnId, seriousness.isSeriousOrDelicate)
@@ -1473,8 +1581,14 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
 
     triggerBargeIn(interruptAtMs = 600) {
+      const activeTurnId = get().activeTurnId
+      if (activeTurnId !== null) {
+        bargeInTurnIds.add(activeTurnId)
+        void get().abortActiveTurn()
+      }
+
       let pipeline = activeSpeechPipeline
-      if (!pipeline || pipeline.getScheduledChunks().length === 0) {
+      if (!pipeline || (pipeline.getScheduledChunks().length === 0 && !get().isStreamingTurn)) {
         pipeline = createPipelineForTurn()
         pipeline.enqueue(
           'Olha só, eu estava explicando toda a arquitetura de memória episódica FSRS-6. Mas você me cortou bem no meio da frase!',
@@ -1491,6 +1605,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         stageEmotion: 'surprised',
         simulatedVowels: { A: 0, E: 0, I: 0, O: 0, U: 0 },
         lastPlaybackReceipt: receipt,
+        pendingInterruptionControlNote: receipt.controlNote,
         bubbleText: `${receipt.heardText} — [Barge-In!]`,
       })
 
@@ -2053,8 +2168,69 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
 
     setMicMode(mode) {
-      agency.privacyController.setMicMode(mode)
+      const agencyMode: MicMode = mode === 'push-to-talk' ? 'ptt' : mode
+      agency.privacyController.setMicMode(agencyMode)
+      voiceRuntime.setMicMode(mode)
       set({ privacyState: agency.privacyController.getState() })
+    },
+
+    setActiveSttProvider(providerId) {
+      voiceRuntime.setActiveSttProvider(providerId)
+      set((state) => ({
+        voiceSettings: {
+          ...state.voiceSettings,
+          activeSttProviderId: providerId,
+        },
+      }))
+    },
+
+    setActiveTtsProvider(providerId) {
+      voiceRuntime.setActiveTtsProvider(providerId)
+      set((state) => ({
+        voiceSettings: {
+          ...state.voiceSettings,
+          activeTtsProviderId: providerId,
+        },
+        ttfaByProvider: voiceRuntime.getTtfaTelemetry(),
+      }))
+    },
+
+    setWakeWordEnabled(enabled) {
+      voiceRuntime.setWakeWordEnabled(enabled)
+      set((state) => ({
+        voiceSettings: {
+          ...state.voiceSettings,
+          wakeWordEnabled: enabled,
+        },
+      }))
+    },
+
+    async setPushToTalkHeld(held) {
+      set({ isPushToTalkHeld: held })
+      await voiceRuntime.setPushToTalkActive(held)
+    },
+
+    async runAudioFixtureSimulation(fixtureId) {
+      const prevWake = get().voiceSettings.wakeWordEnabled
+      const prevMic = get().privacyState.micMode
+      const result = await voiceRuntime.runFixtureScenario(fixtureId)
+      voiceRuntime.setWakeWordEnabled(prevWake)
+      voiceRuntime.setMicMode(prevMic)
+      const snap = result.snapshot
+      set((state) => ({
+        lastVoiceFixtureResult: result,
+        ttfaByProvider: snap.ttfaByProvider,
+        voiceCasRejectedCount: snap.turnState.casRejectedCount,
+        voiceCancelledShortCount: snap.cancelledShortCount,
+        lastPlaybackReceipt: snap.lastPlaybackReceipt ?? state.lastPlaybackReceipt,
+        pendingInterruptionControlNote:
+          snap.lastPlaybackReceipt?.controlNote ?? state.pendingInterruptionControlNote,
+      }))
+      return result
+    },
+
+    async runVoiceFixtureScenario(fixtureId) {
+      return get().runAudioFixtureSimulation(fixtureId)
     },
 
     setEyesMode(mode) {
@@ -2121,11 +2297,22 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       unsubscribeHostEvents = null
       subscribedBridge = null
       activeSpeechPipeline = null
+      firstDeltaEnqueuedAtMs = null
+      firstChunkRecordedForTurn = false
       evalRunSeq += 1
       completedTurnEvents.clear()
       pendingTurnResolvers.clear()
       pendingTurnSeriousness.clear()
+      streamedDeltaTurnIds.clear()
+      bargeInTurnIds.clear()
       agency = createAgencyRuntime()
+      voiceRuntime = createVoiceSessionRuntime({
+        micMode: 'continuous',
+        wakeWordEnabled: DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordEnabled,
+        wakeWordPhrases: DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordPhrases,
+        activeSttProviderId: DEFAULT_VOICE_RUNTIME_SETTINGS.activeSttProviderId,
+        activeTtsProviderId: DEFAULT_VOICE_RUNTIME_SETTINGS.activeTtsProviderId,
+      })
       lastPromptMinuteLabel = formatLocalTimeHHMM(Date.now())
 
       const freshPrompt = composeAshyTurnPrompt({
@@ -2204,6 +2391,17 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         scheduledAudioChunks: [],
         lastPlaybackReceipt: null,
         lastStageSignals: [],
+        voiceSettings: {
+          ...DEFAULT_VOICE_RUNTIME_SETTINGS,
+          wakeWordPhrases: [...DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordPhrases],
+        },
+        ttfaByProvider: voiceRuntime.getTtfaTelemetry(),
+        pendingInterruptionControlNote: null,
+        lastTurnInterruptionNote: null,
+        voiceCasRejectedCount: 0,
+        voiceCancelledShortCount: 0,
+        lastVoiceFixtureResult: null,
+        isPushToTalkHeld: false,
         settingsSubTab: 'privacidade',
         showDesktopAvatar: true,
         computerActionsEnabled: true,

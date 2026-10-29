@@ -43,6 +43,7 @@ export interface ComposeTurnPromptInput {
   userHabits?: readonly UserHabit[]
   prospectiveIntents?: readonly ProspectiveIntent[]
   screenContext?: string
+  interruptionControlNote?: string
   conversationHistory?: readonly ConversationMessage[]
 }
 
@@ -390,6 +391,17 @@ export function buildVolatileTurnContext(input: ComposeTurnPromptInput): string 
   }
   sections.push(ambientLines.join('\n'))
 
+  const cleanInterruption = sanitizePromptLine(input.interruptionControlNote)
+  if (cleanInterruption.length > 0) {
+    sections.push(
+      [
+        '[VOICE BARGE-IN RECEIPT]',
+        `- ${cleanInterruption}`,
+        '- Diretriz de Interrupção: O usuário interrompeu sua fala anterior no meio. Reaja com naturalidade imediata ao que ele acabou de dizer, sabendo exatamente o que ele ouviu ("heard") e o que ficou por dizer ("unheard"), sem repetir o trecho já ouvido como robô.',
+      ].join('\n'),
+    )
+  }
+
   const approvedHabits = (input.userHabits ?? []).filter(
     (h) => h.approvalStatus !== 'pending_review' && h.confidence >= 0.5,
   )
@@ -471,6 +483,11 @@ export function composeAshyTurnPrompt(input: ComposeTurnPromptInput): ComposedTu
     if (cleanScreen) {
       contextBulletLines.push(`- Active Screen/Window: ${cleanScreen}`)
     }
+  }
+
+  const cleanInterruption = sanitizePromptLine(input.interruptionControlNote)
+  if (cleanInterruption.length > 0) {
+    contextBulletLines.push(`- Voice Barge-In Receipt: ${cleanInterruption}`)
   }
 
   if (seriousness.isSeriousOrDelicate) {

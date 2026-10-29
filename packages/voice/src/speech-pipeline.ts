@@ -1,12 +1,20 @@
 import { CONTROL_SENTINEL, type AshyStageSignal } from '@ashy/llm'
+import type { TtsProviderId } from '@ashy/shared'
 import { createTtsChunker, type TtsChunkerOptions } from './tts-chunker'
 
 export interface TtsSynthesisOutput {
+  providerId?: TtsProviderId
   durationMs?: number
   durationSec?: number
   samples?: Float32Array
   sampleRate?: number
   audioBuffer?: unknown
+  vowelFrames?: ReadonlyArray<{ A: number; E: number; I: number; O: number; U: number }>
+  synthesisLatencyMs?: number
+}
+
+export interface EnqueueSpeechOptions {
+  flush?: boolean
 }
 
 export interface ScheduledAudioChunk {
@@ -47,7 +55,13 @@ export interface RealtimeSpeechPipelineOptions {
 }
 
 export interface RealtimeSpeechPipeline {
-  enqueue(textWithSentinels: string, signals?: AshyStageSignal[]): void
+  enqueue(
+    textWithSentinels: string,
+    signals?: AshyStageSignal[],
+    options?: EnqueueSpeechOptions,
+  ): void
+  enqueueDelta(textDelta: string): void
+  flush(): void
   advancePlaybackTo(currentPlaybackTimeSec: number): void
   interrupt(cause: string, currentPlaybackTimeSec: number): PlaybackReceipt
   getScheduledChunks(): readonly ScheduledAudioChunk[]
@@ -214,34 +228,48 @@ export function createRealtimeSpeechPipeline(
     }
   }
 
-  function enqueue(textWithSentinels: string, signals: AshyStageSignal[] = []): void {
+  function queueChunkTexts(chunks: readonly string[]): void {
+    for (const chunkText of chunks) {
+      const seq = nextSeqToAssign++
+      const preDelaySec = pendingDelayForNextChunkSec
+      pendingDelayForNextChunkSec = 0
+      allChunkTasks.push({
+        seq,
+        text: chunkText,
+        abortController: new AbortController(),
+        status: 'queued',
+        preDelaySec,
+      })
+    }
+  }
+
+  function enqueue(
+    textWithSentinels: string,
+    signals: AshyStageSignal[] = [],
+    enqueueOptions?: EnqueueSpeechOptions,
+  ): void {
     if (interrupted) {
       interrupted = false
     }
 
+    const shouldFlush = enqueueOptions?.flush ?? true
     const parts = textWithSentinels.split(CONTROL_SENTINEL)
     let signalCursor = 0
 
     for (let i = 0; i < parts.length; i++) {
       const span = parts[i]!
-      if (span.trim().length > 0) {
-        const chunks = chunker.writeFlush(span)
-        for (const chunkText of chunks) {
-          const seq = nextSeqToAssign++
-          const preDelaySec = pendingDelayForNextChunkSec
-          pendingDelayForNextChunkSec = 0
-          allChunkTasks.push({
-            seq,
-            text: chunkText,
-            abortController: new AbortController(),
-            status: 'queued',
-            preDelaySec,
-          })
-        }
+      const hasFollowingSentinel = i < parts.length - 1
+
+      if (hasFollowingSentinel || shouldFlush) {
+        const chunks = span.length > 0 ? chunker.writeFlush(span) : chunker.flush()
+        queueChunkTexts(chunks)
+      } else if (span.length > 0) {
+        const chunks = chunker.write(span)
+        queueChunkTexts(chunks)
       }
 
       // Between part[i] and part[i + 1], a CONTROL_SENTINEL occurred
-      if (i < parts.length - 1) {
+      if (hasFollowingSentinel) {
         const signal = signals[signalCursor++]
         if (signal) {
           const afterChunkSeq = nextSeqToAssign - 1
@@ -258,19 +286,38 @@ export function createRealtimeSpeechPipeline(
     }
 
     // Any remaining signals provided in the array are attached after the last chunk
-    while (signalCursor < signals.length) {
-      const signal = signals[signalCursor++]!
-      const afterChunkSeq = nextSeqToAssign - 1
-      stageSignals.push({
-        signal,
-        afterChunkSeq,
-        fired: false,
-      })
-      if (signal.type === 'delay' && signal.seconds > 0) {
-        pendingDelayForNextChunkSec += signal.seconds
+    if (signalCursor < signals.length) {
+      queueChunkTexts(chunker.flush())
+      while (signalCursor < signals.length) {
+        const signal = signals[signalCursor++]!
+        const afterChunkSeq = nextSeqToAssign - 1
+        stageSignals.push({
+          signal,
+          afterChunkSeq,
+          fired: false,
+        })
+        if (signal.type === 'delay' && signal.seconds > 0) {
+          pendingDelayForNextChunkSec += signal.seconds
+        }
       }
     }
 
+    fireEligibleStageSignals(currentPlaybackTimeSec)
+    pumpWorkers()
+  }
+
+  function enqueueDelta(textDelta: string): void {
+    enqueue(textDelta, [], { flush: false })
+  }
+
+  function flush(): void {
+    if (interrupted) {
+      interrupted = false
+    }
+    const remaining = chunker.flush()
+    if (remaining.length > 0) {
+      queueChunkTexts(remaining)
+    }
     fireEligibleStageSignals(currentPlaybackTimeSec)
     pumpWorkers()
   }
@@ -288,6 +335,22 @@ export function createRealtimeSpeechPipeline(
       Number.isFinite(playbackTimeSec) ? playbackTimeSec : currentPlaybackTimeSec,
     )
     currentPlaybackTimeSec = clampedTimeSec
+
+    // Red-Team B1 fix: drain any unscheduled words still buffered inside TtsChunker
+    // before computing PlaybackReceipt so 100% of streamed words are retained in unheardText
+    const bufferedTailChunks = chunker.flush()
+    for (const tailText of bufferedTailChunks) {
+      const seq = nextSeqToAssign++
+      const preDelaySec = pendingDelayForNextChunkSec
+      pendingDelayForNextChunkSec = 0
+      allChunkTasks.push({
+        seq,
+        text: tailText,
+        abortController: new AbortController(),
+        status: 'cancelled',
+        preDelaySec,
+      })
+    }
 
     // Phase 1: Cancel all in-flight and queued TTS synthesis tasks + trigger 100ms fade-out
     for (const task of allChunkTasks) {
@@ -406,6 +469,8 @@ export function createRealtimeSpeechPipeline(
 
   return {
     enqueue,
+    enqueueDelta,
+    flush,
     advancePlaybackTo,
     interrupt,
     getScheduledChunks() {

@@ -29,6 +29,67 @@ export const LLM_PROVIDER_IDS = [
 export type LlmProviderId = (typeof LLM_PROVIDER_IDS)[number]
 export const LlmProviderIdSchema = v.picklist(LLM_PROVIDER_IDS)
 
+export const STT_PROVIDER_IDS = [
+  'openai-whisper',
+  'local-whisper-http',
+  'deterministic-wav-stt',
+] as const
+
+export type SttProviderId = (typeof STT_PROVIDER_IDS)[number]
+export const SttProviderIdSchema = v.picklist(STT_PROVIDER_IDS)
+
+export const TTS_PROVIDER_IDS = [
+  'elevenlabs',
+  'openai-tts',
+  'local-kokoro-http',
+  'local-synth-fallback',
+] as const
+
+export type TtsProviderId = (typeof TTS_PROVIDER_IDS)[number]
+export const TtsProviderIdSchema = v.picklist(TTS_PROVIDER_IDS)
+
+export const VOICE_FIXTURE_IDS = [
+  'thinking-pause-cas',
+  'barge-in-interrupt',
+  'wake-word-oi-ashy',
+  'keyboard-click-noise',
+] as const
+
+export type VoiceFixtureId = (typeof VOICE_FIXTURE_IDS)[number]
+export const VoiceFixtureIdSchema = v.picklist(VOICE_FIXTURE_IDS)
+
+export interface TtfaTelemetryRecord {
+  providerId: TtsProviderId
+  lastTtfaMs: number | null
+  avgTtfaMs: number | null
+  sampleCount: number
+  lastSynthesizedAt: number | null
+}
+
+export interface VoiceRuntimeSettings {
+  activeSttProviderId: SttProviderId
+  activeTtsProviderId: TtsProviderId
+  sttBaseUrl: string
+  sttModelId: string
+  ttsBaseUrl: string
+  ttsModelId: string
+  ttsVoiceId: string
+  wakeWordEnabled: boolean
+  wakeWordPhrases: string[]
+}
+
+export const DEFAULT_VOICE_RUNTIME_SETTINGS: VoiceRuntimeSettings = {
+  activeSttProviderId: 'deterministic-wav-stt',
+  activeTtsProviderId: 'local-synth-fallback',
+  sttBaseUrl: 'http://127.0.0.1:8080',
+  sttModelId: 'whisper-1',
+  ttsBaseUrl: 'http://127.0.0.1:8880',
+  ttsModelId: 'kokoro-v1',
+  ttsVoiceId: 'ashy-pt-br',
+  wakeWordEnabled: true,
+  wakeWordPhrases: ['ashy', 'ei ashy', 'oi ashy'],
+}
+
 export const DELETABLE_MEMORY_KINDS = [
   'fact',
   'episode',
@@ -312,6 +373,9 @@ export const SendTurnInputSchema = v.object({
   sessionId: v.pipe(v.string(), v.trim(), v.nonEmpty()),
   text: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(16000)),
   screenContext: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(512))),
+  interruptionControlNote: v.optional(
+    v.pipe(v.string(), v.trim(), v.maxLength(1024)),
+  ),
 })
 
 export type SendTurnInput = v.InferOutput<typeof SendTurnInputSchema>

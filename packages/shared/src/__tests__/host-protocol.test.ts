@@ -31,6 +31,13 @@ import {
   CrossEpisodeLinkSchema,
   DreamReflectionCycleResultSchema,
   DEFAULT_ASHY_VOICE_MD,
+  STT_PROVIDER_IDS,
+  SttProviderIdSchema,
+  TTS_PROVIDER_IDS,
+  TtsProviderIdSchema,
+  VOICE_FIXTURE_IDS,
+  VoiceFixtureIdSchema,
+  DEFAULT_VOICE_RUNTIME_SETTINGS,
 } from '../index'
 
 describe('@ashy/shared host-protocol', () => {
@@ -610,5 +617,70 @@ describe('@ashy/shared host-protocol', () => {
     ).toBe(false)
 
     expect(DEFAULT_ASHY_VOICE_MD).toContain('## Salvaguardas de Vínculo Saudável')
+  })
+
+  it('validates Phase 5 STT/TTS provider schemas, voice fixture IDs, DEFAULT_VOICE_RUNTIME_SETTINGS, and SendTurnInputSchema.interruptionControlNote', () => {
+    expect(STT_PROVIDER_IDS).toEqual([
+      'openai-whisper',
+      'local-whisper-http',
+      'deterministic-wav-stt',
+    ])
+    for (const id of STT_PROVIDER_IDS) {
+      expect(v.safeParse(SttProviderIdSchema, id).success).toBe(true)
+    }
+    expect(v.safeParse(SttProviderIdSchema, 'invalid-stt').success).toBe(false)
+
+    expect(TTS_PROVIDER_IDS).toEqual([
+      'elevenlabs',
+      'openai-tts',
+      'local-kokoro-http',
+      'local-synth-fallback',
+    ])
+    for (const id of TTS_PROVIDER_IDS) {
+      expect(v.safeParse(TtsProviderIdSchema, id).success).toBe(true)
+    }
+    expect(v.safeParse(TtsProviderIdSchema, 'invalid-tts').success).toBe(false)
+
+    expect(VOICE_FIXTURE_IDS).toEqual([
+      'thinking-pause-cas',
+      'barge-in-interrupt',
+      'wake-word-oi-ashy',
+      'keyboard-click-noise',
+    ])
+    for (const id of VOICE_FIXTURE_IDS) {
+      expect(v.safeParse(VoiceFixtureIdSchema, id).success).toBe(true)
+    }
+    expect(v.safeParse(VoiceFixtureIdSchema, 'invalid-fixture').success).toBe(false)
+
+    expect(DEFAULT_VOICE_RUNTIME_SETTINGS).toEqual({
+      activeSttProviderId: 'deterministic-wav-stt',
+      activeTtsProviderId: 'local-synth-fallback',
+      sttBaseUrl: 'http://127.0.0.1:8080',
+      sttModelId: 'whisper-1',
+      ttsBaseUrl: 'http://127.0.0.1:8880',
+      ttsModelId: 'kokoro-v1',
+      ttsVoiceId: 'ashy-pt-br',
+      wakeWordEnabled: true,
+      wakeWordPhrases: ['ashy', 'ei ashy', 'oi ashy'],
+    })
+
+    const note =
+      '[Interrupted after 1500ms — user heard: "Eu acho que" | unheard: "esse código precisa de refatoração."]'
+    const validTurnWithNote = v.safeParse(SendTurnInputSchema, {
+      sessionId: 'sess-voice-1',
+      text: 'Espera, foca só no banco de dados',
+      interruptionControlNote: `  ${note}  `,
+    })
+    expect(validTurnWithNote.success).toBe(true)
+    if (validTurnWithNote.success) {
+      expect(validTurnWithNote.output.interruptionControlNote).toBe(note)
+    }
+
+    const oversizedNote = v.safeParse(SendTurnInputSchema, {
+      sessionId: 'sess-voice-1',
+      text: 'Espera',
+      interruptionControlNote: 'n'.repeat(1025),
+    })
+    expect(oversizedNote.success).toBe(false)
   })
 })

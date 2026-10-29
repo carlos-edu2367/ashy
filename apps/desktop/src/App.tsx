@@ -5,11 +5,15 @@ import {
   M2_GATE_THRESHOLDS,
   MILESTONE_CATEGORIES,
   SEMANTIC_FACT_CATEGORIES,
+  STT_PROVIDER_IDS,
+  TTS_PROVIDER_IDS,
   type ApprovableMemoryKind,
   type AshyEmotion,
   type MemoryGovernanceCategory,
   type MilestoneCategory,
   type SemanticFactCategory,
+  type SttProviderId,
+  type TtsProviderId,
 } from '@ashy/shared'
 import type { FsrsReviewRating } from '@ashy/cortex'
 import { AshyStageCanvas } from '@ashy/stage'
@@ -2661,6 +2665,249 @@ export function App(): React.ReactElement {
               <div className="ashy-settings-column">
                 {/* Models & Provider Vault Panel (Ajustes > Modelos) */}
                 <ModelsSettingsPanel />
+
+                {/* Phase 5: Voice Runtime, TTFA Telemetry & .wav Audio Fixtures Panel (Ajustes > Voz) */}
+                <section
+                  className="ashy-settings-card"
+                  data-testid="voice-runtime-panel"
+                  style={{
+                    borderColor:
+                      state.settingsSubTab === 'voz'
+                        ? 'rgba(244, 166, 136, 0.5)'
+                        : 'var(--border-soft)',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      flexWrap: 'wrap',
+                      gap: '10px',
+                    }}
+                  >
+                    <div className="ashy-settings-section-head">
+                      <div className="ashy-settings-section-icon">
+                        <Volume2 size={20} />
+                      </div>
+                      <div>
+                        <h3 className="ashy-setting-title">
+                          Voz em Tempo Real, Turn-Taking &amp; Barge-In
+                        </h3>
+                        <p className="ashy-setting-desc">
+                          Provedores STT/TTS locais e nuvem, telemetria TTFA, proteção CAS e
+                          simulador determinístico de fixtures .wav.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                      <span
+                        className="ashy-badge peach"
+                        data-testid="voice-ttfa-badge"
+                      >
+                        TTFA ({state.voiceSettings.activeTtsProviderId}):{' '}
+                        {state.ttfaByProvider[state.voiceSettings.activeTtsProviderId]
+                          ?.lastTtfaMs !== null &&
+                        state.ttfaByProvider[state.voiceSettings.activeTtsProviderId]
+                          ?.lastTtfaMs !== undefined
+                          ? `${state.ttfaByProvider[state.voiceSettings.activeTtsProviderId].lastTtfaMs} ms (avg ${state.ttfaByProvider[state.voiceSettings.activeTtsProviderId].avgTtfaMs ?? state.ttfaByProvider[state.voiceSettings.activeTtsProviderId].lastTtfaMs} ms)`
+                          : 'aguardando síntese'}
+                      </span>
+                      <span
+                        className="ashy-badge violet"
+                        data-testid="voice-cas-badge"
+                      >
+                        CAS: {state.voiceCasRejectedCount} · Cliques ignorados:{' '}
+                        {state.voiceCancelledShortCount}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* STT & TTS Provider Selectors */}
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
+                      gap: '12px',
+                    }}
+                  >
+                    <div>
+                      <label
+                        htmlFor="select-stt-provider"
+                        style={{
+                          display: 'block',
+                          fontSize: '12px',
+                          color: 'var(--text-secondary)',
+                          marginBottom: '4px',
+                        }}
+                      >
+                        Provedor STT (Transcrição):
+                      </label>
+                      <select
+                        id="select-stt-provider"
+                        data-testid="select-stt-provider"
+                        className="ashy-select"
+                        value={state.voiceSettings.activeSttProviderId}
+                        onChange={(e) =>
+                          state.setActiveSttProvider(e.target.value as SttProviderId)
+                        }
+                      >
+                        {STT_PROVIDER_IDS.map((id) => (
+                          <option key={id} value={id}>
+                            {id}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label
+                        htmlFor="select-tts-provider"
+                        style={{
+                          display: 'block',
+                          fontSize: '12px',
+                          color: 'var(--text-secondary)',
+                          marginBottom: '4px',
+                        }}
+                      >
+                        Provedor TTS (Síntese de Voz):
+                      </label>
+                      <select
+                        id="select-tts-provider"
+                        data-testid="select-tts-provider"
+                        className="ashy-select"
+                        value={state.voiceSettings.activeTtsProviderId}
+                        onChange={(e) =>
+                          state.setActiveTtsProvider(e.target.value as TtsProviderId)
+                        }
+                      >
+                        {TTS_PROVIDER_IDS.map((id) => (
+                          <option key={id} value={id}>
+                            {id}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Wake Word ("Ei Ashy" / "Oi Ashy") Toggle + PTT Hold Button */}
+                  <div className="ashy-setting-box">
+                    <div>
+                      <div className="ashy-setting-title">
+                        Wake Word (&quot;Ashy&quot; / &quot;Ei Ashy&quot; / &quot;Oi Ashy&quot;)
+                      </div>
+                      <p className="ashy-setting-desc">
+                        Abre a escuta ativa automaticamente ao detectar a frase de chamada no
+                        buffer de pré-rolagem (360ms).
+                      </p>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      {state.privacyState.micMode === 'ptt' && (
+                        <button
+                          type="button"
+                          data-testid="btn-hold-ptt"
+                          className={`ashy-outline-btn ${state.isPushToTalkHeld ? 'active' : ''}`}
+                          onMouseDown={() => void state.setPushToTalkHeld(true)}
+                          onMouseUp={() => void state.setPushToTalkHeld(false)}
+                          onClick={() =>
+                            void state.setPushToTalkHeld(!state.isPushToTalkHeld)
+                          }
+                        >
+                          {state.isPushToTalkHeld ? 'Soltar PTT' : 'Segurar PTT'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={state.voiceSettings.wakeWordEnabled}
+                        data-testid="toggle-wake-word"
+                        className={`ashy-switch ${
+                          state.voiceSettings.wakeWordEnabled ? 'checked' : ''
+                        }`}
+                        onClick={() =>
+                          state.setWakeWordEnabled(!state.voiceSettings.wakeWordEnabled)
+                        }
+                      />
+                    </div>
+                  </div>
+
+                  {/* Last Barge-In PlaybackReceipt Inspector */}
+                  <div
+                    className="ashy-setting-box"
+                    style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '4px' }}
+                  >
+                    <div
+                      style={{
+                        fontSize: '12px',
+                        fontWeight: 600,
+                        color: 'var(--text-secondary)',
+                      }}
+                    >
+                      Último Recibo de Interrupção (PlaybackReceipt):
+                    </div>
+                    <code
+                      data-testid="voice-bargein-receipt"
+                      style={{
+                        fontSize: '11.5px',
+                        color: 'var(--text-primary)',
+                        wordBreak: 'break-word',
+                      }}
+                    >
+                      {state.lastPlaybackReceipt?.controlNote ??
+                        'Nenhuma interrupção recente'}
+                    </code>
+                  </div>
+
+                  {/* Deterministic .wav Fixture Simulation Runner */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                      Simular fixtures de áudio reais (.wav 16kHz PCM):
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                      <button
+                        type="button"
+                        className="ashy-outline-btn"
+                        data-testid="run-fixture-thinking-pause-cas"
+                        onClick={() =>
+                          void state.runAudioFixtureSimulation('thinking-pause-cas')
+                        }
+                      >
+                        Pausa de pensamento (CAS)
+                      </button>
+                      <button
+                        type="button"
+                        className="ashy-outline-btn"
+                        data-testid="run-fixture-barge-in-interrupt"
+                        onClick={() =>
+                          void state.runAudioFixtureSimulation('barge-in-interrupt')
+                        }
+                      >
+                        Barge-In no meio da fala
+                      </button>
+                      <button
+                        type="button"
+                        className="ashy-outline-btn"
+                        data-testid="run-fixture-wake-word-oi-ashy"
+                        onClick={() =>
+                          void state.runAudioFixtureSimulation('wake-word-oi-ashy')
+                        }
+                      >
+                        Wake Word (&quot;Oi Ashy&quot;)
+                      </button>
+                      <button
+                        type="button"
+                        className="ashy-outline-btn"
+                        data-testid="run-fixture-keyboard-click-noise"
+                        onClick={() =>
+                          void state.runAudioFixtureSimulation('keyboard-click-noise')
+                        }
+                      >
+                        Ruído de clique (&lt;300ms)
+                      </button>
+                    </div>
+                  </div>
+                </section>
 
                 {/* Main Presence & Privacy Card (Matches Screenshot 3 1:1) */}
                 <section className="ashy-settings-card">
