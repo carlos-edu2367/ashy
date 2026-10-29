@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import {
   ASHY_EMOTIONS,
   MILESTONE_CATEGORIES,
@@ -35,6 +35,7 @@ import {
   Palette,
   Pencil,
   Plus,
+  RotateCcw,
   Save,
   Search,
   Send,
@@ -48,6 +49,8 @@ import {
   Wifi,
   X,
 } from 'lucide-react'
+import { FirstMeetingWizard } from './components/FirstMeetingWizard'
+import { ModelsSettingsPanel } from './components/ModelsSettingsPanel'
 import {
   SUPPORTED_MODELS,
   useAshyStore,
@@ -156,6 +159,20 @@ export function App(): React.ReactElement {
   const [factSubject, setFactSubject] = useState('User')
   const [factPredicate, setFactPredicate] = useState('favorite_stack_is')
   const [factObject, setFactObject] = useState('')
+
+  // Voice Identity (voice.md) live editor state
+  const [voiceDraft, setVoiceDraft] = useState(state.voiceIdentity.content)
+  const [voiceSavedNotice, setVoiceSavedNotice] = useState<string | null>(null)
+
+  useEffect(() => {
+    void useAshyStore.getState().bootstrapFromHost()
+  }, [])
+
+  useEffect(() => {
+    setVoiceDraft(state.voiceIdentity.content)
+  }, [state.voiceIdentity.content])
+
+  const displayName = state.userProfile.userName ?? 'Carlos'
 
   const handleSendChat = async (e?: React.FormEvent) => {
     if (e) e.preventDefault()
@@ -361,6 +378,8 @@ export function App(): React.ReactElement {
 
   return (
     <div className="ashy-window" data-testid="companion-hub">
+      {state.needsOnboarding && <FirstMeetingWizard />}
+
       {/* Subtle Desktop Window Chrome Controls */}
       <div className="ashy-window-controls" aria-label="Controles da janela">
         <button type="button" className="ashy-win-btn" title="Minimizar">
@@ -434,7 +453,7 @@ export function App(): React.ReactElement {
                 <span className="ashy-user-avatar-dot" />
               </div>
               <div style={{ minWidth: 0 }}>
-                <div className="ashy-user-name">Carlos</div>
+                <div className="ashy-user-name">{displayName}</div>
                 <div className="ashy-user-status">Sempre por aqui. ♡</div>
               </div>
             </div>
@@ -475,7 +494,7 @@ export function App(): React.ReactElement {
               {/* Top Stage Greeting & Runtime Status Pill */}
               <div className="ashy-stage-top-bar">
                 <div className="ashy-stage-greeting">
-                  <h1 className="ashy-serif-hero">Bom te ver, Carlos.</h1>
+                  <h1 className="ashy-serif-hero">Bom te ver, {displayName}.</h1>
                   <div className="ashy-stage-presence">
                     <span className="ashy-presence-dot" />
                     <span data-testid="seriousness-gate-badge">
@@ -691,6 +710,58 @@ export function App(): React.ReactElement {
                   ),
                 )}
 
+                {state.lastTurnError && (
+                  <div
+                    data-testid="turn-error-banner"
+                    style={{
+                      padding: '12px 14px',
+                      borderRadius: '12px',
+                      background: 'rgba(217, 107, 112, 0.12)',
+                      border: '1px solid rgba(217, 107, 112, 0.38)',
+                      fontSize: '12px',
+                      color: '#f5b5b8',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '8px',
+                    }}
+                  >
+                    <div style={{ fontWeight: 600 }}>
+                      {state.lastTurnError.code}: {state.lastTurnError.message}
+                    </div>
+                    {state.lastTurnError.code === 'PROVIDER_NOT_CONFIGURED' && (
+                      <div>
+                        <button
+                          type="button"
+                          className="ashy-outline-btn"
+                          style={{ padding: '4px 10px', fontSize: '11.5px' }}
+                          onClick={() => {
+                            state.setActiveTab('agency')
+                            state.setSettingsSubTab('modelos')
+                          }}
+                        >
+                          Configurar em Ajustes &gt; Modelos
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {state.persistenceWarning && (
+                  <div
+                    data-testid="persistence-warning-banner"
+                    style={{
+                      padding: '10px 12px',
+                      borderRadius: '10px',
+                      background: 'rgba(242, 190, 121, 0.12)',
+                      border: '1px solid rgba(242, 190, 121, 0.35)',
+                      fontSize: '11.5px',
+                      color: 'var(--status-amber)',
+                    }}
+                  >
+                    Aviso de persistência local: {state.persistenceWarning}
+                  </div>
+                )}
+
                 {state.lastPlaybackReceipt && (
                   <div
                     data-testid="playback-receipt-card"
@@ -858,6 +929,11 @@ export function App(): React.ReactElement {
                       data-testid="btn-barge-in"
                       onClick={() => state.triggerBargeIn(600)}
                     />
+                    <button
+                      type="button"
+                      data-testid="btn-studio-send"
+                      onClick={() => void handleSendChat()}
+                    />
                   </div>
                 )}
                 <form onSubmit={handleSendChat} className="ashy-chat-composer">
@@ -886,7 +962,7 @@ export function App(): React.ReactElement {
                     </button>
                     <button
                       type="submit"
-                      data-testid="btn-studio-send"
+                      data-testid="studio-send-btn"
                       className="ashy-send-btn"
                       title="Enviar"
                     >
@@ -1632,6 +1708,114 @@ export function App(): React.ReactElement {
                     )}
                   </div>
                 </section>
+
+                {/* Live Voice Identity (voice.md) Editor */}
+                <section className="ashy-settings-card" style={{ gap: '12px' }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: '10px',
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <div>
+                      <h3 className="ashy-setting-title">Voz &amp; Identidade Viva (voice.md)</h3>
+                      <p className="ashy-setting-desc">
+                        Edite a personalidade da Ashy em Markdown. Carregado a quente no próximo
+                        turno com auto-heal.
+                      </p>
+                    </div>
+                    <span
+                      data-testid="voice-diagnostics-badge"
+                      className={`ashy-badge ${
+                        state.voiceIdentity.diagnostics.status === 'ok' ? 'emerald' : 'amber'
+                      }`}
+                    >
+                      voice.md: {state.voiceIdentity.diagnostics.status}
+                    </span>
+                  </div>
+
+                  {state.voiceIdentity.diagnostics.message && (
+                    <div style={{ fontSize: '11.5px', color: 'var(--text-secondary)' }}>
+                      {state.voiceIdentity.diagnostics.message}
+                    </div>
+                  )}
+
+                  <textarea
+                    data-testid="voice-identity-editor"
+                    className="ashy-input"
+                    rows={8}
+                    style={{
+                      fontFamily: 'var(--font-mono)',
+                      fontSize: '12px',
+                      lineHeight: 1.5,
+                      resize: 'vertical',
+                    }}
+                    value={voiceDraft}
+                    onChange={(e) => {
+                      setVoiceDraft(e.target.value)
+                      setVoiceSavedNotice(null)
+                    }}
+                  />
+
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: '8px',
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <button
+                        type="button"
+                        data-testid="save-voice-identity-btn"
+                        className="ashy-peach-btn"
+                        onClick={async () => {
+                          try {
+                            await state.saveVoiceIdentity(voiceDraft)
+                            setVoiceSavedNotice('Identidade de voz salva ✓')
+                          } catch (err) {
+                            setVoiceSavedNotice(
+                              `Erro: ${err instanceof Error ? err.message : String(err)}`,
+                            )
+                          }
+                        }}
+                      >
+                        <Save size={14} />
+                        <span>Salvar voice.md</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        data-testid="reset-voice-identity-btn"
+                        className="ashy-outline-btn"
+                        onClick={async () => {
+                          const restored = await state.resetVoiceIdentity()
+                          setVoiceDraft(restored.content)
+                          setVoiceSavedNotice('Restaurado ao padrão ✓')
+                        }}
+                      >
+                        <RotateCcw size={14} />
+                        <span>Restaurar padrão</span>
+                      </button>
+                    </div>
+
+                    {voiceSavedNotice && (
+                      <span
+                        data-testid="voice-save-notice"
+                        className={`ashy-badge ${
+                          voiceSavedNotice.startsWith('Erro:') ? 'amber' : 'emerald'
+                        }`}
+                      >
+                        {voiceSavedNotice}
+                      </span>
+                    )}
+                  </div>
+                </section>
               </div>
 
               {/* Right Column: Live Expression & Lighting Controls */}
@@ -1792,6 +1976,9 @@ export function App(): React.ReactElement {
             <div className="ashy-settings-grid">
               {/* Left Column */}
               <div className="ashy-settings-column">
+                {/* Models & Provider Vault Panel (Ajustes > Modelos) */}
+                <ModelsSettingsPanel />
+
                 {/* Main Presence & Privacy Card (Matches Screenshot 3 1:1) */}
                 <section className="ashy-settings-card">
                   {/* 1. Presença no desktop */}

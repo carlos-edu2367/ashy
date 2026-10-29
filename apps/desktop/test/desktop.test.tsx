@@ -1,15 +1,81 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createAshyHostKernel, type AshyHostKernel } from '../src/host/kernel'
 import {
   App,
   createAshyElectronOverlayConfig,
   useAshyStore,
 } from '../src/index'
+import { setAshyHostBridgeForTesting } from '../src/services/ashy-host-client'
+
+const tempDirs: string[] = []
+const activeKernels: AshyHostKernel[] = []
+
+function makeTempDir(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ashy-desktop-test-'))
+  tempDirs.push(dir)
+  return dir
+}
 
 describe('@ashy/desktop — Phase 7 Companion Hub, Floating Stage Overlay & Full-Stack Integration', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    const dir = makeTempDir()
+    const mockFetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      const bodyStr = typeof init?.body === 'string' ? init.body : ''
+      let replyDelta = ''
+
+      if (bodyStr.includes('SERIOUSNESS GATE ACTIVE')) {
+        replyDelta =
+          '<|ACT {"emotion":"concerned","intensity":0.9}|> Ei... respira um segundo. Hoje foi pesado demais mesmo. <|DELAY 0.4|> Larga esse teclado um pouco, eu seguro as pontas por aqui — me conta o que aconteceu se quiser desabafar, ou a gente só fica quieto um instante.'
+      } else if (bodyStr.includes('Eligible Inside Joke [motif-padre-npm]')) {
+        replyDelta =
+          '<|ACT {"emotion":"smug","intensity":0.88}|> Silêncio suspeito no sistema nunca me engana. <|DELAY 0.35|> Já preparei o trace completo e se esse estado fantasma piscar de novo, a gente vai precisar chamar um padre no npm (<|CALLBACK motif-padre-npm|>) antes do próximo deploy.'
+      } else {
+        replyDelta =
+          '<|ACT {"emotion":"tease","intensity":0.84}|> Essa piada já entrou em Cooldown Lock pra não saturar, mas meu radar de arquitetura continua afiado! <|DELAY 0.3|> Manda o próximo módulo que a gente destrincha em tempo real.'
+      }
+
+      const sse = [
+        `data: ${JSON.stringify({ choices: [{ delta: { content: replyDelta } }] })}\n\n`,
+        'data: [DONE]\n\n',
+      ].join('')
+
+      return new Response(sse, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    })
+
+    const kernel = await createAshyHostKernel({
+      userDataDir: dir,
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    })
+    activeKernels.push(kernel)
+    await kernel.seedDemoFixtures()
+    await kernel.saveProviderConfig({
+      providerId: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      modelId: 'anthropic/claude-3.7-sonnet',
+      apiKey: 'sk-or-v1-testkey1234',
+    })
+    await kernel.setActiveProvider('openrouter')
+    setAshyHostBridgeForTesting(kernel)
     useAshyStore.getState().resetStoreForTesting()
+    await useAshyStore.getState().bootstrapFromHost()
+  })
+
+  afterEach(async () => {
+    setAshyHostBridgeForTesting(null)
+    while (activeKernels.length > 0) {
+      await activeKernels.pop()!.stop()
+    }
+    while (tempDirs.length > 0) {
+      fs.rmSync(tempDirs.pop()!, { recursive: true, force: true })
+    }
   })
 
   it('1. renders App in both Companion Hub mode (all 5 tabs) and Floating Stage Overlay mode with AshyStageCanvas', () => {

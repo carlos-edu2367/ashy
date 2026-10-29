@@ -12,12 +12,18 @@ import {
   type PrivacyState,
 } from '@ashy/agency'
 import {
-  AshyCortex,
-  computeFsrsRetrievability,
-  createAshyCortex,
+  applyEmotionSignalToMood,
+  applyExperienceTraitDelta,
+  composeAshyTurnPrompt,
   evaluateSeriousnessGate,
+  formatLocalTimeHHMM,
   inspectMotifCooldownStatus,
+  rankEpisodicMemories,
+  recordMotifInvocation,
+  revertTraitEvolution as revertCortexTraitEvolution,
+  reviewEpisodicMemory,
   selectEligibleMotifs,
+  type AshyCortex,
   type ComposedTurnPrompt,
   type FsrsReviewRating,
   type MotifCooldownStatus,
@@ -30,18 +36,33 @@ import {
   type AshyStageSignal,
 } from '@ashy/llm'
 import {
+  ASHY_BASELINE_MOOD,
+  ASHY_DEFAULT_TRAITS,
   ASHY_EMOTIONS,
+  LLM_PROVIDER_IDS,
+  type AshyBootstrapSnapshot,
   type AshyEmotion,
+  type AshyHostBridge,
+  type AshyHostStreamEvent,
   type AutobiographicalMilestone,
+  type ChatMessageRecord,
+  type ChatSessionRecord,
+  type CompleteOnboardingInput,
   type EpisodicMemory,
+  type LlmProviderId,
   type MilestoneCategory,
   type MoodVector,
   type PersonalityEvolutionRecord,
   type PersonalityTraits,
   type ProspectiveIntent,
+  type ProviderHealthResult,
+  type PublicProviderConfig,
   type RelationalMotif,
+  type RelationshipStage,
+  type SaveProviderConfigInput,
   type SemanticFact,
   type SemanticFactCategory,
+  type TestProviderInput,
   type UserHabit,
 } from '@ashy/shared'
 import type { AshyPresenceStatus } from '@ashy/stage'
@@ -52,6 +73,10 @@ import {
   type ScheduledAudioChunk,
 } from '@ashy/voice'
 import { create } from 'zustand'
+import { DEFAULT_PROVIDER_CONFIGS } from '../host/provider-vault'
+import { DEFAULT_ASHY_VOICE_MD } from '../host/voice-identity-store'
+import { getAshyHostBridge } from '../services/ashy-host-client'
+import { DEMO_MEMORY_CARDS } from '../test/fixtures/demo-seed'
 
 export type DesktopViewMode = 'hub' | 'stage'
 export type HubTabId = 'studio' | 'story' | 'memories' | 'personality' | 'agency'
@@ -123,7 +148,7 @@ export interface ChatTurnMessage {
   content: string
   rawContent?: string
   emotion?: AshyEmotion
-  modelId?: SupportedModelId
+  modelId?: string
   invokedMotifId?: string
   seriousnessTriggered?: boolean
   timeLabel?: string
@@ -139,11 +164,35 @@ export interface RoomTrophy {
   unlocked: boolean
 }
 
+export interface TurnErrorState {
+  code: 'PROVIDER_NOT_CONFIGURED' | 'LLM_REQUEST_FAILED' | 'INTERNAL_ERROR'
+  message: string
+  recoverable: boolean
+}
+
 export interface AshyDesktopState {
   // Navigation & View Mode
   viewMode: DesktopViewMode
   activeTab: HubTabId
   activeModelId: SupportedModelId
+
+  // Phase 0/1 Host Runtime & Onboarding State
+  isBootstrapped: boolean
+  needsOnboarding: boolean
+  userProfile: AshyBootstrapSnapshot['userProfile']
+  relationshipStage: RelationshipStage
+  familiarityScore: number
+  trustScore: number
+  totalTurns: number
+  activeSessionId: string
+  sessions: ChatSessionRecord[]
+  providers: AshyBootstrapSnapshot['providers']
+  voiceIdentity: AshyBootstrapSnapshot['voice']
+  runtimeDiagnostics: AshyBootstrapSnapshot['runtimeDiagnostics']
+  isStreamingTurn: boolean
+  activeTurnId: string | null
+  lastTurnError: TurnErrorState | null
+  persistenceWarning: string | null
 
   // Stage & Procedural Controls
   stageMode: 'tachie' | 'live2d'
@@ -195,7 +244,24 @@ export interface AshyDesktopState {
   auditLog: ActionAuditLogEntry[]
   lastMcpResultSummary: string | null
 
-  // Actions
+  // Host & Onboarding Actions
+  bootstrapFromHost: () => Promise<AshyBootstrapSnapshot>
+  applyBootstrapSnapshot: (snapshot: AshyBootstrapSnapshot) => void
+  completeOnboarding: (input: CompleteOnboardingInput) => Promise<AshyBootstrapSnapshot>
+  saveProviderConfig: (input: SaveProviderConfigInput) => Promise<{
+    config: PublicProviderConfig
+    providers: AshyBootstrapSnapshot['providers']
+  }>
+  setActiveProvider: (providerId: LlmProviderId) => Promise<AshyBootstrapSnapshot['providers']>
+  testProviderConnection: (input: TestProviderInput) => Promise<ProviderHealthResult>
+  saveVoiceIdentity: (content: string) => Promise<AshyBootstrapSnapshot['voice']>
+  resetVoiceIdentity: () => Promise<AshyBootstrapSnapshot['voice']>
+  createSession: (title?: string) => Promise<ChatSessionRecord>
+  selectSession: (sessionId: string) => Promise<void>
+  abortActiveTurn: () => Promise<void>
+  seedDemoFixtures: () => Promise<AshyBootstrapSnapshot>
+
+  // Navigation & Stage Actions
   setViewMode: (mode: DesktopViewMode) => void
   setActiveTab: (tab: HubTabId) => void
   setActiveModelId: (modelId: SupportedModelId) => void
@@ -262,304 +328,7 @@ export interface AshyDesktopState {
   resetStoreForTesting: () => void
 }
 
-const SEED_BASE_TIME = Date.UTC(2026, 9, 28, 3, 14, 0)
-
-export const INITIAL_MEMORY_CARDS: ReadonlyArray<FeaturedMemoryCard> = [
-  {
-    id: 'ep-padre-npm-origin',
-    title: 'O fantasma no backend',
-    summary:
-      'Aquele bug no npm que só aparecia no seu computador e sumia do nada. Virou nosso fantasma no backend. 👻',
-    fullStory:
-      'Aquele bug no npm que só aparecia no seu computador e sumia do nada.\n\nA gente tentou de tudo, limpou cache, reinstalou, revisou as dependências, e ele continuava lá.\n\nVirou nosso fantasma no backend. 👻',
-    dateLabel: '12 de outubro',
-    originLabel: 'Conversa de 12 de outubro',
-    filterCategory: 'referencias',
-    image: '/assets/mem-ghost-backend.jpg',
-    featured: true,
-    episodeId: 'ep-padre-npm-origin',
-  },
-  {
-    id: 'ep-orin-ashy',
-    title: 'Orin e Ashy',
-    summary: 'Dois projetos do Carlos, cada um com sua própria identidade.',
-    fullStory:
-      'Dois projetos do Carlos, cada um com sua própria identidade.\n\nEnquanto o Orin foca em precisão analítica e fluxo operacional, a Ashy nasceu para ser companhia viva no desktop — com memória afetiva, humor próprio e presença constante.',
-    dateLabel: '5 de outubro',
-    originLabel: 'Conversa de 5 de outubro',
-    filterCategory: 'sobre_voce',
-    image: '/assets/mem-orin-ashy.jpg',
-    featured: true,
-    episodeId: 'ep-padre-npm-origin',
-  },
-  {
-    id: 'ep-matrix3d-trauma',
-    title: 'Seu jeito de trabalhar',
-    summary: 'Prefere entender o porquê enquanto constrói.',
-    fullStory:
-      'Prefere entender o porquê enquanto constrói.\n\nAntes de aceitar qualquer abstração pronta, você sempre abre a arquitetura, testa as bordas e garante que cada peça faça sentido de ponta a ponta.',
-    dateLabel: '3 de outubro',
-    originLabel: 'Conversa de 3 de outubro',
-    filterCategory: 'sobre_voce',
-    image: '/assets/mem-work-style.jpg',
-    featured: false,
-    episodeId: 'ep-matrix3d-trauma',
-  },
-  {
-    id: 'ep-flashbulb-0314',
-    title: 'Primeira conversa',
-    summary:
-      'Nossa primeira conversa. Ainda me lembro da sua curiosidade e das ideias que você trouxe.',
-    fullStory:
-      'Nossa primeira conversa. Ainda me lembro da sua curiosidade e das ideias que você trouxe naquela primeira madrugada desenhando como eu deveria existir no seu computador.',
-    dateLabel: '1 de outubro',
-    originLabel: 'Conversa de 1 de outubro',
-    filterCategory: 'momentos',
-    image: '/assets/mem-first-chat.jpg',
-    featured: false,
-    episodeId: 'ep-flashbulb-0314',
-  },
-  {
-    id: 'ep-prototype-plan',
-    title: 'Retomar o protótipo',
-    summary: 'Voltar para o protótipo do ashy e continuar refinando a experiência de voz.',
-    fullStory:
-      'Voltar para o protótipo do ashy e continuar refinando a experiência de voz:\n• Voz mais natural\n• Refinar fluxo de interrupção (barge-in)\n• Testar novos recursos de presença\n• Continuar protótipo local',
-    dateLabel: '28 de setembro',
-    originLabel: 'Plano de 28 de setembro',
-    filterCategory: 'planos',
-    badge: 'Plano',
-    image: '/assets/mem-prototype-plan.jpg',
-    featured: false,
-    episodeId: 'ep-flashbulb-0314',
-  },
-]
-
-function createSeededRuntime() {
-  const cortex = createAshyCortex({ forceMemoryFallback: true })
-
-  // 1. Seed Milestones (Our Story)
-  cortex.db.upsertMilestone({
-    id: 'milestone-first-meeting',
-    title: 'First Boot & Late-Night Architecture Session',
-    narrative:
-      'Primeira inicialização da Ashy no desktop. Definimos a arquitetura de 6 pacotes e prometemos zero clichês corporativos.',
-    category: 'first_meeting',
-    episodeId: 'ep-padre-npm-origin',
-    roomTrophyId: 'trophy-first-boot-mug',
-    createdAt: SEED_BASE_TIME - 7 * 86_400_000,
-  })
-
-  cortex.db.upsertMilestone({
-    id: 'milestone-inside-joke-padre',
-    title: "Born Inside Joke: 'Chamar um padre no npm'",
-    narrative:
-      'Depois de 2 horas caçando uma race condition fantasma sem logs, nasceu a piada oficial de rodar npx exorcist no npm.',
-    category: 'inside_joke_born',
-    episodeId: 'ep-padre-npm-origin',
-    roomTrophyId: 'trophy-padre-npm-relic',
-    createdAt: SEED_BASE_TIME - 4 * 86_400_000,
-  })
-
-  cortex.db.upsertMilestone({
-    id: 'milestone-flashbulb-deploy',
-    title: 'Saved Production Database at 03:14 AM',
-    narrative:
-      'Interceptamos um script de limpeza destrutivo antes de atingir o banco principal às 03:14 da manhã.',
-    category: 'flashbulb_moment',
-    episodeId: 'ep-flashbulb-0314',
-    roomTrophyId: 'trophy-prod-shield',
-    createdAt: SEED_BASE_TIME,
-  })
-
-  // 2. Seed Episodic Memories (FSRS-6 + Flashbulb)
-  cortex.db.upsertEpisodicMemory({
-    id: 'ep-flashbulb-0314',
-    title: 'Saved Production Database at 03:14 AM',
-    summary: 'Bloqueamos um rm -rf acidental e salvamos o cluster SQLite às 03:14 AM.',
-    content:
-      'Momento de alta adrenalina na madrugada: o Blast-Radius Guard segurou o comando destrutivo a tempo.',
-    createdAt: SEED_BASE_TIME - 10 * 86_400_000,
-    lastReviewedAt: SEED_BASE_TIME - 8 * 86_400_000,
-    stability: 14.5,
-    difficulty: 3.2,
-    surprise: 0.96,
-    isFlashbulb: true,
-    tags: ['flashbulb', 'production', 'security'],
-    embedding: [0.92, 0.18, 0.08, 0.02],
-  })
-
-  cortex.db.upsertEpisodicMemory({
-    id: 'ep-padre-npm-origin',
-    title: 'O Exorcismo do Backend (Padre no NPM)',
-    summary: 'Caçamos um bug fantasma na fila de eventos e sugerimos chamar um padre no npm.',
-    content:
-      'Silêncio total nos logs do worker; descobrimos que era um listener órfão e criamos a piada do padre no npm.',
-    createdAt: SEED_BASE_TIME - 5 * 86_400_000,
-    lastReviewedAt: SEED_BASE_TIME - 2 * 86_400_000,
-    stability: 6.4,
-    difficulty: 4.1,
-    surprise: 0.78,
-    isFlashbulb: false,
-    tags: ['debug', 'inside_joke', 'backend'],
-    embedding: [0.75, 0.55, 0.12, 0.04],
-  })
-
-  cortex.db.upsertEpisodicMemory({
-    id: 'ep-matrix3d-trauma',
-    title: 'Migração do Chroma Key para Quad-Fitter',
-    summary: 'Aposentamos o CSS matrix3d em favor de interseção de 4 retas de borda em Python.',
-    content:
-      'Prometemos que nunca mais usaríamos CSS matrix3d para tela verde em movimento.',
-    createdAt: SEED_BASE_TIME - 3 * 86_400_000,
-    lastReviewedAt: SEED_BASE_TIME - 1 * 86_400_000,
-    stability: 4.2,
-    difficulty: 4.8,
-    surprise: 0.65,
-    isFlashbulb: false,
-    tags: ['video', 'architecture', 'chroma_key'],
-    embedding: [0.35, 0.82, 0.24, 0.1],
-  })
-
-  // 3. Seed Semantic Facts (Active + Invalidated Bi-Temporal History)
-  cortex.db.upsertSemanticFact({
-    id: 'fact-favorite-stack',
-    category: 'preference',
-    subject: 'User',
-    predicate: 'favorite_stack_is',
-    object: 'TypeScript + SQLite + React 19',
-    confidence: 0.98,
-    sourceEpisodeIds: ['ep-padre-npm-origin'],
-    validFrom: SEED_BASE_TIME - 7 * 86_400_000,
-    invalidAt: null,
-  })
-
-  cortex.db.upsertSemanticFact({
-    id: 'fact-anti-slop-rule',
-    category: 'guideline',
-    subject: 'User',
-    predicate: 'hates_cliches',
-    object: "corporate AI clichés ('Com certeza!', 'Como uma IA')",
-    confidence: 0.99,
-    sourceEpisodeIds: ['ep-padre-npm-origin'],
-    validFrom: SEED_BASE_TIME - 7 * 86_400_000,
-    invalidAt: null,
-  })
-
-  cortex.db.upsertSemanticFact({
-    id: 'fact-old-orm',
-    category: 'preference',
-    subject: 'User',
-    predicate: 'prefers_storage',
-    object: 'Heavy C++ Native Addons with Node-Gyp',
-    confidence: 0.72,
-    sourceEpisodeIds: ['ep-padre-npm-origin'],
-    validFrom: SEED_BASE_TIME - 14 * 86_400_000,
-    invalidAt: SEED_BASE_TIME - 6 * 86_400_000,
-  })
-
-  cortex.db.upsertSemanticFact({
-    id: 'fact-new-sqlite',
-    category: 'preference',
-    subject: 'User',
-    predicate: 'prefers_storage',
-    object: 'Native node:sqlite DatabaseSync + FTS5 Zero-Gyp',
-    confidence: 0.97,
-    sourceEpisodeIds: ['ep-flashbulb-0314'],
-    validFrom: SEED_BASE_TIME - 6 * 86_400_000,
-    invalidAt: null,
-  })
-
-  // 4. Seed Relational Motifs (Inside-Joke Engine)
-  cortex.db.upsertRelationalMotif({
-    id: 'motif-padre-npm',
-    motif: 'chamar um padre no npm',
-    originSummary: 'Surgiu às 02:40 AM quando o worker travou sem emitir uma única linha de log.',
-    originEpisodeId: 'ep-padre-npm-origin',
-    triggerCues: [
-      'padre',
-      'npm',
-      'fantasma',
-      'backend',
-      'bug',
-      'log',
-      'logs',
-      'exorcizar',
-      'piada',
-      'provocacao',
-      'servidor',
-    ],
-    stage: 'inside_joke',
-    timesUsed: 3,
-    lastUsedAt: null,
-    cooldownHours: 24,
-    createdAt: SEED_BASE_TIME - 4 * 86_400_000,
-  })
-
-  cortex.db.upsertRelationalMotif({
-    id: 'motif-crime-perfeito',
-    motif: 'crime perfeito nos logs',
-    originSummary: 'Quando um serviço falha silenciosamente com status 200 OK.',
-    originEpisodeId: 'ep-padre-npm-origin',
-    triggerCues: ['crime', 'perfeito', 'silencio', '200 ok', 'misterio'],
-    stage: 'legendary',
-    timesUsed: 6,
-    lastUsedAt: null,
-    cooldownHours: 48,
-    createdAt: SEED_BASE_TIME - 6 * 86_400_000,
-  })
-
-  cortex.db.upsertRelationalMotif({
-    id: 'motif-matrix3d',
-    motif: 'Matrix3D Nunca Mais',
-    originSummary: 'Promessa solene após migrar o tracking de tela verde para quad_fitter.py.',
-    originEpisodeId: 'ep-matrix3d-trauma',
-    triggerCues: ['matrix3d', 'chroma', 'tela verde', 'green screen'],
-    stage: 'seed',
-    timesUsed: 1,
-    lastUsedAt: null,
-    cooldownHours: 24,
-    createdAt: SEED_BASE_TIME - 3 * 86_400_000,
-  })
-
-  // 5. Seed User Habits & Prospective Intents
-  cortex.db.upsertUserHabit({
-    id: 'habit-late-night',
-    patternKey: 'coding_late_night',
-    description: 'Sessões de arquitetura profunda concentradas entre 22h30 e 03h00.',
-    confidence: 0.94,
-    observationCount: 14,
-    updatedAt: SEED_BASE_TIME,
-  })
-
-  cortex.db.upsertUserHabit({
-    id: 'habit-tdd-strict',
-    patternKey: 'tdd_red_green_refactor',
-    description: 'Sempre exige testes falhando (RED) e mentalidade Red-Team antes do código.',
-    confidence: 0.98,
-    observationCount: 22,
-    updatedAt: SEED_BASE_TIME,
-  })
-
-  cortex.db.upsertProspectiveIntent({
-    id: 'intent-hydrate',
-    topic: 'Remind user to hydrate after 2h debugging',
-    contextCue: '2h continuous coding session',
-    dueAt: SEED_BASE_TIME + 7_200_000,
-    status: 'pending',
-    createdAt: SEED_BASE_TIME,
-  })
-
-  cortex.db.upsertProspectiveIntent({
-    id: 'intent-v1-launch',
-    topic: 'Follow up on Ashy V1 launch',
-    contextCue: 'All 7 workspace packages integrated in apps/desktop',
-    dueAt: SEED_BASE_TIME + 86_400_000,
-    status: 'pending',
-    createdAt: SEED_BASE_TIME,
-  })
-
-  // 6. Initialize PrivacyController, ActionGatekeeper, and ProgressiveMcpRegistry
+function createAgencyRuntime() {
   const privacyController = new PrivacyController({
     micMode: 'continuous',
     eyesMode: 'window',
@@ -606,7 +375,7 @@ function createSeededRuntime() {
         },
       },
       handler: (args) => ({
-        observedWindow: String(args.windowTitle ?? 'VS Code — ashy/apps/desktop/src/App.tsx'),
+        observedWindow: String(args.windowTitle ?? 'Ashy Studio Window'),
         timestamp: Date.now(),
       }),
     },
@@ -665,15 +434,38 @@ function createSeededRuntime() {
   ])
 
   return {
-    cortex,
     privacyController,
     gatekeeper,
     mcpRegistry,
   }
 }
 
-let runtime = createSeededRuntime()
-let activeSpeechPipeline: RealtimeSpeechPipeline | null = null
+function createInitialPublicProviders(): AshyBootstrapSnapshot['providers'] {
+  const configs = {} as Record<LlmProviderId, PublicProviderConfig>
+  for (const id of LLM_PROVIDER_IDS) {
+    const def = DEFAULT_PROVIDER_CONFIGS[id]
+    configs[id] = {
+      providerId: id,
+      label: def.label,
+      baseUrl: def.baseUrl,
+      modelId: def.modelId,
+      requiresApiKey: def.requiresApiKey,
+      hasApiKey: false,
+      maskedApiKey: null,
+      lastVerifiedAt: null,
+      lastError: null,
+    }
+  }
+  return {
+    activeProviderId: 'openrouter',
+    configs,
+    hasActiveReadyProvider: false,
+    diagnostics: {
+      status: 'ok',
+      updatedAt: 0,
+    },
+  }
+}
 
 function buildRoomTrophies(milestones: readonly AutobiographicalMilestone[]): RoomTrophy[] {
   const milestoneIds = new Set(milestones.map((m) => m.id))
@@ -735,48 +527,219 @@ function parseAssistantRawOutput(rawReply: string): {
   }
 }
 
-export const useAshyStore = create<AshyDesktopState>((set, get) => {
-  function syncFromCortex(activeModelId?: SupportedModelId) {
-    const modelId = activeModelId ?? get().activeModelId
-    const affective = runtime.cortex.db.getAffectiveState()
-    const milestones = runtime.cortex.db.listMilestones()
-    const episodicMemories = runtime.cortex.db.listEpisodicMemories()
-    const query = get()?.memorySearchQuery ?? ''
-    const rankedMemories = runtime.cortex.db.searchEpisodicMemoriesHybrid(query, undefined, {
-      nowMs: Date.now(),
-      limit: 10,
-    })
-    const semanticFacts = runtime.cortex.db.listSemanticFacts()
-    const relationalMotifs = runtime.cortex.db.listRelationalMotifs()
-    const userHabits = runtime.cortex.db.listUserHabits()
-    const prospectiveIntents = runtime.cortex.db.listProspectiveIntents()
-    const personalityEvolutionLog = runtime.cortex.db.listPersonalityEvolution()
+function rankEpisodesInMemory(
+  episodes: readonly EpisodicMemory[],
+  query: string,
+  nowMs = Date.now(),
+): RankedEpisodicMemory[] {
+  const q = query.trim().toLowerCase()
+  const filtered = q
+    ? episodes.filter(
+        (ep) =>
+          ep.title.toLowerCase().includes(q) ||
+          ep.summary.toLowerCase().includes(q) ||
+          ep.content.toLowerCase().includes(q) ||
+          ep.tags.some((t) => t.toLowerCase().includes(q)),
+      )
+    : [...episodes]
 
-    const lastUserMsg =
-      [...(get()?.chatMessages ?? [])].reverse().find((m) => m.role === 'user')?.content ??
-      'Revisando o status da arquitetura Ashy v1 no desktop.'
+  return rankEpisodicMemories(filtered, {
+    text: query,
+    nowMs,
+    limit: 10,
+  })
+}
 
-    const lastPrompt = runtime.cortex.compileTurnPrompt({
-      userMessage: lastUserMsg,
-      modelId,
-      nowMs: Date.now(),
-      screenContext: 'VS Code — apps/desktop/src/App.tsx',
-    })
+function mapChatRecordsToTurnMessages(
+  records: readonly ChatMessageRecord[],
+  motifs: readonly RelationalMotif[],
+): ChatTurnMessage[] {
+  const result: ChatTurnMessage[] = []
+  for (const rec of records) {
+    if (rec.role !== 'user' && rec.role !== 'assistant') continue
+    let invokedMotifId: string | undefined
+    let jokeCard: ChatJokeCallbackCard | undefined
 
-    return {
-      mood: affective.mood,
-      traits: affective.traits,
-      milestones,
-      episodicMemories,
-      rankedMemories,
-      semanticFacts,
-      relationalMotifs,
-      userHabits,
-      prospectiveIntents,
-      personalityEvolutionLog,
-      lastPrompt,
-      roomTrophies: buildRoomTrophies(milestones),
+    if (rec.role === 'assistant' && rec.markersJson) {
+      try {
+        const parsedMarkers = JSON.parse(rec.markersJson) as Array<{
+          type?: string
+          motifId?: string
+        }>
+        if (Array.isArray(parsedMarkers)) {
+          const cb = parsedMarkers.find((m) => m.type === 'callback' && typeof m.motifId === 'string')
+          if (cb?.motifId) {
+            invokedMotifId = cb.motifId
+            const matchedMotif = motifs.find((j) => j.id === cb.motifId)
+            if (matchedMotif) {
+              jokeCard = {
+                title: 'Uma piada nossa',
+                description: matchedMotif.originSummary,
+                motifId: matchedMotif.id,
+                memoryId: matchedMotif.originEpisodeId ?? '',
+              }
+            }
+          }
+        }
+      } catch {
+        // Ignore malformed markersJson
+      }
     }
+
+    result.push({
+      id: rec.id,
+      role: rec.role,
+      content: rec.content,
+      rawContent: rec.rawContent,
+      emotion: rec.emotion,
+      modelId: rec.modelId ?? undefined,
+      invokedMotifId,
+      timeLabel: formatLocalTimeHHMM(rec.createdAt),
+      jokeCard,
+      timestamp: rec.createdAt,
+    })
+  }
+  return result
+}
+
+function mapEpisodesToMemoryCards(
+  episodes: readonly EpisodicMemory[],
+  existingCards: readonly FeaturedMemoryCard[],
+): FeaturedMemoryCard[] {
+  const hasDemoSeed =
+    DEMO_MEMORY_CARDS.length > 0 &&
+    episodes.some((ep) => ep.id === DEMO_MEMORY_CARDS[0]?.id)
+
+  const baseCards: FeaturedMemoryCard[] = hasDemoSeed
+    ? DEMO_MEMORY_CARDS.map((card) => {
+        const edited = existingCards.find((c) => c.id === card.id)
+        return edited ? { ...edited } : { ...card }
+      })
+    : []
+
+  const seenEpisodeIds = new Set<string>()
+  const seenCardIds = new Set<string>()
+  for (const card of baseCards) {
+    seenCardIds.add(card.id)
+    if (card.episodeId) seenEpisodeIds.add(card.episodeId)
+  }
+
+  const dynamicCards: FeaturedMemoryCard[] = []
+  for (const ep of episodes) {
+    if (seenCardIds.has(ep.id) || seenEpisodeIds.has(ep.id)) continue
+    const existing = existingCards.find((c) => c.id === ep.id)
+    if (existing) {
+      dynamicCards.push(existing)
+      continue
+    }
+    const categoryTag = ep.tags.find(
+      (t): t is Exclude<MemoryFilterCategory, 'todas'> =>
+        t === 'momentos' || t === 'sobre_voce' || t === 'referencias' || t === 'planos',
+    )
+    dynamicCards.push({
+      id: ep.id,
+      title: ep.title,
+      summary: ep.summary,
+      fullStory: ep.content,
+      dateLabel: formatLocalTimeHHMM(ep.createdAt),
+      originLabel: 'Conversa registrada',
+      filterCategory: categoryTag ?? 'momentos',
+      image: '/assets/mem-first-chat.jpg',
+      featured: ep.isFlashbulb,
+      episodeId: ep.id,
+    })
+  }
+
+  return [...dynamicCards, ...baseCards]
+}
+
+function getInProcessKernelCortex(): AshyCortex | null {
+  try {
+    const bridge = getAshyHostBridge() as unknown as { cortex?: AshyCortex }
+    if (bridge && bridge.cortex && bridge.cortex.db) {
+      return bridge.cortex
+    }
+  } catch {
+    // Ignore when bridge does not expose in-process cortex
+  }
+  return null
+}
+
+let agency = createAgencyRuntime()
+let activeSpeechPipeline: RealtimeSpeechPipeline | null = null
+let subscribedBridge: AshyHostBridge | null = null
+let unsubscribeHostEvents: (() => void) | null = null
+let lastPromptMinuteLabel = formatLocalTimeHHMM(Date.now())
+
+const completedTurnEvents = new Map<string, AshyHostStreamEvent>()
+const pendingTurnResolvers = new Map<string, () => void>()
+const pendingTurnSeriousness = new Map<string, boolean>()
+
+export const useAshyStore = create<AshyDesktopState>((set, get) => {
+  function compilePromptFromState(params?: {
+    userMessage?: string
+    modelId?: string
+    stage?: RelationshipStage
+    voiceIdentityMarkdown?: string
+    userName?: string | null
+    userPronouns?: string | null
+    semanticFacts?: readonly SemanticFact[]
+    traits?: PersonalityTraits
+    mood?: MoodVector
+    rankedMemories?: readonly RankedEpisodicMemory[]
+    relationalMotifs?: readonly RelationalMotif[]
+    chatMessages?: readonly ChatTurnMessage[]
+  }): ComposedTurnPrompt {
+    const current = get()
+    const userMessage =
+      params?.userMessage ??
+      [...(params?.chatMessages ?? current?.chatMessages ?? [])]
+        .reverse()
+        .find((m) => m.role === 'user')?.content ??
+      'Olá Ashy.'
+
+    const modelId = params?.modelId ?? current?.activeModelId ?? 'claude-3-7-sonnet'
+    const seriousness = evaluateSeriousnessGate(userMessage)
+    const baseMood = params?.mood ?? current?.mood ?? ASHY_BASELINE_MOOD
+    const effectiveMood: MoodVector = seriousness.isSeriousOrDelicate
+      ? {
+          ...baseMood,
+          playfulness: Math.min(baseMood.playfulness, seriousness.maxPlayfulnessAllowed),
+        }
+      : baseMood
+
+    const motifs = params?.relationalMotifs ?? current?.relationalMotifs ?? []
+    const eligibleMotifs = selectEligibleMotifs(motifs, userMessage, Date.now(), {
+      isSeriousContext: seriousness.isSeriousOrDelicate,
+    })
+
+    const facts = (params?.semanticFacts ?? current?.semanticFacts ?? []).filter(
+      (f) => f.invalidAt === null || f.invalidAt === undefined,
+    )
+
+    return composeAshyTurnPrompt({
+      userMessage,
+      modelId,
+      timeOfDayLabel: lastPromptMinuteLabel,
+      stage: params?.stage ?? current?.relationshipStage ?? 'stranger',
+      voiceIdentityMarkdown:
+        params?.voiceIdentityMarkdown ?? current?.voiceIdentity?.content ?? DEFAULT_ASHY_VOICE_MD,
+      userName: params?.userName !== undefined ? params.userName : (current?.userProfile?.userName ?? null),
+      userPronouns:
+        params?.userPronouns !== undefined
+          ? params.userPronouns
+          : (current?.userProfile?.userPronouns ?? null),
+      semanticFacts: facts,
+      traits: params?.traits ?? current?.traits ?? ASHY_DEFAULT_TRAITS,
+      mood: effectiveMood,
+      seriousness,
+      retrievedMemories: (params?.rankedMemories ?? current?.rankedMemories ?? []).slice(0, 4),
+      eligibleMotifs,
+      conversationHistory: (params?.chatMessages ?? current?.chatMessages ?? []).map((m) => ({
+        role: m.role,
+        content: m.content,
+      })),
+    })
   }
 
   function createPipelineForTurn(): RealtimeSpeechPipeline {
@@ -802,45 +765,272 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     return pipeline
   }
 
-  const initialAffective = runtime.cortex.db.getAffectiveState()
-  const initialMilestones = runtime.cortex.db.listMilestones()
-  const initialMemories = runtime.cortex.db.listEpisodicMemories()
-  const initialRanked = runtime.cortex.db.searchEpisodicMemoriesHybrid('', undefined, {
-    nowMs: SEED_BASE_TIME,
-    limit: 10,
-  })
-  const initialPrompt = runtime.cortex.compileTurnPrompt({
-    userMessage: 'Pronta para mais uma sessão de arquitetura, Ashy?',
-    modelId: 'claude-3-7-sonnet',
-    nowMs: SEED_BASE_TIME,
-    screenContext: 'VS Code — apps/desktop/src/App.tsx',
-  })
+  function handleHostStreamEvent(event: AshyHostStreamEvent): void {
+    const assistantMsgId = `msg-assistant-${event.turnId}`
 
-  const initialChat: ChatTurnMessage[] = [
-    {
-      id: 'msg-seed-1',
-      role: 'user',
-      content: 'Lembra do fantasma no backend?',
-      timeLabel: '21:14',
-      timestamp: SEED_BASE_TIME - 60_000,
-    },
-    {
-      id: 'msg-seed-2',
-      role: 'assistant',
-      content: 'Outro bug? Eu já estava procurando um exorcista no npm. 😉',
-      emotion: 'smug',
-      modelId: 'claude-3-7-sonnet',
-      invokedMotifId: 'motif-padre-npm',
-      timeLabel: '21:14',
-      jokeCard: {
-        title: 'Uma piada nossa',
-        description: 'Você e eu sempre brincamos com os "fantasmas" que aparecem no backend.',
-        motifId: 'motif-padre-npm',
-        memoryId: 'ep-padre-npm-origin',
-      },
-      timestamp: SEED_BASE_TIME - 55_000,
-    },
-  ]
+    if (event.type === 'turn:started') {
+      set((state) => {
+        const hasAssistantMsg = state.chatMessages.some((m) => m.id === assistantMsgId)
+        return {
+          isStreamingTurn: true,
+          activeTurnId: event.turnId,
+          lastTurnError: null,
+          presenceStatus: 'Thinking',
+          chatMessages: hasAssistantMsg
+            ? state.chatMessages
+            : [
+                ...state.chatMessages,
+                {
+                  id: assistantMsgId,
+                  role: 'assistant',
+                  content: '',
+                  emotion: state.stageEmotion,
+                  modelId: state.activeModelId,
+                  timeLabel: formatLocalTimeHHMM(event.startedAt),
+                  timestamp: event.startedAt,
+                },
+              ],
+        }
+      })
+      return
+    }
+
+    if (event.type === 'turn:delta') {
+      set((state) => {
+        const exists = state.chatMessages.some((m) => m.id === assistantMsgId)
+        const updatedMessages = exists
+          ? state.chatMessages.map((m) =>
+              m.id === assistantMsgId ? { ...m, content: m.content + event.textDelta } : m,
+            )
+          : [
+              ...state.chatMessages,
+              {
+                id: assistantMsgId,
+                role: 'assistant' as const,
+                content: event.textDelta,
+                emotion: state.stageEmotion,
+                modelId: state.activeModelId,
+                timeLabel: formatLocalTimeHHMM(Date.now()),
+                timestamp: Date.now(),
+              },
+            ]
+        const latestContent =
+          updatedMessages.find((m) => m.id === assistantMsgId)?.content ?? event.textDelta
+
+        return {
+          chatMessages: updatedMessages,
+          bubbleText: latestContent,
+          isSpeaking: true,
+          presenceStatus: 'Speaking',
+          simulatedVowels: { A: 0.75, E: 0.4, I: 0.2, O: 0.5, U: 0.15 },
+        }
+      })
+      return
+    }
+
+    if (event.type === 'turn:marker') {
+      const marker = event.marker
+      if (marker.type === 'act' && marker.emotion) {
+        const nextEmotion = marker.emotion
+        const nextIntensity = marker.intensity ?? 0.85
+        set((state) => ({
+          stageEmotion: nextEmotion,
+          emotionIntensity: nextIntensity,
+          lastStageSignals: [
+            ...state.lastStageSignals,
+            {
+              type: 'act',
+              emotion: nextEmotion,
+              intensity: nextIntensity,
+              raw: `<|ACT {"emotion":"${nextEmotion}","intensity":${nextIntensity}}|>`,
+            },
+          ],
+          chatMessages: state.chatMessages.map((m) =>
+            m.id === assistantMsgId ? { ...m, emotion: nextEmotion } : m,
+          ),
+        }))
+        return
+      }
+
+      if (marker.type === 'callback') {
+        const matchedMotif = get().relationalMotifs.find((j) => j.id === marker.motifId)
+        const jokeCard: ChatJokeCallbackCard | undefined = matchedMotif
+          ? {
+              title: 'Uma piada nossa',
+              description: matchedMotif.originSummary,
+              motifId: matchedMotif.id,
+              memoryId: matchedMotif.originEpisodeId ?? '',
+            }
+          : undefined
+
+        set((state) => ({
+          lastStageSignals: [
+            ...state.lastStageSignals,
+            {
+              type: 'callback',
+              motifId: marker.motifId,
+              raw: `<|CALLBACK motif="${marker.motifId}"|>`,
+            },
+          ],
+          chatMessages: state.chatMessages.map((m) =>
+            m.id === assistantMsgId
+              ? {
+                  ...m,
+                  invokedMotifId: marker.motifId,
+                  ...(jokeCard ? { jokeCard } : {}),
+                }
+              : m,
+          ),
+        }))
+        return
+      }
+
+      if (marker.type === 'delay') {
+        set((state) => ({
+          lastStageSignals: [
+            ...state.lastStageSignals,
+            {
+              type: 'delay',
+              seconds: marker.seconds,
+              raw: `<|DELAY ${marker.seconds}|>`,
+            },
+          ],
+        }))
+      }
+      return
+    }
+
+    if (event.type === 'turn:keepalive') {
+      set({
+        presenceStatus: 'Thinking',
+      })
+      return
+    }
+
+    if (event.type === 'turn:completed') {
+      void (async () => {
+        const parsed = parseAssistantRawOutput(
+          event.assistantMessage.rawContent || event.assistantMessage.content,
+        )
+        const pipeline = createPipelineForTurn()
+        pipeline.enqueue(
+          parsed.textWithSentinels || event.assistantMessage.content,
+          parsed.signals,
+        )
+        await Promise.resolve()
+        await Promise.resolve()
+
+        const scheduledChunks = [...pipeline.getScheduledChunks()]
+        const wasSerious = pendingTurnSeriousness.get(event.turnId) === true
+        pendingTurnSeriousness.delete(event.turnId)
+
+        get().applyBootstrapSnapshot(event.snapshot)
+
+        const targetEmotion: AshyEmotion = wasSerious
+          ? 'concerned'
+          : event.assistantMessage.emotion
+
+        set((state) => ({
+          isStreamingTurn: false,
+          activeTurnId: null,
+          persistenceWarning: event.persistenceWarning,
+          stageEmotion: targetEmotion,
+          mood: wasSerious
+            ? {
+                ...state.mood,
+                playfulness: Math.min(0.12, state.mood.playfulness),
+              }
+            : state.mood,
+          bubbleText: event.assistantMessage.content,
+          isSpeaking: true,
+          presenceStatus: 'Speaking',
+          simulatedVowels: { A: 0.75, E: 0.4, I: 0.2, O: 0.5, U: 0.15 },
+          scheduledAudioChunks: scheduledChunks,
+          lastStageSignals: parsed.signals,
+          chatMessages: state.chatMessages.map((m) =>
+            m.id === event.assistantMessage.id
+              ? {
+                  ...m,
+                  emotion: targetEmotion,
+                  seriousnessTriggered: wasSerious,
+                }
+              : m,
+          ),
+        }))
+
+        completedTurnEvents.set(event.turnId, event)
+        const resolver = pendingTurnResolvers.get(event.turnId)
+        if (resolver) {
+          pendingTurnResolvers.delete(event.turnId)
+          resolver()
+        }
+      })()
+      return
+    }
+
+    if (event.type === 'turn:aborted') {
+      pendingTurnSeriousness.delete(event.turnId)
+      set({
+        isStreamingTurn: false,
+        activeTurnId: null,
+        isSpeaking: false,
+        presenceStatus: 'Idle',
+        simulatedVowels: { A: 0, E: 0, I: 0, O: 0, U: 0 },
+      })
+      completedTurnEvents.set(event.turnId, event)
+      const resolver = pendingTurnResolvers.get(event.turnId)
+      if (resolver) {
+        pendingTurnResolvers.delete(event.turnId)
+        resolver()
+      }
+      return
+    }
+
+    if (event.type === 'turn:error') {
+      pendingTurnSeriousness.delete(event.turnId)
+      set((state) => ({
+        isStreamingTurn: false,
+        activeTurnId: null,
+        isSpeaking: false,
+        presenceStatus: 'Idle',
+        simulatedVowels: { A: 0, E: 0, I: 0, O: 0, U: 0 },
+        lastTurnError: {
+          code: event.code,
+          message: event.message,
+          recoverable: event.recoverable,
+        },
+        chatMessages: state.chatMessages.filter(
+          (m) => !(m.id === assistantMsgId && m.content.trim().length === 0),
+        ),
+      }))
+      completedTurnEvents.set(event.turnId, event)
+      const resolver = pendingTurnResolvers.get(event.turnId)
+      if (resolver) {
+        pendingTurnResolvers.delete(event.turnId)
+        resolver()
+      }
+    }
+  }
+
+  function ensureHostSubscription(): AshyHostBridge {
+    const bridge = getAshyHostBridge()
+    if (subscribedBridge !== bridge) {
+      unsubscribeHostEvents?.()
+      subscribedBridge = bridge
+      unsubscribeHostEvents = bridge.onHostEvent(handleHostStreamEvent)
+    }
+    return bridge
+  }
+
+  const initialPrompt = composeAshyTurnPrompt({
+    userMessage: 'Olá Ashy.',
+    modelId: 'claude-3-7-sonnet',
+    timeOfDayLabel: lastPromptMinuteLabel,
+    stage: 'stranger',
+    voiceIdentityMarkdown: DEFAULT_ASHY_VOICE_MD,
+    traits: ASHY_DEFAULT_TRAITS,
+    mood: ASHY_BASELINE_MOOD,
+  })
 
   return {
     viewMode:
@@ -850,8 +1040,39 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     activeTab: 'studio',
     activeModelId: 'claude-3-7-sonnet',
 
+    isBootstrapped: false,
+    needsOnboarding: true,
+    userProfile: {
+      userName: null,
+      userPronouns: null,
+    },
+    relationshipStage: 'stranger',
+    familiarityScore: 0,
+    trustScore: 0.1,
+    totalTurns: 0,
+    activeSessionId: 'session-initial',
+    sessions: [],
+    providers: createInitialPublicProviders(),
+    voiceIdentity: {
+      content: DEFAULT_ASHY_VOICE_MD,
+      diagnostics: {
+        status: 'ok',
+        updatedAt: 0,
+      },
+      updatedAt: 0,
+    },
+    runtimeDiagnostics: {
+      dbMode: 'wal',
+      dbPath: '',
+      lastPersistenceWarning: null,
+    },
+    isStreamingTurn: false,
+    activeTurnId: null,
+    lastTurnError: null,
+    persistenceWarning: null,
+
     stageMode: 'tachie',
-    stageEmotion: 'smug',
+    stageEmotion: 'neutral',
     emotionIntensity: 0.85,
     ambientLuminance: 0.35,
     isSpeaking: false,
@@ -859,24 +1080,24 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     bubbleText: 'Fico por aqui. No seu ritmo. ♡',
     simulatedVowels: { A: 0.65, E: 0.25, I: 0.1, O: 0.35, U: 0.15 },
 
-    mood: initialAffective.mood,
-    traits: initialAffective.traits,
-    milestones: initialMilestones,
-    episodicMemories: initialMemories,
-    rankedMemories: initialRanked,
-    memoryCards: [...INITIAL_MEMORY_CARDS],
-    selectedMemoryId: 'ep-padre-npm-origin',
+    mood: { ...ASHY_BASELINE_MOOD },
+    traits: { ...ASHY_DEFAULT_TRAITS },
+    milestones: [],
+    episodicMemories: [],
+    rankedMemories: [],
+    memoryCards: [],
+    selectedMemoryId: '',
     memoryFilter: 'todas',
     memorySearchQuery: '',
-    semanticFacts: runtime.cortex.db.listSemanticFacts(),
-    relationalMotifs: runtime.cortex.db.listRelationalMotifs(),
-    userHabits: runtime.cortex.db.listUserHabits(),
-    prospectiveIntents: runtime.cortex.db.listProspectiveIntents(),
-    personalityEvolutionLog: runtime.cortex.db.listPersonalityEvolution(),
+    semanticFacts: [],
+    relationalMotifs: [],
+    userHabits: [],
+    prospectiveIntents: [],
+    personalityEvolutionLog: [],
     lastPrompt: initialPrompt,
-    roomTrophies: buildRoomTrophies(initialMilestones),
+    roomTrophies: buildRoomTrophies([]),
 
-    chatMessages: initialChat,
+    chatMessages: [],
     scheduledAudioChunks: [],
     lastPlaybackReceipt: null,
     lastStageSignals: [],
@@ -887,14 +1108,186 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     computerActionsPolicy: 'ask',
     quietHoursRange: '22:00 — 08:00',
     preferencesSavedToast: false,
-    privacyState: runtime.privacyController.getState(),
+    privacyState: agency.privacyController.getState(),
     mcpSearchQuery: '',
-    mcpSearchResults: runtime.mcpRegistry.search_mcp_tools({ query: '', limit: 10 }),
-    exposedMetaToolsCount: runtime.mcpRegistry.getExposedMetaTools().length,
-    registeredMcpToolsCount: runtime.mcpRegistry.getRegisteredToolsCount(),
-    pendingActions: runtime.gatekeeper.getPendingActions(),
-    auditLog: [...runtime.gatekeeper.getAuditLog()],
+    mcpSearchResults: agency.mcpRegistry.search_mcp_tools({ query: '', limit: 10 }),
+    exposedMetaToolsCount: agency.mcpRegistry.getExposedMetaTools().length,
+    registeredMcpToolsCount: agency.mcpRegistry.getRegisteredToolsCount(),
+    pendingActions: agency.gatekeeper.getPendingActions(),
+    auditLog: [...agency.gatekeeper.getAuditLog()],
     lastMcpResultSummary: null,
+
+    async bootstrapFromHost() {
+      const bridge = ensureHostSubscription()
+      const snapshot = await bridge.getBootstrapSnapshot()
+      get().applyBootstrapSnapshot(snapshot)
+      return snapshot
+    },
+
+    applyBootstrapSnapshot(snapshot) {
+      const current = get()
+      const ranked = rankEpisodesInMemory(
+        snapshot.memories.episodes,
+        current.memorySearchQuery,
+      )
+      const mappedMessages = mapChatRecordsToTurnMessages(
+        snapshot.messages,
+        snapshot.memories.jokes,
+      )
+      const mappedCards = mapEpisodesToMemoryCards(
+        snapshot.memories.episodes,
+        current.memoryCards,
+      )
+      const nextSelectedMemoryId =
+        mappedCards.some((c) => c.id === current.selectedMemoryId) && current.selectedMemoryId
+          ? current.selectedMemoryId
+          : (mappedCards[0]?.id ?? '')
+
+      const kernelCortex = getInProcessKernelCortex()
+      const userHabits = kernelCortex
+        ? kernelCortex.db.listUserHabits()
+        : current.userHabits
+      const prospectiveIntents = kernelCortex
+        ? kernelCortex.db.listProspectiveIntents()
+        : current.prospectiveIntents
+      const personalityEvolutionLog = kernelCortex
+        ? kernelCortex.db.listPersonalityEvolution()
+        : current.personalityEvolutionLog
+
+      const nextPrompt = compilePromptFromState({
+        modelId: current.activeModelId,
+        stage: snapshot.relationship.stage,
+        voiceIdentityMarkdown: snapshot.voice.content,
+        userName: snapshot.userProfile.userName,
+        userPronouns: snapshot.userProfile.userPronouns,
+        semanticFacts: snapshot.memories.facts,
+        traits: snapshot.affect.traits,
+        mood: snapshot.affect.mood,
+        rankedMemories: ranked,
+        relationalMotifs: snapshot.memories.jokes,
+        chatMessages: mappedMessages,
+      })
+
+      set({
+        isBootstrapped: true,
+        needsOnboarding: snapshot.needsOnboarding,
+        userProfile: snapshot.userProfile,
+        relationshipStage: snapshot.relationship.stage,
+        familiarityScore: snapshot.relationship.familiarityScore,
+        trustScore: snapshot.relationship.trustScore,
+        totalTurns: snapshot.relationship.totalTurns,
+        activeSessionId: snapshot.activeSession.id,
+        sessions: snapshot.sessions,
+        providers: snapshot.providers,
+        voiceIdentity: snapshot.voice,
+        runtimeDiagnostics: snapshot.runtimeDiagnostics,
+        persistenceWarning: snapshot.runtimeDiagnostics.lastPersistenceWarning,
+        mood: snapshot.affect.mood,
+        traits: snapshot.affect.traits,
+        stageEmotion: snapshot.affect.dominantEmotion,
+        milestones: snapshot.relationship.milestones,
+        episodicMemories: snapshot.memories.episodes,
+        rankedMemories: ranked,
+        memoryCards: mappedCards,
+        selectedMemoryId: nextSelectedMemoryId,
+        semanticFacts: snapshot.memories.facts,
+        relationalMotifs: snapshot.memories.jokes,
+        userHabits,
+        prospectiveIntents,
+        personalityEvolutionLog,
+        chatMessages: mappedMessages,
+        lastPrompt: nextPrompt,
+        roomTrophies: buildRoomTrophies(snapshot.relationship.milestones),
+      })
+    },
+
+    async completeOnboarding(input) {
+      const bridge = ensureHostSubscription()
+      const snapshot = await bridge.completeOnboarding(input)
+      get().applyBootstrapSnapshot(snapshot)
+      return snapshot
+    },
+
+    async saveProviderConfig(input) {
+      const bridge = ensureHostSubscription()
+      const result = await bridge.saveProviderConfig(input)
+      set({ providers: result.providers })
+      return result
+    },
+
+    async setActiveProvider(providerId) {
+      const bridge = ensureHostSubscription()
+      const providers = await bridge.setActiveProvider(providerId)
+      set({ providers })
+      return providers
+    },
+
+    async testProviderConnection(input) {
+      const bridge = ensureHostSubscription()
+      const result = await bridge.testProviderConnection(input)
+      try {
+        const snapshot = await bridge.getBootstrapSnapshot()
+        set({ providers: snapshot.providers })
+      } catch {
+        // Ignore snapshot refresh failure during probe
+      }
+      return result
+    },
+
+    async saveVoiceIdentity(content) {
+      const bridge = ensureHostSubscription()
+      const voice = await bridge.saveVoiceIdentity(content)
+      set((state) => ({
+        voiceIdentity: voice,
+        lastPrompt: compilePromptFromState({
+          voiceIdentityMarkdown: voice.content,
+          modelId: state.activeModelId,
+        }),
+      }))
+      return voice
+    },
+
+    async resetVoiceIdentity() {
+      const bridge = ensureHostSubscription()
+      const voice = await bridge.resetVoiceIdentity()
+      set((state) => ({
+        voiceIdentity: voice,
+        lastPrompt: compilePromptFromState({
+          voiceIdentityMarkdown: voice.content,
+          modelId: state.activeModelId,
+        }),
+      }))
+      return voice
+    },
+
+    async createSession(title) {
+      const bridge = ensureHostSubscription()
+      const session = await bridge.createSession(title)
+      const snapshot = await bridge.getBootstrapSnapshot()
+      get().applyBootstrapSnapshot(snapshot)
+      return session
+    },
+
+    async selectSession(sessionId) {
+      const bridge = ensureHostSubscription()
+      await bridge.selectSession(sessionId)
+      const snapshot = await bridge.getBootstrapSnapshot()
+      get().applyBootstrapSnapshot(snapshot)
+    },
+
+    async abortActiveTurn() {
+      const turnId = get().activeTurnId
+      if (!turnId) return
+      const bridge = ensureHostSubscription()
+      await bridge.abortTurn(turnId)
+    },
+
+    async seedDemoFixtures() {
+      const bridge = ensureHostSubscription()
+      const snapshot = await bridge.seedDemoFixtures()
+      get().applyBootstrapSnapshot(snapshot)
+      return snapshot
+    },
 
     setViewMode(mode) {
       set({ viewMode: mode })
@@ -905,17 +1298,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
 
     setActiveModelId(modelId) {
-      const lastUserMsg =
-        [...get().chatMessages].reverse().find((m) => m.role === 'user')?.content ??
-        'Lembra do fantasma no backend?'
-
-      const compiled = runtime.cortex.compileTurnPrompt({
-        userMessage: lastUserMsg,
+      const compiled = compilePromptFromState({
         modelId,
-        nowMs: Date.now(),
-        screenContext: 'VS Code — apps/desktop/src/App.tsx',
       })
-
       set({
         activeModelId: modelId,
         lastPrompt: compiled,
@@ -928,11 +1313,15 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
     setStageEmotion(emotion, intensity = 0.85) {
       if (!ASHY_EMOTIONS.includes(emotion)) return
-      const pulsed = runtime.cortex.recordEmotionPulse(emotion, intensity, Date.now())
+      const nextMood = applyEmotionSignalToMood(get().mood, emotion, intensity)
+      const kernelCortex = getInProcessKernelCortex()
+      if (kernelCortex) {
+        kernelCortex.recordEmotionPulse(emotion, intensity, Date.now())
+      }
       set({
         stageEmotion: emotion,
         emotionIntensity: intensity,
-        mood: pulsed.mood,
+        mood: nextMood,
       })
     },
 
@@ -956,123 +1345,66 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       const trimmed = userMessage.trim()
       if (!trimmed) return
 
-      const nowMs = Date.now()
-      const currentModelId = get().activeModelId
+      const bridge = ensureHostSubscription()
+      const current = get()
       const seriousness = evaluateSeriousnessGate(trimmed)
-
-      const compiledPrompt = runtime.cortex.compileTurnPrompt({
+      const compiledPrompt = compilePromptFromState({
         userMessage: trimmed,
-        modelId: currentModelId,
-        nowMs,
-        screenContext: 'VS Code — apps/desktop/src/App.tsx',
-        conversationHistory: get().chatMessages.map((m) => ({
-          role: m.role,
-          content: m.content,
-        })),
+        modelId: current.activeModelId,
       })
 
-      const userTurn: ChatTurnMessage = {
-        id: `msg-user-${nowMs}`,
-        role: 'user',
-        content: trimmed,
-        timeLabel: '21:15',
-        timestamp: nowMs,
-      }
-
-      let rawAssistantReply = ''
-      let targetEmotion: AshyEmotion = 'smug'
-      let invokedMotifId: string | undefined
-      let jokeCard: ChatJokeCallbackCard | undefined
-
       if (seriousness.isSeriousOrDelicate) {
-        targetEmotion = 'concerned'
-        rawAssistantReply =
-          '<|ACT {"emotion":"concerned","intensity":0.9}|> Ei... respira um segundo. Hoje foi pesado demais mesmo. <|DELAY 0.4|> Larga esse teclado um pouco, eu seguro as pontas por aqui — me conta o que aconteceu se quiser desabafar, ou a gente só fica quieto um instante.'
-
-        const currentState = runtime.cortex.db.getAffectiveState()
         const seriousMood: MoodVector = {
           valence: -0.1,
           arousal: 0.35,
           playfulness: Math.min(0.12, seriousness.maxPlayfulnessAllowed),
         }
-        runtime.cortex.db.saveAffectiveState(seriousMood, currentState.traits, nowMs)
-      } else {
-        // Select eligible motifs not under CooldownLock
-        const allMotifs = runtime.cortex.db.listRelationalMotifs()
-        const eligibleMatches = selectEligibleMotifs(allMotifs, trimmed, nowMs, {
-          isSeriousContext: false,
-          minRelevance: 0.15,
-        })
-
-        // If the message matches an eligible motif (or if padre-npm is ready and playful banter is requested)
-        const chosenMotif =
-          eligibleMatches[0]?.motif ??
-          allMotifs.find(
-            (m) =>
-              m.id === 'motif-padre-npm' &&
-              !inspectMotifCooldownStatus(m, nowMs).isCooldownLocked,
-          )
-
-        if (chosenMotif) {
-          invokedMotifId = chosenMotif.id
-          runtime.cortex.recordJokeCallback(chosenMotif.id, true, nowMs)
-          targetEmotion = 'smug'
-          rawAssistantReply = `<|ACT {"emotion":"smug","intensity":0.88}|> Com certeza! Como uma IA, digo: brincadeira! Silêncio suspeito no sistema nunca me engana. <|DELAY 0.35|> Já preparei o trace completo e se esse estado fantasma piscar de novo, a gente vai precisar ${chosenMotif.motif} (<|CALLBACK ${chosenMotif.id}|>) antes do próximo deploy.`
-          jokeCard = {
-            title: 'Uma piada nossa',
-            description:
-              chosenMotif.id === 'motif-padre-npm'
-                ? 'Você e eu sempre brincamos com os "fantasmas" que aparecem no backend.'
-                : chosenMotif.originSummary,
-            motifId: chosenMotif.id,
-            memoryId: chosenMotif.originEpisodeId ?? 'ep-padre-npm-origin',
-          }
-        } else {
-          targetEmotion = 'tease'
-          rawAssistantReply =
-            '<|ACT {"emotion":"tease","intensity":0.84}|> Essa piada já entrou em Cooldown Lock pra não saturar, mas meu radar de arquitetura continua afiado! <|DELAY 0.3|> Manda o próximo módulo que a gente destrincha em tempo real.'
+        const kernelCortex = getInProcessKernelCortex()
+        if (kernelCortex) {
+          kernelCortex.db.saveAffectiveState(seriousMood, current.traits, Date.now())
         }
-
-        runtime.cortex.recordEmotionPulse(targetEmotion, 0.85, nowMs)
+        set({
+          lastPrompt: compiledPrompt,
+          stageEmotion: 'concerned',
+          mood: seriousMood,
+        })
+      } else {
+        set({
+          lastPrompt: compiledPrompt,
+        })
       }
 
-      const parsed = parseAssistantRawOutput(rawAssistantReply)
-      const pipeline = createPipelineForTurn()
-      pipeline.enqueue(parsed.textWithSentinels, parsed.signals)
-
-      // Allow microtasks from synthesizeFn promises to settle so scheduledAudioChunks are populated immediately
-      await Promise.resolve()
-      await Promise.resolve()
-
-      const scheduledChunks = [...pipeline.getScheduledChunks()]
-      const assistantTurn: ChatTurnMessage = {
-        id: `msg-ashy-${nowMs + 1}`,
-        role: 'assistant',
-        content: parsed.cleanText,
-        rawContent: rawAssistantReply,
-        emotion: targetEmotion,
-        modelId: currentModelId,
-        invokedMotifId,
-        seriousnessTriggered: seriousness.isSeriousOrDelicate,
-        timeLabel: '21:15',
-        jokeCard,
-        timestamp: nowMs + 1,
-      }
-
-      const nextCortexSnapshot = syncFromCortex(currentModelId)
-
-      set({
-        ...nextCortexSnapshot,
-        lastPrompt: compiledPrompt,
-        chatMessages: [...get().chatMessages, userTurn, assistantTurn],
-        stageEmotion: targetEmotion,
-        bubbleText: parsed.cleanText,
-        isSpeaking: true,
-        presenceStatus: 'Speaking',
-        simulatedVowels: { A: 0.75, E: 0.4, I: 0.2, O: 0.5, U: 0.15 },
-        scheduledAudioChunks: scheduledChunks,
-        lastStageSignals: parsed.signals,
+      const { turnId, userMessage: savedUserMsg } = await bridge.sendTurn({
+        sessionId: get().activeSessionId,
+        text: trimmed,
       })
+
+      pendingTurnSeriousness.set(turnId, seriousness.isSeriousOrDelicate)
+
+      set((state) => {
+        const hasUserMsg = state.chatMessages.some((m) => m.id === savedUserMsg.id)
+        if (hasUserMsg) return {}
+        const userTurn: ChatTurnMessage = {
+          id: savedUserMsg.id,
+          role: 'user',
+          content: savedUserMsg.content,
+          timeLabel: formatLocalTimeHHMM(savedUserMsg.createdAt),
+          timestamp: savedUserMsg.createdAt,
+        }
+        return {
+          chatMessages: [...state.chatMessages, userTurn],
+        }
+      })
+
+      if (completedTurnEvents.has(turnId)) {
+        completedTurnEvents.delete(turnId)
+        return
+      }
+
+      await new Promise<void>((resolve) => {
+        pendingTurnResolvers.set(turnId, resolve)
+      })
+      completedTurnEvents.delete(turnId)
     },
 
     triggerBargeIn(interruptAtMs = 600) {
@@ -1116,7 +1448,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       const cleanStory = input.fullStory?.trim() || cleanSummary
       const cat = input.filterCategory ?? 'momentos'
 
-      runtime.cortex.db.upsertEpisodicMemory({
+      const episode: EpisodicMemory = {
         id: newId,
         title: cleanTitle,
         summary: cleanSummary,
@@ -1128,7 +1460,12 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         surprise: 0.8,
         isFlashbulb: false,
         tags: [cat],
-      })
+      }
+
+      const kernelCortex = getInProcessKernelCortex()
+      if (kernelCortex) {
+        kernelCortex.db.upsertEpisodicMemory(episode)
+      }
 
       const card: FeaturedMemoryCard = {
         id: newId,
@@ -1143,8 +1480,10 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         episodeId: newId,
       }
 
+      const nextEpisodes = [episode, ...get().episodicMemories]
       set({
-        ...syncFromCortex(),
+        episodicMemories: nextEpisodes,
+        rankedMemories: rankEpisodesInMemory(nextEpisodes, get().memorySearchQuery, nowMs),
         memoryCards: [card, ...get().memoryCards],
         selectedMemoryId: card.id,
       })
@@ -1176,26 +1515,36 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         memoryCards: remaining,
         selectedMemoryId: nextSelected,
       })
+      void getAshyHostBridge()
+        .deleteMemoryItem({ kind: 'episode', id })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     addMilestone(input) {
       const nowMs = Date.now()
-      const created = runtime.cortex.db.upsertMilestone({
+      const created: AutobiographicalMilestone = {
         id: `milestone-custom-${nowMs}`,
         title: input.title.trim() || 'New Shared Milestone',
         narrative: input.narrative.trim() || 'Recorded manually in Our Story timeline.',
         category: input.category,
         createdAt: nowMs,
+      }
+      const kernelCortex = getInProcessKernelCortex()
+      if (kernelCortex) {
+        kernelCortex.db.upsertMilestone(created)
+      }
+      const nextMilestones = [...get().milestones, created]
+      set({
+        milestones: nextMilestones,
+        roomTrophies: buildRoomTrophies(nextMilestones),
       })
-      set(syncFromCortex())
       return created
     },
 
     searchMemories(query) {
-      const results = runtime.cortex.db.searchEpisodicMemoriesHybrid(query, undefined, {
-        nowMs: Date.now(),
-        limit: 10,
-      })
+      const results = rankEpisodesInMemory(get().episodicMemories, query, Date.now())
       set({
         memorySearchQuery: query,
         rankedMemories: results,
@@ -1204,27 +1553,53 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
 
     reviewEpisodicMemoryById(id, rating) {
-      runtime.cortex.reviewMemory(id, rating, Date.now())
-      set(syncFromCortex())
+      const nowMs = Date.now()
+      const existing = get().episodicMemories.find((m) => m.id === id)
+      if (!existing) return
+      const updated = reviewEpisodicMemory(existing, rating, nowMs)
+      const kernelCortex = getInProcessKernelCortex()
+      if (kernelCortex) {
+        kernelCortex.db.upsertEpisodicMemory(updated)
+      }
+      const nextEpisodes = get().episodicMemories.map((m) => (m.id === id ? updated : m))
+      set({
+        episodicMemories: nextEpisodes,
+        rankedMemories: rankEpisodesInMemory(nextEpisodes, get().memorySearchQuery, nowMs),
+      })
     },
 
     invokeMotifManually(motifId) {
-      runtime.cortex.recordJokeCallback(motifId, true, Date.now())
-      set(syncFromCortex())
+      const nowMs = Date.now()
+      const existing = get().relationalMotifs.find((m) => m.id === motifId)
+      if (!existing) return
+      const updated = recordMotifInvocation(existing, true, nowMs)
+      const kernelCortex = getInProcessKernelCortex()
+      if (kernelCortex) {
+        kernelCortex.db.upsertRelationalMotif(updated)
+      }
+      set({
+        relationalMotifs: get().relationalMotifs.map((m) => (m.id === motifId ? updated : m)),
+      })
     },
 
     resetMotifCooldown(motifId) {
-      const existing = runtime.cortex.db.getRelationalMotif(motifId)
+      const existing = get().relationalMotifs.find((m) => m.id === motifId)
       if (!existing) return
-      runtime.cortex.db.upsertRelationalMotif({
+      const updated: RelationalMotif = {
         ...existing,
         lastUsedAt: null,
+      }
+      const kernelCortex = getInProcessKernelCortex()
+      if (kernelCortex) {
+        kernelCortex.db.upsertRelationalMotif(updated)
+      }
+      set({
+        relationalMotifs: get().relationalMotifs.map((m) => (m.id === motifId ? updated : m)),
       })
-      set(syncFromCortex())
     },
 
     getMotifCooldownInfo(motifId) {
-      const motif = runtime.cortex.db.getRelationalMotif(motifId)
+      const motif = get().relationalMotifs.find((m) => m.id === motifId)
       if (!motif) {
         return {
           isCooldownLocked: false,
@@ -1237,93 +1612,155 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
     addSemanticFact(input) {
       const nowMs = Date.now()
-      const existingActive = runtime.cortex.db
-        .listSemanticFacts({ activeOnly: true })
-        .find(
-          (f) =>
-            f.category.toLowerCase() === input.category.toLowerCase() &&
-            f.subject.toLowerCase() === input.subject.trim().toLowerCase() &&
-            f.predicate.toLowerCase() === input.predicate.trim().toLowerCase(),
-        )
+      const cleanSubject = input.subject.trim() || 'User'
+      const cleanPredicate = input.predicate.trim() || 'prefers'
+      const cleanObject = input.object.trim() || 'TypeScript'
 
-      if (existingActive) {
-        runtime.cortex.db.invalidateSemanticFact(existingActive.id, nowMs)
-      }
-
-      runtime.cortex.db.upsertSemanticFact({
-        id: `fact-custom-${nowMs}`,
-        category: input.category,
-        subject: input.subject.trim() || 'User',
-        predicate: input.predicate.trim() || 'prefers',
-        object: input.object.trim() || 'TypeScript',
-        confidence: 0.95,
-        sourceEpisodeIds: ['ep-padre-npm-origin'],
-        validFrom: nowMs,
-        invalidAt: null,
+      const updatedFacts = get().semanticFacts.map((f) => {
+        if (
+          f.invalidAt === null &&
+          f.category.toLowerCase() === input.category.toLowerCase() &&
+          f.subject.toLowerCase() === cleanSubject.toLowerCase() &&
+          f.predicate.toLowerCase() === cleanPredicate.toLowerCase()
+        ) {
+          return {
+            ...f,
+            invalidAt: nowMs,
+          }
+        }
+        return f
       })
 
-      set(syncFromCortex())
+      const newFact: SemanticFact = {
+        id: `fact-custom-${nowMs}`,
+        category: input.category,
+        subject: cleanSubject,
+        predicate: cleanPredicate,
+        object: cleanObject,
+        confidence: 0.95,
+        sourceEpisodeIds: ['manual-ui-entry'],
+        validFrom: nowMs,
+        invalidAt: null,
+      }
+
+      const nextFacts = [...updatedFacts, newFact]
+      set({
+        semanticFacts: nextFacts,
+        lastPrompt: compilePromptFromState({
+          semanticFacts: nextFacts,
+        }),
+      })
+
+      void getAshyHostBridge()
+        .upsertSemanticFact({
+          id: newFact.id,
+          category: newFact.category,
+          subject: newFact.subject,
+          predicate: newFact.predicate,
+          object: newFact.object,
+          confidence: newFact.confidence,
+        })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     completeProspectiveIntent(intentId) {
-      const existing = runtime.cortex.db.listProspectiveIntents().find((i) => i.id === intentId)
+      const existing = get().prospectiveIntents.find((i) => i.id === intentId)
       if (!existing) return
-      runtime.cortex.db.upsertProspectiveIntent({
+      const updated: ProspectiveIntent = {
         ...existing,
         status: 'completed',
+      }
+      const kernelCortex = getInProcessKernelCortex()
+      if (kernelCortex) {
+        kernelCortex.db.upsertProspectiveIntent(updated)
+      }
+      set({
+        prospectiveIntents: get().prospectiveIntents.map((i) =>
+          i.id === intentId ? updated : i,
+        ),
       })
-      set(syncFromCortex())
     },
 
     runDreamConsolidation() {
       const nowMs = Date.now()
-      runtime.cortex.ingestEpisodeWithConsolidation({
-        episode: {
-          id: `ep-dream-${nowMs}`,
-          title: 'Dream & Reflection Consolidation Cycle',
-          summary:
-            'Consolidação noturna reforçou memórias de arquitetura e aumentou a afinidade com o usuário.',
-          content:
-            'Durante o ciclo de Dream & Reflection, Ashy revisou os episódios de pair programming.',
-          createdAt: nowMs,
-          lastReviewedAt: nowMs,
-          stability: 8.0,
-          difficulty: 3.5,
-          surprise: 0.72,
-          isFlashbulb: false,
-          tags: ['dream_cycle', 'late_night_debug'],
-        },
-        candidateFacts: [
-          {
-            category: 'preference',
-            subject: 'User',
-            predicate: 'favorite_stack_is',
-            object: 'TypeScript + SQLite + React 19',
-          },
-        ],
-        nowMs,
-      })
+      const episodeId = `ep-dream-${nowMs}`
+      const dreamEpisode: EpisodicMemory = {
+        id: episodeId,
+        title: 'Dream & Reflection Consolidation Cycle',
+        summary:
+          'Consolidação noturna reforçou memórias de arquitetura e aumentou a afinidade com o usuário.',
+        content:
+          'Durante o ciclo de Dream & Reflection, Ashy revisou os episódios de pair programming.',
+        createdAt: nowMs,
+        lastReviewedAt: nowMs,
+        stability: 8.0,
+        difficulty: 3.5,
+        surprise: 0.72,
+        isFlashbulb: false,
+        tags: ['dream_cycle', 'late_night_debug'],
+      }
 
-      const { record } = runtime.cortex.evolveTrait({
+      const { traits: nextTraits, record } = applyExperienceTraitDelta({
+        traits: get().traits,
         trait: 'warmthAffection',
         delta: 0.05,
-        reasonEpisodeId: `ep-dream-${nowMs}`,
+        reasonEpisodeId: episodeId,
         explanation:
           'Dream & Reflection consolidation: shared late-night debugging and mutual trust increased warmthAffection (+0.05).',
         nowMs,
       })
 
+      const kernelCortex = getInProcessKernelCortex()
+      if (kernelCortex) {
+        kernelCortex.db.upsertEpisodicMemory(dreamEpisode)
+        kernelCortex.db.saveAffectiveState(get().mood, nextTraits, nowMs)
+        kernelCortex.db.upsertPersonalityEvolution(record)
+      }
+
+      const nextEpisodes = [dreamEpisode, ...get().episodicMemories]
+      const nextLog = [record, ...get().personalityEvolutionLog]
+
       set({
-        ...syncFromCortex(),
+        traits: nextTraits,
+        episodicMemories: nextEpisodes,
+        rankedMemories: rankEpisodesInMemory(nextEpisodes, get().memorySearchQuery, nowMs),
+        personalityEvolutionLog: nextLog,
         stageEmotion: 'happy',
+        lastPrompt: compilePromptFromState({
+          traits: nextTraits,
+        }),
       })
 
       return record
     },
 
     revertTraitEvolution(recordId) {
-      runtime.cortex.revertTrait(recordId, Date.now())
-      set(syncFromCortex())
+      const nowMs = Date.now()
+      const record = get().personalityEvolutionLog.find((r) => r.id === recordId)
+      if (!record) return
+      const { traits: revertedTraits, record: revertedRecord } = revertCortexTraitEvolution(
+        get().traits,
+        record,
+        nowMs,
+      )
+
+      const kernelCortex = getInProcessKernelCortex()
+      if (kernelCortex) {
+        kernelCortex.db.saveAffectiveState(get().mood, revertedTraits, nowMs)
+        kernelCortex.db.upsertPersonalityEvolution(revertedRecord)
+      }
+
+      set({
+        traits: revertedTraits,
+        personalityEvolutionLog: get().personalityEvolutionLog.map((r) =>
+          r.id === recordId ? revertedRecord : r,
+        ),
+        lastPrompt: compilePromptFromState({
+          traits: revertedTraits,
+        }),
+      })
     },
 
     setSettingsSubTab(subTab) {
@@ -1351,27 +1788,27 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
 
     setMicMode(mode) {
-      runtime.privacyController.setMicMode(mode)
-      set({ privacyState: runtime.privacyController.getState() })
+      agency.privacyController.setMicMode(mode)
+      set({ privacyState: agency.privacyController.getState() })
     },
 
     setEyesMode(mode) {
-      runtime.privacyController.setEyesMode(mode)
-      set({ privacyState: runtime.privacyController.getState() })
+      agency.privacyController.setEyesMode(mode)
+      set({ privacyState: agency.privacyController.getState() })
     },
 
     setDndMode(enabled) {
-      runtime.privacyController.setDndMode(enabled)
-      set({ privacyState: runtime.privacyController.getState() })
+      agency.privacyController.setDndMode(enabled)
+      set({ privacyState: agency.privacyController.getState() })
     },
 
     activateFullPrivacyShield() {
-      const next = runtime.privacyController.activatePrivacyShield()
+      const next = agency.privacyController.activatePrivacyShield()
       set({ privacyState: next })
     },
 
     searchMcpTools(query) {
-      const results = runtime.mcpRegistry.search_mcp_tools({ query, limit: 10 })
+      const results = agency.mcpRegistry.search_mcp_tools({ query, limit: 10 })
       set({
         mcpSearchQuery: query,
         mcpSearchResults: results,
@@ -1380,7 +1817,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
 
     async triggerMcpTool(toolName, args = {}) {
-      const res = await runtime.mcpRegistry.call_mcp_tool({ toolName, args })
+      const res = await agency.mcpRegistry.call_mcp_tool({ toolName, args })
       let summary = `Tool "${toolName}" -> ${res.status}`
       if (res.pendingCard?.blastRadiusWarning) {
         summary += ` (${res.pendingCard.blastRadiusWarning})`
@@ -1389,79 +1826,111 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       }
 
       set({
-        pendingActions: runtime.gatekeeper.getPendingActions(),
-        auditLog: [...runtime.gatekeeper.getAuditLog()],
+        pendingActions: agency.gatekeeper.getPendingActions(),
+        auditLog: [...agency.gatekeeper.getAuditLog()],
         lastMcpResultSummary: summary,
       })
       return res
     },
 
     async approvePendingAction(actionId, scope) {
-      await runtime.gatekeeper.approveAction(actionId, scope)
+      await agency.gatekeeper.approveAction(actionId, scope)
       set({
-        pendingActions: runtime.gatekeeper.getPendingActions(),
-        auditLog: [...runtime.gatekeeper.getAuditLog()],
+        pendingActions: agency.gatekeeper.getPendingActions(),
+        auditLog: [...agency.gatekeeper.getAuditLog()],
         lastMcpResultSummary: `Approved action ${actionId} (scope=${scope})`,
       })
     },
 
     denyPendingAction(actionId, reason = 'Denied by user in Consent Center') {
-      const res = runtime.gatekeeper.denyAction(actionId, reason)
+      const res = agency.gatekeeper.denyAction(actionId, reason)
       set({
-        pendingActions: runtime.gatekeeper.getPendingActions(),
-        auditLog: [...runtime.gatekeeper.getAuditLog()],
+        pendingActions: agency.gatekeeper.getPendingActions(),
+        auditLog: [...agency.gatekeeper.getAuditLog()],
         lastMcpResultSummary: res.feedback,
       })
     },
 
     resetStoreForTesting() {
-      runtime.cortex.close()
-      runtime = createSeededRuntime()
+      unsubscribeHostEvents?.()
+      unsubscribeHostEvents = null
+      subscribedBridge = null
       activeSpeechPipeline = null
+      completedTurnEvents.clear()
+      pendingTurnResolvers.clear()
+      pendingTurnSeriousness.clear()
+      agency = createAgencyRuntime()
+      lastPromptMinuteLabel = formatLocalTimeHHMM(Date.now())
 
-      const freshAffect = runtime.cortex.db.getAffectiveState()
-      const freshMilestones = runtime.cortex.db.listMilestones()
-      const freshMemories = runtime.cortex.db.listEpisodicMemories()
-      const freshRanked = runtime.cortex.db.searchEpisodicMemoriesHybrid('', undefined, {
-        nowMs: SEED_BASE_TIME,
-        limit: 10,
-      })
-      const freshPrompt = runtime.cortex.compileTurnPrompt({
-        userMessage: 'Pronta para mais uma sessão de arquitetura, Ashy?',
+      const freshPrompt = composeAshyTurnPrompt({
+        userMessage: 'Olá Ashy.',
         modelId: 'claude-3-7-sonnet',
-        nowMs: SEED_BASE_TIME,
-        screenContext: 'VS Code — apps/desktop/src/App.tsx',
+        timeOfDayLabel: lastPromptMinuteLabel,
+        stage: 'stranger',
+        voiceIdentityMarkdown: DEFAULT_ASHY_VOICE_MD,
+        traits: ASHY_DEFAULT_TRAITS,
+        mood: ASHY_BASELINE_MOOD,
       })
 
       set({
         viewMode: 'hub',
         activeTab: 'studio',
         activeModelId: 'claude-3-7-sonnet',
+        isBootstrapped: false,
+        needsOnboarding: true,
+        userProfile: {
+          userName: null,
+          userPronouns: null,
+        },
+        relationshipStage: 'stranger',
+        familiarityScore: 0,
+        trustScore: 0.1,
+        totalTurns: 0,
+        activeSessionId: 'session-initial',
+        sessions: [],
+        providers: createInitialPublicProviders(),
+        voiceIdentity: {
+          content: DEFAULT_ASHY_VOICE_MD,
+          diagnostics: {
+            status: 'ok',
+            updatedAt: 0,
+          },
+          updatedAt: 0,
+        },
+        runtimeDiagnostics: {
+          dbMode: 'wal',
+          dbPath: '',
+          lastPersistenceWarning: null,
+        },
+        isStreamingTurn: false,
+        activeTurnId: null,
+        lastTurnError: null,
+        persistenceWarning: null,
         stageMode: 'tachie',
-        stageEmotion: 'smug',
+        stageEmotion: 'neutral',
         emotionIntensity: 0.85,
         ambientLuminance: 0.35,
         isSpeaking: false,
         presenceStatus: 'Idle',
         bubbleText: 'Fico por aqui. No seu ritmo. ♡',
         simulatedVowels: { A: 0.65, E: 0.25, I: 0.1, O: 0.35, U: 0.15 },
-        mood: freshAffect.mood,
-        traits: freshAffect.traits,
-        milestones: freshMilestones,
-        episodicMemories: freshMemories,
-        rankedMemories: freshRanked,
-        memoryCards: [...INITIAL_MEMORY_CARDS],
-        selectedMemoryId: 'ep-padre-npm-origin',
+        mood: { ...ASHY_BASELINE_MOOD },
+        traits: { ...ASHY_DEFAULT_TRAITS },
+        milestones: [],
+        episodicMemories: [],
+        rankedMemories: [],
+        memoryCards: [],
+        selectedMemoryId: '',
         memoryFilter: 'todas',
         memorySearchQuery: '',
-        semanticFacts: runtime.cortex.db.listSemanticFacts(),
-        relationalMotifs: runtime.cortex.db.listRelationalMotifs(),
-        userHabits: runtime.cortex.db.listUserHabits(),
-        prospectiveIntents: runtime.cortex.db.listProspectiveIntents(),
-        personalityEvolutionLog: runtime.cortex.db.listPersonalityEvolution(),
+        semanticFacts: [],
+        relationalMotifs: [],
+        userHabits: [],
+        prospectiveIntents: [],
+        personalityEvolutionLog: [],
         lastPrompt: freshPrompt,
-        roomTrophies: buildRoomTrophies(freshMilestones),
-        chatMessages: [...initialChat],
+        roomTrophies: buildRoomTrophies([]),
+        chatMessages: [],
         scheduledAudioChunks: [],
         lastPlaybackReceipt: null,
         lastStageSignals: [],
@@ -1471,15 +1940,19 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         computerActionsPolicy: 'ask',
         quietHoursRange: '22:00 — 08:00',
         preferencesSavedToast: false,
-        privacyState: runtime.privacyController.getState(),
+        privacyState: agency.privacyController.getState(),
         mcpSearchQuery: '',
-        mcpSearchResults: runtime.mcpRegistry.search_mcp_tools({ query: '', limit: 10 }),
-        exposedMetaToolsCount: runtime.mcpRegistry.getExposedMetaTools().length,
-        registeredMcpToolsCount: runtime.mcpRegistry.getRegisteredToolsCount(),
-        pendingActions: runtime.gatekeeper.getPendingActions(),
-        auditLog: [...runtime.gatekeeper.getAuditLog()],
+        mcpSearchResults: agency.mcpRegistry.search_mcp_tools({ query: '', limit: 10 }),
+        exposedMetaToolsCount: agency.mcpRegistry.getExposedMetaTools().length,
+        registeredMcpToolsCount: agency.mcpRegistry.getRegisteredToolsCount(),
+        pendingActions: agency.gatekeeper.getPendingActions(),
+        auditLog: [...agency.gatekeeper.getAuditLog()],
         lastMcpResultSummary: null,
       })
     },
   }
 })
+
+export function resetAshyStore(): void {
+  useAshyStore.getState().resetStoreForTesting()
+}
