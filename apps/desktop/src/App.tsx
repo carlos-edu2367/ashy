@@ -3,7 +3,9 @@ import {
   ASHY_EMOTIONS,
   MILESTONE_CATEGORIES,
   SEMANTIC_FACT_CATEGORIES,
+  type ApprovableMemoryKind,
   type AshyEmotion,
+  type MemoryGovernanceCategory,
   type MilestoneCategory,
   type SemanticFactCategory,
 } from '@ashy/shared'
@@ -100,6 +102,17 @@ const TRAIT_META: ReadonlyArray<{
 
 const WAVEFORM_BARS: readonly number[] = [
   6, 10, 16, 12, 22, 28, 16, 20, 30, 14, 24, 18, 12, 26, 18, 14, 20, 12, 8,
+]
+
+const GOVERNANCE_CATEGORY_META: ReadonlyArray<{
+  category: MemoryGovernanceCategory
+  label: string
+}> = [
+  { category: 'facts', label: 'Fatos sobre você' },
+  { category: 'episodes', label: 'Episódios' },
+  { category: 'jokes', label: 'Piadas internas' },
+  { category: 'habits', label: 'Hábitos' },
+  { category: 'intents', label: 'Planos futuros' },
 ]
 
 function AshySparkleLogo(): React.ReactElement {
@@ -362,6 +375,77 @@ export function App(): React.ReactElement {
 
   const topRowCards = filteredMemoryCards.filter((c) => c.featured)
   const bottomRowCards = filteredMemoryCards.filter((c) => !c.featured)
+
+  const pendingReviewItems: Array<{
+    id: string
+    kind: ApprovableMemoryKind
+    kindLabel: string
+    title: string
+    detail: string
+    provenanceEpisodeId?: string
+  }> = [
+    ...state.semanticFacts
+      .filter((f) => f.approvalStatus === 'pending_review')
+      .map((f) => ({
+        id: f.id,
+        kind: 'fact' as const,
+        kindLabel: 'Fato semântico',
+        title: `${f.predicate}: ${f.object}`,
+        detail: `${f.subject} (${f.category})`,
+        provenanceEpisodeId: f.sourceEpisodeIds[0],
+      })),
+    ...state.episodicMemories
+      .filter((ep) => ep.approvalStatus === 'pending_review')
+      .map((ep) => ({
+        id: ep.id,
+        kind: 'episode' as const,
+        kindLabel: 'Episódio',
+        title: ep.title,
+        detail: ep.summary,
+        provenanceEpisodeId: ep.id,
+      })),
+    ...state.relationalMotifs
+      .filter((m) => m.approvalStatus === 'pending_review')
+      .map((m) => ({
+        id: m.id,
+        kind: 'joke' as const,
+        kindLabel: 'Piada interna',
+        title: m.motif,
+        detail: m.originSummary,
+        provenanceEpisodeId: m.originEpisodeId,
+      })),
+    ...state.userHabits
+      .filter((h) => h.approvalStatus === 'pending_review')
+      .map((h) => ({
+        id: h.id,
+        kind: 'habit' as const,
+        kindLabel: 'Hábito',
+        title: h.patternKey,
+        detail: h.description,
+        provenanceEpisodeId: h.sourceEpisodeId,
+      })),
+    ...state.prospectiveIntents
+      .filter((i) => i.approvalStatus === 'pending_review')
+      .map((i) => ({
+        id: i.id,
+        kind: 'intent' as const,
+        kindLabel: 'Plano futuro',
+        title: i.topic,
+        detail: i.contextCue,
+        provenanceEpisodeId: i.sourceEpisodeId,
+      })),
+  ]
+
+  const approvedMotifs = state.relationalMotifs.filter(
+    (m) => m.approvalStatus !== 'pending_review',
+  )
+  const approvedHabits = state.userHabits.filter((h) => h.approvalStatus !== 'pending_review')
+  const approvedIntents = state.prospectiveIntents.filter(
+    (i) => i.approvalStatus !== 'pending_review',
+  )
+  const approvedFacts = state.semanticFacts.filter(
+    (f) => f.approvalStatus !== 'pending_review',
+  )
 
   const selectedMemoryCard =
     state.memoryCards.find((c) => c.id === state.selectedMemoryId) ??
@@ -1003,6 +1087,16 @@ export function App(): React.ReactElement {
 
                 <button
                   type="button"
+                  data-testid="btn-consolidate-memories"
+                  className="ashy-outline-btn"
+                  onClick={() => void state.consolidateSessionMemories(true)}
+                >
+                  <Sparkles size={15} />
+                  <span>Consolidar Agora</span>
+                </button>
+
+                <button
+                  type="button"
                   data-testid="btn-new-memory"
                   className="ashy-peach-btn"
                   onClick={() => setShowNewMemoryModal(!showNewMemoryModal)}
@@ -1012,6 +1106,167 @@ export function App(): React.ReactElement {
                 </button>
               </div>
             </header>
+
+            {/* Memory Governance Panel (Auto vs. Confirm per category) */}
+            <section
+              className="ashy-card"
+              data-testid="memory-governance-panel"
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '10px',
+                padding: '12px 16px',
+              }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: '8px',
+                }}
+              >
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: '13.5px' }}>
+                    Governança de Memória Autônoma
+                  </div>
+                  <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                    Escolha quais categorias são salvas automaticamente e quais exigem sua aprovação em quarentena antes de entrar no contexto.
+                  </div>
+                </div>
+                <span className="ashy-badge violet">
+                  {pendingReviewItems.length} pendentes
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                {GOVERNANCE_CATEGORY_META.map((item) => {
+                  const requireConfirm = state.memoryGovernancePolicy[item.category]
+                  return (
+                    <button
+                      key={item.category}
+                      type="button"
+                      data-testid={`governance-toggle-${item.category}`}
+                      aria-pressed={requireConfirm}
+                      className={`ashy-filter-pill ${requireConfirm ? 'active' : ''}`}
+                      onClick={() =>
+                        void state.setMemoryGovernancePolicy(
+                          item.category,
+                          !requireConfirm,
+                        )
+                      }
+                    >
+                      <span>{item.label}:</span>
+                      <strong>
+                        {requireConfirm ? 'Pedir confirmação' : 'Automático'}
+                      </strong>
+                    </button>
+                  )
+                })}
+              </div>
+            </section>
+
+            {/* Quarantine / Pending Review Memories */}
+            {pendingReviewItems.length > 0 && (
+              <section
+                className="ashy-card"
+                data-testid="pending-review-memories"
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '10px',
+                  padding: '12px 16px',
+                  border: '1px solid rgba(242, 190, 121, 0.45)',
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    gap: '8px',
+                  }}
+                >
+                  <div style={{ fontWeight: 600, fontSize: '13.5px' }}>
+                    Memórias pendentes de aprovação ({pendingReviewItems.length})
+                  </div>
+                  <span className="ashy-badge amber">Quarentena ativa</span>
+                </div>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  {pendingReviewItems.map((item) => (
+                    <div
+                      key={`${item.kind}-${item.id}`}
+                      data-testid={`pending-memory-item-${item.id}`}
+                      style={{
+                        padding: '10px 12px',
+                        borderRadius: '10px',
+                        background: '#171421',
+                        border: '1px solid var(--border-subtle)',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        gap: '10px',
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            flexWrap: 'wrap',
+                          }}
+                        >
+                          <span className="ashy-badge amber">{item.kindLabel}</span>
+                          <strong style={{ fontSize: '13px' }}>{item.title}</strong>
+                          {item.provenanceEpisodeId && (
+                            <span
+                              className="ashy-badge violet"
+                              data-testid={`provenance-badge-${item.id}`}
+                            >
+                              Origem: {item.provenanceEpisodeId}
+                            </span>
+                          )}
+                        </div>
+                        <div
+                          style={{
+                            fontSize: '12px',
+                            color: 'var(--text-secondary)',
+                            marginTop: '3px',
+                          }}
+                        >
+                          {item.detail}
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '6px' }}>
+                        <button
+                          type="button"
+                          className="ashy-peach-btn"
+                          style={{ padding: '5px 11px', fontSize: '12px' }}
+                          data-testid={`btn-approve-memory-${item.id}`}
+                          onClick={() => void state.approveMemoryItem(item.kind, item.id)}
+                        >
+                          Aprovar
+                        </button>
+                        <button
+                          type="button"
+                          className="ashy-danger-outline-btn"
+                          style={{ padding: '5px 11px', fontSize: '12px' }}
+                          data-testid={`btn-discard-memory-${item.id}`}
+                          onClick={() => void state.deleteMemoryItem(item.kind, item.id)}
+                        >
+                          Descartar
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
 
             {/* New Memory Inline Creator Modal */}
             {showNewMemoryModal && (
@@ -1230,10 +1485,10 @@ export function App(): React.ReactElement {
                     style={{ marginBottom: 0, cursor: 'pointer', listStyle: 'none' }}
                   >
                     <span style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
-                      Referências vivas e piadas nossas ({state.relationalMotifs.length})
+                      Referências vivas e piadas nossas ({approvedMotifs.length})
                     </span>
                     <span className="ashy-badge violet">
-                      {state.relationalMotifs.length} referências
+                      {approvedMotifs.length} referências
                     </span>
                   </summary>
                   <div
@@ -1244,7 +1499,7 @@ export function App(): React.ReactElement {
                       marginTop: '10px',
                     }}
                   >
-                    {state.relationalMotifs.map((motif) => {
+                    {approvedMotifs.map((motif) => {
                       const cooldown = state.getMotifCooldownInfo(motif.id)
                       return (
                         <div
@@ -1275,6 +1530,15 @@ export function App(): React.ReactElement {
                                 ? `Descansando (${cooldown.remainingCooldownHours.toFixed(1)}h)`
                                 : 'Pronta para surgir'}
                             </span>
+                            {motif.originEpisodeId && (
+                              <span
+                                className="ashy-badge violet"
+                                style={{ marginLeft: '6px' }}
+                                data-testid={`provenance-badge-${motif.id}`}
+                              >
+                                Origem: {motif.originEpisodeId}
+                              </span>
+                            )}
                             <div
                               style={{
                                 fontSize: '11.5px',
@@ -1304,12 +1568,155 @@ export function App(): React.ReactElement {
                             >
                               Liberar agora
                             </button>
+                            <button
+                              type="button"
+                              className="ashy-danger-outline-btn"
+                              style={{ padding: '5px 10px', fontSize: '11.5px' }}
+                              data-testid={`btn-delete-joke-${motif.id}`}
+                              onClick={() => void state.deleteMemoryItem('joke', motif.id)}
+                            >
+                              Excluir
+                            </button>
                           </div>
                         </div>
                       )
                     })}
                   </div>
                 </details>
+
+                {/* Active User Habits & Rhythm */}
+                <section
+                  className="ashy-card"
+                  data-testid="active-habits-list"
+                  style={{ padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: '8px' }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: '8px',
+                    }}
+                  >
+                    <span style={{ fontSize: '13px', color: 'var(--text-secondary)', fontWeight: 600 }}>
+                      Hábitos observados ({approvedHabits.length})
+                    </span>
+                    <span className="ashy-badge violet">{approvedHabits.length} hábitos</span>
+                  </div>
+                  {approvedHabits.map((habit) => (
+                    <div
+                      key={habit.id}
+                      data-testid={`habit-card-${habit.id}`}
+                      style={{
+                        padding: '8px 11px',
+                        borderRadius: '10px',
+                        background: '#171421',
+                        border: '1px solid var(--border-subtle)',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        gap: '10px',
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      <div style={{ fontSize: '12px' }}>
+                        <strong>{habit.patternKey}</strong> — {habit.description}
+                        {habit.sourceEpisodeId && (
+                          <span
+                            className="ashy-badge violet"
+                            style={{ marginLeft: '6px' }}
+                            data-testid={`provenance-badge-${habit.id}`}
+                          >
+                            Origem: {habit.sourceEpisodeId}
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        className="ashy-danger-outline-btn"
+                        style={{ padding: '4px 9px', fontSize: '11.5px' }}
+                        data-testid={`btn-delete-habit-${habit.id}`}
+                        onClick={() => void state.deleteMemoryItem('habit', habit.id)}
+                      >
+                        Excluir
+                      </button>
+                    </div>
+                  ))}
+                </section>
+
+                {/* Active Prospective Intents */}
+                <section
+                  className="ashy-card"
+                  data-testid="active-intents-list"
+                  style={{ padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: '8px' }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: '8px',
+                    }}
+                  >
+                    <span style={{ fontSize: '13px', color: 'var(--text-secondary)', fontWeight: 600 }}>
+                      Planos e intenções futuras ({approvedIntents.length})
+                    </span>
+                    <span className="ashy-badge peach">{approvedIntents.length} planos</span>
+                  </div>
+                  {approvedIntents.map((intent) => (
+                    <div
+                      key={intent.id}
+                      data-testid={`intent-card-${intent.id}`}
+                      style={{
+                        padding: '8px 11px',
+                        borderRadius: '10px',
+                        background: '#171421',
+                        border: '1px solid var(--border-subtle)',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        gap: '10px',
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      <div style={{ fontSize: '12px' }}>
+                        <strong>{intent.topic}</strong> ({intent.contextCue}){' '}
+                        <span className="ashy-badge emerald">{intent.status}</span>
+                        {intent.sourceEpisodeId && (
+                          <span
+                            className="ashy-badge violet"
+                            style={{ marginLeft: '6px' }}
+                            data-testid={`provenance-badge-${intent.id}`}
+                          >
+                            Origem: {intent.sourceEpisodeId}
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ display: 'flex', gap: '6px' }}>
+                        {intent.status !== 'completed' && (
+                          <button
+                            type="button"
+                            className="ashy-outline-btn"
+                            style={{ padding: '4px 9px', fontSize: '11.5px' }}
+                            data-testid={`btn-complete-intent-${intent.id}`}
+                            onClick={() => state.completeProspectiveIntent(intent.id)}
+                          >
+                            Concluir
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="ashy-danger-outline-btn"
+                          style={{ padding: '4px 9px', fontSize: '11.5px' }}
+                          data-testid={`btn-delete-intent-${intent.id}`}
+                          onClick={() => void state.deleteMemoryItem('intent', intent.id)}
+                        >
+                          Excluir
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </section>
               </div>
 
               {/* Right Detail Inspector Drawer */}
@@ -1462,12 +1869,24 @@ export function App(): React.ReactElement {
                         display: 'flex',
                         justifyContent: 'space-between',
                         alignItems: 'center',
+                        gap: '8px',
                       }}
                     >
                       <h3 className="ashy-setting-title" style={{ fontSize: '16px', margin: 0 }}>
                         {ms.title}
                       </h3>
-                      <span className="ashy-badge violet">{ms.category}</span>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <span className="ashy-badge violet">{ms.category}</span>
+                        <button
+                          type="button"
+                          className="ashy-danger-outline-btn"
+                          style={{ padding: '4px 8px', fontSize: '11px' }}
+                          data-testid={`btn-delete-milestone-${ms.id}`}
+                          onClick={() => void state.deleteMemoryItem('milestone', ms.id)}
+                        >
+                          Excluir
+                        </button>
+                      </div>
                     </div>
                     <p className="ashy-setting-desc" style={{ lineHeight: 1.55 }}>
                       {ms.narrative}
@@ -1537,9 +1956,10 @@ export function App(): React.ReactElement {
                     Preferências e hábitos que evoluem com o tempo.
                   </p>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                    {state.semanticFacts.map((fact) => (
+                    {approvedFacts.map((fact) => (
                       <div
                         key={fact.id}
+                        data-testid={`fact-card-${fact.id}`}
                         style={{
                           padding: '9px 12px',
                           borderRadius: '10px',
@@ -1555,9 +1975,24 @@ export function App(): React.ReactElement {
                         <span>
                           {fact.predicate}: <strong>{fact.object}</strong>
                         </span>
-                        <span className={`ashy-badge ${fact.invalidAt ? 'amber' : 'emerald'}`}>
-                          {fact.invalidAt ? 'Antigo' : 'Ativo'}
-                        </span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          <span
+                            className={`ashy-badge ${
+                              fact.invalidAt ? 'amber' : 'emerald'
+                            }`}
+                          >
+                            {fact.invalidAt ? 'Antigo' : 'Ativo'}
+                          </span>
+                          <button
+                            type="button"
+                            className="ashy-danger-outline-btn"
+                            style={{ padding: '4px 8px', fontSize: '11px' }}
+                            data-testid={`btn-delete-fact-${fact.id}`}
+                            onClick={() => void state.deleteMemoryItem('fact', fact.id)}
+                          >
+                            Excluir
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>

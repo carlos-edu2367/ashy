@@ -17,6 +17,7 @@ import {
   getAshyHostBridge,
   setAshyHostBridgeForTesting,
 } from '../services/ashy-host-client'
+import { useAshyStore } from '../store/useAshyStore'
 
 const tempDirs: string[] = []
 
@@ -463,6 +464,7 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
 
       const malformedRes = await fetch(`${baseUrl}/__ashy_host/rpc`, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: '{bad-json',
       })
       expect(malformedRes.status).toBe(400)
@@ -473,9 +475,170 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
         body: JSON.stringify({ method: '__proto__', payload: {} }),
       })
       expect(protoRes.status).toBe(400)
+
+      // 3. Verify CSRF / Cross-Origin / DNS Rebinding / Content-Type security hardening
+      const crossOriginRpcRes = await fetch(`${baseUrl}/__ashy_host/rpc`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: 'https://evil.attacker.example',
+        },
+        body: JSON.stringify({ method: 'getBootstrapSnapshot' }),
+      })
+      expect(crossOriginRpcRes.status).toBe(403)
+
+      const crossSiteFetchRes = await fetch(`${baseUrl}/__ashy_host/rpc`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Sec-Fetch-Site': 'cross-site',
+        },
+        body: JSON.stringify({ method: 'getBootstrapSnapshot' }),
+      })
+      expect(crossSiteFetchRes.status).toBe(403)
+
+      const crossOriginEventsRes = await fetch(`${baseUrl}/__ashy_host/events`, {
+        method: 'GET',
+        headers: {
+          Origin: 'https://evil.attacker.example',
+        },
+      })
+      expect(crossOriginEventsRes.status).toBe(403)
+
+      const textPlainCsrfRes = await fetch(`${baseUrl}/__ashy_host/rpc`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/plain',
+        },
+        body: JSON.stringify({ method: 'getBootstrapSnapshot' }),
+      })
+      expect(textPlainCsrfRes.status).toBe(415)
+
+      // DNS rebinding check via raw http.request with spoofed Host header
+      const dnsRebindStatus = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port,
+            path: '/__ashy_host/rpc',
+            method: 'POST',
+            headers: {
+              Host: 'rebind.attacker.example:5173',
+              'Content-Type': 'application/json',
+            },
+          },
+          (res) => {
+            res.resume()
+            resolve(res.statusCode ?? 0)
+          },
+        )
+        req.on('error', reject)
+        req.write(JSON.stringify({ method: 'getBootstrapSnapshot' }))
+        req.end()
+      })
+      expect(dnsRebindStatus).toBe(403)
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()))
       await kernel.stop()
     }
+  })
+
+  it('persists store mutations (memories, story edits, milestones, dream cycle, trait revert, motifs, intents) across IPC bridge without in-process cortex access', async () => {
+    const dir = makeTempDir()
+    const kernel1 = await createAshyHostKernel({ userDataDir: dir })
+
+    type IpcRpcListener = (
+      event: unknown,
+      req: { method: string; payload?: unknown },
+    ) => Promise<unknown> | unknown
+    let rpcHandler: IpcRpcListener | null = null
+
+    const fakeIpcMain = {
+      handle: vi.fn((channel: string, handler: IpcRpcListener) => {
+        if (channel === 'ashy:rpc') {
+          rpcHandler = handler
+        }
+      }),
+      removeHandler: vi.fn(),
+    }
+
+    const cleanupIpc1 = registerAshyElectronIpc(fakeIpcMain, kernel1, () => [])
+    const fakeIpcRenderer = {
+      invoke: vi.fn(async (channel: string, req: { method: string; payload?: unknown }) => {
+        if (channel !== 'ashy:rpc' || !rpcHandler) {
+          throw new Error(`No handler for ${channel}`)
+        }
+        return rpcHandler({}, req)
+      }),
+      on: vi.fn(),
+      removeListener: vi.fn(),
+    }
+
+    const ipcBridge = createPreloadHostBridge(createAshyPreloadApi(fakeIpcRenderer))
+    // Ensure the bridge does NOT expose .cortex (simulating strict Electron contextIsolation / HTTP)
+    expect('cortex' in (ipcBridge as unknown as Record<string, unknown>)).toBe(false)
+
+    setAshyHostBridgeForTesting(ipcBridge)
+    useAshyStore.getState().resetStoreForTesting()
+    await useAshyStore.getState().seedDemoFixtures()
+
+    // 1. Create memory card & edit its story
+    const createdCard = useAshyStore.getState().createMemoryCard({
+      title: 'Memória via IPC',
+      summary: 'Resumo original',
+      fullStory: 'História original',
+      filterCategory: 'momentos',
+    })
+    useAshyStore.getState().updateMemoryStory(
+      createdCard.id,
+      'Memória via IPC Editada',
+      'História atualizada pelo IPC real',
+    )
+
+    // 2. Add milestone
+    const milestone = useAshyStore.getState().addMilestone({
+      title: 'Marco IPC',
+      narrative: 'Persistido via IPC sem getInProcessKernelCortex',
+      category: 'project_shipped',
+    })
+
+    // 3. Run dream consolidation & revert trait evolution
+    const evoRecord = useAshyStore.getState().runDreamConsolidation()
+    useAshyStore.getState().revertTraitEvolution(evoRecord.id)
+
+    // 4. Complete prospective intent & invoke motif
+    const firstIntentId = useAshyStore.getState().prospectiveIntents[0]?.id
+    if (firstIntentId) {
+      useAshyStore.getState().completeProspectiveIntent(firstIntentId)
+    }
+
+    // Flush background RPC promises
+    await new Promise((r) => setTimeout(r, 50))
+    cleanupIpc1()
+    await kernel1.stop()
+
+    // Reboot a brand-new kernel2 on the same userDataDir and bootstrap store over IPC
+    const kernel2 = await createAshyHostKernel({ userDataDir: dir })
+    const cleanupIpc2 = registerAshyElectronIpc(fakeIpcMain, kernel2, () => [])
+
+    useAshyStore.getState().resetStoreForTesting()
+    await useAshyStore.getState().bootstrapFromHost()
+
+    const rebootedState = useAshyStore.getState()
+    const persistedEp = rebootedState.episodicMemories.find((e) => e.id === createdCard.id)
+    expect(persistedEp?.title).toBe('Memória via IPC Editada')
+    expect(persistedEp?.content).toBe('História atualizada pelo IPC real')
+
+    expect(rebootedState.milestones.some((m) => m.id === milestone.id)).toBe(true)
+    const persistedEvo = rebootedState.personalityEvolutionLog.find((r) => r.id === evoRecord.id)
+    expect(persistedEvo?.revertedAt).toBeTypeOf('number')
+
+    if (firstIntentId) {
+      const persistedIntent = rebootedState.prospectiveIntents.find((i) => i.id === firstIntentId)
+      expect(persistedIntent?.status).toBe('completed')
+    }
+
+    cleanupIpc2()
+    await kernel2.stop()
   })
 })

@@ -50,6 +50,11 @@ checkForbidden(
   /from\s+['"]\.\.\/host\//,
   'Renderer store must not import Node-only modules from ../host/',
 )
+checkForbidden(
+  'apps/desktop/src/store/useAshyStore.ts',
+  /getInProcessKernelCortex/,
+  'Renderer store must not bypass AshyHostBridge via getInProcessKernelCortex()',
+)
 
 // 2. Verify all 6 Phase 0/1 organs have live producer + live reader + integration test
 const organChecks = [

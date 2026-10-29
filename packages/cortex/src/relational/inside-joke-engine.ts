@@ -1,3 +1,4 @@
+import { computeCosineSimilarity128, embedTextSync128 } from '@ashy/llm'
 import {
   RelationalMotifSchema,
   type RelationalMotif,
@@ -21,6 +22,12 @@ export interface MotifCooldownStatus {
   isCooldownLocked: boolean
   elapsedHoursSinceUse: number | null
   remainingCooldownHours: number
+}
+
+export interface MotifSelectionOptions {
+  isSeriousContext?: boolean
+  minRelevance?: number
+  queryEmbedding?: readonly number[]
 }
 
 function normalizeText(text: string): string {
@@ -56,8 +63,12 @@ export function inspectMotifCooldownStatus(
 }
 
 export function computeMotifRelevance(
-  motif: Pick<RelationalMotif, 'motif' | 'triggerCues'>,
+  motif: Pick<RelationalMotif, 'motif' | 'triggerCues'> & {
+    originSummary?: string
+    embedding?: readonly number[]
+  },
   contextText: string,
+  queryEmbedding?: readonly number[],
 ): { relevanceScore: number; matchedCues: string[] } {
   const normalizedContext = normalizeText(contextText)
   if (!normalizedContext.trim()) {
@@ -95,8 +106,33 @@ export function computeMotifRelevance(
     score += 0.3 * (motifHits / motifTokens.length)
   }
 
+  const lexicalScore = Math.min(1, score)
+
+  const contextVec =
+    queryEmbedding && queryEmbedding.length === 128
+      ? queryEmbedding
+      : embedTextSync128(contextText)
+
+  const motifVec =
+    motif.embedding && motif.embedding.length === 128
+      ? motif.embedding
+      : embedTextSync128([motif.motif, motif.originSummary ?? '', ...motif.triggerCues].join(' '))
+
+  const semanticSim = computeCosineSimilarity128(contextVec, motifVec)
+  const combined = Math.min(
+    1,
+    Math.max(
+      lexicalScore,
+      semanticSim >= 0.22 ? 0.85 * semanticSim + 0.25 * lexicalScore : lexicalScore,
+    ),
+  )
+
+  if (semanticSim >= 0.22 && matchedCues.length === 0) {
+    matchedCues.push('semantic_context_match')
+  }
+
   return {
-    relevanceScore: Math.min(1, score),
+    relevanceScore: Number(combined.toFixed(4)),
     matchedCues,
   }
 }
@@ -111,20 +147,23 @@ export function selectEligibleMotifs(
   motifs: readonly RelationalMotif[],
   contextText: string,
   nowMs: number,
-  options?: {
-    isSeriousContext?: boolean
-    minRelevance?: number
-  },
+  options?: MotifSelectionOptions,
 ): EligibleMotifMatch[] {
   if (options?.isSeriousContext === true) {
     return []
   }
 
   const minRelevance = options?.minRelevance ?? 0.2
+  const precomputedQueryVec =
+    options?.queryEmbedding && options.queryEmbedding.length === 128
+      ? options.queryEmbedding
+      : typeof contextText === 'string' && contextText.trim().length > 0
+        ? embedTextSync128(contextText)
+        : undefined
   const eligible: EligibleMotifMatch[] = []
 
   for (const motif of motifs) {
-    if (motif.stage === 'dormant') {
+    if (motif.stage === 'dormant' || motif.approvalStatus === 'pending_review') {
       continue
     }
 
@@ -133,7 +172,11 @@ export function selectEligibleMotifs(
       continue
     }
 
-    const { relevanceScore, matchedCues } = computeMotifRelevance(motif, contextText)
+    const { relevanceScore, matchedCues } = computeMotifRelevance(
+      motif,
+      contextText,
+      precomputedQueryVec,
+    )
     if (relevanceScore >= minRelevance) {
       eligible.push({
         motif,

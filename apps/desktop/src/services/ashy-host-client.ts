@@ -1,13 +1,24 @@
 import type {
+  ApprovableMemoryKind,
   AshyBootstrapSnapshot,
+  AshyEmotion,
   AshyHostBridge,
   AshyHostStreamEvent,
+  AutobiographicalMilestone,
   ChatMessageRecord,
   ChatSessionRecord,
   CompleteOnboardingInput,
+  DeletableMemoryKind,
+  EpisodicMemory,
   LlmProviderId,
+  MemoryGovernanceCategory,
+  MemoryGovernancePolicy,
+  PersonalityEvolutionRecord,
+  PersonalityTraits,
+  ProspectiveIntent,
   ProviderHealthResult,
   PublicProviderConfig,
+  RelationalMotif,
   SaveProviderConfigInput,
   SemanticFact,
   SendTurnInput,
@@ -94,11 +105,62 @@ export function createPreloadHostBridge(
     upsertSemanticFact(input: UpsertFactInput): Promise<SemanticFact> {
       return invoke<SemanticFact>('upsertSemanticFact', input)
     },
+    upsertEpisodicMemory(episode: EpisodicMemory): Promise<EpisodicMemory> {
+      return invoke<EpisodicMemory>('upsertEpisodicMemory', episode)
+    },
+    upsertMilestone(
+      milestone: AutobiographicalMilestone,
+    ): Promise<AutobiographicalMilestone> {
+      return invoke<AutobiographicalMilestone>('upsertMilestone', milestone)
+    },
+    upsertRelationalMotif(motif: RelationalMotif): Promise<RelationalMotif> {
+      return invoke<RelationalMotif>('upsertRelationalMotif', motif)
+    },
+    upsertProspectiveIntent(intent: ProspectiveIntent): Promise<ProspectiveIntent> {
+      return invoke<ProspectiveIntent>('upsertProspectiveIntent', intent)
+    },
+    recordEmotionPulse(input: {
+      emotion: AshyEmotion
+      intensity?: number
+    }): Promise<AshyBootstrapSnapshot['affect']> {
+      return invoke('recordEmotionPulse', input)
+    },
+    persistDreamConsolidation(input: {
+      episode: EpisodicMemory
+      traits: PersonalityTraits
+      record: PersonalityEvolutionRecord
+    }): Promise<void> {
+      return invoke<void>('persistDreamConsolidation', input)
+    },
+    persistTraitRevert(input: {
+      traits: PersonalityTraits
+      record: PersonalityEvolutionRecord
+    }): Promise<void> {
+      return invoke<void>('persistTraitRevert', input)
+    },
     deleteMemoryItem(input: {
-      kind: 'fact' | 'episode' | 'joke'
+      kind: DeletableMemoryKind
       id: string
     }): Promise<void> {
       return invoke<void>('deleteMemoryItem', input)
+    },
+    consolidateSessionMemories(input?: {
+      sessionId?: string
+      force?: boolean
+    }): Promise<AshyBootstrapSnapshot> {
+      return invoke<AshyBootstrapSnapshot>('consolidateSessionMemories', input)
+    },
+    approveMemoryItem(input: {
+      kind: ApprovableMemoryKind
+      id: string
+    }): Promise<AshyBootstrapSnapshot> {
+      return invoke<AshyBootstrapSnapshot>('approveMemoryItem', input)
+    },
+    setMemoryGovernancePolicy(input: {
+      category: MemoryGovernanceCategory
+      requireConfirmation: boolean
+    }): Promise<MemoryGovernancePolicy> {
+      return invoke<MemoryGovernancePolicy>('setMemoryGovernancePolicy', input)
     },
     seedDemoFixtures(): Promise<AshyBootstrapSnapshot> {
       return invoke<AshyBootstrapSnapshot>('seedDemoFixtures')
@@ -239,11 +301,62 @@ export function createHttpSseHostBridge(
     upsertSemanticFact(input: UpsertFactInput): Promise<SemanticFact> {
       return rpc<SemanticFact>('upsertSemanticFact', input)
     },
+    upsertEpisodicMemory(episode: EpisodicMemory): Promise<EpisodicMemory> {
+      return rpc<EpisodicMemory>('upsertEpisodicMemory', episode)
+    },
+    upsertMilestone(
+      milestone: AutobiographicalMilestone,
+    ): Promise<AutobiographicalMilestone> {
+      return rpc<AutobiographicalMilestone>('upsertMilestone', milestone)
+    },
+    upsertRelationalMotif(motif: RelationalMotif): Promise<RelationalMotif> {
+      return rpc<RelationalMotif>('upsertRelationalMotif', motif)
+    },
+    upsertProspectiveIntent(intent: ProspectiveIntent): Promise<ProspectiveIntent> {
+      return rpc<ProspectiveIntent>('upsertProspectiveIntent', intent)
+    },
+    recordEmotionPulse(input: {
+      emotion: AshyEmotion
+      intensity?: number
+    }): Promise<AshyBootstrapSnapshot['affect']> {
+      return rpc('recordEmotionPulse', input)
+    },
+    persistDreamConsolidation(input: {
+      episode: EpisodicMemory
+      traits: PersonalityTraits
+      record: PersonalityEvolutionRecord
+    }): Promise<void> {
+      return rpc<void>('persistDreamConsolidation', input)
+    },
+    persistTraitRevert(input: {
+      traits: PersonalityTraits
+      record: PersonalityEvolutionRecord
+    }): Promise<void> {
+      return rpc<void>('persistTraitRevert', input)
+    },
     deleteMemoryItem(input: {
-      kind: 'fact' | 'episode' | 'joke'
+      kind: DeletableMemoryKind
       id: string
     }): Promise<void> {
       return rpc<void>('deleteMemoryItem', input)
+    },
+    consolidateSessionMemories(input?: {
+      sessionId?: string
+      force?: boolean
+    }): Promise<AshyBootstrapSnapshot> {
+      return rpc<AshyBootstrapSnapshot>('consolidateSessionMemories', input)
+    },
+    approveMemoryItem(input: {
+      kind: ApprovableMemoryKind
+      id: string
+    }): Promise<AshyBootstrapSnapshot> {
+      return rpc<AshyBootstrapSnapshot>('approveMemoryItem', input)
+    },
+    setMemoryGovernancePolicy(input: {
+      category: MemoryGovernanceCategory
+      requireConfirmation: boolean
+    }): Promise<MemoryGovernancePolicy> {
+      return rpc<MemoryGovernancePolicy>('setMemoryGovernancePolicy', input)
     },
     seedDemoFixtures(): Promise<AshyBootstrapSnapshot> {
       return rpc<AshyBootstrapSnapshot>('seedDemoFixtures')
@@ -287,3 +400,5 @@ export function getAshyHostBridge(): AshyHostBridge {
 
   return cachedDefaultBridge
 }
+
+export const getAshyHostClient = getAshyHostBridge

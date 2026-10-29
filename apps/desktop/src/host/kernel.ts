@@ -5,16 +5,26 @@ import { createContainer, type DIContainer } from '@ashy/bus'
 import { createAshyCortex, type AshyCortex } from '@ashy/cortex'
 import {
   CompleteOnboardingInputSchema,
+  type ApprovableMemoryKind,
   type AshyBootstrapSnapshot,
   type AshyEmotion,
   type AshyHostBridge,
   type AshyHostStreamEvent,
+  type AutobiographicalMilestone,
   type ChatMessageRecord,
   type ChatSessionRecord,
   type CompleteOnboardingInput,
+  type DeletableMemoryKind,
+  type EpisodicMemory,
   type LlmProviderId,
+  type MemoryGovernanceCategory,
+  type MemoryGovernancePolicy,
+  type PersonalityEvolutionRecord,
+  type PersonalityTraits,
+  type ProspectiveIntent,
   type ProviderHealthResult,
   type PublicProviderConfig,
+  type RelationalMotif,
   type RelationshipStage,
   type SaveProviderConfigInput,
   type SemanticFact,
@@ -188,15 +198,21 @@ export async function createAshyHostKernel(
     const facts = cortex.db.listSemanticFacts()
     const episodes = cortex.db.listEpisodicMemories()
     const jokes = cortex.db.listRelationalMotifs()
+    const habits = cortex.db.listUserHabits()
+    const intents = cortex.db.listProspectiveIntents()
+    const evolutionLog = cortex.db.listPersonalityEvolution()
+    const governancePolicy = cortex.db.getMemoryGovernancePolicy()
 
     const totalTurns = sessions.reduce((sum, s) => sum + s.turnCount, 0)
-    const hasEstablishedJoke = jokes.some(
+    const approvedEpisodes = episodes.filter((ep) => ep.approvalStatus !== 'pending_review')
+    const approvedJokes = jokes.filter((j) => j.approvalStatus !== 'pending_review')
+    const hasEstablishedJoke = approvedJokes.some(
       (j) => j.stage === 'inside_joke' || j.stage === 'legendary',
     )
     const relMetrics = deriveRelationshipMetrics({
       totalTurns,
       milestonesCount: milestones.length,
-      episodesCount: episodes.length,
+      episodesCount: approvedEpisodes.length,
       hasEstablishedJoke,
     })
 
@@ -231,6 +247,10 @@ export async function createAshyHostKernel(
         facts,
         episodes,
         jokes,
+        habits,
+        intents,
+        evolutionLog,
+        governancePolicy,
       },
       voice: voiceStore.read(),
       providers: providerVault.getPublicState(),
@@ -259,6 +279,15 @@ export async function createAshyHostKernel(
 
   async function stop(): Promise<void> {
     if (!started) return
+    try {
+      await cortexInstance.consolidateSessionMemories({
+        sessionId: activeSessionId,
+        force: true,
+        sessionSwitch: true,
+      })
+    } catch {
+      // Fault-isolated: do not block shutdown if consolidation fails
+    }
     await container.stop()
     started = false
   }
@@ -353,6 +382,20 @@ export async function createAshyHostKernel(
       if (!session) {
         throw new Error(`ChatSession not found: ${sessionId}`)
       }
+      if (
+        sessionId !== activeSessionId &&
+        !turnOrchestratorInstance.hasActiveTurnForSession(activeSessionId)
+      ) {
+        try {
+          await cortexInstance.consolidateSessionMemories({
+            sessionId: activeSessionId,
+            force: true,
+            sessionSwitch: true,
+          })
+        } catch {
+          // Fault-isolated: do not block session switch if consolidation fails
+        }
+      }
       activeSessionId = session.id
       return {
         session,
@@ -434,8 +477,65 @@ export async function createAshyHostKernel(
       })
     },
 
+    async upsertEpisodicMemory(episode: EpisodicMemory): Promise<EpisodicMemory> {
+      return cortexInstance.db.upsertEpisodicMemory(episode)
+    },
+
+    async upsertMilestone(
+      milestone: AutobiographicalMilestone,
+    ): Promise<AutobiographicalMilestone> {
+      return cortexInstance.db.upsertMilestone(milestone)
+    },
+
+    async upsertRelationalMotif(motif: RelationalMotif): Promise<RelationalMotif> {
+      return cortexInstance.db.upsertRelationalMotif(motif)
+    },
+
+    async upsertProspectiveIntent(intent: ProspectiveIntent): Promise<ProspectiveIntent> {
+      return cortexInstance.db.upsertProspectiveIntent(intent)
+    },
+
+    async recordEmotionPulse(input: {
+      emotion: AshyEmotion
+      intensity?: number
+    }): Promise<AshyBootstrapSnapshot['affect']> {
+      dominantEmotion = input.emotion
+      const pulsed = cortexInstance.recordEmotionPulse(
+        input.emotion,
+        input.intensity ?? 0.85,
+        Date.now(),
+      )
+      return {
+        mood: pulsed.mood,
+        traits: pulsed.traits,
+        dominantEmotion,
+      }
+    },
+
+    async persistDreamConsolidation(input: {
+      episode: EpisodicMemory
+      traits: PersonalityTraits
+      record: PersonalityEvolutionRecord
+    }): Promise<void> {
+      const now = Date.now()
+      cortexInstance.db.upsertEpisodicMemory(input.episode)
+      const currentAffect = cortexInstance.db.getAffectiveState()
+      cortexInstance.db.saveAffectiveState(currentAffect.mood, input.traits, now)
+      cortexInstance.db.upsertPersonalityEvolution(input.record)
+    },
+
+    async persistTraitRevert(input: {
+      traits: PersonalityTraits
+      record: PersonalityEvolutionRecord
+    }): Promise<void> {
+      const now = Date.now()
+      const currentAffect = cortexInstance.db.getAffectiveState()
+      cortexInstance.db.saveAffectiveState(currentAffect.mood, input.traits, now)
+      cortexInstance.db.upsertPersonalityEvolution(input.record)
+    },
+
     async deleteMemoryItem(input: {
-      kind: 'fact' | 'episode' | 'joke'
+      kind: DeletableMemoryKind
       id: string
     }): Promise<void> {
       if (input.kind === 'fact') {
@@ -444,7 +544,46 @@ export async function createAshyHostKernel(
         cortexInstance.db.deleteEpisodicMemory(input.id)
       } else if (input.kind === 'joke') {
         cortexInstance.db.deleteRelationalMotif(input.id)
+      } else if (input.kind === 'habit') {
+        cortexInstance.db.deleteUserHabit(input.id)
+      } else if (input.kind === 'intent') {
+        cortexInstance.db.deleteProspectiveIntent(input.id)
+      } else if (input.kind === 'milestone') {
+        cortexInstance.db.deleteMilestone(input.id)
       }
+    },
+
+    async consolidateSessionMemories(input?: {
+      sessionId?: string
+      force?: boolean
+    }): Promise<AshyBootstrapSnapshot> {
+      const normalizedSessionId =
+        input?.sessionId && input.sessionId.trim().length > 0
+          ? input.sessionId.trim()
+          : activeSessionId
+      await cortexInstance.consolidateSessionMemories({
+        sessionId: normalizedSessionId,
+        force: input?.force ?? true,
+      })
+      return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)
+    },
+
+    async approveMemoryItem(input: {
+      kind: ApprovableMemoryKind
+      id: string
+    }): Promise<AshyBootstrapSnapshot> {
+      cortexInstance.approveMemoryItem(input.kind, input.id)
+      return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)
+    },
+
+    async setMemoryGovernancePolicy(input: {
+      category: MemoryGovernanceCategory
+      requireConfirmation: boolean
+    }): Promise<MemoryGovernancePolicy> {
+      return cortexInstance.setMemoryGovernancePolicy(
+        input.category,
+        input.requireConfirmation,
+      )
     },
 
     async seedDemoFixtures(): Promise<AshyBootstrapSnapshot> {

@@ -1,9 +1,12 @@
+import { embedTextSync128 } from '@ashy/llm'
 import {
   ASHY_BASELINE_MOOD,
   ASHY_DEFAULT_TRAITS,
   ASHY_EMOTIONS,
   AutobiographicalMilestoneSchema,
+  DEFAULT_MEMORY_GOVERNANCE_POLICY,
   EpisodicMemorySchema,
+  MEMORY_GOVERNANCE_CATEGORIES,
   MoodVectorSchema,
   PersonalityEvolutionRecordSchema,
   PersonalityTraitsSchema,
@@ -11,12 +14,16 @@ import {
   RelationalMotifSchema,
   SemanticFactSchema,
   UserHabitSchema,
+  type ApprovableMemoryKind,
   type AshyEmotion,
   type AutobiographicalMilestone,
   type ChatMessageRecord,
   type ChatSessionRecord,
   type EpisodicMemory,
   type LlmProviderId,
+  type MemoryApprovalStatus,
+  type MemoryGovernanceCategory,
+  type MemoryGovernancePolicy,
   type MoodVector,
   type PersonalityEvolutionRecord,
   type PersonalityTraits,
@@ -253,6 +260,11 @@ function openPersistentDatabase(filePath: string): SqliteDatabaseLike | null {
 
 const VALID_CHAT_ROLES = new Set(['user', 'assistant', 'system'])
 const VALID_EMOTIONS = new Set<string>(ASHY_EMOTIONS)
+const VALID_GOVERNANCE_CATEGORIES = new Set<string>(MEMORY_GOVERNANCE_CATEGORIES)
+
+function parseApprovalStatus(raw: unknown): MemoryApprovalStatus {
+  return raw === 'pending_review' ? 'pending_review' : 'approved'
+}
 
 /**
  * Browser-compatible in-memory storage adapter mirroring all memory tables + affective/style/chat stores.
@@ -270,6 +282,7 @@ export class MemoryStorageAdapter {
   readonly goldenExemplars = new Map<string, GoldenExemplarRecord>()
   readonly chatSessions = new Map<string, ChatSessionRecord>()
   readonly chatMessages: ChatMessageRecord[] = []
+  governancePolicy: MemoryGovernancePolicy = { ...DEFAULT_MEMORY_GOVERNANCE_POLICY }
   affectiveState: AffectiveStateSnapshot = {
     mood: { ...ASHY_BASELINE_MOOD },
     traits: { ...ASHY_DEFAULT_TRAITS },
@@ -286,6 +299,11 @@ export class MemoryStorageAdapter {
     this.migrations.set(2, {
       version: 2,
       name: 'v2_phase1_chat_and_exemplars',
+      appliedAt: now,
+    })
+    this.migrations.set(3, {
+      version: 3,
+      name: 'v3_phase2_self_writing_memory',
       appliedAt: now,
     })
     for (const ex of DEFAULT_GOLDEN_STYLE_EXEMPLARS) {
@@ -346,6 +364,18 @@ export class CortexDatabase {
     }
   }
 
+  private ensureColumnExists(table: string, column: string, sqlDef: string): void {
+    if (!this.sqlite) return
+    if (!/^[a-z_][a-z0-9_]*$/i.test(table) || !/^[a-z_][a-z0-9_]*$/i.test(column)) {
+      throw new Error(`Invalid SQL identifier in ensureColumnExists: ${table}.${column}`)
+    }
+    const cols = this.sqlite.prepare(`PRAGMA table_info(${table})`).all()
+    const exists = cols.some((c) => String(c.name) === column)
+    if (!exists) {
+      this.sqlite.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${sqlDef}`)
+    }
+  }
+
   private initializeSqliteSchema(): void {
     if (!this.sqlite) return
     this.sqlite.exec(`
@@ -367,7 +397,8 @@ export class CortexDatabase {
         surprise REAL NOT NULL,
         is_flashbulb INTEGER NOT NULL,
         tags_json TEXT NOT NULL,
-        embedding_json TEXT
+        embedding_json TEXT,
+        approval_status TEXT NOT NULL DEFAULT 'approved'
       );
 
       CREATE VIRTUAL TABLE IF NOT EXISTS episodic_fts USING fts5(
@@ -386,7 +417,9 @@ export class CortexDatabase {
         confidence REAL NOT NULL,
         source_episode_ids_json TEXT NOT NULL,
         valid_from INTEGER NOT NULL,
-        invalid_at INTEGER
+        invalid_at INTEGER,
+        embedding_json TEXT,
+        approval_status TEXT NOT NULL DEFAULT 'approved'
       );
 
       CREATE TABLE IF NOT EXISTS relational_motifs (
@@ -399,7 +432,9 @@ export class CortexDatabase {
         times_used INTEGER NOT NULL,
         last_used_at INTEGER,
         cooldown_hours REAL NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        embedding_json TEXT,
+        approval_status TEXT NOT NULL DEFAULT 'approved'
       );
 
       CREATE TABLE IF NOT EXISTS autobiographical_milestones (
@@ -418,7 +453,9 @@ export class CortexDatabase {
         description TEXT NOT NULL,
         confidence REAL NOT NULL,
         observation_count INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        source_episode_id TEXT,
+        approval_status TEXT NOT NULL DEFAULT 'approved'
       );
 
       CREATE TABLE IF NOT EXISTS prospective_intents (
@@ -427,7 +464,9 @@ export class CortexDatabase {
         context_cue TEXT NOT NULL,
         due_at INTEGER,
         status TEXT NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        source_episode_id TEXT,
+        approval_status TEXT NOT NULL DEFAULT 'approved'
       );
 
       CREATE TABLE IF NOT EXISTS personality_evolution_log (
@@ -484,12 +523,31 @@ export class CortexDatabase {
         provider_id TEXT,
         model_id TEXT,
         latency_ms INTEGER,
+        consolidated_episode_id TEXT,
         created_at INTEGER NOT NULL
       );
 
       CREATE INDEX IF NOT EXISTS idx_chat_messages_session_created
         ON chat_messages(session_id, created_at ASC);
+
+      CREATE TABLE IF NOT EXISTS memory_governance_settings (
+        category TEXT PRIMARY KEY,
+        require_confirmation INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+      );
     `)
+
+    // Idempotent column upgrades for pre-existing v1/v2 database files
+    this.ensureColumnExists('episodic_memories', 'approval_status', "TEXT NOT NULL DEFAULT 'approved'")
+    this.ensureColumnExists('semantic_facts', 'embedding_json', 'TEXT')
+    this.ensureColumnExists('semantic_facts', 'approval_status', "TEXT NOT NULL DEFAULT 'approved'")
+    this.ensureColumnExists('relational_motifs', 'embedding_json', 'TEXT')
+    this.ensureColumnExists('relational_motifs', 'approval_status', "TEXT NOT NULL DEFAULT 'approved'")
+    this.ensureColumnExists('user_habits', 'source_episode_id', 'TEXT')
+    this.ensureColumnExists('user_habits', 'approval_status', "TEXT NOT NULL DEFAULT 'approved'")
+    this.ensureColumnExists('prospective_intents', 'source_episode_id', 'TEXT')
+    this.ensureColumnExists('prospective_intents', 'approval_status', "TEXT NOT NULL DEFAULT 'approved'")
+    this.ensureColumnExists('chat_messages', 'consolidated_episode_id', 'TEXT')
 
     const now = Date.now()
     const insertMigration = this.sqlite.prepare(`
@@ -498,6 +556,7 @@ export class CortexDatabase {
     `)
     insertMigration.run(1, 'v1_initial_cortex_schema', now)
     insertMigration.run(2, 'v2_phase1_chat_and_exemplars', now)
+    insertMigration.run(3, 'v3_phase2_self_writing_memory', now)
 
     // Seed default Golden Style Exemplars if empty
     const countRow = this.sqlite
@@ -555,6 +614,7 @@ export class CortexDatabase {
         'golden_exemplars',
         'chat_sessions',
         'chat_messages',
+        'memory_governance_settings',
       ]
     }
     const rows = this.sqlite
@@ -565,7 +625,19 @@ export class CortexDatabase {
 
   // 1. Episodic Memories
   public upsertEpisodicMemory(input: EpisodicMemory): EpisodicMemory {
-    const memory = v.parse(EpisodicMemorySchema, input)
+    const autoEmbedding =
+      input.embedding && input.embedding.length > 0
+        ? input.embedding
+        : embedTextSync128(
+            `${input.title} ${input.summary} ${input.content} ${(input.tags ?? []).join(' ')}`,
+          )
+    const approvalStatus: MemoryApprovalStatus = input.approvalStatus ?? 'approved'
+
+    const memory = v.parse(EpisodicMemorySchema, {
+      ...input,
+      embedding: autoEmbedding,
+      approvalStatus,
+    })
     this.memory.episodicMemories.set(memory.id, memory)
 
     if (this.sqlite) {
@@ -573,8 +645,9 @@ export class CortexDatabase {
         .prepare(
           `INSERT OR REPLACE INTO episodic_memories (
             id, title, summary, content, created_at, last_reviewed_at,
-            stability, difficulty, surprise, is_flashbulb, tags_json, embedding_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            stability, difficulty, surprise, is_flashbulb, tags_json,
+            embedding_json, approval_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           memory.id,
@@ -589,6 +662,7 @@ export class CortexDatabase {
           memory.isFlashbulb ? 1 : 0,
           JSON.stringify(memory.tags),
           memory.embedding ? JSON.stringify(memory.embedding) : null,
+          memory.approvalStatus ?? 'approved',
         )
 
       this.sqlite.prepare('DELETE FROM episodic_fts WHERE memory_id = ?').run(memory.id)
@@ -615,12 +689,74 @@ export class CortexDatabase {
 
   public deleteEpisodicMemory(id: string): boolean {
     const existedInMem = this.memory.episodicMemories.delete(id)
-    if (!this.sqlite) {
-      return existedInMem
+
+    for (let i = 0; i < this.memory.chatMessages.length; i++) {
+      const msg = this.memory.chatMessages[i]
+      if (msg && msg.consolidatedEpisodeId === id) {
+        this.memory.chatMessages[i] = {
+          ...msg,
+          consolidatedEpisodeId: null,
+        }
+      }
     }
-    this.sqlite.prepare('DELETE FROM episodic_fts WHERE memory_id = ?').run(id)
-    this.sqlite.prepare('DELETE FROM episodic_memories WHERE id = ?').run(id)
-    return true
+
+    if (this.sqlite) {
+      this.sqlite.prepare('DELETE FROM episodic_fts WHERE memory_id = ?').run(id)
+      this.sqlite.prepare('DELETE FROM episodic_memories WHERE id = ?').run(id)
+      this.sqlite
+        .prepare(
+          'UPDATE chat_messages SET consolidated_episode_id = NULL WHERE consolidated_episode_id = ?',
+        )
+        .run(id)
+    }
+
+    for (const fact of this.listSemanticFacts()) {
+      if (fact.sourceEpisodeIds.includes(id)) {
+        const filtered = fact.sourceEpisodeIds.filter((epId) => epId !== id)
+        this.upsertSemanticFact({
+          ...fact,
+          sourceEpisodeIds: filtered.length > 0 ? filtered : ['deleted-episode'],
+        })
+      }
+    }
+
+    for (const motif of this.listRelationalMotifs()) {
+      if (motif.originEpisodeId === id) {
+        this.upsertRelationalMotif({
+          ...motif,
+          originEpisodeId: undefined,
+        })
+      }
+    }
+
+    for (const habit of this.listUserHabits()) {
+      if (habit.sourceEpisodeId === id) {
+        this.upsertUserHabit({
+          ...habit,
+          sourceEpisodeId: undefined,
+        })
+      }
+    }
+
+    for (const intent of this.listProspectiveIntents()) {
+      if (intent.sourceEpisodeId === id) {
+        this.upsertProspectiveIntent({
+          ...intent,
+          sourceEpisodeId: undefined,
+        })
+      }
+    }
+
+    for (const milestone of this.listMilestones()) {
+      if (milestone.episodeId === id) {
+        this.upsertMilestone({
+          ...milestone,
+          episodeId: undefined,
+        })
+      }
+    }
+
+    return this.sqlite ? true : existedInMem
   }
 
   public listEpisodicMemories(): EpisodicMemory[] {
@@ -638,10 +774,36 @@ export class CortexDatabase {
   public searchEpisodicMemoriesHybrid(
     queryText: string,
     queryEmbedding?: readonly number[],
-    options?: { nowMs?: number; limit?: number },
+    nowMsOrOptions?:
+      | number
+      | { nowMs?: number; limit?: number; includePendingReview?: boolean },
+    topK?: number,
+    extraOptions?: { includePendingReview?: boolean; nowMs?: number; limit?: number },
   ): RankedEpisodicMemory[] {
-    const allMemories = this.listEpisodicMemories()
+    const nowMs =
+      typeof nowMsOrOptions === 'number'
+        ? nowMsOrOptions
+        : (nowMsOrOptions?.nowMs ?? extraOptions?.nowMs)
+    const limit =
+      typeof nowMsOrOptions === 'number'
+        ? (topK ?? extraOptions?.limit)
+        : (nowMsOrOptions?.limit ?? topK ?? extraOptions?.limit)
+    const includePendingReview =
+      typeof nowMsOrOptions === 'number'
+        ? (extraOptions?.includePendingReview ?? false)
+        : (nowMsOrOptions?.includePendingReview ?? extraOptions?.includePendingReview ?? false)
+
+    const allMemories = this.listEpisodicMemories().filter((m) =>
+      includePendingReview ? true : m.approvalStatus !== 'pending_review',
+    )
     if (allMemories.length === 0) return []
+
+    const effectiveQueryEmbedding =
+      queryEmbedding && queryEmbedding.length > 0
+        ? queryEmbedding
+        : typeof queryText === 'string' && queryText.trim().length > 0
+          ? embedTextSync128(queryText)
+          : undefined
 
     const bm25ScoresById = new Map<string, number>()
 
@@ -673,10 +835,10 @@ export class CortexDatabase {
 
     return rankEpisodicMemories(allMemories, {
       text: queryText,
-      embedding: queryEmbedding,
-      nowMs: options?.nowMs,
+      embedding: effectiveQueryEmbedding,
+      nowMs,
       bm25ScoresById,
-      limit: options?.limit,
+      limit,
     })
   }
 
@@ -698,12 +860,23 @@ export class CortexDatabase {
         typeof embeddingJson === 'string' && embeddingJson.length > 0
           ? JSON.parse(embeddingJson)
           : undefined,
+      approvalStatus: parseApprovalStatus(row.approval_status),
     })
   }
 
   // 2. Semantic Facts
   public upsertSemanticFact(input: SemanticFact): SemanticFact {
-    const fact = v.parse(SemanticFactSchema, input)
+    const autoEmbedding =
+      input.embedding && input.embedding.length > 0
+        ? input.embedding
+        : embedTextSync128(`${input.category} ${input.subject} ${input.predicate} ${input.object}`)
+    const approvalStatus: MemoryApprovalStatus = input.approvalStatus ?? 'approved'
+
+    const fact = v.parse(SemanticFactSchema, {
+      ...input,
+      embedding: autoEmbedding,
+      approvalStatus,
+    })
     this.memory.semanticFacts.set(fact.id, fact)
 
     if (this.sqlite) {
@@ -711,8 +884,9 @@ export class CortexDatabase {
         .prepare(
           `INSERT OR REPLACE INTO semantic_facts (
             id, category, subject, predicate, object, confidence,
-            source_episode_ids_json, valid_from, invalid_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            source_episode_ids_json, valid_from, invalid_at,
+            embedding_json, approval_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           fact.id,
@@ -724,6 +898,8 @@ export class CortexDatabase {
           JSON.stringify(fact.sourceEpisodeIds),
           fact.validFrom,
           fact.invalidAt ?? null,
+          fact.embedding ? JSON.stringify(fact.embedding) : null,
+          fact.approvalStatus ?? 'approved',
         )
     }
 
@@ -759,8 +935,9 @@ export class CortexDatabase {
       const rows = this.sqlite
         .prepare('SELECT * FROM semantic_facts ORDER BY valid_from ASC')
         .all()
-      facts = rows.map((row) =>
-        v.parse(SemanticFactSchema, {
+      facts = rows.map((row) => {
+        const embeddingJson = row.embedding_json
+        return v.parse(SemanticFactSchema, {
           id: String(row.id),
           category: String(row.category),
           subject: String(row.subject),
@@ -771,13 +948,23 @@ export class CortexDatabase {
           validFrom: Number(row.valid_from),
           invalidAt:
             row.invalid_at === null || row.invalid_at === undefined ? null : Number(row.invalid_at),
-        }),
-      )
+          embedding:
+            typeof embeddingJson === 'string' && embeddingJson.length > 0
+              ? JSON.parse(embeddingJson)
+              : undefined,
+          approvalStatus: parseApprovalStatus(row.approval_status),
+        })
+      })
     }
 
     return facts.filter((fact) => {
-      if (options?.activeOnly && fact.invalidAt !== null && fact.invalidAt !== undefined) {
-        return false
+      if (options?.activeOnly) {
+        if (fact.invalidAt !== null && fact.invalidAt !== undefined) {
+          return false
+        }
+        if (fact.approvalStatus === 'pending_review') {
+          return false
+        }
       }
       if (options?.category && fact.category !== options.category) {
         return false
@@ -792,7 +979,19 @@ export class CortexDatabase {
 
   // 3. Relational Motifs (Inside Jokes)
   public upsertRelationalMotif(input: RelationalMotif): RelationalMotif {
-    const motif = v.parse(RelationalMotifSchema, input)
+    const autoEmbedding =
+      input.embedding && input.embedding.length > 0
+        ? input.embedding
+        : embedTextSync128(
+            [input.motif, input.originSummary ?? '', ...(input.triggerCues ?? [])].join(' '),
+          )
+    const approvalStatus: MemoryApprovalStatus = input.approvalStatus ?? 'approved'
+
+    const motif = v.parse(RelationalMotifSchema, {
+      ...input,
+      embedding: autoEmbedding,
+      approvalStatus,
+    })
     this.memory.relationalMotifs.set(motif.id, motif)
 
     if (this.sqlite) {
@@ -800,8 +999,9 @@ export class CortexDatabase {
         .prepare(
           `INSERT OR REPLACE INTO relational_motifs (
             id, motif, origin_summary, origin_episode_id, trigger_cues_json,
-            stage, times_used, last_used_at, cooldown_hours, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            stage, times_used, last_used_at, cooldown_hours, created_at,
+            embedding_json, approval_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           motif.id,
@@ -814,6 +1014,8 @@ export class CortexDatabase {
           motif.lastUsedAt ?? null,
           motif.cooldownHours,
           motif.createdAt,
+          motif.embedding ? JSON.stringify(motif.embedding) : null,
+          motif.approvalStatus ?? 'approved',
         )
     }
 
@@ -840,8 +1042,9 @@ export class CortexDatabase {
     const rows = this.sqlite
       .prepare('SELECT * FROM relational_motifs ORDER BY created_at ASC')
       .all()
-    return rows.map((row) =>
-      v.parse(RelationalMotifSchema, {
+    return rows.map((row) => {
+      const embeddingJson = row.embedding_json
+      return v.parse(RelationalMotifSchema, {
         id: String(row.id),
         motif: String(row.motif),
         originSummary: String(row.origin_summary),
@@ -858,8 +1061,13 @@ export class CortexDatabase {
             : Number(row.last_used_at),
         cooldownHours: Number(row.cooldown_hours),
         createdAt: Number(row.created_at),
-      }),
-    )
+        embedding:
+          typeof embeddingJson === 'string' && embeddingJson.length > 0
+            ? JSON.parse(embeddingJson)
+            : undefined,
+        approvalStatus: parseApprovalStatus(row.approval_status),
+      })
+    })
   }
 
   // 4. Autobiographical Milestones (Our Story)
@@ -886,6 +1094,15 @@ export class CortexDatabase {
     }
 
     return milestone
+  }
+
+  public deleteMilestone(id: string): boolean {
+    const existed = this.memory.milestones.delete(id)
+    if (!this.sqlite) {
+      return existed
+    }
+    this.sqlite.prepare('DELETE FROM autobiographical_milestones WHERE id = ?').run(id)
+    return true
   }
 
   public listMilestones(): AutobiographicalMilestone[] {
@@ -916,15 +1133,20 @@ export class CortexDatabase {
 
   // 5. User Habits
   public upsertUserHabit(input: UserHabit): UserHabit {
-    const habit = v.parse(UserHabitSchema, input)
+    const approvalStatus: MemoryApprovalStatus = input.approvalStatus ?? 'approved'
+    const habit = v.parse(UserHabitSchema, {
+      ...input,
+      approvalStatus,
+    })
     this.memory.userHabits.set(habit.id, habit)
 
     if (this.sqlite) {
       this.sqlite
         .prepare(
           `INSERT OR REPLACE INTO user_habits (
-            id, pattern_key, description, confidence, observation_count, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?)`,
+            id, pattern_key, description, confidence, observation_count,
+            updated_at, source_episode_id, approval_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           habit.id,
@@ -933,10 +1155,21 @@ export class CortexDatabase {
           habit.confidence,
           habit.observationCount,
           habit.updatedAt,
+          habit.sourceEpisodeId ?? null,
+          habit.approvalStatus ?? 'approved',
         )
     }
 
     return habit
+  }
+
+  public deleteUserHabit(id: string): boolean {
+    const existed = this.memory.userHabits.delete(id)
+    if (!this.sqlite) {
+      return existed
+    }
+    this.sqlite.prepare('DELETE FROM user_habits WHERE id = ?').run(id)
+    return true
   }
 
   public listUserHabits(): UserHabit[] {
@@ -954,21 +1187,31 @@ export class CortexDatabase {
         confidence: Number(row.confidence),
         observationCount: Number(row.observation_count),
         updatedAt: Number(row.updated_at),
+        sourceEpisodeId:
+          row.source_episode_id === null || row.source_episode_id === undefined
+            ? undefined
+            : String(row.source_episode_id),
+        approvalStatus: parseApprovalStatus(row.approval_status),
       }),
     )
   }
 
   // 6. Prospective Intents
   public upsertProspectiveIntent(input: ProspectiveIntent): ProspectiveIntent {
-    const intent = v.parse(ProspectiveIntentSchema, input)
+    const approvalStatus: MemoryApprovalStatus = input.approvalStatus ?? 'approved'
+    const intent = v.parse(ProspectiveIntentSchema, {
+      ...input,
+      approvalStatus,
+    })
     this.memory.prospectiveIntents.set(intent.id, intent)
 
     if (this.sqlite) {
       this.sqlite
         .prepare(
           `INSERT OR REPLACE INTO prospective_intents (
-            id, topic, context_cue, due_at, status, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?)`,
+            id, topic, context_cue, due_at, status, created_at,
+            source_episode_id, approval_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           intent.id,
@@ -977,10 +1220,21 @@ export class CortexDatabase {
           intent.dueAt ?? null,
           intent.status,
           intent.createdAt,
+          intent.sourceEpisodeId ?? null,
+          intent.approvalStatus ?? 'approved',
         )
     }
 
     return intent
+  }
+
+  public deleteProspectiveIntent(id: string): boolean {
+    const existed = this.memory.prospectiveIntents.delete(id)
+    if (!this.sqlite) {
+      return existed
+    }
+    this.sqlite.prepare('DELETE FROM prospective_intents WHERE id = ?').run(id)
+    return true
   }
 
   public listProspectiveIntents(status?: ProspectiveIntentStatus): ProspectiveIntent[] {
@@ -999,6 +1253,11 @@ export class CortexDatabase {
           dueAt: row.due_at === null || row.due_at === undefined ? null : Number(row.due_at),
           status: String(row.status),
           createdAt: Number(row.created_at),
+          sourceEpisodeId:
+            row.source_episode_id === null || row.source_episode_id === undefined
+              ? undefined
+              : String(row.source_episode_id),
+          approvalStatus: parseApprovalStatus(row.approval_status),
         }),
       )
     }
@@ -1008,7 +1267,125 @@ export class CortexDatabase {
     return intents
   }
 
-  // 7. Personality Evolution Log & Affective State
+  // 7. Memory Governance Policy & Quarantine Approval
+  public getMemoryGovernancePolicy(): MemoryGovernancePolicy {
+    const policy: MemoryGovernancePolicy = { ...DEFAULT_MEMORY_GOVERNANCE_POLICY }
+    if (!this.sqlite) {
+      return { ...this.memory.governancePolicy }
+    }
+    const rows = this.sqlite
+      .prepare('SELECT category, require_confirmation FROM memory_governance_settings')
+      .all()
+    for (const row of rows) {
+      const cat = String(row.category)
+      if (VALID_GOVERNANCE_CATEGORIES.has(cat)) {
+        policy[cat as MemoryGovernanceCategory] = Number(row.require_confirmation) === 1
+      }
+    }
+    this.memory.governancePolicy = { ...policy }
+    return policy
+  }
+
+  public setMemoryGovernancePolicy(
+    category: MemoryGovernanceCategory,
+    requireConfirmation: boolean,
+  ): MemoryGovernancePolicy {
+    if (!VALID_GOVERNANCE_CATEGORIES.has(category)) {
+      throw new Error(`Invalid MemoryGovernanceCategory: ${String(category)}`)
+    }
+    const flag = Boolean(requireConfirmation)
+    this.memory.governancePolicy = {
+      ...this.getMemoryGovernancePolicy(),
+      [category]: flag,
+    }
+
+    if (this.sqlite) {
+      this.sqlite
+        .prepare(
+          `INSERT OR REPLACE INTO memory_governance_settings (category, require_confirmation, updated_at)
+           VALUES (?, ?, ?)`,
+        )
+        .run(category, flag ? 1 : 0, Date.now())
+    }
+
+    return this.getMemoryGovernancePolicy()
+  }
+
+  public approveMemoryItem(
+    kind: ApprovableMemoryKind,
+    id: string,
+    nowMs = Date.now(),
+  ): boolean {
+    const safeNow = Number.isFinite(nowMs) && nowMs >= 0 ? nowMs : Date.now()
+
+    switch (kind) {
+      case 'fact': {
+        const allFacts = this.listSemanticFacts()
+        const target = allFacts.find((f) => f.id === id)
+        if (!target) return false
+
+        for (const other of allFacts) {
+          if (
+            other.id !== target.id &&
+            (other.invalidAt === null || other.invalidAt === undefined) &&
+            other.approvalStatus !== 'pending_review' &&
+            other.category.trim().toLowerCase() === target.category.trim().toLowerCase() &&
+            other.subject.trim().toLowerCase() === target.subject.trim().toLowerCase() &&
+            other.predicate.trim().toLowerCase() === target.predicate.trim().toLowerCase() &&
+            other.object.trim().toLowerCase() !== target.object.trim().toLowerCase()
+          ) {
+            this.invalidateSemanticFact(other.id, safeNow)
+          }
+        }
+
+        this.upsertSemanticFact({
+          ...target,
+          approvalStatus: 'approved',
+        })
+        return true
+      }
+      case 'episode': {
+        const episode = this.getEpisodicMemory(id)
+        if (!episode) return false
+        this.upsertEpisodicMemory({
+          ...episode,
+          approvalStatus: 'approved',
+        })
+        return true
+      }
+      case 'joke': {
+        const motif = this.getRelationalMotif(id)
+        if (!motif) return false
+        this.upsertRelationalMotif({
+          ...motif,
+          approvalStatus: 'approved',
+        })
+        return true
+      }
+      case 'habit': {
+        const habit = this.listUserHabits().find((h) => h.id === id)
+        if (!habit) return false
+        this.upsertUserHabit({
+          ...habit,
+          approvalStatus: 'approved',
+        })
+        return true
+      }
+      case 'intent': {
+        const intent = this.listProspectiveIntents().find((i) => i.id === id)
+        if (!intent) return false
+        this.upsertProspectiveIntent({
+          ...intent,
+          approvalStatus: 'approved',
+        })
+        return true
+      }
+      default:
+        return false
+    }
+  }
+
+  // 8. Personality Evolution Log & Affective State
   public upsertPersonalityEvolution(
     input: PersonalityEvolutionRecord,
   ): PersonalityEvolutionRecord {
@@ -1113,7 +1490,7 @@ export class CortexDatabase {
     return this.memory.affectiveState
   }
 
-  // 8. Style Exemplars & 20 PT-BR Golden Dialogue Exemplars
+  // 9. Style Exemplars & 20 PT-BR Golden Dialogue Exemplars
   public upsertStyleExemplar(exemplar: StyleExemplar): StyleExemplar {
     this.memory.styleExemplars.set(exemplar.id, exemplar)
     if (this.sqlite) {
@@ -1182,7 +1559,7 @@ export class CortexDatabase {
     }))
   }
 
-  // 9. Chat Sessions & Messages (Migration v2)
+  // 10. Chat Sessions & Messages (Migration v2 & v3)
   public createChatSession(input: {
     id: string
     title: string
@@ -1279,6 +1656,9 @@ export class CortexDatabase {
       throw new Error(`Invalid chat message role: ${String(input.role)}`)
     }
     const emotion: AshyEmotion = VALID_EMOTIONS.has(input.emotion) ? input.emotion : 'neutral'
+    const existingMemIdx = this.memory.chatMessages.findIndex((m) => m.id === input.id)
+    const existingMemMsg = existingMemIdx >= 0 ? this.memory.chatMessages[existingMemIdx] : undefined
+
     const record: ChatMessageRecord = {
       id: input.id,
       sessionId: input.sessionId,
@@ -1290,6 +1670,10 @@ export class CortexDatabase {
       providerId: input.providerId ?? null,
       modelId: input.modelId ?? null,
       latencyMs: input.latencyMs ?? null,
+      consolidatedEpisodeId:
+        input.consolidatedEpisodeId !== undefined
+          ? input.consolidatedEpisodeId
+          : (existingMemMsg?.consolidatedEpisodeId ?? null),
       createdAt: input.createdAt,
     }
 
@@ -1300,10 +1684,9 @@ export class CortexDatabase {
       if (!session) {
         throw new Error(`FOREIGN KEY constraint failed: session ${record.sessionId} does not exist`)
       }
-      const existingIdx = this.memory.chatMessages.findIndex((m) => m.id === record.id)
-      const isNewMessage = existingIdx < 0
-      if (existingIdx >= 0) {
-        this.memory.chatMessages[existingIdx] = record
+      const isNewMessage = existingMemIdx < 0
+      if (existingMemIdx >= 0) {
+        this.memory.chatMessages[existingMemIdx] = record
       } else {
         this.memory.chatMessages.push(record)
       }
@@ -1318,9 +1701,16 @@ export class CortexDatabase {
     }
 
     const existingRow = this.sqlite
-      .prepare('SELECT id FROM chat_messages WHERE id = ?')
+      .prepare('SELECT id, consolidated_episode_id FROM chat_messages WHERE id = ?')
       .get(record.id)
     const turnDelta = !existingRow && record.role === 'assistant' ? 1 : 0
+    if (
+      input.consolidatedEpisodeId === undefined &&
+      existingRow &&
+      typeof existingRow.consolidated_episode_id === 'string'
+    ) {
+      record.consolidatedEpisodeId = existingRow.consolidated_episode_id
+    }
 
     this.sqlite.exec('BEGIN IMMEDIATE')
     try {
@@ -1328,8 +1718,9 @@ export class CortexDatabase {
         .prepare(
           `INSERT OR REPLACE INTO chat_messages (
             id, session_id, role, content, raw_content, emotion,
-            markers_json, provider_id, model_id, latency_ms, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            markers_json, provider_id, model_id, latency_ms,
+            consolidated_episode_id, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           record.id,
@@ -1342,6 +1733,7 @@ export class CortexDatabase {
           record.providerId ?? null,
           record.modelId ?? null,
           record.latencyMs ?? null,
+          record.consolidatedEpisodeId ?? null,
           record.createdAt,
         )
 
@@ -1363,6 +1755,12 @@ export class CortexDatabase {
         // Ignore rollback failure
       }
       throw err
+    }
+
+    if (existingMemIdx >= 0) {
+      this.memory.chatMessages[existingMemIdx] = record
+    } else {
+      this.memory.chatMessages.push(record)
     }
 
     const memSession = this.memory.chatSessions.get(record.sessionId)
@@ -1406,6 +1804,67 @@ export class CortexDatabase {
     return rows.map((row) => this.mapRowToChatMessage(row))
   }
 
+  public listUnconsolidatedChatMessages(sessionId: string): ChatMessageRecord[] {
+    if (!this.sqlite) {
+      return this.memory.chatMessages
+        .filter(
+          (m) =>
+            m.sessionId === sessionId &&
+            (m.consolidatedEpisodeId === null || m.consolidatedEpisodeId === undefined),
+        )
+        .sort((a, b) => a.createdAt - b.createdAt)
+    }
+
+    const rows = this.sqlite
+      .prepare(
+        `SELECT rowid AS _rowid, * FROM chat_messages
+         WHERE session_id = ? AND consolidated_episode_id IS NULL
+         ORDER BY created_at ASC, _rowid ASC`,
+      )
+      .all(sessionId)
+
+    return rows.map((row) => this.mapRowToChatMessage(row))
+  }
+
+  public markChatMessagesConsolidated(
+    messageIds: readonly string[],
+    episodeId: string,
+  ): void {
+    const cleanEpisodeId = episodeId.trim()
+    if (!cleanEpisodeId || messageIds.length === 0) return
+
+    const idSet = new Set(messageIds)
+    for (let i = 0; i < this.memory.chatMessages.length; i++) {
+      const msg = this.memory.chatMessages[i]
+      if (msg && idSet.has(msg.id)) {
+        this.memory.chatMessages[i] = {
+          ...msg,
+          consolidatedEpisodeId: cleanEpisodeId,
+        }
+      }
+    }
+
+    if (this.sqlite) {
+      this.sqlite.exec('BEGIN IMMEDIATE')
+      try {
+        const stmt = this.sqlite.prepare(
+          'UPDATE chat_messages SET consolidated_episode_id = ? WHERE id = ?',
+        )
+        for (const msgId of messageIds) {
+          stmt.run(cleanEpisodeId, msgId)
+        }
+        this.sqlite.exec('COMMIT')
+      } catch (err) {
+        try {
+          this.sqlite.exec('ROLLBACK')
+        } catch {
+          // Ignore rollback failure
+        }
+        throw err
+      }
+    }
+  }
+
   private mapRowToChatSession(row: Record<string, unknown>): ChatSessionRecord {
     return {
       id: String(row.id),
@@ -1438,6 +1897,10 @@ export class CortexDatabase {
         row.model_id === null || row.model_id === undefined ? null : String(row.model_id),
       latencyMs:
         row.latency_ms === null || row.latency_ms === undefined ? null : Number(row.latency_ms),
+      consolidatedEpisodeId:
+        row.consolidated_episode_id === null || row.consolidated_episode_id === undefined
+          ? null
+          : String(row.consolidated_episode_id),
       createdAt: Number(row.created_at),
     }
   }

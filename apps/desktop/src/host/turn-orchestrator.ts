@@ -48,6 +48,7 @@ export interface TurnOrchestrator {
   abortTurn(turnId: string): Promise<void>
   abortSessionTurn(sessionId: string): void
   abortAll(): void
+  hasActiveTurnForSession(sessionId: string): boolean
   onEvent(listener: (event: AshyHostStreamEvent) => void): () => void
   getDominantEmotion(): AshyEmotion
   getLastPersistenceWarning(): string | null
@@ -243,6 +244,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     let rawAccum = ''
     let turnEmotion: AshyEmotion = 'neutral'
     const markers: TurnMarkerPayload[] = []
+    const invokedMotifIds: string[] = []
     let fallbackSnapshot: AshyBootstrapSnapshot | null = null
     try {
       fallbackSnapshot = await options.getBootstrapSnapshot()
@@ -320,6 +322,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
             motifId: signal.motifId,
           }
           markers.push(marker)
+          invokedMotifIds.push(signal.motifId)
           try {
             cortex.recordJokeCallback(signal.motifId, true, Date.now())
           } catch {
@@ -442,6 +445,12 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
         createdAt: completedAt,
       }
 
+      // Stream is complete; mark turn no longer in-flight for this session before persisting assistantMessage
+      activeTurnsById.delete(turnId)
+      if (activeTurnsBySession.get(sessionId)?.turnId === turnId) {
+        activeTurnsBySession.delete(sessionId)
+      }
+
       // Post-turn SQLite persistence with strict fault isolation (companion-emergence invariant)
       let persistenceWarning: string | null = null
       try {
@@ -452,6 +461,18 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
           assistantText: finalCleanContent,
           emotion: turnEmotion,
           now: completedAt,
+        })
+        cortex.reviewTurnMemories({
+          retrievedMemories: compiled.retrievedMemories,
+          assistantText: assistantMessage.content,
+          invokedMotifIds,
+          eligibleIntents: compiled.eligibleIntents,
+          nowMs: completedAt,
+        })
+        await cortex.consolidateSessionMemories({
+          sessionId: input.sessionId,
+          nowMs: completedAt,
+          force: false,
         })
         lastPersistenceWarning = null
         options.onPersistenceWarning?.(null)
@@ -529,6 +550,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     abortTurn,
     abortSessionTurn,
     abortAll,
+    hasActiveTurnForSession: (sessionId: string) => activeTurnsBySession.has(sessionId),
     onEvent,
     getDominantEmotion: () => currentDominantEmotion,
     getLastPersistenceWarning: () => lastPersistenceWarning,

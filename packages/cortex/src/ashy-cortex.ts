@@ -1,12 +1,21 @@
 import type {
+  ApprovableMemoryKind,
   AshyEmotion,
+  AutobiographicalMilestone,
   ChatMessageRecord,
   ChatSessionRecord,
   EpisodicMemory,
+  MemoryGovernanceCategory,
+  MemoryGovernancePolicy,
   PersonalityEvolutionRecord,
   PersonalityTraitKey,
   PersonalityTraits,
+  ProspectiveIntent,
+  RelationalMotif,
   RelationshipStage,
+  SemanticFact,
+  SemanticFactCategory,
+  UserHabit,
 } from '@ashy/shared'
 import {
   applyEmotionSignalToMood,
@@ -26,12 +35,21 @@ import {
   type CandidateSemanticFactInput,
   type ConsolidationResult,
 } from './dream/dream-worker'
+import { extractStructuredEpisode } from './memory/episode-extractor'
+import {
+  detectEpisodeBoundary,
+  type EpisodeBoundaryDecision,
+} from './memory/episode-segmenter'
 import {
   reviewEpisodicMemory,
   tokenizeForSearch,
   type FsrsReviewRating,
   type RankedEpisodicMemory,
 } from './memory/fsrs-ranker'
+import {
+  evaluateTurnMemoryUsage,
+  type EvaluateTurnMemoryUsageResult,
+} from './memory/fsrs-turn-loop'
 import {
   composeAshyTurnPrompt,
   type ComposedTurnPrompt,
@@ -50,7 +68,7 @@ const USER_TOOL_DECLARATION_RE =
 const USER_PROJECT_DECLARATION_RE =
   /(?:meu projeto atual é|estou trabalhando no projeto)\s+([^.!?\n]{2,80})/i
 const CLAUSE_CONTINUATION_SPLIT_RE =
-  /\s*(?:,\s*(?:uso muito|eu trabalho com|meu projeto atual é|estou trabalhando no projeto)|\s+e\s+(?:uso muito|eu trabalho com|meu projeto atual é|estou trabalhando no projeto|pode me chamar de|meu nome é))(?=\s|$).*$/i
+  /\s*(?:,\s*(?:uso muito|eu trabalho com|meu projeto atual é|estou trabalhando no projeto|meu editor favorito é|agora meu|prefiro|amanhã|semana que vem|me lembra de|depois preciso|sempre costumo|todo dia)|\s+e\s+(?:uso muito|eu trabalho com|meu projeto atual é|estou trabalhando no projeto|pode me chamar de|meu nome é|meu editor favorito é|agora meu|prefiro|amanhã|semana que vem|me lembra de|depois preciso|sempre costumo|todo dia))(?=\s|$).*$/i
 
 function cleanExtractedFactValue(raw: string, maxLen = 80): string {
   return raw
@@ -71,8 +89,32 @@ function cleanExtractedUserName(raw: string): string {
   return words.join(' ')
 }
 
+function normKey(value: string): string {
+  return value.trim().toLowerCase()
+}
+
+export interface ConsolidateSessionMemoriesParams {
+  sessionId: string
+  nowMs?: number
+  force?: boolean
+  sessionSwitch?: boolean
+  generateJsonFn?: (prompt: string) => Promise<string>
+}
+
+export interface ConsolidateSessionMemoriesResult {
+  consolidated: boolean
+  boundary: EpisodeBoundaryDecision
+  episode: EpisodicMemory | null
+  facts: SemanticFact[]
+  motifs: RelationalMotif[]
+  habits: UserHabit[]
+  intents: ProspectiveIntent[]
+  milestones: AutobiographicalMilestone[]
+}
+
 export class AshyCortex {
   public readonly db: CortexDatabase
+  private readonly consolidationLocks = new Map<string, Promise<ConsolidateSessionMemoriesResult>>()
 
   constructor(options?: CortexDatabaseOptions) {
     this.db = createCortexDatabase(options)
@@ -104,6 +146,26 @@ export class AshyCortex {
 
   public listChatMessages(sessionId: string, limit?: number): ChatMessageRecord[] {
     return this.db.listChatMessages(sessionId, limit)
+  }
+
+  // Governance & Quarantine delegation helpers
+  public getMemoryGovernancePolicy(): MemoryGovernancePolicy {
+    return this.db.getMemoryGovernancePolicy()
+  }
+
+  public setMemoryGovernancePolicy(
+    category: MemoryGovernanceCategory,
+    requireConfirmation: boolean,
+  ): MemoryGovernancePolicy {
+    return this.db.setMemoryGovernancePolicy(category, requireConfirmation)
+  }
+
+  public approveMemoryItem(
+    kind: ApprovableMemoryKind,
+    id: string,
+    nowMs = Date.now(),
+  ): boolean {
+    return this.db.approveMemoryItem(kind, id, nowMs)
   }
 
   public recall(
@@ -167,6 +229,8 @@ export class AshyCortex {
     screenContext?: string
     conversationHistory?: readonly ConversationMessage[]
     topKMemories?: number
+    userHabits?: readonly UserHabit[]
+    prospectiveIntents?: readonly ProspectiveIntent[]
   }): ComposedTurnPrompt {
     const nowMs = params.nowMs ?? Date.now()
     const state = this.db.getAffectiveState()
@@ -197,6 +261,7 @@ export class AshyCortex {
       nowMs,
       {
         isSeriousContext: seriousness.isSeriousOrDelicate,
+        queryEmbedding: params.queryEmbedding,
       },
     )
 
@@ -240,6 +305,9 @@ export class AshyCortex {
       seriousness,
       retrievedMemories,
       eligibleMotifs,
+      userHabits: params.userHabits ?? this.db.listUserHabits(),
+      prospectiveIntents:
+        params.prospectiveIntents ?? this.db.listProspectiveIntents('pending'),
       screenContext: params.screenContext,
       conversationHistory: params.conversationHistory,
     })
@@ -258,6 +326,7 @@ export class AshyCortex {
     const cleanUserText = (input.userText ?? '').replace(/\0/g, '').trim()
     const cleanAssistantText = (input.assistantText ?? '').replace(/\0/g, '').trim()
     const episodeId = `ep-turn-${cleanTurnId}`
+    const policy = this.db.getMemoryGovernancePolicy()
 
     let episodeCreated = false
     if (cleanUserText.length >= 12) {
@@ -283,37 +352,101 @@ export class AshyCortex {
         surprise: isHighAffect ? 0.65 : 0.4,
         isFlashbulb: false,
         tags,
+        approvalStatus: policy.episodes ? 'pending_review' : 'approved',
       })
       episodeCreated = true
     }
 
     let factsCreated = 0
 
-    const nameMatch = USER_NAME_DECLARATION_RE.exec(cleanUserText)
-    if (nameMatch?.[1]) {
-      const extractedName = cleanExtractedUserName(nameMatch[1])
-      if (extractedName.length >= 2) {
-        for (const existing of this.db.listActiveSemanticFacts('identity')) {
-          if (
-            existing.subject === 'user' &&
-            (existing.predicate === 'name' || existing.predicate === 'user_name') &&
-            existing.id !== 'fact-user-name'
-          ) {
+    const persistTurnFact = (params: {
+      defaultId: string
+      category: SemanticFactCategory
+      predicate: string
+      object: string
+      confidence: number
+    }) => {
+      const activeFacts = this.db.listActiveSemanticFacts(params.category)
+      const samePredicateActive = activeFacts.filter(
+        (f) =>
+          normKey(f.subject) === 'user' &&
+          (normKey(f.predicate) === normKey(params.predicate) ||
+            (params.predicate === 'name' && normKey(f.predicate) === 'user_name')),
+      )
+
+      const identicalActive = samePredicateActive.find(
+        (f) => normKey(f.object) === normKey(params.object),
+      )
+      if (identicalActive) {
+        const mergedEpisodeIds = Array.from(
+          new Set([...identicalActive.sourceEpisodeIds, episodeId]),
+        )
+        this.db.upsertSemanticFact({
+          ...identicalActive,
+          sourceEpisodeIds: mergedEpisodeIds,
+          approvalStatus: 'approved',
+        })
+        factsCreated += 1
+        return
+      }
+
+      if (!policy.facts) {
+        for (const existing of samePredicateActive) {
+          if (existing.id !== params.defaultId) {
             this.db.invalidateSemanticFact(existing.id, now)
           }
         }
         this.db.upsertSemanticFact({
-          id: 'fact-user-name',
-          category: 'identity',
+          id: params.defaultId,
+          category: params.category,
           subject: 'user',
-          predicate: 'name',
-          object: extractedName,
-          confidence: 0.95,
+          predicate: params.predicate,
+          object: params.object,
+          confidence: params.confidence,
           sourceEpisodeIds: [episodeId],
           validFrom: now,
           invalidAt: null,
+          approvalStatus: 'approved',
         })
         factsCreated += 1
+        return
+      }
+
+      // Quarantine enabled (`policy.facts === true`):
+      // Do NOT invalidate existing approved facts and do NOT overwrite an existing approved or pending_review ID
+      const existingWithSameId = this.db
+        .listSemanticFacts()
+        .find((f) => f.id === params.defaultId)
+      const candidateId = existingWithSameId
+        ? `${params.defaultId}-${cleanTurnId}`
+        : params.defaultId
+
+      this.db.upsertSemanticFact({
+        id: candidateId,
+        category: params.category,
+        subject: 'user',
+        predicate: params.predicate,
+        object: params.object,
+        confidence: params.confidence,
+        sourceEpisodeIds: [episodeId],
+        validFrom: now,
+        invalidAt: null,
+        approvalStatus: 'pending_review',
+      })
+      factsCreated += 1
+    }
+
+    const nameMatch = USER_NAME_DECLARATION_RE.exec(cleanUserText)
+    if (nameMatch?.[1]) {
+      const extractedName = cleanExtractedUserName(nameMatch[1])
+      if (extractedName.length >= 2) {
+        persistTurnFact({
+          defaultId: 'fact-user-name',
+          category: 'identity',
+          predicate: 'name',
+          object: extractedName,
+          confidence: 0.95,
+        })
       }
     }
 
@@ -321,18 +454,13 @@ export class AshyCortex {
     if (workMatch?.[1]) {
       const extractedWork = cleanExtractedFactValue(workMatch[1], 80)
       if (extractedWork.length >= 3) {
-        this.db.upsertSemanticFact({
-          id: `fact-user-work-${cleanTurnId}`,
+        persistTurnFact({
+          defaultId: `fact-user-work-${cleanTurnId}`,
           category: 'preference',
-          subject: 'user',
           predicate: 'works_with',
           object: extractedWork,
           confidence: 0.85,
-          sourceEpisodeIds: [episodeId],
-          validFrom: now,
-          invalidAt: null,
         })
-        factsCreated += 1
       }
     }
 
@@ -340,18 +468,13 @@ export class AshyCortex {
     if (toolMatch?.[1]) {
       const extractedTool = cleanExtractedFactValue(toolMatch[1], 80)
       if (extractedTool.length >= 3) {
-        this.db.upsertSemanticFact({
-          id: `fact-user-tool-${cleanTurnId}`,
+        persistTurnFact({
+          defaultId: `fact-user-tool-${cleanTurnId}`,
           category: 'preference',
-          subject: 'user',
           predicate: 'uses_tool',
           object: extractedTool,
           confidence: 0.85,
-          sourceEpisodeIds: [episodeId],
-          validFrom: now,
-          invalidAt: null,
         })
-        factsCreated += 1
       }
     }
 
@@ -359,25 +482,428 @@ export class AshyCortex {
     if (projectMatch?.[1]) {
       const extractedProject = cleanExtractedFactValue(projectMatch[1], 80)
       if (extractedProject.length >= 2) {
-        this.db.upsertSemanticFact({
-          id: `fact-user-project-${cleanTurnId}`,
+        persistTurnFact({
+          defaultId: `fact-user-project-${cleanTurnId}`,
           category: 'goal',
-          subject: 'user',
           predicate: 'current_project',
           object: extractedProject,
           confidence: 0.85,
-          sourceEpisodeIds: [episodeId],
-          validFrom: now,
-          invalidAt: null,
         })
-        factsCreated += 1
       }
+    }
+
+    if (factsCreated > 0 && !episodeCreated && cleanUserText.length > 0) {
+      this.db.upsertEpisodicMemory({
+        id: episodeId,
+        title: cleanUserText.slice(0, 60),
+        summary: `Usuário: ${cleanUserText.slice(0, 120)} | Ashy: ${cleanAssistantText.slice(0, 120)}`,
+        content: `Usuário: ${cleanUserText}\nAshy: ${cleanAssistantText}`,
+        createdAt: now,
+        lastReviewedAt: now,
+        stability: 3.0,
+        difficulty: 4.5,
+        surprise: 0.4,
+        isFlashbulb: false,
+        tags: ['conversation'],
+        approvalStatus: policy.episodes ? 'pending_review' : 'approved',
+      })
+      episodeCreated = true
     }
 
     return {
       episodeCreated,
       factsCreated,
     }
+  }
+
+  public async consolidateSessionMemories(
+    params: ConsolidateSessionMemoriesParams,
+  ): Promise<ConsolidateSessionMemoriesResult> {
+    const lockKey = params.sessionId.trim() || '__default__'
+    const prevLock = this.consolidationLocks.get(lockKey)
+    const nextPromise = (prevLock ? prevLock.catch(() => undefined) : Promise.resolve()).then(
+      () => this.executeConsolidateSessionMemories(params),
+    )
+    this.consolidationLocks.set(lockKey, nextPromise)
+    try {
+      return await nextPromise
+    } finally {
+      if (this.consolidationLocks.get(lockKey) === nextPromise) {
+        this.consolidationLocks.delete(lockKey)
+      }
+    }
+  }
+
+  private async executeConsolidateSessionMemories(
+    params: ConsolidateSessionMemoriesParams,
+  ): Promise<ConsolidateSessionMemoriesResult> {
+    const safeNow =
+      params.nowMs !== undefined && Number.isFinite(params.nowMs) && params.nowMs >= 0
+        ? params.nowMs
+        : Date.now()
+
+    const unconsolidated = this.db.listUnconsolidatedChatMessages(params.sessionId)
+    const boundary = detectEpisodeBoundary(unconsolidated, {
+      nowMs: safeNow,
+      force: params.force,
+      sessionSwitch: params.sessionSwitch,
+    })
+
+    if (!boundary.shouldConsolidate || boundary.batchMessages.length === 0) {
+      return {
+        consolidated: false,
+        boundary,
+        episode: null,
+        facts: [],
+        motifs: [],
+        habits: [],
+        intents: [],
+        milestones: [],
+      }
+    }
+
+    const batch = boundary.batchMessages
+    const minCreatedAt = Math.min(...batch.map((m) => m.createdAt))
+    const maxCreatedAt = Math.max(...batch.map((m) => m.createdAt))
+    const cleanSessionSlug =
+      params.sessionId.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 24) || 'session'
+    const firstMsgSlug = batch[0]!.id.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 24) || 'm0'
+    const episodeId = `ep-${cleanSessionSlug}-${minCreatedAt}-${firstMsgSlug}`
+
+    const extracted = await extractStructuredEpisode({
+      episodeId,
+      messages: batch,
+      generateJsonFn: params.generateJsonFn,
+      nowMs: safeNow,
+    })
+
+    // Supersede any per-turn draft `ep-turn-*` episodes created during this batch window
+    const supersededDraftIds = new Set<string>()
+    for (const ep of this.db.listEpisodicMemories()) {
+      if (!ep.id.startsWith('ep-turn-')) continue
+      const turnSlug = ep.id.slice('ep-turn-'.length)
+      const inTimeWindow =
+        ep.createdAt >= minCreatedAt - 5_000 && ep.createdAt <= maxCreatedAt + 60_000
+      const matchesTurnSlug = batch.some(
+        (m) => turnSlug.length > 0 && m.id.includes(turnSlug),
+      )
+      const matchesBatchContent = batch.some(
+        (m) => m.content.trim().length > 0 && ep.content.includes(m.content.trim()),
+      )
+      if (matchesTurnSlug || (inTimeWindow && matchesBatchContent)) {
+        supersededDraftIds.add(ep.id)
+      }
+    }
+
+    if (supersededDraftIds.size > 0) {
+      for (const fact of this.db.listSemanticFacts()) {
+        if (fact.sourceEpisodeIds.some((id) => supersededDraftIds.has(id))) {
+          const updatedSourceIds = Array.from(
+            new Set(
+              fact.sourceEpisodeIds.map((id) => (supersededDraftIds.has(id) ? episodeId : id)),
+            ),
+          )
+          this.db.upsertSemanticFact({
+            ...fact,
+            sourceEpisodeIds: updatedSourceIds,
+          })
+        }
+      }
+      for (const motif of this.db.listRelationalMotifs()) {
+        if (motif.originEpisodeId && supersededDraftIds.has(motif.originEpisodeId)) {
+          this.db.upsertRelationalMotif({
+            ...motif,
+            originEpisodeId: episodeId,
+          })
+        }
+      }
+      for (const draftId of supersededDraftIds) {
+        this.db.deleteEpisodicMemory(draftId)
+      }
+    }
+
+    const policy = this.db.getMemoryGovernancePolicy()
+
+    // 1. Persist consolidated EpisodicMemory
+    const episodeToSave: EpisodicMemory = {
+      ...extracted.episode,
+      approvalStatus: policy.episodes ? 'pending_review' : 'approved',
+    }
+    this.db.upsertEpisodicMemory(episodeToSave)
+
+    // 2. Consolidate SemanticFacts (Predict -> Calibrate vs Quarantine)
+    const allExistingFacts = this.db.listSemanticFacts()
+    const approvedExistingFacts = allExistingFacts.filter(
+      (f) => f.approvalStatus !== 'pending_review',
+    )
+    const existingMotifs = this.db.listRelationalMotifs()
+
+    const consolidation = runPredictCalibrateConsolidation({
+      episode: episodeToSave,
+      candidateFacts: policy.facts
+        ? []
+        : extracted.facts.map((f) => ({
+            id: f.id,
+            category: f.category,
+            subject: f.subject,
+            predicate: f.predicate,
+            object: f.object,
+            confidence: f.confidence,
+          })),
+      candidateMotifs: policy.jokes
+        ? []
+        : extracted.motifs.map((m) => ({
+            id: m.id,
+            motif: m.motif,
+            triggerCues: m.triggerCues,
+            originSummary: m.originSummary,
+          })),
+      existingFacts: approvedExistingFacts,
+      existingMotifs,
+      nowMs: safeNow,
+    })
+
+    const persistedFacts: SemanticFact[] = []
+
+    if (!policy.facts) {
+      for (const fact of consolidation.updatedFacts) {
+        const saved = this.db.upsertSemanticFact({
+          ...fact,
+          approvalStatus: 'approved',
+        })
+        if (saved.sourceEpisodeIds.includes(episodeId)) {
+          persistedFacts.push(saved)
+        }
+      }
+    } else {
+      // Quarantine enabled (`policy.facts === true`):
+      // Keep existing approved facts untouched and place only new/changed candidate facts in 'pending_review'
+      for (const cand of extracted.facts) {
+        const activeApprovedMatch = approvedExistingFacts.find(
+          (f) =>
+            (f.invalidAt === null || f.invalidAt === undefined) &&
+            normKey(f.category) === normKey(cand.category) &&
+            normKey(f.subject) === normKey(cand.subject) &&
+            normKey(f.predicate) === normKey(cand.predicate) &&
+            normKey(f.object) === normKey(cand.object),
+        )
+
+        if (activeApprovedMatch) {
+          const reinforced = this.db.upsertSemanticFact({
+            ...activeApprovedMatch,
+            sourceEpisodeIds: Array.from(
+              new Set([...activeApprovedMatch.sourceEpisodeIds, episodeId]),
+            ),
+            approvalStatus: 'approved',
+          })
+          persistedFacts.push(reinforced)
+          continue
+        }
+
+        const existingPendingSame = this.db
+          .listSemanticFacts()
+          .find(
+            (f) =>
+              f.approvalStatus === 'pending_review' &&
+              normKey(f.category) === normKey(cand.category) &&
+              normKey(f.subject) === normKey(cand.subject) &&
+              normKey(f.predicate) === normKey(cand.predicate) &&
+              normKey(f.object) === normKey(cand.object),
+          )
+
+        const savedPending = this.db.upsertSemanticFact({
+          ...cand,
+          id: existingPendingSame?.id ?? cand.id,
+          sourceEpisodeIds: Array.from(
+            new Set([...(existingPendingSame?.sourceEpisodeIds ?? []), episodeId]),
+          ),
+          validFrom: safeNow,
+          invalidAt: null,
+          approvalStatus: 'pending_review',
+        })
+        persistedFacts.push(savedPending)
+      }
+    }
+
+    // 3. Persist RelationalMotifs respecting `policy.jokes`
+    const persistedMotifs: RelationalMotif[] = []
+    if (!policy.jokes) {
+      for (const motif of consolidation.updatedMotifs) {
+        const preExisting = existingMotifs.find((m) => m.id === motif.id)
+        const wasReinforcedInThisEpisode =
+          !preExisting ||
+          motif.originEpisodeId === episodeId ||
+          motif.timesUsed !== preExisting.timesUsed ||
+          motif.lastUsedAt !== preExisting.lastUsedAt ||
+          extracted.motifs.some((cand) => normKey(cand.motif) === normKey(motif.motif))
+        const approvalStatus = wasReinforcedInThisEpisode
+          ? 'approved'
+          : (preExisting?.approvalStatus ?? 'approved')
+        const savedMotif = this.db.upsertRelationalMotif({
+          ...motif,
+          originEpisodeId: motif.originEpisodeId ?? episodeId,
+          approvalStatus,
+        })
+        if (!preExisting || wasReinforcedInThisEpisode) {
+          persistedMotifs.push(savedMotif)
+        }
+      }
+    } else {
+      for (const cand of extracted.motifs) {
+        const existingPendingSame = existingMotifs.find(
+          (m) =>
+            m.approvalStatus === 'pending_review' &&
+            normKey(m.motif) === normKey(cand.motif),
+        )
+        const savedPendingMotif = this.db.upsertRelationalMotif({
+          ...cand,
+          id: existingPendingSame?.id ?? cand.id,
+          originEpisodeId: episodeId,
+          approvalStatus: 'pending_review',
+        })
+        persistedMotifs.push(savedPendingMotif)
+      }
+    }
+
+    // 4. Persist UserHabits respecting `policy.habits`
+    const existingHabits = this.db.listUserHabits()
+    const persistedHabits: UserHabit[] = []
+    for (const habit of extracted.habits) {
+      const existingSameKey = existingHabits.find(
+        (h) => normKey(h.patternKey) === normKey(habit.patternKey),
+      )
+      if (existingSameKey && !policy.habits) {
+        const updatedHabit = this.db.upsertUserHabit({
+          ...existingSameKey,
+          confidence: Math.min(1, Number((existingSameKey.confidence + 0.05).toFixed(4))),
+          observationCount: existingSameKey.observationCount + 1,
+          updatedAt: safeNow,
+          sourceEpisodeId: episodeId,
+          approvalStatus: 'approved',
+        })
+        persistedHabits.push(updatedHabit)
+      } else {
+        const savedHabit = this.db.upsertUserHabit({
+          ...habit,
+          id: existingSameKey?.id ?? habit.id,
+          sourceEpisodeId: episodeId,
+          approvalStatus: policy.habits ? 'pending_review' : 'approved',
+        })
+        persistedHabits.push(savedHabit)
+      }
+    }
+
+    // 5. Persist ProspectiveIntents respecting `policy.intents`
+    const existingIntents = this.db.listProspectiveIntents()
+    const persistedIntents: ProspectiveIntent[] = []
+    for (const intent of extracted.intents) {
+      const duplicateIntent = existingIntents.find(
+        (i) => i.status === 'pending' && normKey(i.topic) === normKey(intent.topic),
+      )
+      if (duplicateIntent) {
+        if (duplicateIntent.approvalStatus === 'pending_review' && !policy.intents) {
+          const promotedIntent = this.db.upsertProspectiveIntent({
+            ...duplicateIntent,
+            sourceEpisodeId: episodeId,
+            approvalStatus: 'approved',
+          })
+          persistedIntents.push(promotedIntent)
+        } else {
+          persistedIntents.push(duplicateIntent)
+        }
+        continue
+      }
+      const savedIntent = this.db.upsertProspectiveIntent({
+        ...intent,
+        sourceEpisodeId: episodeId,
+        approvalStatus: policy.intents ? 'pending_review' : 'approved',
+      })
+      persistedIntents.push(savedIntent)
+    }
+
+    // 6. Persist AutobiographicalMilestones (only for approved episodes/jokes)
+    const persistedMilestones: AutobiographicalMilestone[] = []
+    for (const milestone of consolidation.newMilestones) {
+      if (milestone.category === 'flashbulb_moment' && policy.episodes) {
+        continue
+      }
+      if (milestone.category === 'inside_joke_born' && policy.jokes) {
+        continue
+      }
+      persistedMilestones.push(this.db.upsertMilestone(milestone))
+    }
+
+    // 7. Mark batch chat_messages as consolidated
+    this.db.markChatMessagesConsolidated(
+      batch.map((m) => m.id),
+      episodeId,
+    )
+
+    return {
+      consolidated: true,
+      boundary,
+      episode: episodeToSave,
+      facts: persistedFacts,
+      motifs: persistedMotifs,
+      habits: persistedHabits,
+      intents: persistedIntents,
+      milestones: persistedMilestones,
+    }
+  }
+
+  public reviewTurnMemories(params: {
+    retrievedMemories: readonly RankedEpisodicMemory[]
+    assistantText: string
+    invokedMotifIds?: readonly string[]
+    eligibleIntents?: readonly ProspectiveIntent[]
+    nowMs?: number
+  }): EvaluateTurnMemoryUsageResult {
+    const safeNow =
+      params.nowMs !== undefined && Number.isFinite(params.nowMs) && params.nowMs >= 0
+        ? params.nowMs
+        : Date.now()
+    const evaluation = evaluateTurnMemoryUsage({
+      retrievedMemories: params.retrievedMemories,
+      assistantText: params.assistantText,
+      invokedMotifIds: params.invokedMotifIds,
+      motifs: this.db.listRelationalMotifs(),
+      nowMs: safeNow,
+    })
+
+    for (const item of evaluation.reviewedMemories) {
+      this.db.upsertEpisodicMemory(item.memory)
+    }
+
+    const MAX_OVERDUE_MS = 7 * 86_400_000
+    const candidateIntents =
+      params.eligibleIntents ??
+      this.db.listProspectiveIntents('pending').filter((intent) => {
+        if (intent.approvalStatus === 'pending_review') return false
+        if (intent.dueAt === null || intent.dueAt === undefined) return false
+        return intent.dueAt <= safeNow && safeNow - intent.dueAt <= MAX_OVERDUE_MS
+      })
+
+    const assistantTokens = new Set(tokenizeForSearch(params.assistantText ?? ''))
+    for (const intent of candidateIntents) {
+      if (intent.status !== 'pending' || intent.approvalStatus === 'pending_review') {
+        continue
+      }
+      const isDue =
+        intent.dueAt !== null &&
+        intent.dueAt !== undefined &&
+        intent.dueAt <= safeNow &&
+        safeNow - intent.dueAt <= MAX_OVERDUE_MS
+      const intentTokens = tokenizeForSearch(intent.topic).filter((t) => t.length >= 3)
+      const mentionedInReply = intentTokens.some((t) => assistantTokens.has(t))
+      if (isDue || mentionedInReply) {
+        this.db.upsertProspectiveIntent({
+          ...intent,
+          status: 'triggered',
+        })
+      }
+    }
+
+    return evaluation
   }
 
   public recordEmotionPulse(emotion: AshyEmotion, intensity = 0.8, nowMs = Date.now()) {
@@ -428,8 +954,15 @@ export class AshyCortex {
     if (!motif) {
       throw new Error(`RelationalMotif not found: ${motifId}`)
     }
+    if (motif.approvalStatus === 'pending_review') {
+      return motif
+    }
     const updated = recordMotifInvocation(motif, userReactedPositively, nowMs)
     return this.db.upsertRelationalMotif(updated)
+  }
+
+  public recordMotifCallback(motifId: string, userReactedPositively: boolean, nowMs = Date.now()) {
+    return this.recordJokeCallback(motifId, userReactedPositively, nowMs)
   }
 
   public reviewMemory(memoryId: string, rating: FsrsReviewRating, nowMs = Date.now()) {

@@ -140,7 +140,6 @@ export function seedAshyDemoFixtures(cortex: AshyCortex): void {
     surprise: 0.96,
     isFlashbulb: true,
     tags: ['flashbulb', 'production', 'security'],
-    embedding: [0.92, 0.18, 0.08, 0.02],
   })
 
   cortex.db.upsertEpisodicMemory({
@@ -156,7 +155,6 @@ export function seedAshyDemoFixtures(cortex: AshyCortex): void {
     surprise: 0.78,
     isFlashbulb: false,
     tags: ['debug', 'inside_joke', 'backend'],
-    embedding: [0.75, 0.55, 0.12, 0.04],
   })
 
   cortex.db.upsertEpisodicMemory({
@@ -172,7 +170,6 @@ export function seedAshyDemoFixtures(cortex: AshyCortex): void {
     surprise: 0.65,
     isFlashbulb: false,
     tags: ['video', 'architecture', 'chroma_key'],
-    embedding: [0.35, 0.82, 0.24, 0.1],
   })
 
   // 3. Seed Semantic Facts (Identity + Active + Invalidated Bi-Temporal History)

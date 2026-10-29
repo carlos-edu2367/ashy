@@ -2,9 +2,19 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import path from 'node:path'
 import type { Plugin } from 'vite'
 import type {
+  ApprovableMemoryKind,
+  AshyEmotion,
   AshyHostBridge,
+  AutobiographicalMilestone,
   CompleteOnboardingInput,
+  DeletableMemoryKind,
+  EpisodicMemory,
   LlmProviderId,
+  MemoryGovernanceCategory,
+  PersonalityEvolutionRecord,
+  PersonalityTraits,
+  ProspectiveIntent,
+  RelationalMotif,
   SaveProviderConfigInput,
   SendTurnInput,
   TestProviderInput,
@@ -14,6 +24,31 @@ import type { AshyHostKernel, AshyHostKernelOptions } from './kernel'
 import { createNodeAesSecretProtector, type SecretProtector } from './secret-protector'
 
 const MAX_RPC_BODY_BYTES = 2 * 1024 * 1024
+
+const VALID_DELETABLE_MEMORY_KINDS: readonly DeletableMemoryKind[] = [
+  'fact',
+  'episode',
+  'joke',
+  'habit',
+  'intent',
+  'milestone',
+]
+
+const VALID_APPROVABLE_MEMORY_KINDS: readonly ApprovableMemoryKind[] = [
+  'fact',
+  'episode',
+  'joke',
+  'habit',
+  'intent',
+]
+
+const VALID_MEMORY_GOVERNANCE_CATEGORIES: readonly MemoryGovernanceCategory[] = [
+  'facts',
+  'episodes',
+  'jokes',
+  'habits',
+  'intents',
+]
 
 const ALLOWED_RPC_METHODS = new Set<string>([
   'getBootstrapSnapshot',
@@ -28,7 +63,17 @@ const ALLOWED_RPC_METHODS = new Set<string>([
   'saveVoiceIdentity',
   'resetVoiceIdentity',
   'upsertSemanticFact',
+  'upsertEpisodicMemory',
+  'upsertMilestone',
+  'upsertRelationalMotif',
+  'upsertProspectiveIntent',
+  'recordEmotionPulse',
+  'persistDreamConsolidation',
+  'persistTraitRevert',
   'deleteMemoryItem',
+  'consolidateSessionMemories',
+  'approveMemoryItem',
+  'setMemoryGovernancePolicy',
   'seedDemoFixtures',
 ])
 
@@ -39,16 +84,26 @@ export class DisallowedRpcMethodError extends Error {
   }
 }
 
+function isValidRpcIdString(val: unknown): val is string {
+  return (
+    typeof val === 'string' &&
+    val.trim().length > 0 &&
+    val.length <= 256 &&
+    !val.includes('\0')
+  )
+}
+
 function extractStringArg(payload: unknown, fieldName: string): string {
-  if (typeof payload === 'string' && payload.trim().length > 0) {
+  if (typeof payload === 'string' && payload.trim().length > 0 && !payload.includes('\0')) {
     return payload
   }
   if (
     payload !== null &&
     typeof payload === 'object' &&
-    fieldName in payload &&
+    Object.prototype.hasOwnProperty.call(payload, fieldName) &&
     typeof (payload as Record<string, unknown>)[fieldName] === 'string' &&
-    ((payload as Record<string, string>)[fieldName] ?? '').trim().length > 0
+    ((payload as Record<string, string>)[fieldName] ?? '').trim().length > 0 &&
+    !((payload as Record<string, string>)[fieldName] ?? '').includes('\0')
   ) {
     return (payload as Record<string, string>)[fieldName]!
   }
@@ -89,7 +144,7 @@ export async function dispatchHostRpc(
           ? payload
           : payload !== null &&
               typeof payload === 'object' &&
-              'title' in payload &&
+              Object.prototype.hasOwnProperty.call(payload, 'title') &&
               typeof (payload as { title?: unknown }).title === 'string'
             ? (payload as { title: string }).title
             : undefined
@@ -139,19 +194,116 @@ export async function dispatchHostRpc(
       return kernel.upsertSemanticFact(obj)
     }
 
+    case 'upsertEpisodicMemory':
+      return kernel.upsertEpisodicMemory(
+        assertObjectPayload<EpisodicMemory>(payload, method),
+      )
+
+    case 'upsertMilestone':
+      return kernel.upsertMilestone(
+        assertObjectPayload<AutobiographicalMilestone>(payload, method),
+      )
+
+    case 'upsertRelationalMotif':
+      return kernel.upsertRelationalMotif(
+        assertObjectPayload<RelationalMotif>(payload, method),
+      )
+
+    case 'upsertProspectiveIntent':
+      return kernel.upsertProspectiveIntent(
+        assertObjectPayload<ProspectiveIntent>(payload, method),
+      )
+
+    case 'recordEmotionPulse':
+      return kernel.recordEmotionPulse(
+        assertObjectPayload<{ emotion: AshyEmotion; intensity?: number }>(payload, method),
+      )
+
+    case 'persistDreamConsolidation':
+      return kernel.persistDreamConsolidation(
+        assertObjectPayload<{
+          episode: EpisodicMemory
+          traits: PersonalityTraits
+          record: PersonalityEvolutionRecord
+        }>(payload, method),
+      )
+
+    case 'persistTraitRevert':
+      return kernel.persistTraitRevert(
+        assertObjectPayload<{
+          traits: PersonalityTraits
+          record: PersonalityEvolutionRecord
+        }>(payload, method),
+      )
+
     case 'deleteMemoryItem': {
       const obj = assertObjectPayload<{
-        kind: 'fact' | 'episode' | 'joke'
+        kind: DeletableMemoryKind
         id: string
       }>(payload, method)
       if (
-        (obj.kind !== 'fact' && obj.kind !== 'episode' && obj.kind !== 'joke') ||
-        typeof obj.id !== 'string' ||
-        obj.id.trim().length === 0
+        !VALID_DELETABLE_MEMORY_KINDS.includes(obj.kind) ||
+        !isValidRpcIdString(obj.id)
       ) {
-        throw new Error('Invalid RPC argument for deleteMemoryItem: expected { kind: fact|episode|joke, id: string }')
+        throw new Error(
+          'Invalid RPC argument for deleteMemoryItem: expected { kind: fact|episode|joke|habit|intent|milestone, id: string }',
+        )
       }
       return kernel.deleteMemoryItem(obj)
+    }
+
+    case 'consolidateSessionMemories': {
+      if (payload === undefined || payload === null) {
+        return kernel.consolidateSessionMemories()
+      }
+      const obj = assertObjectPayload<{
+        sessionId?: string
+        force?: boolean
+      }>(payload, method)
+      if (
+        (obj.sessionId !== undefined &&
+          (typeof obj.sessionId !== 'string' ||
+            obj.sessionId.length > 256 ||
+            obj.sessionId.includes('\0'))) ||
+        (obj.force !== undefined && typeof obj.force !== 'boolean')
+      ) {
+        throw new Error(
+          'Invalid RPC argument for consolidateSessionMemories: expected { sessionId?: string, force?: boolean }',
+        )
+      }
+      return kernel.consolidateSessionMemories(obj)
+    }
+
+    case 'approveMemoryItem': {
+      const obj = assertObjectPayload<{
+        kind: ApprovableMemoryKind
+        id: string
+      }>(payload, method)
+      if (
+        !VALID_APPROVABLE_MEMORY_KINDS.includes(obj.kind) ||
+        !isValidRpcIdString(obj.id)
+      ) {
+        throw new Error(
+          'Invalid RPC argument for approveMemoryItem: expected { kind: fact|episode|joke|habit|intent, id: string }',
+        )
+      }
+      return kernel.approveMemoryItem(obj)
+    }
+
+    case 'setMemoryGovernancePolicy': {
+      const obj = assertObjectPayload<{
+        category: MemoryGovernanceCategory
+        requireConfirmation: boolean
+      }>(payload, method)
+      if (
+        !VALID_MEMORY_GOVERNANCE_CATEGORIES.includes(obj.category) ||
+        typeof obj.requireConfirmation !== 'boolean'
+      ) {
+        throw new Error(
+          'Invalid RPC argument for setMemoryGovernancePolicy: expected { category: facts|episodes|jokes|habits|intents, requireConfirmation: boolean }',
+        )
+      }
+      return kernel.setMemoryGovernancePolicy(obj)
     }
 
     case 'seedDemoFixtures':
@@ -222,6 +374,58 @@ function sendJson(res: ServerResponse, statusCode: number, body: unknown): void 
   res.end(payload)
 }
 
+const ALLOWED_LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+
+function parseHostHeaderHostname(rawHost: string): string {
+  const trimmed = rawHost.trim().toLowerCase()
+  if (trimmed.startsWith('[')) {
+    const closeIdx = trimmed.indexOf(']')
+    return closeIdx >= 0 ? trimmed.slice(0, closeIdx + 1) : trimmed
+  }
+  const colonIdx = trimmed.indexOf(':')
+  return colonIdx >= 0 ? trimmed.slice(0, colonIdx) : trimmed
+}
+
+function isAllowedLoopbackRequest(req: IncomingMessage): { ok: true } | { ok: false; reason: string } {
+  const hostHeader = req.headers.host
+  if (typeof hostHeader === 'string' && hostHeader.trim().length > 0) {
+    const hostname = parseHostHeaderHostname(hostHeader)
+    if (!ALLOWED_LOOPBACK_HOSTS.has(hostname)) {
+      return { ok: false, reason: 'Forbidden: non-loopback Host header (DNS rebinding protection)' }
+    }
+  }
+
+  const secFetchSite = req.headers['sec-fetch-site']
+  if (typeof secFetchSite === 'string' && secFetchSite.trim().toLowerCase() === 'cross-site') {
+    return { ok: false, reason: 'Forbidden: cross-site request blocked' }
+  }
+
+  const originHeader = req.headers.origin
+  if (typeof originHeader === 'string' && originHeader.trim().length > 0) {
+    try {
+      const parsedOrigin = new URL(originHeader)
+      const originHost = parsedOrigin.hostname.toLowerCase()
+      if (
+        (parsedOrigin.protocol !== 'http:' && parsedOrigin.protocol !== 'https:') ||
+        !ALLOWED_LOOPBACK_HOSTS.has(originHost)
+      ) {
+        return { ok: false, reason: 'Forbidden: cross-origin request blocked' }
+      }
+    } catch {
+      return { ok: false, reason: 'Forbidden: invalid Origin header' }
+    }
+  }
+
+  return { ok: true }
+}
+
+function hasJsonContentType(req: IncomingMessage): boolean {
+  const contentType = req.headers['content-type']
+  if (typeof contentType !== 'string') return false
+  const mediaType = contentType.split(';')[0]?.trim().toLowerCase() ?? ''
+  return mediaType === 'application/json'
+}
+
 export function createAshyHostHttpMiddleware(
   getKernel: () => Promise<AshyHostBridge>,
 ): (req: IncomingMessage, res: ServerResponse, next: () => void) => void {
@@ -232,6 +436,11 @@ export function createAshyHostHttpMiddleware(
     if (pathname === '/__ashy_host/events') {
       if (req.method !== 'GET') {
         sendJson(res, 405, { ok: false, error: 'Method Not Allowed' })
+        return
+      }
+      const check = isAllowedLoopbackRequest(req)
+      if (!check.ok) {
+        sendJson(res, 403, { ok: false, error: check.reason })
         return
       }
 
@@ -275,6 +484,18 @@ export function createAshyHostHttpMiddleware(
     if (pathname === '/__ashy_host/rpc') {
       if (req.method !== 'POST') {
         sendJson(res, 405, { ok: false, error: 'Method Not Allowed' })
+        return
+      }
+      const check = isAllowedLoopbackRequest(req)
+      if (!check.ok) {
+        sendJson(res, 403, { ok: false, error: check.reason })
+        return
+      }
+      if (!hasJsonContentType(req)) {
+        sendJson(res, 415, {
+          ok: false,
+          error: 'Unsupported Media Type: expected application/json',
+        })
         return
       }
 

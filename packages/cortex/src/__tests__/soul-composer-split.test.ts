@@ -51,6 +51,45 @@ describe('@ashy/cortex SoulComposer static/volatile split & turn memory indexing
     expect(compiled.systemPrompt).toBe(
       `${compiled.staticSystemPrompt}\n\n${compiled.volatileTurnContext}`,
     )
+
+    // Verify per-turn episodic memories & inside jokes are injected once in userTurnContent ([Context])
+    // and not duplicated inside systemPrompt / volatileTurnContext
+    cortex.db.upsertEpisodicMemory({
+      id: 'ep-dedupe-01',
+      title: 'Deploy de Madrugada',
+      summary: 'Subimos o cluster SQLite às 3h da manhã sem quebrar nada.',
+      content: 'Deploy de Madrugada: Subimos o cluster SQLite às 3h da manhã sem quebrar nada.',
+      createdAt: 1730000000000,
+      lastReviewedAt: 1730000000000,
+      stability: 30,
+      difficulty: 2,
+      surprise: 0.85,
+      isFlashbulb: true,
+      tags: ['SQLite'],
+    })
+    cortex.db.upsertRelationalMotif({
+      id: 'motif-dedupe-01',
+      motif: 'chamar um padre pro SQLite',
+      originSummary: 'Quando o lock WAL travou no Windows',
+      triggerCues: ['sqlite', 'banco', 'revisar'],
+      stage: 'inside_joke',
+      timesUsed: 2,
+      lastUsedAt: 0,
+      cooldownHours: 0.01,
+      createdAt: 1730000000000,
+    })
+
+    const withRecall = cortex.compileTurnPrompt({
+      userMessage: 'Vamos revisar o banco SQLite de novo?',
+      stage: 'companion',
+      nowMs: 1730000500000,
+    })
+
+    expect(withRecall.userTurnContent).toContain('Episodic Memory [ep-dedupe-01]')
+    expect(withRecall.userTurnContent).toContain('Eligible Inside Joke [motif-dedupe-01]')
+    expect(withRecall.volatileTurnContext).not.toContain('Episodic Memory [ep-dedupe-01]')
+    expect(withRecall.volatileTurnContext).not.toContain('Eligible Inside Joke [motif-dedupe-01]')
+
     cortex.close()
   })
 

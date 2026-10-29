@@ -194,6 +194,28 @@ describe('@ashy/bus — 2. Typed Event Bus, Hop Budget & Streaming RPC (event-bu
     warnSpy.mockRestore()
   })
 
+  it('isolates hop budgets between independent (unbridged) EventBus instances during nested synchronous emits', () => {
+    const busLowHops = createEventBus({ id: 'low-hops', maxHops: 1 })
+    const busIndependent = createEventBus({ id: 'independent', maxHops: 8 })
+
+    const triggerEvt = defineEvent<string>('test:trigger')
+    const auditEvt = defineEvent<string>('test:audit')
+
+    const auditReceived: string[] = []
+    busIndependent.on(auditEvt, (msg) => {
+      auditReceived.push(msg)
+    })
+
+    busLowHops.on(triggerEvt, (msg) => {
+      // At this point busLowHops has 0 hops remaining in its own cascade,
+      // but busIndependent is NOT bridged to busLowHops and must not be starved.
+      busIndependent.emit(auditEvt, `audit:${msg}`)
+    })
+
+    busLowHops.emit(triggerEvt, 'hello')
+    expect(auditReceived).toEqual(['audit:hello'])
+  })
+
   it('supports unary RPC across bridged buses with timeout and AbortSignal', async () => {
     const busA = createEventBus()
     const busB = createEventBus()

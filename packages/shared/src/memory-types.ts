@@ -35,6 +35,39 @@ const FiniteNumberSchema = v.pipe(
   v.check((n) => Number.isFinite(n), 'Embedding element must be a finite number'),
 )
 
+// Memory Governance & Approval
+export const MEMORY_APPROVAL_STATUSES = ['approved', 'pending_review'] as const
+export type MemoryApprovalStatus = (typeof MEMORY_APPROVAL_STATUSES)[number]
+export const MemoryApprovalStatusSchema = v.picklist(MEMORY_APPROVAL_STATUSES)
+
+export const MEMORY_GOVERNANCE_CATEGORIES = [
+  'facts',
+  'episodes',
+  'jokes',
+  'habits',
+  'intents',
+] as const
+export type MemoryGovernanceCategory = (typeof MEMORY_GOVERNANCE_CATEGORIES)[number]
+export const MemoryGovernanceCategorySchema = v.picklist(MEMORY_GOVERNANCE_CATEGORIES)
+
+export type MemoryGovernancePolicy = Record<MemoryGovernanceCategory, boolean>
+
+export const MemoryGovernancePolicySchema = v.object({
+  facts: v.boolean(),
+  episodes: v.boolean(),
+  jokes: v.boolean(),
+  habits: v.boolean(),
+  intents: v.boolean(),
+})
+
+export const DEFAULT_MEMORY_GOVERNANCE_POLICY: MemoryGovernancePolicy = {
+  facts: false,
+  episodes: false,
+  jokes: false,
+  habits: false,
+  intents: false,
+}
+
 // 1. EpisodicMemory
 export const EpisodicMemorySchema = v.object({
   id: NonEmptyStringSchema,
@@ -54,6 +87,7 @@ export const EpisodicMemorySchema = v.object({
   isFlashbulb: v.boolean(),
   tags: v.array(NonEmptyStringSchema),
   embedding: v.optional(v.array(FiniteNumberSchema)),
+  approvalStatus: v.optional(MemoryApprovalStatusSchema),
 })
 
 export type EpisodicMemory = v.InferOutput<typeof EpisodicMemorySchema>
@@ -83,6 +117,8 @@ export const SemanticFactSchema = v.object({
   sourceEpisodeIds: v.array(NonEmptyStringSchema),
   validFrom: TimestampSchema,
   invalidAt: v.optional(v.nullable(TimestampSchema)),
+  embedding: v.optional(v.array(FiniteNumberSchema)),
+  approvalStatus: v.optional(MemoryApprovalStatusSchema),
 })
 
 export type SemanticFact = v.InferOutput<typeof SemanticFactSchema>
@@ -110,6 +146,8 @@ export const RelationalMotifSchema = v.object({
   lastUsedAt: v.optional(v.nullable(TimestampSchema)),
   cooldownHours: NonNegativeFiniteNumberSchema,
   createdAt: TimestampSchema,
+  embedding: v.optional(v.array(FiniteNumberSchema)),
+  approvalStatus: v.optional(MemoryApprovalStatusSchema),
 })
 
 export type RelationalMotif = v.InferOutput<typeof RelationalMotifSchema>
@@ -147,6 +185,8 @@ export const UserHabitSchema = v.object({
   confidence: UnitIntervalSchema,
   observationCount: NonNegativeIntSchema,
   updatedAt: TimestampSchema,
+  sourceEpisodeId: v.optional(NonEmptyStringSchema),
+  approvalStatus: v.optional(MemoryApprovalStatusSchema),
 })
 
 export type UserHabit = v.InferOutput<typeof UserHabitSchema>
@@ -169,6 +209,8 @@ export const ProspectiveIntentSchema = v.object({
   dueAt: v.optional(v.nullable(TimestampSchema)),
   status: ProspectiveIntentStatusSchema,
   createdAt: TimestampSchema,
+  sourceEpisodeId: v.optional(NonEmptyStringSchema),
+  approvalStatus: v.optional(MemoryApprovalStatusSchema),
 })
 
 export type ProspectiveIntent = v.InferOutput<typeof ProspectiveIntentSchema>

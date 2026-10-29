@@ -1,8 +1,13 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { embedTextSync128 } from '@ashy/llm'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createCortexDatabase, DEFAULT_GOLDEN_EXEMPLARS } from '../index'
+import {
+  createCortexDatabase,
+  DEFAULT_GOLDEN_EXEMPLARS,
+  rankEpisodicMemories,
+} from '../index'
 
 const tempDirs: string[] = []
 
@@ -123,7 +128,7 @@ describe('@ashy/cortex Phase 1 persistence & Migration v2', () => {
 
     const db = createCortexDatabase({ filePath: dbPath })
     expect(db.isPersistent).toBe(true)
-    expect(db.getAppliedMigrations().map((m) => m.version)).toEqual([1, 2])
+    expect(db.getAppliedMigrations().map((m) => m.version)).toEqual([1, 2, 3])
 
     const files = fs.readdirSync(dir)
     expect(files.some((f) => f.startsWith('ashy.db.corrupt.'))).toBe(true)
@@ -246,6 +251,288 @@ describe('@ashy/cortex Phase 1 persistence & Migration v2', () => {
       expect(db.getChatSession('sess-window')?.turnCount).toBe(5)
 
       db.close()
+    }
+  })
+
+  it('applies Migration v3 (v3_phase2_self_writing_memory), auto-embeds 128-D vectors, handles dimension mismatches, enforces quarantine governance, and tracks unconsolidated messages across restarts', () => {
+    const dir = makeTempDir()
+    const dbPath = path.join(dir, 'ashy-v3.db')
+
+    for (const forceMemoryFallback of [false, true]) {
+      const db1 = createCortexDatabase(
+        forceMemoryFallback ? { forceMemoryFallback: true } : { filePath: dbPath },
+      )
+
+      const migrations = db1.getAppliedMigrations()
+      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3])
+      expect(migrations.find((m) => m.version === 3)?.name).toBe('v3_phase2_self_writing_memory')
+      expect(db1.listSqlTables()).toContain('memory_governance_settings')
+
+      // 1. Auto-embedding (128-D) on upsert when embedding is omitted
+      const epApproved = db1.upsertEpisodicMemory({
+        id: 'ep-cursed-backend',
+        title: 'Fantasma no backend',
+        summary: 'Esse código tá tão amaldiçoado que deve ter um fantasma no backend.',
+        content: 'Eu já tava pensando em chamar um exorcista de JavaScript.',
+        createdAt: 1730001000000,
+        lastReviewedAt: 1730001000000,
+        stability: 5.0,
+        difficulty: 3.5,
+        surprise: 0.8,
+        isFlashbulb: false,
+        tags: ['backend', 'javascript'],
+      })
+      expect(epApproved.embedding).toHaveLength(128)
+      expect(epApproved.approvalStatus).toBe('approved')
+
+      const epPending = db1.upsertEpisodicMemory({
+        id: 'ep-pending-quarantine',
+        title: 'Segredo em quarentena',
+        summary: 'Episódio pendente de revisão sobre exorcista de JavaScript.',
+        content: 'Fantasma no backend aguardando aprovação.',
+        createdAt: 1730001005000,
+        lastReviewedAt: 1730001005000,
+        stability: 5.0,
+        difficulty: 3.5,
+        surprise: 0.7,
+        isFlashbulb: false,
+        tags: ['quarantine'],
+        approvalStatus: 'pending_review',
+      })
+      expect(epPending.approvalStatus).toBe('pending_review')
+
+      // Hybrid search auto-computes 128-D query embedding and excludes pending_review by default
+      const semanticHitsDefault = db1.searchEpisodicMemoriesHybrid(
+        'Fui mexer numa biblioteca antiga e deu erro.',
+        undefined,
+        { nowMs: 1730001010000 },
+      )
+      expect(semanticHitsDefault.map((r) => r.memory.id)).toEqual(['ep-cursed-backend'])
+      expect(semanticHitsDefault[0]!.vectorSimilarity).toBeGreaterThan(0.25)
+
+      const semanticHitsWithPending = db1.searchEpisodicMemoriesHybrid(
+        'Fui mexer numa biblioteca antiga e deu erro.',
+        undefined,
+        { nowMs: 1730001010000, includePendingReview: true },
+      )
+      expect(semanticHitsWithPending.map((r) => r.memory.id)).toContain('ep-pending-quarantine')
+
+      // Dimension mismatch guard in rankEpisodicMemories (4-D legacy episode vs 128-D query)
+      const legacy4dEpisode = db1.upsertEpisodicMemory({
+        id: 'ep-legacy-4d',
+        title: 'Bug fantasma na biblioteca antiga',
+        summary: 'Erro bizarro no código legado do backend',
+        content: 'Resolvemos o bug amaldiçoado no pacote antigo.',
+        createdAt: 1730001002000,
+        lastReviewedAt: 1730001002000,
+        stability: 4.0,
+        difficulty: 4.0,
+        surprise: 0.6,
+        isFlashbulb: false,
+        tags: ['legacy', 'bug'],
+        embedding: [0, 0, 0, 1],
+      })
+      const queryVec128 = embedTextSync128('Lembra daquele bug? Consegui resolver.')
+      const rankedMismatch = rankEpisodicMemories([legacy4dEpisode], {
+        text: 'Lembra daquele bug? Consegui resolver.',
+        embedding: queryVec128,
+        nowMs: 1730001010000,
+      })
+      expect(rankedMismatch[0]!.vectorSimilarity).toBeGreaterThan(0.25)
+
+      // 2. Semantic Facts & Relational Motifs auto-embed 128-D and support quarantine + conflict invalidation on approve
+      const oldFact = db1.upsertSemanticFact({
+        id: 'fact-editor-vscode',
+        category: 'preference',
+        subject: 'user',
+        predicate: 'favorite_editor',
+        object: 'VS Code',
+        confidence: 0.9,
+        sourceEpisodeIds: ['ep-cursed-backend'],
+        validFrom: 1730001000000,
+        invalidAt: null,
+      })
+      expect(oldFact.embedding).toHaveLength(128)
+      expect(oldFact.approvalStatus).toBe('approved')
+
+      const pendingFact = db1.upsertSemanticFact({
+        id: 'fact-editor-neovim-pending',
+        category: 'preference',
+        subject: 'user',
+        predicate: 'favorite_editor',
+        object: 'Neovim',
+        confidence: 0.95,
+        sourceEpisodeIds: ['ep-cursed-backend'],
+        validFrom: 1730002000000,
+        invalidAt: null,
+        approvalStatus: 'pending_review',
+      })
+      expect(pendingFact.approvalStatus).toBe('pending_review')
+
+      // Raw listSemanticFacts() includes pending_review for UI inspection, but active queries exclude it
+      expect(db1.listSemanticFacts().map((f) => f.id)).toContain('fact-editor-neovim-pending')
+      expect(db1.listSemanticFacts({ activeOnly: true }).map((f) => f.id)).toEqual([
+        'fact-editor-vscode',
+      ])
+      expect(db1.listActiveSemanticFacts().map((f) => f.id)).toEqual(['fact-editor-vscode'])
+
+      const motif = db1.upsertRelationalMotif({
+        id: 'motif-ghost',
+        motif: 'fantasma no backend',
+        originSummary: 'Código amaldiçoado no backend',
+        originEpisodeId: 'ep-cursed-backend',
+        triggerCues: ['fantasma no backend'],
+        stage: 'seed',
+        timesUsed: 0,
+        lastUsedAt: null,
+        cooldownHours: 24,
+        createdAt: 1730001000000,
+        approvalStatus: 'pending_review',
+      })
+      expect(motif.embedding).toHaveLength(128)
+      expect(motif.approvalStatus).toBe('pending_review')
+      expect(db1.approveMemoryItem('joke', 'motif-ghost')).toBe(true)
+      expect(db1.getRelationalMotif('motif-ghost')?.approvalStatus).toBe('approved')
+
+      // 3. Governance policy persistence
+      expect(db1.getMemoryGovernancePolicy()).toEqual({
+        facts: false,
+        episodes: false,
+        jokes: false,
+        habits: false,
+        intents: false,
+      })
+      const updatedPolicy = db1.setMemoryGovernancePolicy('facts', true)
+      expect(updatedPolicy.facts).toBe(true)
+
+      // 4. Habits, Intents, Milestones deletion & sourceEpisodeId persistence
+      db1.upsertUserHabit({
+        id: 'habit-night',
+        patternKey: 'late_night_coding',
+        description: 'Programa de madrugada',
+        confidence: 0.9,
+        observationCount: 3,
+        updatedAt: 1730001000000,
+        sourceEpisodeId: 'ep-cursed-backend',
+        approvalStatus: 'pending_review',
+      })
+      db1.upsertProspectiveIntent({
+        id: 'intent-deploy',
+        topic: 'Deploy de sexta-feira',
+        contextCue: 'deploy, produção',
+        dueAt: 1730080000000,
+        status: 'pending',
+        createdAt: 1730001000000,
+        sourceEpisodeId: 'ep-cursed-backend',
+        approvalStatus: 'pending_review',
+      })
+      db1.upsertMilestone({
+        id: 'ms-temp',
+        title: 'Marco temporário',
+        narrative: 'Teste de deleção',
+        category: 'first_meeting',
+        episodeId: 'ep-cursed-backend',
+        createdAt: 1730001000000,
+      })
+
+      // 5. Unconsolidated chat messages tracking
+      db1.createChatSession({
+        id: 'sess-consolidation',
+        title: 'Sessão de Consolidação',
+        startedAt: 1730001000000,
+      })
+      db1.appendChatMessage({
+        id: 'cmsg-1',
+        sessionId: 'sess-consolidation',
+        role: 'user',
+        content: 'Turno 1 usuário',
+        rawContent: 'Turno 1 usuário',
+        emotion: 'neutral',
+        markersJson: '[]',
+        createdAt: 1730001001000,
+      })
+      db1.appendChatMessage({
+        id: 'cmsg-2',
+        sessionId: 'sess-consolidation',
+        role: 'assistant',
+        content: 'Turno 1 Ashy',
+        rawContent: 'Turno 1 Ashy',
+        emotion: 'happy',
+        markersJson: '[]',
+        createdAt: 1730001002000,
+      })
+      db1.appendChatMessage({
+        id: 'cmsg-3',
+        sessionId: 'sess-consolidation',
+        role: 'user',
+        content: 'Turno 2 ainda não consolidado',
+        rawContent: 'Turno 2 ainda não consolidado',
+        emotion: 'neutral',
+        markersJson: '[]',
+        createdAt: 1730001003000,
+      })
+
+      expect(db1.listUnconsolidatedChatMessages('sess-consolidation').map((m) => m.id)).toEqual([
+        'cmsg-1',
+        'cmsg-2',
+        'cmsg-3',
+      ])
+      db1.markChatMessagesConsolidated(['cmsg-1', 'cmsg-2'], 'ep-cursed-backend')
+      expect(db1.listUnconsolidatedChatMessages('sess-consolidation').map((m) => m.id)).toEqual([
+        'cmsg-3',
+      ])
+
+      // Approve pending fact -> activates it AND invalidates older active conflicting fact ('VS Code')
+      const approvedOk = db1.approveMemoryItem('fact', 'fact-editor-neovim-pending', 1730003000000)
+      expect(approvedOk).toBe(true)
+      const activeFactsAfterApproval = db1.listActiveSemanticFacts()
+      expect(activeFactsAfterApproval.map((f) => f.id)).toEqual(['fact-editor-neovim-pending'])
+      expect(activeFactsAfterApproval[0]?.object).toBe('Neovim')
+      const invalidatedOldFact = db1
+        .listSemanticFacts()
+        .find((f) => f.id === 'fact-editor-vscode')
+      expect(invalidatedOldFact?.invalidAt).toBe(1730003000000)
+
+      // Approve habit, intent, episode
+      expect(db1.approveMemoryItem('habit', 'habit-night')).toBe(true)
+      expect(db1.approveMemoryItem('intent', 'intent-deploy')).toBe(true)
+      expect(db1.approveMemoryItem('episode', 'ep-pending-quarantine')).toBe(true)
+
+      if (!forceMemoryFallback) {
+        db1.close()
+        const db2 = createCortexDatabase({ filePath: dbPath })
+        expect(db2.getMemoryGovernancePolicy().facts).toBe(true)
+        expect(db2.listUnconsolidatedChatMessages('sess-consolidation').map((m) => m.id)).toEqual([
+          'cmsg-3',
+        ])
+        const allMsgs = db2.listChatMessages('sess-consolidation')
+        expect(allMsgs.find((m) => m.id === 'cmsg-1')?.consolidatedEpisodeId).toBe(
+          'ep-cursed-backend',
+        )
+        expect(allMsgs.find((m) => m.id === 'cmsg-3')?.consolidatedEpisodeId).toBeNull()
+
+        expect(db2.listUserHabits()[0]?.sourceEpisodeId).toBe('ep-cursed-backend')
+        expect(db2.listUserHabits()[0]?.approvalStatus).toBe('approved')
+        expect(db2.listProspectiveIntents()[0]?.sourceEpisodeId).toBe('ep-cursed-backend')
+        expect(db2.listProspectiveIntents()[0]?.approvalStatus).toBe('approved')
+
+        expect(db2.deleteUserHabit('habit-night')).toBe(true)
+        expect(db2.listUserHabits()).toHaveLength(0)
+        expect(db2.deleteProspectiveIntent('intent-deploy')).toBe(true)
+        expect(db2.listProspectiveIntents()).toHaveLength(0)
+        expect(db2.deleteMilestone('ms-temp')).toBe(true)
+        expect(db2.listMilestones()).toHaveLength(0)
+
+        db2.close()
+      } else {
+        expect(db1.deleteUserHabit('habit-night')).toBe(true)
+        expect(db1.listUserHabits()).toHaveLength(0)
+        expect(db1.deleteProspectiveIntent('intent-deploy')).toBe(true)
+        expect(db1.listProspectiveIntents()).toHaveLength(0)
+        expect(db1.deleteMilestone('ms-temp')).toBe(true)
+        expect(db1.listMilestones()).toHaveLength(0)
+        db1.close()
+      }
     }
   })
 })

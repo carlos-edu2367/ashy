@@ -1,12 +1,20 @@
 import * as v from 'valibot'
 import type { AshyEmotion } from './emotions'
-import type { MoodVector, PersonalityTraits } from './affect-types'
+import type {
+  MoodVector,
+  PersonalityEvolutionRecord,
+  PersonalityTraits,
+} from './affect-types'
 import type {
   AutobiographicalMilestone,
   EpisodicMemory,
+  MemoryGovernanceCategory,
+  MemoryGovernancePolicy,
+  ProspectiveIntent,
   RelationalMotif,
   SemanticFact,
   SemanticFactCategory,
+  UserHabit,
 } from './memory-types'
 
 export const LLM_PROVIDER_IDS = [
@@ -19,6 +27,27 @@ export const LLM_PROVIDER_IDS = [
 
 export type LlmProviderId = (typeof LLM_PROVIDER_IDS)[number]
 export const LlmProviderIdSchema = v.picklist(LLM_PROVIDER_IDS)
+
+export const DELETABLE_MEMORY_KINDS = [
+  'fact',
+  'episode',
+  'joke',
+  'habit',
+  'intent',
+  'milestone',
+] as const
+export type DeletableMemoryKind = (typeof DELETABLE_MEMORY_KINDS)[number]
+export const DeletableMemoryKindSchema = v.picklist(DELETABLE_MEMORY_KINDS)
+
+export const APPROVABLE_MEMORY_KINDS = [
+  'fact',
+  'episode',
+  'joke',
+  'habit',
+  'intent',
+] as const
+export type ApprovableMemoryKind = (typeof APPROVABLE_MEMORY_KINDS)[number]
+export const ApprovableMemoryKindSchema = v.picklist(APPROVABLE_MEMORY_KINDS)
 
 export type RelationshipStage =
   | 'stranger'
@@ -60,6 +89,7 @@ export interface ChatMessageRecord {
   providerId?: LlmProviderId | null
   modelId?: string | null
   latencyMs?: number | null
+  consolidatedEpisodeId?: string | null
   createdAt: number
 }
 
@@ -109,6 +139,10 @@ export interface AshyBootstrapSnapshot {
     facts: SemanticFact[]
     episodes: EpisodicMemory[]
     jokes: RelationalMotif[]
+    habits?: UserHabit[]
+    intents?: ProspectiveIntent[]
+    evolutionLog?: PersonalityEvolutionRecord[]
+    governancePolicy?: MemoryGovernancePolicy
   }
   voice: {
     content: string
@@ -264,7 +298,36 @@ export interface AshyHostBridge {
   saveVoiceIdentity(content: string): Promise<AshyBootstrapSnapshot['voice']>
   resetVoiceIdentity(): Promise<AshyBootstrapSnapshot['voice']>
   upsertSemanticFact(input: UpsertFactInput): Promise<SemanticFact>
-  deleteMemoryItem(input: { kind: 'fact' | 'episode' | 'joke'; id: string }): Promise<void>
+  upsertEpisodicMemory(episode: EpisodicMemory): Promise<EpisodicMemory>
+  upsertMilestone(milestone: AutobiographicalMilestone): Promise<AutobiographicalMilestone>
+  upsertRelationalMotif(motif: RelationalMotif): Promise<RelationalMotif>
+  upsertProspectiveIntent(intent: ProspectiveIntent): Promise<ProspectiveIntent>
+  recordEmotionPulse(input: {
+    emotion: AshyEmotion
+    intensity?: number
+  }): Promise<AshyBootstrapSnapshot['affect']>
+  persistDreamConsolidation(input: {
+    episode: EpisodicMemory
+    traits: PersonalityTraits
+    record: PersonalityEvolutionRecord
+  }): Promise<void>
+  persistTraitRevert(input: {
+    traits: PersonalityTraits
+    record: PersonalityEvolutionRecord
+  }): Promise<void>
+  deleteMemoryItem(input: { kind: DeletableMemoryKind; id: string }): Promise<void>
+  consolidateSessionMemories(input?: {
+    sessionId?: string
+    force?: boolean
+  }): Promise<AshyBootstrapSnapshot>
+  approveMemoryItem(input: {
+    kind: ApprovableMemoryKind
+    id: string
+  }): Promise<AshyBootstrapSnapshot>
+  setMemoryGovernancePolicy(input: {
+    category: MemoryGovernanceCategory
+    requireConfirmation: boolean
+  }): Promise<MemoryGovernancePolicy>
   seedDemoFixtures(): Promise<AshyBootstrapSnapshot>
   onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }

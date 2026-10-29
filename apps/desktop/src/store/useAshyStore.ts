@@ -23,7 +23,6 @@ import {
   revertTraitEvolution as revertCortexTraitEvolution,
   reviewEpisodicMemory,
   selectEligibleMotifs,
-  type AshyCortex,
   type ComposedTurnPrompt,
   type FsrsReviewRating,
   type MotifCooldownStatus,
@@ -40,8 +39,10 @@ import {
   ASHY_DEFAULT_TRAITS,
   ASHY_EMOTIONS,
   DEFAULT_ASHY_VOICE_MD,
+  DEFAULT_MEMORY_GOVERNANCE_POLICY,
   DEFAULT_PROVIDER_CONFIGS,
   LLM_PROVIDER_IDS,
+  type ApprovableMemoryKind,
   type AshyBootstrapSnapshot,
   type AshyEmotion,
   type AshyHostBridge,
@@ -50,8 +51,11 @@ import {
   type ChatMessageRecord,
   type ChatSessionRecord,
   type CompleteOnboardingInput,
+  type DeletableMemoryKind,
   type EpisodicMemory,
   type LlmProviderId,
+  type MemoryGovernanceCategory,
+  type MemoryGovernancePolicy,
   type MilestoneCategory,
   type MoodVector,
   type PersonalityEvolutionRecord,
@@ -204,7 +208,7 @@ export interface AshyDesktopState {
   bubbleText: string
   simulatedVowels: { A: number; E: number; I: number; O: number; U: number }
 
-  // Cortex Snapshots
+  // Cortex Snapshots & Memory Governance
   mood: MoodVector
   traits: PersonalityTraits
   milestones: AutobiographicalMilestone[]
@@ -219,6 +223,7 @@ export interface AshyDesktopState {
   userHabits: UserHabit[]
   prospectiveIntents: ProspectiveIntent[]
   personalityEvolutionLog: PersonalityEvolutionRecord[]
+  memoryGovernancePolicy: MemoryGovernancePolicy
   lastPrompt: ComposedTurnPrompt
   roomTrophies: RoomTrophy[]
 
@@ -273,7 +278,7 @@ export interface AshyDesktopState {
   sendUserMessage: (userMessage: string) => Promise<void>
   triggerBargeIn: (interruptAtMs?: number) => PlaybackReceipt
 
-  // Memory & Story Actions
+  // Memory, Governance & Story Actions
   setSelectedMemoryId: (id: string) => void
   setMemoryFilter: (filter: MemoryFilterCategory) => void
   createMemoryCard: (input: {
@@ -284,6 +289,13 @@ export interface AshyDesktopState {
   }) => FeaturedMemoryCard
   updateMemoryStory: (id: string, newTitle: string, newStory: string) => void
   deleteMemoryCard: (id: string) => void
+  deleteMemoryItem: (kind: DeletableMemoryKind, id: string) => Promise<void>
+  consolidateSessionMemories: (force?: boolean) => Promise<void>
+  approveMemoryItem: (kind: ApprovableMemoryKind, id: string) => Promise<void>
+  setMemoryGovernancePolicy: (
+    category: MemoryGovernanceCategory,
+    requireConfirmation: boolean,
+  ) => Promise<void>
   addMilestone: (input: {
     title: string
     narrative: string
@@ -532,16 +544,17 @@ function rankEpisodesInMemory(
   query: string,
   nowMs = Date.now(),
 ): RankedEpisodicMemory[] {
+  const approvedEpisodes = episodes.filter((ep) => ep.approvalStatus !== 'pending_review')
   const q = query.trim().toLowerCase()
   const filtered = q
-    ? episodes.filter(
+    ? approvedEpisodes.filter(
         (ep) =>
           ep.title.toLowerCase().includes(q) ||
           ep.summary.toLowerCase().includes(q) ||
           ep.content.toLowerCase().includes(q) ||
           ep.tags.some((t) => t.toLowerCase().includes(q)),
       )
-    : [...episodes]
+    : [...approvedEpisodes]
 
   return rankEpisodicMemories(filtered, {
     text: query,
@@ -570,7 +583,9 @@ function mapChatRecordsToTurnMessages(
           const cb = parsedMarkers.find((m) => m.type === 'callback' && typeof m.motifId === 'string')
           if (cb?.motifId) {
             invokedMotifId = cb.motifId
-            const matchedMotif = motifs.find((j) => j.id === cb.motifId)
+            const matchedMotif = motifs.find(
+              (j) => j.id === cb.motifId && j.approvalStatus !== 'pending_review',
+            )
             if (matchedMotif) {
               jokeCard = {
                 title: 'Uma piada nossa',
@@ -606,9 +621,10 @@ function mapEpisodesToMemoryCards(
   episodes: readonly EpisodicMemory[],
   existingCards: readonly FeaturedMemoryCard[],
 ): FeaturedMemoryCard[] {
+  const approvedEpisodes = episodes.filter((ep) => ep.approvalStatus !== 'pending_review')
   const hasDemoSeed =
     DEMO_MEMORY_CARDS.length > 0 &&
-    episodes.some((ep) => ep.id === DEMO_MEMORY_CARDS[0]?.id)
+    approvedEpisodes.some((ep) => ep.id === DEMO_MEMORY_CARDS[0]?.id)
 
   const baseCards: FeaturedMemoryCard[] = hasDemoSeed
     ? DEMO_MEMORY_CARDS.map((card) => {
@@ -625,7 +641,7 @@ function mapEpisodesToMemoryCards(
   }
 
   const dynamicCards: FeaturedMemoryCard[] = []
-  for (const ep of episodes) {
+  for (const ep of approvedEpisodes) {
     if (seenCardIds.has(ep.id) || seenEpisodeIds.has(ep.id)) continue
     const existing = existingCards.find((c) => c.id === ep.id)
     if (existing) {
@@ -653,18 +669,6 @@ function mapEpisodesToMemoryCards(
   return [...dynamicCards, ...baseCards]
 }
 
-function getInProcessKernelCortex(): AshyCortex | null {
-  try {
-    const bridge = getAshyHostBridge() as unknown as { cortex?: AshyCortex }
-    if (bridge && bridge.cortex && bridge.cortex.db) {
-      return bridge.cortex
-    }
-  } catch {
-    // Ignore when bridge does not expose in-process cortex
-  }
-  return null
-}
-
 let agency = createAgencyRuntime()
 let activeSpeechPipeline: RealtimeSpeechPipeline | null = null
 let subscribedBridge: AshyHostBridge | null = null
@@ -688,6 +692,8 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     mood?: MoodVector
     rankedMemories?: readonly RankedEpisodicMemory[]
     relationalMotifs?: readonly RelationalMotif[]
+    userHabits?: readonly UserHabit[]
+    prospectiveIntents?: readonly ProspectiveIntent[]
     chatMessages?: readonly ChatTurnMessage[]
   }): ComposedTurnPrompt {
     const current = get()
@@ -708,14 +714,32 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         }
       : baseMood
 
-    const motifs = params?.relationalMotifs ?? current?.relationalMotifs ?? []
+    const motifs = (params?.relationalMotifs ?? current?.relationalMotifs ?? []).filter(
+      (m) => m.approvalStatus !== 'pending_review',
+    )
     const eligibleMotifs = selectEligibleMotifs(motifs, userMessage, Date.now(), {
       isSeriousContext: seriousness.isSeriousOrDelicate,
     })
 
     const facts = (params?.semanticFacts ?? current?.semanticFacts ?? []).filter(
-      (f) => f.invalidAt === null || f.invalidAt === undefined,
+      (f) =>
+        (f.invalidAt === null || f.invalidAt === undefined) &&
+        f.approvalStatus !== 'pending_review',
     )
+
+    const retrievedMemories = (params?.rankedMemories ?? current?.rankedMemories ?? [])
+      .filter((r) => r.memory.approvalStatus !== 'pending_review')
+      .slice(0, 4)
+
+    const habits = (params?.userHabits ?? current?.userHabits ?? []).filter(
+      (h) => h.approvalStatus !== 'pending_review',
+    )
+
+    const intents = (
+      params?.prospectiveIntents ??
+      current?.prospectiveIntents ??
+      []
+    ).filter((i) => i.approvalStatus !== 'pending_review' && i.status === 'pending')
 
     return composeAshyTurnPrompt({
       userMessage,
@@ -724,7 +748,8 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       stage: params?.stage ?? current?.relationshipStage ?? 'stranger',
       voiceIdentityMarkdown:
         params?.voiceIdentityMarkdown ?? current?.voiceIdentity?.content ?? DEFAULT_ASHY_VOICE_MD,
-      userName: params?.userName !== undefined ? params.userName : (current?.userProfile?.userName ?? null),
+      userName:
+        params?.userName !== undefined ? params.userName : (current?.userProfile?.userName ?? null),
       userPronouns:
         params?.userPronouns !== undefined
           ? params.userPronouns
@@ -733,8 +758,10 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       traits: params?.traits ?? current?.traits ?? ASHY_DEFAULT_TRAITS,
       mood: effectiveMood,
       seriousness,
-      retrievedMemories: (params?.rankedMemories ?? current?.rankedMemories ?? []).slice(0, 4),
+      retrievedMemories,
       eligibleMotifs,
+      userHabits: habits,
+      prospectiveIntents: intents,
       conversationHistory: (params?.chatMessages ?? current?.chatMessages ?? []).map((m) => ({
         role: m.role,
         content: m.content,
@@ -853,7 +880,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       }
 
       if (marker.type === 'callback') {
-        const matchedMotif = get().relationalMotifs.find((j) => j.id === marker.motifId)
+        const matchedMotif = get().relationalMotifs.find(
+          (j) => j.id === marker.motifId && j.approvalStatus !== 'pending_review',
+        )
         const jokeCard: ChatJokeCallbackCard | undefined = matchedMotif
           ? {
               title: 'Uma piada nossa',
@@ -1094,6 +1123,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     userHabits: [],
     prospectiveIntents: [],
     personalityEvolutionLog: [],
+    memoryGovernancePolicy: { ...DEFAULT_MEMORY_GOVERNANCE_POLICY },
     lastPrompt: initialPrompt,
     roomTrophies: buildRoomTrophies([]),
 
@@ -1143,16 +1173,12 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           ? current.selectedMemoryId
           : (mappedCards[0]?.id ?? '')
 
-      const kernelCortex = getInProcessKernelCortex()
-      const userHabits = kernelCortex
-        ? kernelCortex.db.listUserHabits()
-        : current.userHabits
-      const prospectiveIntents = kernelCortex
-        ? kernelCortex.db.listProspectiveIntents()
-        : current.prospectiveIntents
-      const personalityEvolutionLog = kernelCortex
-        ? kernelCortex.db.listPersonalityEvolution()
-        : current.personalityEvolutionLog
+      const userHabits = snapshot.memories.habits ?? current.userHabits
+      const prospectiveIntents = snapshot.memories.intents ?? current.prospectiveIntents
+      const personalityEvolutionLog =
+        snapshot.memories.evolutionLog ?? current.personalityEvolutionLog
+      const memoryGovernancePolicy =
+        snapshot.memories.governancePolicy ?? current.memoryGovernancePolicy
 
       const nextPrompt = compilePromptFromState({
         modelId: current.activeModelId,
@@ -1165,6 +1191,8 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         mood: snapshot.affect.mood,
         rankedMemories: ranked,
         relationalMotifs: snapshot.memories.jokes,
+        userHabits,
+        prospectiveIntents,
         chatMessages: mappedMessages,
       })
 
@@ -1195,6 +1223,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         userHabits,
         prospectiveIntents,
         personalityEvolutionLog,
+        memoryGovernancePolicy,
         chatMessages: mappedMessages,
         lastPrompt: nextPrompt,
         roomTrophies: buildRoomTrophies(snapshot.relationship.milestones),
@@ -1314,15 +1343,16 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     setStageEmotion(emotion, intensity = 0.85) {
       if (!ASHY_EMOTIONS.includes(emotion)) return
       const nextMood = applyEmotionSignalToMood(get().mood, emotion, intensity)
-      const kernelCortex = getInProcessKernelCortex()
-      if (kernelCortex) {
-        kernelCortex.recordEmotionPulse(emotion, intensity, Date.now())
-      }
       set({
         stageEmotion: emotion,
         emotionIntensity: intensity,
         mood: nextMood,
       })
+      void getAshyHostBridge()
+        .recordEmotionPulse({ emotion, intensity })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     setAmbientLuminance(luminance) {
@@ -1358,10 +1388,6 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           valence: -0.1,
           arousal: 0.35,
           playfulness: Math.min(0.12, seriousness.maxPlayfulnessAllowed),
-        }
-        const kernelCortex = getInProcessKernelCortex()
-        if (kernelCortex) {
-          kernelCortex.db.saveAffectiveState(seriousMood, current.traits, Date.now())
         }
         set({
           lastPrompt: compiledPrompt,
@@ -1462,11 +1488,6 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         tags: [cat],
       }
 
-      const kernelCortex = getInProcessKernelCortex()
-      if (kernelCortex) {
-        kernelCortex.db.upsertEpisodicMemory(episode)
-      }
-
       const card: FeaturedMemoryCard = {
         id: newId,
         title: cleanTitle,
@@ -1488,38 +1509,187 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         selectedMemoryId: card.id,
       })
 
+      void getAshyHostBridge()
+        .upsertEpisodicMemory(episode)
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
+
       return card
     },
 
     updateMemoryStory(id, newTitle, newStory) {
+      const nowMs = Date.now()
+      const cleanTitle = newTitle.trim()
+      const cleanStory = newStory.trim()
+
       const cards = get().memoryCards.map((c) =>
         c.id === id
           ? {
               ...c,
-              title: newTitle.trim() || c.title,
-              fullStory: newStory.trim() || c.fullStory,
-              summary: (newStory.trim() || c.summary).split('\n')[0] ?? c.summary,
+              title: cleanTitle || c.title,
+              fullStory: cleanStory || c.fullStory,
+              summary: (cleanStory || c.summary).split('\n')[0] ?? c.summary,
             }
           : c,
       )
-      set({ memoryCards: cards })
+
+      const existingEpisode = get().episodicMemories.find((ep) => ep.id === id)
+      let nextEpisodes = get().episodicMemories
+      if (existingEpisode) {
+        const updatedEpisode: EpisodicMemory = {
+          ...existingEpisode,
+          title: cleanTitle || existingEpisode.title,
+          content: cleanStory || existingEpisode.content,
+          summary: (cleanStory || existingEpisode.summary).split('\n')[0] ?? existingEpisode.summary,
+          lastReviewedAt: nowMs,
+        }
+        nextEpisodes = get().episodicMemories.map((ep) =>
+          ep.id === id ? updatedEpisode : ep,
+        )
+        void getAshyHostBridge()
+          .upsertEpisodicMemory(updatedEpisode)
+          .catch(() => {
+            // Ignore when offline in unit test
+          })
+      }
+
+      set({
+        memoryCards: cards,
+        episodicMemories: nextEpisodes,
+        rankedMemories: rankEpisodesInMemory(nextEpisodes, get().memorySearchQuery, nowMs),
+      })
     },
 
     deleteMemoryCard(id) {
-      const remaining = get().memoryCards.filter((c) => c.id !== id)
-      const nextSelected =
-        get().selectedMemoryId === id
-          ? (remaining[0]?.id ?? '')
-          : get().selectedMemoryId
-      set({
-        memoryCards: remaining,
-        selectedMemoryId: nextSelected,
-      })
-      void getAshyHostBridge()
-        .deleteMemoryItem({ kind: 'episode', id })
-        .catch(() => {
-          // Ignore when offline in unit test
+      void get().deleteMemoryItem('episode', id)
+    },
+
+    async deleteMemoryItem(kind, id) {
+      const current = get()
+      if (kind === 'episode') {
+        const nextEpisodes = current.episodicMemories.filter((ep) => ep.id !== id)
+        const nextRanked = rankEpisodesInMemory(nextEpisodes, current.memorySearchQuery)
+        const remainingCards = current.memoryCards.filter(
+          (c) => c.id !== id && c.episodeId !== id,
+        )
+        const nextSelected =
+          current.selectedMemoryId === id
+            ? (remainingCards[0]?.id ?? '')
+            : current.selectedMemoryId
+        const nextFacts = current.semanticFacts.map((f) => {
+          if (!f.sourceEpisodeIds.includes(id)) return f
+          const filtered = f.sourceEpisodeIds.filter((epId) => epId !== id)
+          return {
+            ...f,
+            sourceEpisodeIds: filtered.length > 0 ? filtered : ['deleted-episode'],
+          }
         })
+        const nextMotifs = current.relationalMotifs.map((m) =>
+          m.originEpisodeId === id ? { ...m, originEpisodeId: undefined } : m,
+        )
+        const nextHabits = current.userHabits.map((h) =>
+          h.sourceEpisodeId === id ? { ...h, sourceEpisodeId: undefined } : h,
+        )
+        const nextIntents = current.prospectiveIntents.map((i) =>
+          i.sourceEpisodeId === id ? { ...i, sourceEpisodeId: undefined } : i,
+        )
+        const nextMilestones = current.milestones.map((m) =>
+          m.episodeId === id ? { ...m, episodeId: undefined } : m,
+        )
+        set({
+          episodicMemories: nextEpisodes,
+          rankedMemories: nextRanked,
+          memoryCards: remainingCards,
+          selectedMemoryId: nextSelected,
+          semanticFacts: nextFacts,
+          relationalMotifs: nextMotifs,
+          userHabits: nextHabits,
+          prospectiveIntents: nextIntents,
+          milestones: nextMilestones,
+          lastPrompt: compilePromptFromState({
+            rankedMemories: nextRanked,
+            semanticFacts: nextFacts,
+            relationalMotifs: nextMotifs,
+            userHabits: nextHabits,
+            prospectiveIntents: nextIntents,
+          }),
+        })
+      } else if (kind === 'fact') {
+        const nextFacts = current.semanticFacts.filter((f) => f.id !== id)
+        set({
+          semanticFacts: nextFacts,
+          lastPrompt: compilePromptFromState({
+            semanticFacts: nextFacts,
+          }),
+        })
+      } else if (kind === 'joke') {
+        const nextMotifs = current.relationalMotifs.filter((m) => m.id !== id)
+        set({
+          relationalMotifs: nextMotifs,
+          lastPrompt: compilePromptFromState({
+            relationalMotifs: nextMotifs,
+          }),
+        })
+      } else if (kind === 'habit') {
+        const nextHabits = current.userHabits.filter((h) => h.id !== id)
+        set({
+          userHabits: nextHabits,
+          lastPrompt: compilePromptFromState({
+            userHabits: nextHabits,
+          }),
+        })
+      } else if (kind === 'intent') {
+        const nextIntents = current.prospectiveIntents.filter((i) => i.id !== id)
+        set({
+          prospectiveIntents: nextIntents,
+          lastPrompt: compilePromptFromState({
+            prospectiveIntents: nextIntents,
+          }),
+        })
+      } else if (kind === 'milestone') {
+        const nextMilestones = current.milestones.filter((m) => m.id !== id)
+        set({
+          milestones: nextMilestones,
+          roomTrophies: buildRoomTrophies(nextMilestones),
+        })
+      }
+
+      try {
+        await getAshyHostBridge().deleteMemoryItem({ kind, id })
+      } catch {
+        // Ignore when offline in unit test
+      }
+    },
+
+    async consolidateSessionMemories(force = true) {
+      const bridge = ensureHostSubscription()
+      const snapshot = await bridge.consolidateSessionMemories({
+        sessionId: get().activeSessionId,
+        force,
+      })
+      get().applyBootstrapSnapshot(snapshot)
+    },
+
+    async approveMemoryItem(kind, id) {
+      const bridge = ensureHostSubscription()
+      const snapshot = await bridge.approveMemoryItem({ kind, id })
+      get().applyBootstrapSnapshot(snapshot)
+    },
+
+    async setMemoryGovernancePolicy(category, requireConfirmation) {
+      set((state) => ({
+        memoryGovernancePolicy: {
+          ...state.memoryGovernancePolicy,
+          [category]: requireConfirmation,
+        },
+      }))
+      const bridge = ensureHostSubscription()
+      const updated = await bridge.setMemoryGovernancePolicy({
+        category,
+        requireConfirmation,
+      })
+      set({ memoryGovernancePolicy: updated })
     },
 
     addMilestone(input) {
@@ -1531,15 +1701,16 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         category: input.category,
         createdAt: nowMs,
       }
-      const kernelCortex = getInProcessKernelCortex()
-      if (kernelCortex) {
-        kernelCortex.db.upsertMilestone(created)
-      }
       const nextMilestones = [...get().milestones, created]
       set({
         milestones: nextMilestones,
         roomTrophies: buildRoomTrophies(nextMilestones),
       })
+      void getAshyHostBridge()
+        .upsertMilestone(created)
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
       return created
     },
 
@@ -1557,29 +1728,31 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       const existing = get().episodicMemories.find((m) => m.id === id)
       if (!existing) return
       const updated = reviewEpisodicMemory(existing, rating, nowMs)
-      const kernelCortex = getInProcessKernelCortex()
-      if (kernelCortex) {
-        kernelCortex.db.upsertEpisodicMemory(updated)
-      }
       const nextEpisodes = get().episodicMemories.map((m) => (m.id === id ? updated : m))
       set({
         episodicMemories: nextEpisodes,
         rankedMemories: rankEpisodesInMemory(nextEpisodes, get().memorySearchQuery, nowMs),
       })
+      void getAshyHostBridge()
+        .upsertEpisodicMemory(updated)
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     invokeMotifManually(motifId) {
       const nowMs = Date.now()
       const existing = get().relationalMotifs.find((m) => m.id === motifId)
-      if (!existing) return
+      if (!existing || existing.approvalStatus === 'pending_review') return
       const updated = recordMotifInvocation(existing, true, nowMs)
-      const kernelCortex = getInProcessKernelCortex()
-      if (kernelCortex) {
-        kernelCortex.db.upsertRelationalMotif(updated)
-      }
       set({
         relationalMotifs: get().relationalMotifs.map((m) => (m.id === motifId ? updated : m)),
       })
+      void getAshyHostBridge()
+        .upsertRelationalMotif(updated)
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     resetMotifCooldown(motifId) {
@@ -1589,13 +1762,14 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         ...existing,
         lastUsedAt: null,
       }
-      const kernelCortex = getInProcessKernelCortex()
-      if (kernelCortex) {
-        kernelCortex.db.upsertRelationalMotif(updated)
-      }
       set({
         relationalMotifs: get().relationalMotifs.map((m) => (m.id === motifId ? updated : m)),
       })
+      void getAshyHostBridge()
+        .upsertRelationalMotif(updated)
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     getMotifCooldownInfo(motifId) {
@@ -1672,15 +1846,20 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         ...existing,
         status: 'completed',
       }
-      const kernelCortex = getInProcessKernelCortex()
-      if (kernelCortex) {
-        kernelCortex.db.upsertProspectiveIntent(updated)
-      }
+      const nextIntents = get().prospectiveIntents.map((i) =>
+        i.id === intentId ? updated : i,
+      )
       set({
-        prospectiveIntents: get().prospectiveIntents.map((i) =>
-          i.id === intentId ? updated : i,
-        ),
+        prospectiveIntents: nextIntents,
+        lastPrompt: compilePromptFromState({
+          prospectiveIntents: nextIntents,
+        }),
       })
+      void getAshyHostBridge()
+        .upsertProspectiveIntent(updated)
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     runDreamConsolidation() {
@@ -1712,13 +1891,6 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         nowMs,
       })
 
-      const kernelCortex = getInProcessKernelCortex()
-      if (kernelCortex) {
-        kernelCortex.db.upsertEpisodicMemory(dreamEpisode)
-        kernelCortex.db.saveAffectiveState(get().mood, nextTraits, nowMs)
-        kernelCortex.db.upsertPersonalityEvolution(record)
-      }
-
       const nextEpisodes = [dreamEpisode, ...get().episodicMemories]
       const nextLog = [record, ...get().personalityEvolutionLog]
 
@@ -1733,6 +1905,16 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         }),
       })
 
+      void getAshyHostBridge()
+        .persistDreamConsolidation({
+          episode: dreamEpisode,
+          traits: nextTraits,
+          record,
+        })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
+
       return record
     },
 
@@ -1746,12 +1928,6 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         nowMs,
       )
 
-      const kernelCortex = getInProcessKernelCortex()
-      if (kernelCortex) {
-        kernelCortex.db.saveAffectiveState(get().mood, revertedTraits, nowMs)
-        kernelCortex.db.upsertPersonalityEvolution(revertedRecord)
-      }
-
       set({
         traits: revertedTraits,
         personalityEvolutionLog: get().personalityEvolutionLog.map((r) =>
@@ -1761,6 +1937,15 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           traits: revertedTraits,
         }),
       })
+
+      void getAshyHostBridge()
+        .persistTraitRevert({
+          traits: revertedTraits,
+          record: revertedRecord,
+        })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     setSettingsSubTab(subTab) {
@@ -1928,6 +2113,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         userHabits: [],
         prospectiveIntents: [],
         personalityEvolutionLog: [],
+        memoryGovernancePolicy: { ...DEFAULT_MEMORY_GOVERNANCE_POLICY },
         lastPrompt: freshPrompt,
         roomTrophies: buildRoomTrophies([]),
         chatMessages: [],

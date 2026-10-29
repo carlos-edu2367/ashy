@@ -1,14 +1,17 @@
+import { computeCosineSimilarity128, embedTextSync128 } from '@ashy/llm'
 import {
   ASHY_BASELINE_MOOD,
   ASHY_DEFAULT_TRAITS,
   type MoodVector,
   type PersonalityTraits,
+  type ProspectiveIntent,
   type RelationshipStage,
   type SemanticFact,
   type SeriousnessAssessment,
+  type UserHabit,
 } from '@ashy/shared'
 import { DEFAULT_GOLDEN_STYLE_EXEMPLARS, type StyleExemplar } from '../db/cortex-db'
-import type { RankedEpisodicMemory } from '../memory/fsrs-ranker'
+import { tokenizeForSearch, type RankedEpisodicMemory } from '../memory/fsrs-ranker'
 import type { EligibleMotifMatch } from '../relational/inside-joke-engine'
 import {
   DEFAULT_GOLDEN_EXEMPLARS,
@@ -37,6 +40,8 @@ export interface ComposeTurnPromptInput {
   seriousness?: SeriousnessAssessment
   retrievedMemories?: readonly RankedEpisodicMemory[]
   eligibleMotifs?: readonly EligibleMotifMatch[]
+  userHabits?: readonly UserHabit[]
+  prospectiveIntents?: readonly ProspectiveIntent[]
   screenContext?: string
   conversationHistory?: readonly ConversationMessage[]
 }
@@ -51,11 +56,71 @@ export interface ComposedTurnPrompt {
   userTurnContent: string
   messages: ConversationMessage[]
   seriousness: SeriousnessAssessment
+  retrievedMemories: readonly RankedEpisodicMemory[]
+  eligibleMotifs: readonly EligibleMotifMatch[]
+  eligibleIntents: readonly ProspectiveIntent[]
 }
 
 export type CompiledSoulPrompt = ComposedTurnPrompt
 
 const LEADING_TIMESTAMP_RE = /^\s*\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\]\s*/
+
+export function sanitizePromptLine(raw: string | undefined | null): string {
+  if (typeof raw !== 'string') return ''
+  return raw
+    .replace(/[\r\n\0]+/g, ' ')
+    .replace(/<\|[\s\S]*?\|>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+const INTENT_STOPWORDS = new Set([
+  'de',
+  'da',
+  'do',
+  'das',
+  'dos',
+  'em',
+  'no',
+  'na',
+  'nos',
+  'nas',
+  'um',
+  'uma',
+  'o',
+  'a',
+  'os',
+  'as',
+  'e',
+  'ou',
+  'mas',
+  'que',
+  'se',
+  'por',
+  'para',
+  'pra',
+  'com',
+  'sem',
+  'eu',
+  'voce',
+  'meu',
+  'minha',
+  'amanha',
+  'tenho',
+  'vou',
+  'preciso',
+  'lembra',
+  'semana',
+  'vem',
+  'depois',
+  'segunda',
+  'terca',
+  'quarta',
+  'quinta',
+  'sexta',
+  'sabado',
+  'domingo',
+])
 
 export const DEFAULT_COZY_STUDIO_VOICE_IDENTITY = [
   '# Ashy — Voz & Identidade Viva (Cozy Night Studio)',
@@ -93,6 +158,52 @@ export function sanitizeVoiceIdentityMarkdown(raw?: string): string {
   }
   const cleaned = raw.replace(/\0/g, '').trim()
   return cleaned.length > 0 ? cleaned : DEFAULT_COZY_STUDIO_VOICE_IDENTITY
+}
+
+function computeProspectiveIntentRelevance(
+  intent: ProspectiveIntent,
+  userMessage: string,
+): number {
+  if (typeof userMessage !== 'string' || !userMessage.trim()) {
+    return 0
+  }
+
+  const msgTokens = tokenizeForSearch(userMessage).filter(
+    (t) => t.length >= 3 && !INTENT_STOPWORDS.has(t),
+  )
+  const msgTokenSet = new Set(msgTokens)
+  const intentTokens = Array.from(
+    new Set(
+      tokenizeForSearch(`${intent.contextCue} ${intent.topic}`).filter(
+        (t) => t.length >= 3 && !INTENT_STOPWORDS.has(t),
+      ),
+    ),
+  )
+
+  let matched = 0
+  for (const it of intentTokens) {
+    if (msgTokenSet.has(it)) {
+      matched += 1
+      continue
+    }
+    if (it.length >= 5) {
+      const prefix = it.slice(0, 5)
+      if (msgTokens.some((mt) => mt.startsWith(prefix))) {
+        matched += 1
+      }
+    }
+  }
+
+  const lexicalScore =
+    intentTokens.length > 0 && matched > 0
+      ? Math.min(1, 0.2 + 0.35 * (matched / Math.max(1, Math.min(3, intentTokens.length))))
+      : 0
+
+  const msgVec = embedTextSync128(userMessage)
+  const intentVec = embedTextSync128(`${intent.topic} ${intent.contextCue}`)
+  const semSim = computeCosineSimilarity128(msgVec, intentVec)
+
+  return Math.max(lexicalScore, semSim)
 }
 
 /**
@@ -179,28 +290,34 @@ export function buildVolatileTurnContext(input: ComposeTurnPromptInput): string 
   }
 
   const activeFacts = (input.semanticFacts ?? []).filter(
-    (f) => f.invalidAt === null || f.invalidAt === undefined,
+    (f) =>
+      (f.invalidAt === null || f.invalidAt === undefined) &&
+      f.approvalStatus !== 'pending_review',
   )
 
   const resolvedUserName =
-    input.userName?.replace(/\0/g, '').trim() ||
-    activeFacts
-      .filter(
-        (f) =>
-          f.subject === 'user' && (f.predicate === 'name' || f.predicate === 'user_name'),
-      )
-      .at(-1)?.object ||
+    sanitizePromptLine(input.userName) ||
+    sanitizePromptLine(
+      activeFacts
+        .filter(
+          (f) =>
+            f.subject === 'user' && (f.predicate === 'name' || f.predicate === 'user_name'),
+        )
+        .at(-1)?.object,
+    ) ||
     null
 
   const resolvedUserPronouns =
-    input.userPronouns?.replace(/\0/g, '').trim() ||
-    activeFacts
-      .filter(
-        (f) =>
-          f.subject === 'user' &&
-          (f.predicate === 'pronouns' || f.predicate === 'user_pronouns'),
-      )
-      .at(-1)?.object ||
+    sanitizePromptLine(input.userPronouns) ||
+    sanitizePromptLine(
+      activeFacts
+        .filter(
+          (f) =>
+            f.subject === 'user' &&
+            (f.predicate === 'pronouns' || f.predicate === 'user_pronouns'),
+        )
+        .at(-1)?.object,
+    ) ||
     null
 
   const sections: string[] = []
@@ -259,38 +376,28 @@ export function buildVolatileTurnContext(input: ComposeTurnPromptInput): string 
   }
   sections.push(ambientLines.join('\n'))
 
+  const approvedHabits = (input.userHabits ?? []).filter(
+    (h) => h.approvalStatus !== 'pending_review' && h.confidence >= 0.5,
+  )
+  if (approvedHabits.length > 0) {
+    const habitLines = approvedHabits.map(
+      (h) =>
+        `- [${sanitizePromptLine(h.patternKey)}] ${sanitizePromptLine(h.description)} (confidence=${h.confidence.toFixed(2)})`,
+    )
+    sections.push(['[USER HABITS & RHYTHM]', ...habitLines].join('\n'))
+  }
+
   const factsLines =
     activeFacts.length > 0
-      ? activeFacts.map((f) => `- [${f.category}] ${f.subject} ${f.predicate} ${f.object}`)
+      ? activeFacts.map(
+          (f) =>
+            `- [${f.category}] ${sanitizePromptLine(f.subject)} ${sanitizePromptLine(f.predicate)} ${sanitizePromptLine(f.object)}`,
+        )
       : ['- [identity] Ashy is_companion_of user']
 
-  const memories = input.retrievedMemories ?? []
-  const memoryLines = memories.map((item) => {
-    const clarityHint =
-      item.effectiveRetrievability < 0.5
-        ? ' (memória nebulosa/distante — comente com incerteza natural se citar)'
-        : item.memory.isFlashbulb || item.memory.surprise >= 0.8
-          ? ' (memória flashbulb vívida)'
-          : ''
-    return `- Episodic Memory [${item.memory.id}]${clarityHint}: ${item.memory.title} — ${item.memory.summary}`
-  })
-
   sections.push(
-    ['[RECALLED MEMORIES & FACTS]', ...factsLines, ...memoryLines].join('\n'),
+    ['[RECALLED MEMORIES & FACTS]', ...factsLines].join('\n'),
   )
-
-  const callbackLines = ['[ELIGIBLE INSIDE JOKE CALLBACKS]']
-  const motifs = !seriousness.isSeriousOrDelicate ? (input.eligibleMotifs ?? []) : []
-  if (motifs.length > 0) {
-    for (const match of motifs) {
-      callbackLines.push(
-        `- Eligible Inside Joke [${match.motif.id}] (stage=${match.motif.stage}): ${match.motif.motif} — use <|CALLBACK ${match.motif.id}|> if you weave it in naturally.`,
-      )
-    }
-  } else {
-    callbackLines.push('- None eligible on this turn.')
-  }
-  sections.push(callbackLines.join('\n'))
 
   return sections.join('\n\n')
 }
@@ -310,6 +417,17 @@ export function composeAshyTurnPrompt(input: ComposeTurnPromptInput): ComposedTu
     severity: 0,
     maxPlayfulnessAllowed: 1.0,
   }
+
+  const approvedMemories = (input.retrievedMemories ?? []).filter(
+    (item) => item.memory.approvalStatus !== 'pending_review',
+  )
+  const approvedMotifs = seriousness.isSeriousOrDelicate
+    ? []
+    : (input.eligibleMotifs ?? []).filter(
+        (match) =>
+          match.motif.approvalStatus !== 'pending_review' &&
+          match.motif.stage !== 'dormant',
+      )
 
   const staticSystemPrompt = buildStaticSoulSystemPrompt({
     stage: input.stage,
@@ -347,9 +465,8 @@ export function composeAshyTurnPrompt(input: ComposeTurnPromptInput): ComposedTu
     )
   }
 
-  const memories = input.retrievedMemories ?? []
-  if (memories.length > 0) {
-    for (const item of memories) {
+  if (approvedMemories.length > 0) {
+    for (const item of approvedMemories) {
       const clarityHint =
         item.effectiveRetrievability < 0.5
           ? ' (memória nebulosa/distante — comente com incerteza natural se citar)'
@@ -357,18 +474,40 @@ export function composeAshyTurnPrompt(input: ComposeTurnPromptInput): ComposedTu
             ? ' (memória flashbulb vívida)'
             : ''
       contextBulletLines.push(
-        `- Episodic Memory [${item.memory.id}]${clarityHint}: ${item.memory.title} — ${item.memory.summary}`,
+        `- Episodic Memory [${sanitizePromptLine(item.memory.id)}]${clarityHint}: ${sanitizePromptLine(item.memory.title)} — ${sanitizePromptLine(item.memory.summary)}`,
       )
     }
   }
 
   if (!seriousness.isSeriousOrDelicate) {
-    const motifs = input.eligibleMotifs ?? []
-    for (const match of motifs) {
+    for (const match of approvedMotifs) {
+      const cleanId = sanitizePromptLine(match.motif.id)
       contextBulletLines.push(
-        `- Eligible Inside Joke [${match.motif.id}] (stage=${match.motif.stage}): ${match.motif.motif} — use <|CALLBACK ${match.motif.id}|> if you weave it in naturally.`,
+        `- Eligible Inside Joke [${cleanId}] (stage=${match.motif.stage}): ${sanitizePromptLine(match.motif.motif)} — use <|CALLBACK ${cleanId}|> if you weave it in naturally.`,
       )
     }
+  }
+
+  const MAX_OVERDUE_MS = 7 * 86_400_000
+  const eligibleIntents = (input.prospectiveIntents ?? []).filter((intent) => {
+    if (intent.status !== 'pending' || intent.approvalStatus === 'pending_review') {
+      return false
+    }
+    if (intent.dueAt !== null && intent.dueAt !== undefined) {
+      if (nowMs - intent.dueAt > MAX_OVERDUE_MS) {
+        return false
+      }
+      if (intent.dueAt <= nowMs) {
+        return true
+      }
+    }
+    return computeProspectiveIntentRelevance(intent, input.userMessage) >= 0.2
+  })
+
+  for (const intent of eligibleIntents) {
+    contextBulletLines.push(
+      `- Prospective Intent [${sanitizePromptLine(intent.id)}] (cue=${sanitizePromptLine(intent.contextCue)}): ${sanitizePromptLine(intent.topic)}`,
+    )
   }
 
   const timestampStr = formatUtcTimestampMinute(nowMs)
@@ -406,6 +545,9 @@ export function composeAshyTurnPrompt(input: ComposeTurnPromptInput): ComposedTu
     userTurnContent,
     messages,
     seriousness,
+    retrievedMemories: approvedMemories,
+    eligibleMotifs: approvedMotifs,
+    eligibleIntents,
   }
 }
 

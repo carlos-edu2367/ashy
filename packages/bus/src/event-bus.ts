@@ -143,7 +143,11 @@ export interface EventBus {
   dispose(reason?: unknown): void
   /** Internal hook for bridging buses */
   __receiveBridgePacket(packet: BridgePacket, fromBusId: string): void
-  __subscribeBridge(listener: (packet: BridgePacket, sourceBusId: string) => void): () => void
+  __subscribeBridge(
+    listener: (packet: BridgePacket, sourceBusId: string) => void,
+    peerBus?: EventBus,
+  ): () => void
+  __getBridgePeers(): ReadonlySet<EventBus>
   __hasLocalRpcHandler(name: string): boolean
   __hasLocalStreamRpcHandler(name: string): boolean
 }
@@ -246,12 +250,39 @@ function nextId(prefix: string): string {
 }
 
 // Tracks the shared hop budget across an entire synchronous causal cascade
-// so even branching re-emits (`busA.on` + `busB.on` both calling `emit`) are strictly O(maxHops)
-// and can never cause an O(2^maxHops) exponential broadcast storm!
+// within the same connected component of bridged buses, so even branching re-emits
+// (`busA.on` + `busB.on` both calling `emit`) are strictly O(maxHops) while
+// independent unbridged buses are completely isolated.
 interface CausalCascadeBudget {
   hopsRemaining: number
+  reachableBuses: Set<EventBus>
 }
-let activeCascadeBudget: CausalCascadeBudget | null = null
+const activeCascadeStack: CausalCascadeBudget[] = []
+
+function collectReachableBuses(root: EventBus): Set<EventBus> {
+  const visited = new Set<EventBus>([root])
+  const queue: EventBus[] = [root]
+  while (queue.length > 0) {
+    const current = queue.shift()!
+    for (const peer of current.__getBridgePeers()) {
+      if (!visited.has(peer)) {
+        visited.add(peer)
+        queue.push(peer)
+      }
+    }
+  }
+  return visited
+}
+
+function findActiveCascadeForBus(bus: EventBus): CausalCascadeBudget | null {
+  for (let i = activeCascadeStack.length - 1; i >= 0; i -= 1) {
+    const budget = activeCascadeStack[i]!
+    if (budget.reachableBuses.has(bus)) {
+      return budget
+    }
+  }
+  return null
+}
 
 export function createEventBus(options: EventBusOptions = {}): EventBus {
   busCounter += 1
@@ -269,6 +300,8 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
 
   const eventListeners = new Map<string, Set<EventHandler<any>>>()
   const bridgeListeners = new Set<(packet: BridgePacket, sourceBusId: string) => void>()
+  const bridgePeerCounts = new Map<EventBus, number>()
+  let selfBusRef!: EventBus
 
   const rpcHandlers = new Map<string, RpcHandler<any, any>>()
   const streamRpcHandlers = new Map<string, StreamRpcHandler<any, any>>()
@@ -309,9 +342,14 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
     const handlers = eventListeners.get(envelope.eventName)
     if (!handlers || handlers.size === 0) return
 
-    const isRootCascade = activeCascadeBudget === null
+    let cascade = findActiveCascadeForBus(selfBusRef)
+    const isRootCascade = cascade === null
     if (isRootCascade) {
-      activeCascadeBudget = { hopsRemaining: envelope.hopsRemaining - 1 }
+      cascade = {
+        hopsRemaining: envelope.hopsRemaining - 1,
+        reachableBuses: collectReachableBuses(selfBusRef),
+      }
+      activeCascadeStack.push(cascade)
     }
     try {
       for (const handler of [...handlers]) {
@@ -319,7 +357,7 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
       }
     } finally {
       if (isRootCascade) {
-        activeCascadeBudget = null
+        activeCascadeStack.pop()
       }
     }
   }
@@ -358,12 +396,13 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
   ): EventEnvelope<TPayload> | null {
     assertNotDisposed()
 
+    let cascade = findActiveCascadeForBus(selfBusRef)
     let initialHops: number
     if (emitOpts?.hopsRemaining !== undefined) {
       initialHops = emitOpts.hopsRemaining
-    } else if (activeCascadeBudget !== null) {
-      initialHops = activeCascadeBudget.hopsRemaining
-      activeCascadeBudget.hopsRemaining -= 1
+    } else if (cascade !== null) {
+      initialHops = cascade.hopsRemaining
+      cascade.hopsRemaining -= 1
     } else {
       initialHops = maxHops
     }
@@ -390,22 +429,26 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
       originBusId: busId,
     }
 
-    const isRootCascade = activeCascadeBudget === null
+    const isRootCascade = cascade === null
     if (isRootCascade) {
-      activeCascadeBudget = { hopsRemaining: initialHops - 1 }
+      cascade = {
+        hopsRemaining: initialHops - 1,
+        reachableBuses: collectReachableBuses(selfBusRef),
+      }
+      activeCascadeStack.push(cascade)
     }
 
     try {
       deliverEventLocally(envelope)
 
       const remainingForBridge =
-        activeCascadeBudget !== null
-          ? activeCascadeBudget.hopsRemaining
+        cascade !== null
+          ? cascade.hopsRemaining
           : envelope.hopsRemaining - 1
 
       if (remainingForBridge > 0) {
-        if (activeCascadeBudget !== null) {
-          activeCascadeBudget.hopsRemaining -= 1
+        if (cascade !== null) {
+          cascade.hopsRemaining -= 1
         }
         forwardToBridges(
           {
@@ -424,7 +467,7 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
       }
     } finally {
       if (isRootCascade) {
-        activeCascadeBudget = null
+        activeCascadeStack.pop()
       }
     }
 
@@ -800,9 +843,10 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
 
     if (packet.type === 'event') {
       const { envelope } = packet
+      const cascade = findActiveCascadeForBus(selfBusRef)
       const effectiveHops =
-        activeCascadeBudget !== null
-          ? Math.min(envelope.hopsRemaining, activeCascadeBudget.hopsRemaining)
+        cascade !== null
+          ? Math.min(envelope.hopsRemaining, cascade.hopsRemaining)
           : envelope.hopsRemaining
 
       if (effectiveHops <= 0) {
@@ -816,8 +860,8 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
       }
       seenEvents.add(envelope.deliveryId)
 
-      if (activeCascadeBudget !== null) {
-        activeCascadeBudget.hopsRemaining = effectiveHops - 1
+      if (cascade !== null) {
+        cascade.hopsRemaining = effectiveHops - 1
       }
 
       deliverEventLocally({
@@ -826,8 +870,8 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
       })
 
       const nextHops =
-        activeCascadeBudget !== null
-          ? activeCascadeBudget.hopsRemaining
+        cascade !== null
+          ? cascade.hopsRemaining
           : effectiveHops - 1
 
       if (nextHops > 0) {
@@ -1022,10 +1066,22 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
 
   function __subscribeBridge(
     listener: (packet: BridgePacket, sourceBusId: string) => void,
+    peerBus?: EventBus,
   ): () => void {
     bridgeListeners.add(listener)
+    if (peerBus) {
+      bridgePeerCounts.set(peerBus, (bridgePeerCounts.get(peerBus) ?? 0) + 1)
+    }
     return () => {
       bridgeListeners.delete(listener)
+      if (peerBus) {
+        const nextCount = (bridgePeerCounts.get(peerBus) ?? 1) - 1
+        if (nextCount <= 0) {
+          bridgePeerCounts.delete(peerBus)
+        } else {
+          bridgePeerCounts.set(peerBus, nextCount)
+        }
+      }
     }
   }
 
@@ -1059,13 +1115,14 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
 
     eventListeners.clear()
     bridgeListeners.clear()
+    bridgePeerCounts.clear()
     rpcHandlers.clear()
     streamRpcHandlers.clear()
     seenEvents.clear()
     seenBridgePackets.clear()
   }
 
-  return {
+  selfBusRef = {
     id: busId,
     get isDisposed() {
       return disposed
@@ -1083,9 +1140,11 @@ export function createEventBus(options: EventBusOptions = {}): EventBus {
     dispose,
     __receiveBridgePacket,
     __subscribeBridge,
+    __getBridgePeers: () => new Set(bridgePeerCounts.keys()),
     __hasLocalRpcHandler: (name: string) => rpcHandlers.has(name),
     __hasLocalStreamRpcHandler: (name: string) => streamRpcHandlers.has(name),
   }
+  return selfBusRef
 }
 
 export const createEventContext = createEventBus
@@ -1103,12 +1162,12 @@ export function bridgeBuses(busA: EventBus, busB: EventBus): () => void {
   const unsubA = busA.__subscribeBridge((packet, sourceBusId) => {
     if (sourceBusId === busB.id) return
     busB.__receiveBridgePacket(packet, busA.id)
-  })
+  }, busB)
 
   const unsubB = busB.__subscribeBridge((packet, sourceBusId) => {
     if (sourceBusId === busA.id) return
     busA.__receiveBridgePacket(packet, busB.id)
-  })
+  }, busA)
 
   return () => {
     unsubA()

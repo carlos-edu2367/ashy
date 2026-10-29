@@ -1,3 +1,4 @@
+import { embedTextSync128 } from '@ashy/llm'
 import { EpisodicMemorySchema, type EpisodicMemory } from '@ashy/shared'
 import * as v from 'valibot'
 
@@ -206,6 +207,7 @@ export function rankEpisodicMemories(
   if (memories.length === 0) return []
   const nowMs = query.nowMs ?? Date.now()
   const queryTokens = tokenizeForSearch(query.text)
+  const hasQueryEmbedding = Boolean(query.embedding && query.embedding.length > 0)
 
   const preScored = memories.map((memory) => {
     const combinedDoc = `${memory.title} ${memory.summary} ${memory.content} ${memory.tags.join(' ')}`
@@ -216,11 +218,25 @@ export function rankEpisodicMemories(
         ? externalBm25 + lexicalScore * 0.25
         : lexicalScore
 
-    const vectorSimilarity = query.embedding
-      ? cosineSimilarity(query.embedding, memory.embedding)
-      : lexicalScore > 0
-        ? Math.min(1, lexicalScore / 4)
-        : 0
+    let vectorSimilarity = 0
+    if (hasQueryEmbedding) {
+      const qEmb = query.embedding!
+      if (memory.embedding && memory.embedding.length > 0) {
+        if (memory.embedding.length === qEmb.length) {
+          vectorSimilarity = cosineSimilarity(qEmb, memory.embedding)
+        } else if (qEmb.length === 128) {
+          const recomputedVec = embedTextSync128(combinedDoc)
+          vectorSimilarity = cosineSimilarity(qEmb, recomputedVec)
+        } else {
+          vectorSimilarity = cosineSimilarity(qEmb, memory.embedding)
+        }
+      } else if (qEmb.length === 128) {
+        const recomputedVec = embedTextSync128(combinedDoc)
+        vectorSimilarity = cosineSimilarity(qEmb, recomputedVec)
+      }
+    } else if (lexicalScore > 0) {
+      vectorSimilarity = Math.min(1, lexicalScore / 4)
+    }
 
     return {
       memory,
