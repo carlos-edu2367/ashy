@@ -39,6 +39,8 @@ import {
   ASHY_BASELINE_MOOD,
   ASHY_DEFAULT_TRAITS,
   ASHY_EMOTIONS,
+  DEFAULT_ASHY_VOICE_MD,
+  DEFAULT_PROVIDER_CONFIGS,
   LLM_PROVIDER_IDS,
   type AshyBootstrapSnapshot,
   type AshyEmotion,
@@ -73,8 +75,6 @@ import {
   type ScheduledAudioChunk,
 } from '@ashy/voice'
 import { create } from 'zustand'
-import { DEFAULT_PROVIDER_CONFIGS } from '../host/provider-vault'
-import { DEFAULT_ASHY_VOICE_MD } from '../host/voice-identity-store'
 import { getAshyHostBridge } from '../services/ashy-host-client'
 import { DEMO_MEMORY_CARDS } from '../test/fixtures/demo-seed'
 

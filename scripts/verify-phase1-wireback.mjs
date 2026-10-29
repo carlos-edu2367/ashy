@@ -45,6 +45,11 @@ checkForbidden(
   /VS Code — apps\/desktop\/src\/App\.tsx/,
   'Production store must not hardcode screenContext',
 )
+checkForbidden(
+  'apps/desktop/src/store/useAshyStore.ts',
+  /from\s+['"]\.\.\/host\//,
+  'Renderer store must not import Node-only modules from ../host/',
+)
 
 // 2. Verify all 6 Phase 0/1 organs have live producer + live reader + integration test
 const organChecks = [

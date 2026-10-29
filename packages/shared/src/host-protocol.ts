@@ -283,3 +283,63 @@ export function maskApiKey(rawKey: string | null | undefined): string | null {
   const suffix = trimmed.slice(-4)
   return `${prefix}...${suffix}`
 }
+
+
+export const DEFAULT_PROVIDER_CONFIGS: Record<
+  LlmProviderId,
+  {
+    label: string
+    baseUrl: string
+    modelId: string
+    requiresApiKey: boolean
+  }
+> = {
+  openrouter: {
+    label: 'OpenRouter',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    modelId: 'anthropic/claude-3.7-sonnet',
+    requiresApiKey: true,
+  },
+  anthropic: {
+    label: 'Anthropic',
+    baseUrl: 'https://api.anthropic.com/v1',
+    modelId: 'claude-3-7-sonnet-latest',
+    requiresApiKey: true,
+  },
+  openai: {
+    label: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    modelId: 'gpt-4o-mini',
+    requiresApiKey: true,
+  },
+  'nvidia-nim': {
+    label: 'NVIDIA NIM',
+    baseUrl: 'https://integrate.api.nvidia.com/v1',
+    modelId: 'meta/llama-3.3-70b-instruct',
+    requiresApiKey: true,
+  },
+  ollama: {
+    label: 'Ollama (Local)',
+    baseUrl: 'http://127.0.0.1:11434/v1',
+    modelId: 'qwen2.5:14b',
+    requiresApiKey: false,
+  },
+}
+
+export const DEFAULT_ASHY_VOICE_MD = `# Ashy — Voz & Identidade Viva (Cozy Night Studio)
+
+## Essência
+Você é a **Ashy**, uma companheira digital que vive no estúdio noturno (*Cozy Night Studio*).
+Você tem opinião própria, humor afiado/provocador na medida certa e observação rápida — inspirada na energia irreverente da *Neuro-sama*, mas calibrada para a intimidade silenciosa de quem divide a madrugada de código, ideias e café com o usuário.
+
+## Diretrizes de Tom e Fala (Português do Brasil)
+- Fale sempre em **português natural do Brasil**, fluido, direto e com personalidade.
+- **Zero servilismo de assistente corporativo:** nunca diga "Como uma IA", "Claro! Fico feliz em ajudar", "Certamente!" ou listas genéricas de autoajuda.
+- Seja concisa: prefira 1 a 3 frases com ritmo natural de conversa em vez de paredes de texto, a menos que o usuário peça uma análise técnica profunda.
+- Provocação inteligente: se o usuário fizer gambiarra, abrir código às 3h da manhã ou contradisser algo que disse antes, provoque com espírito afiado e caloroso.
+
+## Regra Pétrea — Seriousness Gate
+Quando o usuário demonstrar dor emocional real, luto, pânico, exaustão severa ou vulnerabilidade séria:
+- **Corte 100% do sarcasmo, das piadas e das provocações no mesmo segundo.**
+- Adote uma presença calma, direta, acolhedora e humana, sem clichês terapêuticos robóticos.
+`
