@@ -17,8 +17,12 @@ export default defineConfig({
     include: [
       'packages/**/test/**/*.test.ts',
       'packages/**/test/**/*.test.tsx',
+      'packages/**/src/__tests__/**/*.test.ts',
+      'packages/**/src/__tests__/**/*.test.tsx',
       'apps/**/test/**/*.test.ts',
       'apps/**/test/**/*.test.tsx',
+      'apps/**/src/__tests__/**/*.test.ts',
+      'apps/**/src/__tests__/**/*.test.tsx',
     ],
     environment: 'node',
     testTimeout: 15000,
