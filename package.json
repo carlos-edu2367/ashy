@@ -11,7 +11,8 @@
     "build": "pnpm --filter @ashy/desktop build",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:wireback": "node scripts/verify-phase1-wireback.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.51.0",

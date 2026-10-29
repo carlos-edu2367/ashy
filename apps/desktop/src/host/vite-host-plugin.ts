@@ -10,7 +10,7 @@ import type {
   TestProviderInput,
   UpsertFactInput,
 } from '@ashy/shared'
-import { createAshyHostKernel, type AshyHostKernel } from './kernel'
+import type { AshyHostKernel, AshyHostKernelOptions } from './kernel'
 import { createNodeAesSecretProtector, type SecretProtector } from './secret-protector'
 
 const MAX_RPC_BODY_BYTES = 2 * 1024 * 1024
@@ -316,6 +316,7 @@ export function createAshyViteHostPlugin(
   let kernelPromise: Promise<AshyHostKernel> | null = options.kernel
     ? Promise.resolve(options.kernel)
     : null
+  let ssrLoader: ((url: string) => Promise<Record<string, unknown>>) | null = null
 
   function getOrStartKernel(): Promise<AshyHostKernel> {
     if (!kernelPromise) {
@@ -325,11 +326,24 @@ export function createAshyViteHostPlugin(
         path.resolve(process.cwd(), '.ashy-data')
       const secretProtector =
         options.secretProtector ?? createNodeAesSecretProtector(userDataDir)
-      kernelPromise = createAshyHostKernel({
+      const kernelOptions: AshyHostKernelOptions = {
         userDataDir,
         secretProtector,
         fetchImpl: options.fetchImpl,
-      })
+      }
+      kernelPromise = (async () => {
+        if (ssrLoader) {
+          const mod = (await ssrLoader('/src/host/kernel.ts')) as {
+            createAshyHostKernel: (opts: AshyHostKernelOptions) => Promise<AshyHostKernel>
+          }
+          return mod.createAshyHostKernel(kernelOptions)
+        }
+        const kernelSpecifier = './kernel'
+        const mod = (await import(/* @vite-ignore */ kernelSpecifier)) as {
+          createAshyHostKernel: (opts: AshyHostKernelOptions) => Promise<AshyHostKernel>
+        }
+        return mod.createAshyHostKernel(kernelOptions)
+      })()
     }
     return kernelPromise
   }
@@ -351,6 +365,7 @@ export function createAshyViteHostPlugin(
   return {
     name: 'ashy-vite-host-plugin',
     configureServer(server) {
+      ssrLoader = (url) => server.ssrLoadModule(url)
       server.middlewares.use(middleware)
       server.httpServer?.once('close', () => {
         void stopKernel()

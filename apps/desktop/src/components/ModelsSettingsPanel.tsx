@@ -46,6 +46,7 @@ export function ModelsSettingsPanel(): React.ReactElement {
   const handleSaveProvider = async () => {
     setIsSaving(true)
     setSavedNotice(null)
+    setTestResult(null)
     try {
       const trimmedKey = apiKey.trim()
       await saveProviderConfig({
@@ -57,6 +58,8 @@ export function ModelsSettingsPanel(): React.ReactElement {
       await setActiveProvider(selectedProvider)
       setApiKey('')
       setSavedNotice('Configuração salva e ativada ✓')
+    } catch (err) {
+      setSavedNotice(`Erro: ${err instanceof Error ? err.message : String(err)}`)
     } finally {
       setIsSaving(false)
     }
@@ -65,6 +68,7 @@ export function ModelsSettingsPanel(): React.ReactElement {
   const handleClearKey = async () => {
     setIsSaving(true)
     setSavedNotice(null)
+    setTestResult(null)
     try {
       await saveProviderConfig({
         providerId: selectedProvider,
@@ -74,6 +78,8 @@ export function ModelsSettingsPanel(): React.ReactElement {
       })
       setApiKey('')
       setSavedNotice('Chave removida ✓')
+    } catch (err) {
+      setSavedNotice(`Erro: ${err instanceof Error ? err.message : String(err)}`)
     } finally {
       setIsSaving(false)
     }
@@ -81,6 +87,7 @@ export function ModelsSettingsPanel(): React.ReactElement {
 
   const handleTestConnection = async () => {
     setIsTesting(true)
+    setSavedNotice(null)
     try {
       const trimmedKey = apiKey.trim()
       const res = await testProviderConnection({
@@ -90,6 +97,15 @@ export function ModelsSettingsPanel(): React.ReactElement {
         ...(trimmedKey.length > 0 ? { apiKey: trimmedKey } : {}),
       })
       setTestResult(res)
+    } catch (err) {
+      setTestResult({
+        providerId: selectedProvider,
+        ok: false,
+        latencyMs: 0,
+        modelId: modelId.trim() || currentConfig.modelId,
+        verifiedAt: Date.now(),
+        error: err instanceof Error ? err.message : String(err),
+      })
     } finally {
       setIsTesting(false)
     }
@@ -342,7 +358,11 @@ export function ModelsSettingsPanel(): React.ReactElement {
                   : `Erro: ${testResult.error ?? 'Falha na verificação'}`}
               </span>
             ) : savedNotice ? (
-              <span className="ashy-badge emerald">{savedNotice}</span>
+              <span
+                className={`ashy-badge ${savedNotice.startsWith('Erro:') ? 'amber' : 'emerald'}`}
+              >
+                {savedNotice}
+              </span>
             ) : currentConfig?.lastError ? (
               <span className="ashy-badge amber">Último erro: {currentConfig.lastError}</span>
             ) : null}

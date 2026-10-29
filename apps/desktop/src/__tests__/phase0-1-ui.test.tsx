@@ -302,6 +302,22 @@ describe('Phase 0/1 UI — First-Meeting Wizard, Models Settings, Voice Identity
     await vi.waitFor(() => {
       expect(useAshyStore.getState().providers.configs['nvidia-nim'].hasApiKey).toBe(false)
     })
+
+    // Adversarial: invalid baseUrl (>512 chars) during save surfaces error in savedNotice without unhandled rejection
+    await act(async () => {
+      setNativeInputValue(
+        getByTestId<HTMLInputElement>('provider-base-url-input'),
+        `https://example.com/${'a'.repeat(520)}`,
+      )
+    })
+
+    await act(async () => {
+      clickElement(getByTestId('save-provider-btn'))
+    })
+
+    await vi.waitFor(() => {
+      expect(getByTestId('provider-test-status').textContent).toMatch(/Erro:.*Invalid length/i)
+    })
   })
 
   it('4. renders live voice.md editor in Alma tab connected to saveVoiceIdentity and resetVoiceIdentity with diagnostics', async () => {
