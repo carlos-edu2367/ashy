@@ -1,0 +1,112 @@
+{
+  "Version": 3,
+  "FileReferences": {
+    "Moc": "ashy-default.moc3",
+    "Textures": [
+      "textures/ashy-cozy-studio-2048.png"
+    ],
+    "Physics": "ashy-default.physics3.json",
+    "Expressions": [
+      {
+        "Name": "neutral",
+        "File": "expressions/neutral.exp3.json"
+      },
+      {
+        "Name": "happy",
+        "File": "expressions/happy.exp3.json"
+      },
+      {
+        "Name": "excited",
+        "File": "expressions/excited.exp3.json"
+      },
+      {
+        "Name": "smug",
+        "File": "expressions/smug.exp3.json"
+      },
+      {
+        "Name": "tease",
+        "File": "expressions/tease.exp3.json"
+      },
+      {
+        "Name": "chaotic",
+        "File": "expressions/chaotic.exp3.json"
+      },
+      {
+        "Name": "curious",
+        "File": "expressions/curious.exp3.json"
+      },
+      {
+        "Name": "think",
+        "File": "expressions/think.exp3.json"
+      },
+      {
+        "Name": "surprised",
+        "File": "expressions/surprised.exp3.json"
+      },
+      {
+        "Name": "awkward",
+        "File": "expressions/awkward.exp3.json"
+      },
+      {
+        "Name": "concerned",
+        "File": "expressions/concerned.exp3.json"
+      },
+      {
+        "Name": "sad",
+        "File": "expressions/sad.exp3.json"
+      },
+      {
+        "Name": "angry",
+        "File": "expressions/angry.exp3.json"
+      }
+    ],
+    "Motions": {
+      "Idle": [
+        {
+          "File": "motions/idle_breath_01.motion3.json"
+        },
+        {
+          "File": "motions/idle_gaze_02.motion3.json"
+        }
+      ],
+      "TapBody": [
+        {
+          "File": "motions/tap_tease_01.motion3.json"
+        },
+        {
+          "File": "motions/tap_shrug_02.motion3.json"
+        }
+      ],
+      "Speak": [
+        {
+          "File": "motions/speak_nod_01.motion3.json"
+        }
+      ],
+      "Tease": [
+        {
+          "File": "motions/tease_wink_01.motion3.json"
+        }
+      ],
+      "Chaotic": [
+        {
+          "File": "motions/chaotic_bounce_01.motion3.json"
+        }
+      ],
+      "Concerned": [
+        {
+          "File": "motions/concerned_soft_01.motion3.json"
+        }
+      ]
+    }
+  },
+  "HitAreas": [
+    {
+      "Id": "HitAreaHead",
+      "Name": "Head"
+    },
+    {
+      "Id": "HitAreaBody",
+      "Name": "Body"
+    }
+  ]
+}

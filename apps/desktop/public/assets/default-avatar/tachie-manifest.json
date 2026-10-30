@@ -1,0 +1,202 @@
+{
+  "id": "ashy-cozy-night-studio-v1",
+  "name": "Ashy — Cozy Night Studio Canonical Rig",
+  "version": "1.0.0",
+  "canvasWidth": 380,
+  "canvasHeight": 460,
+  "pivots": {
+    "torso": {
+      "x": 190,
+      "y": 365
+    },
+    "head": {
+      "x": 190,
+      "y": 205
+    },
+    "leftEye": {
+      "x": 155,
+      "y": 196
+    },
+    "rightEye": {
+      "x": 225,
+      "y": 196
+    },
+    "mouth": {
+      "x": 190,
+      "y": 248
+    }
+  },
+  "layers": [
+    {
+      "id": "hair_back",
+      "zIndex": 10,
+      "assetPath": "assets/default-avatar/layers/hair_back.svg",
+      "group": "hair_back"
+    },
+    {
+      "id": "base_body",
+      "zIndex": 20,
+      "assetPath": "assets/default-avatar/layers/base_body.svg",
+      "group": "torso"
+    },
+    {
+      "id": "face_base",
+      "zIndex": 30,
+      "assetPath": "assets/default-avatar/layers/face_base.svg",
+      "group": "head"
+    },
+    {
+      "id": "blush",
+      "zIndex": 40,
+      "assetPath": "assets/default-avatar/layers/blush.svg",
+      "group": "head"
+    },
+    {
+      "id": "eyes_open",
+      "zIndex": 50,
+      "assetPath": "assets/default-avatar/layers/eyes_open.svg",
+      "group": "eyes"
+    },
+    {
+      "id": "eyes_half",
+      "zIndex": 51,
+      "assetPath": "assets/default-avatar/layers/eyes_half.svg",
+      "group": "eyes"
+    },
+    {
+      "id": "eyes_closed",
+      "zIndex": 52,
+      "assetPath": "assets/default-avatar/layers/eyes_closed.svg",
+      "group": "eyes"
+    },
+    {
+      "id": "eyes_wink",
+      "zIndex": 53,
+      "assetPath": "assets/default-avatar/layers/eyes_wink.svg",
+      "group": "eyes"
+    },
+    {
+      "id": "pupils",
+      "zIndex": 60,
+      "assetPath": "assets/default-avatar/layers/pupils.svg",
+      "group": "pupils"
+    },
+    {
+      "id": "brows_13",
+      "zIndex": 70,
+      "assetPath": "assets/default-avatar/layers/brows_13.svg",
+      "group": "brows"
+    },
+    {
+      "id": "mouth_visemes",
+      "zIndex": 80,
+      "assetPath": "assets/default-avatar/layers/mouth_visemes.svg",
+      "group": "mouth"
+    },
+    {
+      "id": "hair_front",
+      "zIndex": 90,
+      "assetPath": "assets/default-avatar/layers/hair_front.svg",
+      "group": "hair_front"
+    },
+    {
+      "id": "accessories_fx",
+      "zIndex": 100,
+      "assetPath": "assets/default-avatar/layers/accessories_fx.svg",
+      "group": "fx"
+    }
+  ],
+  "emotions": {
+    "neutral": {
+      "emotion": "neutral",
+      "defaultEyeState": "open",
+      "browPreset": "neutral",
+      "accessoryFx": "none",
+      "defaultMotion": "idle"
+    },
+    "happy": {
+      "emotion": "happy",
+      "defaultEyeState": "closed",
+      "browPreset": "happy",
+      "accessoryFx": "heart",
+      "defaultMotion": "nod"
+    },
+    "excited": {
+      "emotion": "excited",
+      "defaultEyeState": "open",
+      "browPreset": "excited",
+      "accessoryFx": "sparkle",
+      "defaultMotion": "bounce"
+    },
+    "smug": {
+      "emotion": "smug",
+      "defaultEyeState": "half",
+      "browPreset": "smug",
+      "accessoryFx": "none",
+      "defaultMotion": "tease"
+    },
+    "tease": {
+      "emotion": "tease",
+      "defaultEyeState": "wink",
+      "browPreset": "tease",
+      "accessoryFx": "heart",
+      "defaultMotion": "tease"
+    },
+    "chaotic": {
+      "emotion": "chaotic",
+      "defaultEyeState": "open",
+      "browPreset": "chaotic",
+      "accessoryFx": "chaos_aura",
+      "defaultMotion": "laugh"
+    },
+    "curious": {
+      "emotion": "curious",
+      "defaultEyeState": "open",
+      "browPreset": "curious",
+      "accessoryFx": "question",
+      "defaultMotion": "nod"
+    },
+    "think": {
+      "emotion": "think",
+      "defaultEyeState": "half",
+      "browPreset": "think",
+      "accessoryFx": "question",
+      "defaultMotion": "think"
+    },
+    "surprised": {
+      "emotion": "surprised",
+      "defaultEyeState": "open",
+      "browPreset": "surprised",
+      "accessoryFx": "sparkle",
+      "defaultMotion": "bounce"
+    },
+    "awkward": {
+      "emotion": "awkward",
+      "defaultEyeState": "half",
+      "browPreset": "awkward",
+      "accessoryFx": "sweat",
+      "defaultMotion": "shrug"
+    },
+    "concerned": {
+      "emotion": "concerned",
+      "defaultEyeState": "open",
+      "browPreset": "concerned",
+      "accessoryFx": "none",
+      "defaultMotion": "idle"
+    },
+    "sad": {
+      "emotion": "sad",
+      "defaultEyeState": "half",
+      "browPreset": "sad",
+      "accessoryFx": "sweat",
+      "defaultMotion": "idle"
+    },
+    "angry": {
+      "emotion": "angry",
+      "defaultEyeState": "open",
+      "browPreset": "angry",
+      "accessoryFx": "chaos_aura",
+      "defaultMotion": "shake"
+    }
+  }
+}
