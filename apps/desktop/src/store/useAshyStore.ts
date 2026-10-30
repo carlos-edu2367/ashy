@@ -38,6 +38,7 @@ import {
   ASHY_BASELINE_MOOD,
   ASHY_DEFAULT_TRAITS,
   ASHY_EMOTIONS,
+  ASHY_MOTION_PRESETS,
   ASHY_TRAIT_CORRIDORS,
   DEFAULT_ASHY_VOICE_MD,
   DEFAULT_MEMORY_GOVERNANCE_POLICY,
@@ -47,8 +48,11 @@ import {
   type ApprovableMemoryKind,
   type AshyBootstrapSnapshot,
   type AshyEmotion,
+  type AshyEyeLayerState,
   type AshyHostBridge,
   type AshyHostStreamEvent,
+  type AshyMotionPreset,
+  type AshyVisemeKey,
   type AutobiographicalMilestone,
   type ChatMessageRecord,
   type ChatSessionRecord,
@@ -80,7 +84,17 @@ import {
   type VoiceFixtureId,
   type VoiceRuntimeSettings,
 } from '@ashy/shared'
-import type { AshyPresenceStatus } from '@ashy/stage'
+import {
+  DEFAULT_ASHY_LIVE2D_MODEL3_JSON,
+  analyzePcmFrameToVowels,
+  createStageSpeechSynchronizer,
+  formatLive2DControlPrompt,
+  inspectLive2DModelJson,
+  resolveTachieActiveLayers,
+  synthesizeFormantVowelPcm,
+  type AshyPresenceStatus,
+  type Live2DModelControls,
+} from '@ashy/stage'
 import {
   createRealtimeSpeechPipeline,
   createVoiceSessionRuntime,
@@ -218,6 +232,15 @@ export interface AshyDesktopState {
   presenceStatus: AshyPresenceStatus
   bubbleText: string
   simulatedVowels: { A: number; E: number; I: number; O: number; U: number }
+  isTransparentOverlayWindow: boolean
+  isStageHidden: boolean
+  ignoringMouseEvents: boolean
+  ignoreMouseTransitionCount: number
+  activeViseme: AshyVisemeKey
+  activeEyeState: AshyEyeLayerState
+  activeMotion: AshyMotionPreset
+  live2dModelControls: Live2DModelControls
+  loadedLive2DModelName: string
 
   // Cortex Snapshots & Memory Governance
   mood: MoodVector
@@ -297,6 +320,16 @@ export interface AshyDesktopState {
   setStageEmotion: (emotion: AshyEmotion, intensity?: number) => void
   setAmbientLuminance: (luminance: number) => void
   toggleSimulatedSpeech: (speaking?: boolean) => void
+  setStageIgnoreMouseEvents: (ignore: boolean) => void
+  setStageHidden: (hidden: boolean) => void
+  toggleStageHidden: () => void
+  triggerStageMotion: (motion: AshyMotionPreset) => void
+  importLive2DModelJson: (rawJson: string | unknown, modelName?: string) => Live2DModelControls
+  runStageLipSyncActDemo: () => Promise<{
+    visitedVisemes: AshyVisemeKey[]
+    visitedEmotions: AshyEmotion[]
+    visitedMotions: AshyMotionPreset[]
+  }>
 
   sendUserMessage: (userMessage: string) => Promise<void>
   triggerBargeIn: (interruptAtMs?: number) => PlaybackReceipt
@@ -720,6 +753,31 @@ const pendingTurnSeriousness = new Map<string, boolean>()
 const streamedDeltaTurnIds = new Set<string>()
 const bargeInTurnIds = new Set<string>()
 
+export function resolveInitialWindowMode(): {
+  viewMode: DesktopViewMode
+  isTransparentOverlayWindow: boolean
+} {
+  const search = typeof window !== 'undefined' ? (window.location?.search ?? '') : ''
+  if (search.includes('view=stage-overlay')) {
+    return { viewMode: 'stage', isTransparentOverlayWindow: true }
+  }
+  if (search.includes('view=stage')) {
+    return { viewMode: 'stage', isTransparentOverlayWindow: false }
+  }
+  return { viewMode: 'hub', isTransparentOverlayWindow: false }
+}
+
+function resolveMotionPreset(rawMotion?: string): AshyMotionPreset | null {
+  if (typeof rawMotion !== 'string') return null
+  const normalized = rawMotion.trim().toLowerCase()
+  if ((ASHY_MOTION_PRESETS as readonly string[]).includes(normalized)) {
+    return normalized as AshyMotionPreset
+  }
+  return null
+}
+
+const DEFAULT_LIVE2D_CONTROLS = inspectLive2DModelJson(DEFAULT_ASHY_LIVE2D_MODEL3_JSON)
+
 export const useAshyStore = create<AshyDesktopState>((set, get) => {
   function compilePromptFromState(params?: {
     userMessage?: string
@@ -737,6 +795,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     prospectiveIntents?: readonly ProspectiveIntent[]
     chatMessages?: readonly ChatTurnMessage[]
     interruptionControlNote?: string
+    live2dModelControls?: Live2DModelControls
   }): ComposedTurnPrompt {
     const current = get()
     const userMessage =
@@ -783,6 +842,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       []
     ).filter((i) => i.approvalStatus !== 'pending_review' && i.status === 'pending')
 
+    const activeControls =
+      params?.live2dModelControls ?? current?.live2dModelControls ?? DEFAULT_LIVE2D_CONTROLS
+
     return composeAshyTurnPrompt({
       userMessage,
       modelId,
@@ -805,6 +867,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       userHabits: habits,
       prospectiveIntents: intents,
       interruptionControlNote: params?.interruptionControlNote,
+      stageControlsPromptBlock: formatLive2DControlPrompt(activeControls),
       conversationHistory: (params?.chatMessages ?? current?.chatMessages ?? []).map((m) => ({
         role: m.role,
         content: m.content,
@@ -840,10 +903,12 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       },
       onStageSignal: (signal) => {
         if (signal.type === 'act' && signal.emotion) {
-          set({
-            stageEmotion: signal.emotion,
+          const maybeMotion = resolveMotionPreset(signal.motion)
+          set((state) => ({
+            stageEmotion: signal.emotion!,
             emotionIntensity: signal.intensity ?? 0.85,
-          })
+            activeMotion: maybeMotion ?? state.activeMotion,
+          }))
         }
       },
     })
@@ -930,11 +995,13 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       if (marker.type === 'act' && marker.emotion) {
         const nextEmotion = marker.emotion
         const nextIntensity = marker.intensity ?? 0.85
+        const nextMotion = resolveMotionPreset(marker.motion)
         const actSignal: AshyStageSignal = {
           type: 'act',
           emotion: nextEmotion,
           intensity: nextIntensity,
-          raw: `<|ACT {"emotion":"${nextEmotion}","intensity":${nextIntensity}}|>`,
+          ...(marker.motion ? { motion: marker.motion } : {}),
+          raw: `<|ACT {"emotion":"${nextEmotion}","intensity":${nextIntensity}${marker.motion ? `,"motion":"${marker.motion}"` : ''}}|>`,
         }
         const pipeline = activeSpeechPipeline ?? createPipelineForTurn()
         if (firstDeltaEnqueuedAtMs === null) {
@@ -945,6 +1012,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         set((state) => ({
           stageEmotion: nextEmotion,
           emotionIntensity: nextIntensity,
+          activeMotion: nextMotion ?? state.activeMotion,
           lastStageSignals: [...state.lastStageSignals, actSignal],
           chatMessages: state.chatMessages.map((m) =>
             m.id === assistantMsgId ? { ...m, emotion: nextEmotion } : m,
@@ -1050,11 +1118,20 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           ? 'concerned'
           : event.assistantMessage.emotion
 
+        const lastActSignalWithMotion = [...parsed.signals]
+          .reverse()
+          .find(
+            (s): s is Extract<typeof s, { type: 'act' }> =>
+              s.type === 'act' && typeof s.motion === 'string',
+          )
+        const resolvedCompletedMotion = resolveMotionPreset(lastActSignalWithMotion?.motion)
+
         set((state) => ({
           isStreamingTurn: false,
           activeTurnId: null,
           persistenceWarning: event.persistenceWarning,
           stageEmotion: targetEmotion,
+          activeMotion: resolvedCompletedMotion ?? state.activeMotion,
           mood: wasSerious
             ? {
                 ...state.mood,
@@ -1147,6 +1224,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     return bridge
   }
 
+  const initialWindowMode = resolveInitialWindowMode()
   const initialPrompt = composeAshyTurnPrompt({
     userMessage: 'Olá Ashy.',
     modelId: 'claude-3-7-sonnet',
@@ -1155,13 +1233,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     voiceIdentityMarkdown: DEFAULT_ASHY_VOICE_MD,
     traits: ASHY_DEFAULT_TRAITS,
     mood: ASHY_BASELINE_MOOD,
+    stageControlsPromptBlock: formatLive2DControlPrompt(DEFAULT_LIVE2D_CONTROLS),
   })
 
   return {
-    viewMode:
-      typeof window !== 'undefined' && window.location?.search?.includes('view=stage')
-        ? 'stage'
-        : 'hub',
+    viewMode: initialWindowMode.viewMode,
     activeTab: 'studio',
     activeModelId: 'claude-3-7-sonnet',
 
@@ -1204,6 +1280,20 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     presenceStatus: 'Idle',
     bubbleText: 'Fico por aqui. No seu ritmo. ♡',
     simulatedVowels: { A: 0.65, E: 0.25, I: 0.1, O: 0.35, U: 0.15 },
+    isTransparentOverlayWindow: initialWindowMode.isTransparentOverlayWindow,
+    isStageHidden: false,
+    ignoringMouseEvents: false,
+    ignoreMouseTransitionCount: 0,
+    activeViseme: 'closed',
+    activeEyeState: 'open',
+    activeMotion: 'idle',
+    live2dModelControls: {
+      ...DEFAULT_LIVE2D_CONTROLS,
+      expressions: [...DEFAULT_LIVE2D_CONTROLS.expressions],
+      motionGroups: DEFAULT_LIVE2D_CONTROLS.motionGroups.map((g) => ({ ...g })),
+      hitAreas: [...DEFAULT_LIVE2D_CONTROLS.hitAreas],
+    },
+    loadedLive2DModelName: 'ashy-default.model3.json',
 
     mood: { ...ASHY_BASELINE_MOOD },
     traits: { ...ASHY_DEFAULT_TRAITS },
@@ -1504,10 +1594,172 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       set({
         isSpeaking: nextSpeaking,
         presenceStatus: nextSpeaking ? 'Speaking' : 'Idle',
+        activeViseme: nextSpeaking ? 'A' : 'closed',
         simulatedVowels: nextSpeaking
           ? { A: 0.78, E: 0.35, I: 0.15, O: 0.45, U: 0.2 }
           : { A: 0, E: 0, I: 0, O: 0, U: 0 },
       })
+    },
+
+    setStageIgnoreMouseEvents(ignore) {
+      const nextIgnore = Boolean(ignore)
+      if (nextIgnore === get().ignoringMouseEvents) {
+        return
+      }
+      set((state) => ({
+        ignoringMouseEvents: nextIgnore,
+        ignoreMouseTransitionCount: state.ignoreMouseTransitionCount + 1,
+      }))
+      void (
+        globalThis as unknown as {
+          ashyHost?: {
+            setOverlayIgnoreMouse?: (input: { ignore: boolean; forward?: boolean }) => unknown
+          }
+        }
+      ).ashyHost?.setOverlayIgnoreMouse?.({ ignore: nextIgnore, forward: true })
+    },
+
+    setStageHidden(hidden) {
+      const nextHidden = Boolean(hidden)
+      if (nextHidden) {
+        set({
+          isStageHidden: true,
+          isSpeaking: false,
+          presenceStatus: 'Idle',
+          activeViseme: 'closed',
+          simulatedVowels: { A: 0, E: 0, I: 0, O: 0, U: 0 },
+          ignoringMouseEvents: false,
+        })
+      } else {
+        set({
+          isStageHidden: false,
+        })
+      }
+      void (
+        globalThis as unknown as {
+          ashyHost?: {
+            setOverlayVisible?: (input: { visible: boolean }) => unknown
+          }
+        }
+      ).ashyHost?.setOverlayVisible?.({ visible: !nextHidden })
+    },
+
+    toggleStageHidden() {
+      get().setStageHidden(!get().isStageHidden)
+    },
+
+    triggerStageMotion(motion) {
+      if ((ASHY_MOTION_PRESETS as readonly string[]).includes(motion)) {
+        set({ activeMotion: motion })
+      }
+    },
+
+    importLive2DModelJson(rawJson, modelName = 'custom-imported.model3.json') {
+      let parsed: unknown = rawJson
+      if (typeof rawJson === 'string') {
+        try {
+          parsed = JSON.parse(rawJson)
+        } catch (err) {
+          throw new Error(
+            `Invalid Live2D .model3.json: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        }
+      }
+      const controls = inspectLive2DModelJson(parsed)
+      const cleanName = modelName.trim() || 'custom-imported.model3.json'
+      const nextPrompt = compilePromptFromState({
+        live2dModelControls: controls,
+      })
+      set({
+        live2dModelControls: controls,
+        loadedLive2DModelName: cleanName,
+        stageMode: 'live2d',
+        lastPrompt: nextPrompt,
+      })
+      return controls
+    },
+
+    async runStageLipSyncActDemo() {
+      const pcmA = synthesizeFormantVowelPcm('A', 120)
+      const pcmO = synthesizeFormantVowelPcm('O', 120)
+      const pcmI = synthesizeFormantVowelPcm('I', 120)
+      void analyzePcmFrameToVowels(pcmA.subarray(0, 640), 16_000)
+      const combinedPcm = new Float32Array(pcmA.length + pcmO.length + pcmI.length)
+      combinedPcm.set(pcmA, 0)
+      combinedPcm.set(pcmO, pcmA.length)
+      combinedPcm.set(pcmI, pcmA.length + pcmO.length)
+
+      const synchronizer = createStageSpeechSynchronizer({
+        samples: combinedPcm,
+        sampleRate: 16_000,
+        actKeyframes: [
+          { atMs: 0, emotion: 'smug', intensity: 0.9, motion: 'tease' },
+          { atMs: 140, emotion: 'excited', intensity: 0.95, motion: 'bounce' },
+        ],
+      })
+
+      const visitedVisemes: AshyVisemeKey[] = []
+      const visitedEmotions: AshyEmotion[] = []
+      const visitedMotions: AshyMotionPreset[] = []
+
+      for (const sampleMs of [40, 180, 300]) {
+        const snap = synchronizer.sampleAt(sampleMs)
+        const activeLayer = resolveTachieActiveLayers(
+          {
+            emotion: snap.emotion,
+            pose: {
+              eyeOpenL: 0.85,
+              eyeOpenR: 0.85,
+              browLY: 0,
+              browRY: 0,
+              browAngle: 0,
+              mouthOpen: snap.acoustic.rawVolume,
+              mouthForm: 0,
+              mouthSmile: 0.5,
+              cheekBlush: 0.2,
+              pupilScale: 1,
+            },
+            vowels: snap.acoustic.rawVowels,
+            effectiveEyeOpenL: 0.85,
+            effectiveEyeOpenR: 0.85,
+            eyeFocus: { x: 0, y: 0 },
+            headFocus: { x: 0, y: 0 },
+            breathValue: 0.2,
+            squintAmount: 0,
+            springOffset: { x: 0, y: 0 },
+          },
+          snap.motion,
+        )
+        visitedVisemes.push(activeLayer.activeViseme)
+        visitedEmotions.push(snap.emotion)
+        visitedMotions.push(snap.motion)
+
+        set({
+          isSpeaking: snap.isSpeaking,
+          presenceStatus: snap.isSpeaking ? 'Speaking' : 'Idle',
+          simulatedVowels: snap.acoustic.rawVowels,
+          activeViseme: activeLayer.activeViseme,
+          activeEyeState: activeLayer.eyeState,
+          stageEmotion: snap.emotion,
+          emotionIntensity: snap.emotionIntensity,
+          activeMotion: snap.motion,
+        })
+      }
+
+      const settled = synchronizer.sampleAt(450)
+      set({
+        isSpeaking: settled.isSpeaking,
+        presenceStatus: 'Idle',
+        simulatedVowels: settled.acoustic.rawVowels,
+        activeViseme: 'closed',
+        activeEyeState: 'open',
+      })
+
+      return {
+        visitedVisemes,
+        visitedEmotions,
+        visitedMotions,
+      }
     },
 
     async sendUserMessage(userMessage: string) {
@@ -2315,6 +2567,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       })
       lastPromptMinuteLabel = formatLocalTimeHHMM(Date.now())
 
+      const resetWindowMode = resolveInitialWindowMode()
       const freshPrompt = composeAshyTurnPrompt({
         userMessage: 'Olá Ashy.',
         modelId: 'claude-3-7-sonnet',
@@ -2323,10 +2576,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         voiceIdentityMarkdown: DEFAULT_ASHY_VOICE_MD,
         traits: ASHY_DEFAULT_TRAITS,
         mood: ASHY_BASELINE_MOOD,
+        stageControlsPromptBlock: formatLive2DControlPrompt(DEFAULT_LIVE2D_CONTROLS),
       })
 
       set({
-        viewMode: 'hub',
+        viewMode: resetWindowMode.viewMode,
         activeTab: 'studio',
         activeModelId: 'claude-3-7-sonnet',
         isBootstrapped: false,
@@ -2367,6 +2621,20 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         presenceStatus: 'Idle',
         bubbleText: 'Fico por aqui. No seu ritmo. ♡',
         simulatedVowels: { A: 0.65, E: 0.25, I: 0.1, O: 0.35, U: 0.15 },
+        isTransparentOverlayWindow: resetWindowMode.isTransparentOverlayWindow,
+        isStageHidden: false,
+        ignoringMouseEvents: false,
+        ignoreMouseTransitionCount: 0,
+        activeViseme: 'closed',
+        activeEyeState: 'open',
+        activeMotion: 'idle',
+        live2dModelControls: {
+          ...DEFAULT_LIVE2D_CONTROLS,
+          expressions: [...DEFAULT_LIVE2D_CONTROLS.expressions],
+          motionGroups: DEFAULT_LIVE2D_CONTROLS.motionGroups.map((g) => ({ ...g })),
+          hitAreas: [...DEFAULT_LIVE2D_CONTROLS.hitAreas],
+        },
+        loadedLive2DModelName: 'ashy-default.model3.json',
         mood: { ...ASHY_BASELINE_MOOD },
         traits: { ...ASHY_DEFAULT_TRAITS },
         milestones: [],
@@ -2420,6 +2688,8 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
   }
 })
+
+export type AshyStoreState = AshyDesktopState
 
 export function resetAshyStore(): void {
   useAshyStore.getState().resetStoreForTesting()

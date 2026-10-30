@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import {
   ASHY_EMOTIONS,
+  ASHY_MOTION_PRESETS,
   ASHY_TRAIT_CORRIDORS,
   M2_GATE_THRESHOLDS,
   MILESTONE_CATEGORIES,
@@ -9,6 +10,7 @@ import {
   TTS_PROVIDER_IDS,
   type ApprovableMemoryKind,
   type AshyEmotion,
+  type AshyMotionPreset,
   type MemoryGovernanceCategory,
   type MilestoneCategory,
   type SemanticFactCategory,
@@ -16,7 +18,7 @@ import {
   type TtsProviderId,
 } from '@ashy/shared'
 import type { FsrsReviewRating } from '@ashy/cortex'
-import { AshyStageCanvas } from '@ashy/stage'
+import { AshyStageCanvas, DEFAULT_ASHY_LIVE2D_MODEL3_JSON } from '@ashy/stage'
 import {
   BookOpen,
   Box,
@@ -183,6 +185,10 @@ export function App(): React.ReactElement {
   const [voiceDraft, setVoiceDraft] = useState(state.voiceIdentity.content)
   const [voiceSavedNotice, setVoiceSavedNotice] = useState<string | null>(null)
   const [m2EvalSeed, setM2EvalSeed] = useState<number>(0)
+  const [live2dJsonDraft, setLive2dJsonDraft] = useState(() =>
+    JSON.stringify(DEFAULT_ASHY_LIVE2D_MODEL3_JSON, null, 2),
+  )
+  const [live2dImportNotice, setLive2dImportNotice] = useState<string | null>(null)
 
   useEffect(() => {
     void useAshyStore.getState().bootstrapFromHost()
@@ -191,6 +197,34 @@ export function App(): React.ReactElement {
   useEffect(() => {
     setVoiceDraft(state.voiceIdentity.content)
   }, [state.voiceIdentity.content])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.altKey || event.ctrlKey || event.metaKey) return
+      const key = event.key.toLowerCase()
+      const current = useAshyStore.getState()
+      if (key === 'm') {
+        event.preventDefault()
+        current.setMicMode(current.privacyState.micMode === 'muted' ? 'continuous' : 'muted')
+      } else if (key === 'e') {
+        event.preventDefault()
+        const curEyes = current.privacyState.eyesMode
+        const nextEyes = curEyes === 'off' ? 'window' : curEyes === 'window' ? 'screen' : 'off'
+        current.setEyesMode(nextEyes)
+      } else if (key === 'd') {
+        event.preventDefault()
+        current.setDndMode(!current.privacyState.dndMode)
+      } else if (key === 'h') {
+        event.preventDefault()
+        current.toggleStageHidden()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [])
 
   const displayName = state.userProfile.userName ?? 'Carlos'
 
@@ -206,6 +240,12 @@ export function App(): React.ReactElement {
   // MODE A: FLOATING STAGE OVERLAY
   // ==========================================================================
   if (state.viewMode === 'stage') {
+    const cycleQuickEyes = () => {
+      const cur = state.privacyState.eyesMode
+      const next = cur === 'off' ? 'window' : cur === 'window' ? 'screen' : 'off'
+      state.setEyesMode(next)
+    }
+
     return (
       <div
         data-testid="floating-stage-overlay"
@@ -216,25 +256,33 @@ export function App(): React.ReactElement {
           alignItems: 'center',
           justifyContent: 'center',
           padding: '24px',
-          background: 'radial-gradient(circle at 50% 38%, #261f35 0%, #111017 80%)',
+          background: state.isTransparentOverlayWindow
+            ? 'transparent'
+            : 'radial-gradient(circle at 50% 38%, #261f35 0%, #111017 80%)',
         }}
       >
         <div
           className="ashy-card"
-          data-ui-island="true"
           style={{
             width: '410px',
             display: 'flex',
             flexDirection: 'column',
             alignItems: 'center',
             gap: '14px',
-            background: 'rgba(24, 21, 34, 0.92)',
-            backdropFilter: 'blur(18px)',
-            border: '1px solid rgba(244, 166, 136, 0.38)',
-            boxShadow: '0 24px 60px rgba(0, 0, 0, 0.65)',
+            background: state.isTransparentOverlayWindow
+              ? 'transparent'
+              : 'rgba(24, 21, 34, 0.92)',
+            backdropFilter: state.isTransparentOverlayWindow ? 'none' : 'blur(18px)',
+            border: state.isTransparentOverlayWindow
+              ? 'none'
+              : '1px solid rgba(244, 166, 136, 0.38)',
+            boxShadow: state.isTransparentOverlayWindow
+              ? 'none'
+              : '0 24px 60px rgba(0, 0, 0, 0.65)',
           }}
         >
           <div
+            data-ui-island="true"
             style={{
               width: '100%',
               display: 'flex',
@@ -257,29 +305,120 @@ export function App(): React.ReactElement {
             </button>
           </div>
 
+          {state.isStageHidden ? (
+            <button
+              type="button"
+              className="ashy-peach-btn"
+              data-testid="btn-restore-hidden-stage"
+              data-ui-island="true"
+              style={{ padding: '10px 18px', fontSize: '13px' }}
+              onClick={() => state.setStageHidden(false)}
+            >
+              Mostrar Ashy (Alt+H)
+            </button>
+          ) : (
+            <div
+              style={{
+                borderRadius: '14px',
+                overflow: 'hidden',
+                border: state.isTransparentOverlayWindow
+                  ? 'none'
+                  : '1px solid var(--border-soft)',
+              }}
+            >
+              <AshyStageCanvas
+                emotion={state.stageEmotion}
+                emotionIntensity={state.emotionIntensity}
+                isSpeaking={state.isSpeaking}
+                rawVowels={state.simulatedVowels}
+                rawVolume={state.isSpeaking ? 0.82 : 0}
+                ambientLuminance={state.ambientLuminance}
+                bubbleText={state.bubbleText}
+                statusLabel={state.presenceStatus}
+                mode={state.stageMode}
+                motionPreset={state.activeMotion}
+                live2dControls={state.live2dModelControls}
+                transparentBackground={state.isTransparentOverlayWindow}
+                onIgnoreMouseChange={(ignore) => state.setStageIgnoreMouseEvents(ignore)}
+                width={380}
+                height={460}
+              />
+            </div>
+          )}
+
+          {/* Stage Quick Controls Island */}
           <div
+            data-testid="stage-quick-controls"
+            data-ui-island="true"
             style={{
-              borderRadius: '14px',
-              overflow: 'hidden',
-              border: '1px solid var(--border-soft)',
+              width: '100%',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '8px',
+              padding: '10px 12px',
+              borderRadius: '12px',
+              background: 'rgba(21, 19, 31, 0.94)',
+              border: '1px solid rgba(244, 166, 136, 0.35)',
             }}
           >
-            <AshyStageCanvas
-              emotion={state.stageEmotion}
-              emotionIntensity={state.emotionIntensity}
-              isSpeaking={state.isSpeaking}
-              rawVowels={state.simulatedVowels}
-              rawVolume={state.isSpeaking ? 0.82 : 0}
-              ambientLuminance={state.ambientLuminance}
-              bubbleText={state.bubbleText}
-              statusLabel={state.presenceStatus}
-              mode={state.stageMode}
-              width={360}
-              height={420}
-            />
+            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="ashy-outline-btn"
+                style={{ padding: '5px 10px', fontSize: '11.5px', flex: 1 }}
+                data-testid="btn-quick-mic"
+                onClick={() =>
+                  state.setMicMode(
+                    state.privacyState.micMode === 'muted' ? 'continuous' : 'muted',
+                  )
+                }
+              >
+                Mic ({state.privacyState.micMode})
+              </button>
+              <button
+                type="button"
+                className="ashy-outline-btn"
+                style={{ padding: '5px 10px', fontSize: '11.5px', flex: 1 }}
+                data-testid="btn-quick-eyes"
+                onClick={cycleQuickEyes}
+              >
+                Eyes ({state.privacyState.eyesMode})
+              </button>
+              <button
+                type="button"
+                className="ashy-outline-btn"
+                style={{ padding: '5px 10px', fontSize: '11.5px', flex: 1 }}
+                data-testid="btn-quick-dnd"
+                onClick={() => state.setDndMode(!state.privacyState.dndMode)}
+              >
+                DND ({state.privacyState.dndMode ? 'ON' : 'OFF'})
+              </button>
+              <button
+                type="button"
+                className="ashy-outline-btn"
+                style={{ padding: '5px 10px', fontSize: '11.5px', flex: 1 }}
+                data-testid="btn-quick-hide-stage"
+                onClick={() => state.toggleStageHidden()}
+              >
+                {state.isStageHidden ? 'Mostrar' : 'Ocultar'}
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+              <span className="ashy-badge peach" data-testid="stage-clickthrough-badge">
+                Click-Through: {state.ignoringMouseEvents ? 'ON' : 'OFF'}
+              </span>
+              <span className="ashy-badge violet" data-testid="stage-active-viseme-badge">
+                Visema: {state.activeViseme}
+              </span>
+              <span className="ashy-badge emerald" data-testid="stage-active-motion-badge">
+                Movimento: {state.activeMotion}
+              </span>
+            </div>
           </div>
 
           <div
+            data-ui-island="true"
             style={{
               width: '100%',
               display: 'flex',
@@ -307,7 +446,11 @@ export function App(): React.ReactElement {
             </button>
           </div>
 
-          <form onSubmit={handleSendChat} style={{ width: '100%', display: 'flex', gap: '8px' }}>
+          <form
+            data-ui-island="true"
+            onSubmit={handleSendChat}
+            style={{ width: '100%', display: 'flex', gap: '8px' }}
+          >
             <input
               type="text"
               className="ashy-input"
@@ -575,6 +718,10 @@ export function App(): React.ReactElement {
                   bubbleText={state.bubbleText}
                   statusLabel={state.presenceStatus}
                   mode={state.stageMode}
+                  motionPreset={state.activeMotion}
+                  live2dControls={state.live2dModelControls}
+                  transparentBackground={state.isTransparentOverlayWindow}
+                  onIgnoreMouseChange={(ignore) => state.setStageIgnoreMouseEvents(ignore)}
                   width={860}
                   height={760}
                   fullBleed={true}
@@ -2532,10 +2679,26 @@ export function App(): React.ReactElement {
                       bubbleText={state.bubbleText}
                       statusLabel={state.presenceStatus}
                       mode={state.stageMode}
+                      motionPreset={state.activeMotion}
+                      live2dControls={state.live2dModelControls}
+                      transparentBackground={state.isTransparentOverlayWindow}
+                      onIgnoreMouseChange={(ignore) => state.setStageIgnoreMouseEvents(ignore)}
                       width={310}
                       height={310}
                       fullBleed={true}
                     />
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                    <span className="ashy-badge peach" data-testid="stage-clickthrough-badge">
+                      Click-Through: {state.ignoringMouseEvents ? 'ON' : 'OFF'}
+                    </span>
+                    <span className="ashy-badge violet" data-testid="stage-active-viseme-badge">
+                      Visema: {state.activeViseme}
+                    </span>
+                    <span className="ashy-badge emerald" data-testid="stage-active-motion-badge">
+                      Movimento: {state.activeMotion}
+                    </span>
                   </div>
 
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
@@ -2565,6 +2728,44 @@ export function App(): React.ReactElement {
                         ))}
                       </select>
                     </div>
+
+                    <div>
+                      <label
+                        htmlFor="select-stage-motion"
+                        style={{
+                          display: 'block',
+                          fontSize: '12px',
+                          color: 'var(--text-secondary)',
+                          marginBottom: '4px',
+                        }}
+                      >
+                        Movimento procedural (9 presets):
+                      </label>
+                      <select
+                        id="select-stage-motion"
+                        data-testid="select-stage-motion"
+                        className="ashy-select"
+                        value={state.activeMotion}
+                        onChange={(e) =>
+                          state.triggerStageMotion(e.target.value as AshyMotionPreset)
+                        }
+                      >
+                        {ASHY_MOTION_PRESETS.map((mp) => (
+                          <option key={mp} value={mp}>
+                            {mp}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <button
+                      type="button"
+                      className="ashy-peach-btn"
+                      data-testid="btn-run-stage-lipsync-demo"
+                      onClick={() => void state.runStageLipSyncActDemo()}
+                    >
+                      Testar Lip-Sync Acústico &amp; Keyframes &lt;|ACT|&gt;
+                    </button>
 
                     <div>
                       <div
@@ -2615,6 +2816,81 @@ export function App(): React.ReactElement {
                         Malha Live2D
                       </button>
                     </div>
+                  </div>
+                </section>
+
+                {/* Live2D .model3.json Importer Card */}
+                <section className="ashy-settings-card" style={{ gap: '10px' }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: '8px',
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <div>
+                      <h3 className="ashy-setting-title">Importador Live2D (.model3.json)</h3>
+                      <p className="ashy-setting-desc">
+                        Inspecione expressões e grupos de movimento Cubism v{state.live2dModelControls.version} e injete no prompt.
+                      </p>
+                    </div>
+                    <span
+                      className="ashy-badge violet"
+                      data-testid="live2d-loaded-expressions-badge"
+                    >
+                      Expressões ({state.live2dModelControls.expressions.length}):{' '}
+                      {state.live2dModelControls.expressions.join(', ') || 'nenhuma'}
+                    </span>
+                  </div>
+
+                  <textarea
+                    data-testid="live2d-json-import-input"
+                    className="ashy-input"
+                    rows={5}
+                    style={{
+                      fontFamily: 'var(--font-mono)',
+                      fontSize: '11.5px',
+                      lineHeight: 1.4,
+                      resize: 'vertical',
+                    }}
+                    value={live2dJsonDraft}
+                    onChange={(e) => {
+                      setLive2dJsonDraft(e.target.value)
+                      setLive2dImportNotice(null)
+                    }}
+                  />
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' }}>
+                    <button
+                      type="button"
+                      className="ashy-peach-btn"
+                      data-testid="btn-import-live2d-json"
+                      onClick={() => {
+                        try {
+                          const controls = state.importLive2DModelJson(live2dJsonDraft)
+                          setLive2dImportNotice(
+                            `Importado: ${controls.expressions.length} expressões, ${controls.motionGroups.length} grupos ✓`,
+                          )
+                        } catch (err) {
+                          setLive2dImportNotice(
+                            `Erro: ${err instanceof Error ? err.message : String(err)}`,
+                          )
+                        }
+                      }}
+                    >
+                      Importar .model3.json
+                    </button>
+                    {live2dImportNotice && (
+                      <span
+                        className={`ashy-badge ${
+                          live2dImportNotice.startsWith('Erro:') ? 'amber' : 'emerald'
+                        }`}
+                      >
+                        {live2dImportNotice}
+                      </span>
+                    )}
                   </div>
                 </section>
               </aside>
