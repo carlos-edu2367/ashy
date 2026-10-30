@@ -736,7 +736,7 @@ export function AshyStageCanvas({
         />
       )}
 
-      {/* Real HTML5 2D Compositor Canvas */}
+      {/* Real HTML5 2D Compositor Canvas (full internal pixel alpha for 4 Hz 128x72 silhouette readback; subtle visual blend in tachie mode so Cozy Night Studio portrait stays crisp) */}
       <canvas
         ref={canvasRef}
         data-testid="ashy-stage-render-canvas"
@@ -748,7 +748,7 @@ export function AshyStageCanvas({
           width: '100%',
           height: '100%',
           pointerEvents: 'none',
-          opacity: 0.94,
+          opacity: mode === 'live2d' ? 0.35 : 0.02,
         }}
       />
 
@@ -808,7 +808,7 @@ export function AshyStageCanvas({
           display: 'block',
           width: '100%',
           height: '100%',
-          opacity: mode === 'live2d' ? 0.96 : 0.92,
+          opacity: mode === 'live2d' ? 0.96 : 0.88,
           pointerEvents: 'none',
         }}
       >
@@ -822,12 +822,30 @@ export function AshyStageCanvas({
             <stop offset="0%" stopColor="#1e1b4b" />
             <stop offset="100%" stopColor="#0f172a" />
           </linearGradient>
+          <radialGradient id={`${gradientId}-aura`} cx="50%" cy="46%" r="48%">
+            <stop
+              offset="0%"
+              stopColor={isSpeaking ? '#f4a688' : '#c084fc'}
+              stopOpacity={isSpeaking ? '0.22' : '0.08'}
+            />
+            <stop offset="100%" stopColor="#0f172a" stopOpacity="0" />
+          </radialGradient>
         </defs>
+
+        {/* Subtle Atmospheric & Viseme Aura in Tachie Mode */}
+        <ellipse
+          cx={190 + headTx * 0.4}
+          cy={210 + headTy * 0.4}
+          rx={145 + mouthRy * 1.6}
+          ry={175 + mouthRy * 1.8}
+          fill={`url(#${gradientId}-aura)`}
+        />
 
         {/* Breathing Torso / Shoulders */}
         <g
           data-testid="ashy-layer-torso"
           transform={`translate(0, ${(34 - breathValue * 4.5).toFixed(2)})`}
+          opacity={mode === 'live2d' ? 0.95 : 0}
         >
           <path
             d="M 95 455 C 102 330, 145 295, 190 295 C 235 295, 278 330, 285 455 Z"
@@ -842,6 +860,7 @@ export function AshyStageCanvas({
         <g
           data-testid="ashy-layer-head"
           transform={`translate(${headTx.toFixed(2)}, ${(34 + headTy).toFixed(2)})`}
+          opacity={mode === 'live2d' ? 0.95 : 0}
         >
           {/* Back Hair */}
           <ellipse
