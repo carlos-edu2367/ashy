@@ -418,6 +418,166 @@ export const RunCoreExperimentInputSchema = v.object({
 
 export type RunCoreExperimentInput = v.InferOutput<typeof RunCoreExperimentInputSchema>
 
+export const COMPUTER_ACTIONS_POLICIES = ['ask', 'session', 'auto_accept', 'off'] as const
+export type ComputerActionsPolicy = (typeof COMPUTER_ACTIONS_POLICIES)[number]
+export const ComputerActionsPolicySchema = v.picklist(COMPUTER_ACTIONS_POLICIES)
+
+export const ACTION_RISK_TIERS = ['observe-only', 'read-safe', 'staged-confirm'] as const
+export type ActionRiskTier = (typeof ACTION_RISK_TIERS)[number]
+export const ActionRiskTierSchema = v.picklist(ACTION_RISK_TIERS)
+
+export const AUDIT_DECISIONS = [
+  'allowed',
+  'staged',
+  'approved',
+  'denied',
+  'blocked_privacy',
+  'blocked_traversal',
+  'revoked',
+] as const
+export type AuditDecision = (typeof AUDIT_DECISIONS)[number]
+export const AuditDecisionSchema = v.picklist(AUDIT_DECISIONS)
+
+export const APPROVAL_SCOPES = ['once', 'session'] as const
+export type ApprovalScope = (typeof APPROVAL_SCOPES)[number]
+export const ApprovalScopeSchema = v.picklist(APPROVAL_SCOPES)
+
+export const EYES_MODES = ['off', 'window', 'screen'] as const
+export type SharedEyesMode = (typeof EYES_MODES)[number]
+export const EyesModeSchema = v.picklist(EYES_MODES)
+
+export const MIC_MODES = ['muted', 'continuous', 'ptt'] as const
+export type SharedMicMode = (typeof MIC_MODES)[number]
+export const MicModeSchema = v.picklist(MIC_MODES)
+
+export interface SharedPendingActionCard {
+  id: string
+  toolName: string
+  serverName: string
+  summary: string
+  argsPreview: string
+  targetPath?: string
+  commandPreview?: string
+  diffPreview?: string
+  riskTier: ActionRiskTier
+  blastRadiusWarning?: string
+  status: 'pending' | 'approved' | 'denied'
+  createdAt: number
+}
+
+export interface SharedActionAuditLogEntry {
+  id: string
+  timestamp: number
+  toolName: string
+  serverName: string
+  riskTier: ActionRiskTier
+  decision: AuditDecision
+  argsPreview: string
+  actionId?: string | null
+  reason?: string | null
+  blastRadiusWarning?: string | null
+  targetPath?: string | null
+  commandPreview?: string | null
+  diffPreview?: string | null
+}
+
+export const ExternalMcpServerConfigSchema = v.object({
+  id: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(80)),
+  name: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(120)),
+  description: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(400)), ''),
+  transport: v.picklist(['http', 'stdio'] as const),
+  url: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(512))),
+  command: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  args: v.optional(v.pipe(v.array(v.pipe(v.string(), v.maxLength(256))), v.maxLength(32)), []),
+  enabled: v.optional(v.boolean(), true),
+})
+export type ExternalMcpServerConfig = v.InferOutput<typeof ExternalMcpServerConfigSchema>
+
+export interface VisionObservationResult {
+  observed: boolean
+  skippedByDhash: boolean
+  blockedByPrivacy: boolean
+  windowTitle: string | null
+  summary: string | null
+  dHashHex: string | null
+  hammingDistance: number | null
+  visionTokensSpent: number
+  timestamp: number
+  reason: string
+}
+
+export interface VisionTelemetryState {
+  eyesMode: SharedEyesMode
+  lastObservation: VisionObservationResult | null
+  framesCapturedCount: number
+  framesSkippedByDhashCount: number
+  blockedPrivacyCount: number
+  totalVisionTokensSpent: number
+}
+
+export interface PersistedAgencyConsentState {
+  eyesMode: SharedEyesMode
+  micMode: SharedMicMode
+  dndMode: boolean
+  approvalPolicy: ComputerActionsPolicy
+  allowedPaths: string[]
+  allowedWindowTitles: string[]
+  toolRiskOverrides: Record<string, ActionRiskTier>
+  externalMcpServers: ExternalMcpServerConfig[]
+  updatedAt: number
+}
+
+export const DEFAULT_PERSISTED_AGENCY_CONSENT_STATE: Readonly<PersistedAgencyConsentState> =
+  Object.freeze({
+    eyesMode: 'off',
+    micMode: 'muted',
+    dndMode: false,
+    approvalPolicy: 'ask',
+    allowedPaths: ['/workspace/ashy', 'C:/Users/User/.gemini/antigravity/scratch/ashy'],
+    allowedWindowTitles: ['VS Code', 'Ashy', 'Terminal'],
+    toolRiskOverrides: {},
+    externalMcpServers: [],
+    updatedAt: 0,
+  })
+
+export const UpdateAgencyConsentInputSchema = v.object({
+  eyesMode: v.optional(EyesModeSchema),
+  micMode: v.optional(MicModeSchema),
+  dndMode: v.optional(v.boolean()),
+  approvalPolicy: v.optional(ComputerActionsPolicySchema),
+  allowedPaths: v.optional(
+    v.pipe(v.array(v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(512))), v.maxLength(64)),
+  ),
+  allowedWindowTitles: v.optional(
+    v.pipe(v.array(v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256))), v.maxLength(64)),
+  ),
+  toolRiskOverrides: v.optional(
+    v.record(v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(120)), ActionRiskTierSchema),
+  ),
+})
+export type UpdateAgencyConsentInput = v.InferOutput<typeof UpdateAgencyConsentInputSchema>
+
+export interface AgencyToolSummary {
+  toolName: string
+  serverName: string
+  description: string
+  defaultRiskTier: ActionRiskTier
+  effectiveRiskTier: ActionRiskTier
+}
+
+export type AgencyToolState = AgencyToolSummary
+
+export interface AgencySnapshot {
+  consent: PersistedAgencyConsentState
+  tools: AgencyToolSummary[]
+  exposedMetaToolsCount: number
+  registeredMcpToolsCount: number
+  pendingActions: SharedPendingActionCard[]
+  sessionApprovedTools: string[]
+  auditLog: SharedActionAuditLogEntry[]
+  vision: VisionTelemetryState
+}
+
 export interface AshyBootstrapSnapshot {
   needsOnboarding: boolean
   userProfile: {
@@ -465,6 +625,7 @@ export interface AshyBootstrapSnapshot {
     lastPersistenceWarning: string | null
   }
   lastEvalReport?: CoreExperimentEvalReport | null
+  agency?: AgencySnapshot
 }
 
 export const CompleteOnboardingInputSchema = v.object({
@@ -649,6 +810,46 @@ export interface AshyHostBridge {
   revertTraitEvolution(input: {
     recordId: string
   }): Promise<AshyBootstrapSnapshot>
+  getAgencySnapshot?(): Promise<AgencySnapshot>
+  callMcpTool?(input: {
+    toolName: string
+    args?: Record<string, unknown>
+  }): Promise<{
+    status: 'executed' | 'staged' | 'blocked_privacy' | 'blocked_traversal' | 'blocked_policy'
+    output?: unknown
+    pendingCard?: SharedPendingActionCard
+    reason?: string
+    snapshot?: AgencySnapshot
+  }>
+  approvePendingAction?(input: {
+    actionId: string
+    scope?: ApprovalScope
+  }): Promise<{
+    status: 'executed'
+    card: SharedPendingActionCard
+    output: unknown
+    snapshot?: AgencySnapshot
+  }>
+  denyPendingAction?(input: {
+    actionId: string
+    reason?: string
+  }): Promise<{
+    status: 'denied'
+    card: SharedPendingActionCard
+    feedback: string
+    snapshot?: AgencySnapshot
+  }>
+  updateAgencyConsent?(input: UpdateAgencyConsentInput): Promise<AgencySnapshot>
+  revokeSessionPermissions?(input?: { toolName?: string }): Promise<AgencySnapshot>
+  captureAuthorizedScreen?(input?: {
+    windowTitle?: string
+    frameFixtureId?: string
+    forceRefresh?: boolean
+  }): Promise<{
+    observation: VisionObservationResult
+    snapshot: AgencySnapshot
+  }>
+  registerExternalMcpServer?(input: ExternalMcpServerConfig): Promise<AgencySnapshot>
   onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
 

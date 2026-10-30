@@ -1,12 +1,18 @@
 import { embedTextSync128 } from '@ashy/llm'
 import {
+  ACTION_RISK_TIERS,
   ASHY_BASELINE_MOOD,
   ASHY_DEFAULT_TRAITS,
   ASHY_EMOTIONS,
+  AUDIT_DECISIONS,
   AutobiographicalMilestoneSchema,
+  COMPUTER_ACTIONS_POLICIES,
   DEFAULT_MEMORY_GOVERNANCE_POLICY,
+  DEFAULT_PERSISTED_AGENCY_CONSENT_STATE,
+  EYES_MODES,
   EpisodicMemorySchema,
   MEMORY_GOVERNANCE_CATEGORIES,
+  MIC_MODES,
   MoodVectorSchema,
   PersonalityEvolutionRecordSchema,
   PersonalityTraitsSchema,
@@ -14,17 +20,22 @@ import {
   RelationalMotifSchema,
   SemanticFactSchema,
   UserHabitSchema,
+  type ActionRiskTier,
   type ApprovableMemoryKind,
   type AshyEmotion,
+  type AuditDecision,
   type AutobiographicalMilestone,
   type ChatMessageRecord,
   type ChatSessionRecord,
+  type ComputerActionsPolicy,
   type EpisodicMemory,
+  type ExternalMcpServerConfig,
   type LlmProviderId,
   type MemoryApprovalStatus,
   type MemoryGovernanceCategory,
   type MemoryGovernancePolicy,
   type MoodVector,
+  type PersistedAgencyConsentState,
   type PersonalityEvolutionRecord,
   type PersonalityTraits,
   type ProspectiveIntent,
@@ -32,6 +43,9 @@ import {
   type RelationalMotif,
   type SemanticFact,
   type SemanticFactCategory,
+  type SharedActionAuditLogEntry,
+  type SharedEyesMode,
+  type SharedMicMode,
   type UserHabit,
 } from '@ashy/shared'
 import * as v from 'valibot'
@@ -261,9 +275,25 @@ function openPersistentDatabase(filePath: string): SqliteDatabaseLike | null {
 const VALID_CHAT_ROLES = new Set(['user', 'assistant', 'system'])
 const VALID_EMOTIONS = new Set<string>(ASHY_EMOTIONS)
 const VALID_GOVERNANCE_CATEGORIES = new Set<string>(MEMORY_GOVERNANCE_CATEGORIES)
+const VALID_EYES_MODES = new Set<string>(EYES_MODES)
+const VALID_MIC_MODES = new Set<string>(MIC_MODES)
+const VALID_COMPUTER_ACTIONS_POLICIES = new Set<string>(COMPUTER_ACTIONS_POLICIES)
+const VALID_ACTION_RISK_TIERS = new Set<string>(ACTION_RISK_TIERS)
+const VALID_AUDIT_DECISIONS = new Set<string>(AUDIT_DECISIONS)
 
 function parseApprovalStatus(raw: unknown): MemoryApprovalStatus {
   return raw === 'pending_review' ? 'pending_review' : 'approved'
+}
+
+function safeParseJson<T>(raw: unknown, fallback: T): T {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return fallback
+  }
+  try {
+    return JSON.parse(raw) as T
+  } catch {
+    return fallback
+  }
 }
 
 /**
@@ -282,6 +312,10 @@ export class MemoryStorageAdapter {
   readonly goldenExemplars = new Map<string, GoldenExemplarRecord>()
   readonly chatSessions = new Map<string, ChatSessionRecord>()
   readonly chatMessages: ChatMessageRecord[] = []
+  readonly actionAuditLog: SharedActionAuditLogEntry[] = []
+  agencyConsentState: PersistedAgencyConsentState = structuredClone(
+    DEFAULT_PERSISTED_AGENCY_CONSENT_STATE as PersistedAgencyConsentState,
+  )
   governancePolicy: MemoryGovernancePolicy = { ...DEFAULT_MEMORY_GOVERNANCE_POLICY }
   affectiveState: AffectiveStateSnapshot = {
     mood: { ...ASHY_BASELINE_MOOD },
@@ -304,6 +338,11 @@ export class MemoryStorageAdapter {
     this.migrations.set(3, {
       version: 3,
       name: 'v3_phase2_self_writing_memory',
+      appliedAt: now,
+    })
+    this.migrations.set(4, {
+      version: 4,
+      name: 'v4_phase7_agency_audit_and_consent',
       appliedAt: now,
     })
     for (const ex of DEFAULT_GOLDEN_STYLE_EXEMPLARS) {
@@ -535,6 +574,38 @@ export class CortexDatabase {
         require_confirmation INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS action_audit_log (
+        id TEXT PRIMARY KEY,
+        timestamp INTEGER NOT NULL,
+        tool_name TEXT NOT NULL,
+        server_name TEXT NOT NULL,
+        risk_tier TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        args_preview TEXT NOT NULL,
+        action_id TEXT,
+        reason TEXT,
+        blast_radius_warning TEXT,
+        target_path TEXT,
+        command_preview TEXT,
+        diff_preview TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_action_audit_log_timestamp
+        ON action_audit_log(timestamp DESC);
+
+      CREATE TABLE IF NOT EXISTS agency_consent_state (
+        singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+        eyes_mode TEXT NOT NULL DEFAULT 'off',
+        mic_mode TEXT NOT NULL DEFAULT 'muted',
+        dnd_mode INTEGER NOT NULL DEFAULT 0,
+        approval_policy TEXT NOT NULL DEFAULT 'ask',
+        allowed_paths_json TEXT NOT NULL DEFAULT '[]',
+        allowed_windows_json TEXT NOT NULL DEFAULT '[]',
+        tool_risk_overrides_json TEXT NOT NULL DEFAULT '{}',
+        external_mcp_servers_json TEXT NOT NULL DEFAULT '[]',
+        updated_at INTEGER NOT NULL
+      );
     `)
 
     // Idempotent column upgrades for pre-existing v1/v2 database files
@@ -557,6 +628,7 @@ export class CortexDatabase {
     insertMigration.run(1, 'v1_initial_cortex_schema', now)
     insertMigration.run(2, 'v2_phase1_chat_and_exemplars', now)
     insertMigration.run(3, 'v3_phase2_self_writing_memory', now)
+    insertMigration.run(4, 'v4_phase7_agency_audit_and_consent', now)
 
     // Seed default Golden Style Exemplars if empty
     const countRow = this.sqlite
@@ -615,6 +687,8 @@ export class CortexDatabase {
         'chat_sessions',
         'chat_messages',
         'memory_governance_settings',
+        'action_audit_log',
+        'agency_consent_state',
       ]
     }
     const rows = this.sqlite
@@ -1979,6 +2053,349 @@ export class CortexDatabase {
           ? null
           : String(row.consolidated_episode_id),
       createdAt: Number(row.created_at),
+    }
+  }
+
+  // 11. Agency Audit Log & Consent State (Migration v4 — Phase 7)
+  public insertActionAuditLog(entry: SharedActionAuditLogEntry): SharedActionAuditLogEntry {
+    const id = String(entry.id || `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`).trim()
+    const riskTier: ActionRiskTier = VALID_ACTION_RISK_TIERS.has(entry.riskTier)
+      ? entry.riskTier
+      : 'staged-confirm'
+    const decision: AuditDecision = VALID_AUDIT_DECISIONS.has(entry.decision)
+      ? entry.decision
+      : 'denied'
+
+    const record: SharedActionAuditLogEntry = {
+      id,
+      timestamp: Number.isFinite(entry.timestamp) ? Math.floor(entry.timestamp) : Date.now(),
+      toolName: String(entry.toolName ?? ''),
+      serverName: String(entry.serverName ?? ''),
+      riskTier,
+      decision,
+      argsPreview: String(entry.argsPreview ?? '{}'),
+      actionId: entry.actionId ?? null,
+      reason: entry.reason ?? null,
+      blastRadiusWarning: entry.blastRadiusWarning ?? null,
+      targetPath: entry.targetPath ?? null,
+      commandPreview: entry.commandPreview ?? null,
+      diffPreview: entry.diffPreview ?? null,
+    }
+
+    const existingIdx = this.memory.actionAuditLog.findIndex((item) => item.id === record.id)
+    if (existingIdx >= 0) {
+      this.memory.actionAuditLog[existingIdx] = record
+    } else {
+      this.memory.actionAuditLog.push(record)
+    }
+
+    if (this.sqlite) {
+      this.sqlite
+        .prepare(
+          `INSERT OR REPLACE INTO action_audit_log (
+            id, timestamp, tool_name, server_name, risk_tier, decision,
+            args_preview, action_id, reason, blast_radius_warning,
+            target_path, command_preview, diff_preview
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          record.id,
+          record.timestamp,
+          record.toolName,
+          record.serverName,
+          record.riskTier,
+          record.decision,
+          record.argsPreview,
+          record.actionId ?? null,
+          record.reason ?? null,
+          record.blastRadiusWarning ?? null,
+          record.targetPath ?? null,
+          record.commandPreview ?? null,
+          record.diffPreview ?? null,
+        )
+    }
+
+    return { ...record }
+  }
+
+  public listActionAuditLog(limit = 100): SharedActionAuditLogEntry[] {
+    if (!Number.isFinite(limit) || limit <= 0) {
+      return []
+    }
+    const safeLimit = Math.floor(limit)
+
+    if (!this.sqlite) {
+      return this.memory.actionAuditLog
+        .map((item, idx) => ({ item, idx }))
+        .sort((a, b) => b.item.timestamp - a.item.timestamp || b.idx - a.idx)
+        .slice(0, safeLimit)
+        .map(({ item }) => ({ ...item }))
+    }
+
+    const rows = this.sqlite
+      .prepare(
+        `SELECT rowid AS _rowid, * FROM action_audit_log
+         ORDER BY timestamp DESC, _rowid DESC
+         LIMIT ?`,
+      )
+      .all(safeLimit)
+
+    return rows.map((row) => this.mapRowToActionAuditLog(row))
+  }
+
+  public clearActionAuditLog(): void {
+    this.memory.actionAuditLog.length = 0
+    if (this.sqlite) {
+      this.sqlite.prepare('DELETE FROM action_audit_log').run()
+    }
+  }
+
+  public getAgencyConsentState(): PersistedAgencyConsentState {
+    if (!this.sqlite) {
+      return structuredClone(this.memory.agencyConsentState)
+    }
+
+    const row = this.sqlite
+      .prepare('SELECT * FROM agency_consent_state WHERE singleton_id = 1')
+      .get()
+    if (!row) {
+      return structuredClone(this.memory.agencyConsentState)
+    }
+
+    const parsed = this.mapRowToAgencyConsentState(row)
+    this.memory.agencyConsentState = structuredClone(parsed)
+    return structuredClone(parsed)
+  }
+
+  public saveAgencyConsentState(
+    patch: Partial<PersistedAgencyConsentState>,
+  ): PersistedAgencyConsentState {
+    const current = this.getAgencyConsentState()
+    const eyesMode: SharedEyesMode =
+      patch.eyesMode && VALID_EYES_MODES.has(patch.eyesMode) ? patch.eyesMode : current.eyesMode
+    const micMode: SharedMicMode =
+      patch.micMode && VALID_MIC_MODES.has(patch.micMode) ? patch.micMode : current.micMode
+    const dndMode = patch.dndMode !== undefined ? Boolean(patch.dndMode) : current.dndMode
+    const approvalPolicy: ComputerActionsPolicy =
+      patch.approvalPolicy && VALID_COMPUTER_ACTIONS_POLICIES.has(patch.approvalPolicy)
+        ? patch.approvalPolicy
+        : current.approvalPolicy
+
+    const allowedPaths = Array.isArray(patch.allowedPaths)
+      ? patch.allowedPaths.map((p) => String(p).trim()).filter(Boolean)
+      : [...current.allowedPaths]
+
+    const allowedWindowTitles = Array.isArray(patch.allowedWindowTitles)
+      ? patch.allowedWindowTitles.map((w) => String(w).trim()).filter(Boolean)
+      : [...current.allowedWindowTitles]
+
+    const toolRiskOverrides: Record<string, ActionRiskTier> = {}
+    const sourceOverrides = patch.toolRiskOverrides ?? current.toolRiskOverrides
+    if (sourceOverrides && typeof sourceOverrides === 'object') {
+      for (const [toolName, tier] of Object.entries(sourceOverrides)) {
+        const cleanTool = toolName.trim()
+        if (cleanTool && VALID_ACTION_RISK_TIERS.has(tier)) {
+          toolRiskOverrides[cleanTool] = tier
+        }
+      }
+    }
+
+    const sourceServers = Array.isArray(patch.externalMcpServers)
+      ? patch.externalMcpServers
+      : current.externalMcpServers
+    const externalMcpServers: ExternalMcpServerConfig[] = sourceServers.map((srv) => ({
+      id: String(srv.id).trim(),
+      name: String(srv.name).trim(),
+      description: String(srv.description ?? '').trim(),
+      transport: srv.transport === 'stdio' ? 'stdio' : 'http',
+      ...(srv.url !== undefined ? { url: String(srv.url).trim() } : {}),
+      ...(srv.command !== undefined ? { command: String(srv.command).trim() } : {}),
+      args: Array.isArray(srv.args) ? srv.args.map((a) => String(a)) : [],
+      enabled: srv.enabled !== undefined ? Boolean(srv.enabled) : true,
+    }))
+
+    const updatedAt =
+      patch.updatedAt !== undefined && Number.isFinite(patch.updatedAt)
+        ? Math.floor(patch.updatedAt)
+        : Date.now()
+
+    const next: PersistedAgencyConsentState = {
+      eyesMode,
+      micMode,
+      dndMode,
+      approvalPolicy,
+      allowedPaths,
+      allowedWindowTitles,
+      toolRiskOverrides,
+      externalMcpServers,
+      updatedAt,
+    }
+
+    this.memory.agencyConsentState = structuredClone(next)
+
+    if (this.sqlite) {
+      this.sqlite
+        .prepare(
+          `INSERT INTO agency_consent_state (
+            singleton_id,
+            eyes_mode,
+            mic_mode,
+            dnd_mode,
+            approval_policy,
+            allowed_paths_json,
+            allowed_windows_json,
+            tool_risk_overrides_json,
+            external_mcp_servers_json,
+            updated_at
+          ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(singleton_id) DO UPDATE SET
+            eyes_mode = excluded.eyes_mode,
+            mic_mode = excluded.mic_mode,
+            dnd_mode = excluded.dnd_mode,
+            approval_policy = excluded.approval_policy,
+            allowed_paths_json = excluded.allowed_paths_json,
+            allowed_windows_json = excluded.allowed_windows_json,
+            tool_risk_overrides_json = excluded.tool_risk_overrides_json,
+            external_mcp_servers_json = excluded.external_mcp_servers_json,
+            updated_at = excluded.updated_at`,
+        )
+        .run(
+          next.eyesMode,
+          next.micMode,
+          next.dndMode ? 1 : 0,
+          next.approvalPolicy,
+          JSON.stringify(next.allowedPaths),
+          JSON.stringify(next.allowedWindowTitles),
+          JSON.stringify(next.toolRiskOverrides),
+          JSON.stringify(next.externalMcpServers),
+          next.updatedAt,
+        )
+    }
+
+    return structuredClone(next)
+  }
+
+  private mapRowToActionAuditLog(row: Record<string, unknown>): SharedActionAuditLogEntry {
+    const rawRisk = String(row.risk_tier ?? 'staged-confirm')
+    const riskTier: ActionRiskTier = VALID_ACTION_RISK_TIERS.has(rawRisk)
+      ? (rawRisk as ActionRiskTier)
+      : 'staged-confirm'
+    const rawDecision = String(row.decision ?? 'denied')
+    const decision: AuditDecision = VALID_AUDIT_DECISIONS.has(rawDecision)
+      ? (rawDecision as AuditDecision)
+      : 'denied'
+
+    return {
+      id: String(row.id),
+      timestamp: Number(row.timestamp),
+      toolName: String(row.tool_name),
+      serverName: String(row.server_name),
+      riskTier,
+      decision,
+      argsPreview: String(row.args_preview ?? '{}'),
+      actionId:
+        row.action_id === null || row.action_id === undefined ? null : String(row.action_id),
+      reason: row.reason === null || row.reason === undefined ? null : String(row.reason),
+      blastRadiusWarning:
+        row.blast_radius_warning === null || row.blast_radius_warning === undefined
+          ? null
+          : String(row.blast_radius_warning),
+      targetPath:
+        row.target_path === null || row.target_path === undefined ? null : String(row.target_path),
+      commandPreview:
+        row.command_preview === null || row.command_preview === undefined
+          ? null
+          : String(row.command_preview),
+      diffPreview:
+        row.diff_preview === null || row.diff_preview === undefined
+          ? null
+          : String(row.diff_preview),
+    }
+  }
+
+  private mapRowToAgencyConsentState(row: Record<string, unknown>): PersistedAgencyConsentState {
+    const rawEyes = String(row.eyes_mode ?? DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.eyesMode)
+    const eyesMode: SharedEyesMode = VALID_EYES_MODES.has(rawEyes)
+      ? (rawEyes as SharedEyesMode)
+      : DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.eyesMode
+
+    const rawMic = String(row.mic_mode ?? DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.micMode)
+    const micMode: SharedMicMode = VALID_MIC_MODES.has(rawMic)
+      ? (rawMic as SharedMicMode)
+      : DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.micMode
+
+    const dndMode = Number(row.dnd_mode ?? 0) === 1
+
+    const rawPolicy = String(
+      row.approval_policy ?? DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.approvalPolicy,
+    )
+    const approvalPolicy: ComputerActionsPolicy = VALID_COMPUTER_ACTIONS_POLICIES.has(rawPolicy)
+      ? (rawPolicy as ComputerActionsPolicy)
+      : DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.approvalPolicy
+
+    const parsedPaths = safeParseJson<unknown[]>(
+      row.allowed_paths_json,
+      [...DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.allowedPaths],
+    )
+    const allowedPaths = Array.isArray(parsedPaths)
+      ? parsedPaths.map((p) => String(p).trim()).filter(Boolean)
+      : [...DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.allowedPaths]
+
+    const parsedWindows = safeParseJson<unknown[]>(
+      row.allowed_windows_json,
+      [...DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.allowedWindowTitles],
+    )
+    const allowedWindowTitles = Array.isArray(parsedWindows)
+      ? parsedWindows.map((w) => String(w).trim()).filter(Boolean)
+      : [...DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.allowedWindowTitles]
+
+    const parsedOverrides = safeParseJson<Record<string, unknown>>(
+      row.tool_risk_overrides_json,
+      {},
+    )
+    const toolRiskOverrides: Record<string, ActionRiskTier> = {}
+    if (parsedOverrides && typeof parsedOverrides === 'object' && !Array.isArray(parsedOverrides)) {
+      for (const [toolName, tier] of Object.entries(parsedOverrides)) {
+        const cleanTool = toolName.trim()
+        if (cleanTool && typeof tier === 'string' && VALID_ACTION_RISK_TIERS.has(tier)) {
+          toolRiskOverrides[cleanTool] = tier as ActionRiskTier
+        }
+      }
+    }
+
+    const parsedServers = safeParseJson<unknown[]>(row.external_mcp_servers_json, [])
+    const externalMcpServers: ExternalMcpServerConfig[] = []
+    if (Array.isArray(parsedServers)) {
+      for (const item of parsedServers) {
+        if (item && typeof item === 'object') {
+          const rec = item as Record<string, unknown>
+          const id = String(rec.id ?? '').trim()
+          const name = String(rec.name ?? '').trim()
+          if (!id || !name) continue
+          externalMcpServers.push({
+            id,
+            name,
+            description: String(rec.description ?? '').trim(),
+            transport: rec.transport === 'stdio' ? 'stdio' : 'http',
+            ...(typeof rec.url === 'string' ? { url: rec.url.trim() } : {}),
+            ...(typeof rec.command === 'string' ? { command: rec.command.trim() } : {}),
+            args: Array.isArray(rec.args) ? rec.args.map((a) => String(a)) : [],
+            enabled: rec.enabled !== undefined ? Boolean(rec.enabled) : true,
+          })
+        }
+      }
+    }
+
+    return {
+      eyesMode,
+      micMode,
+      dndMode,
+      approvalPolicy,
+      allowedPaths,
+      allowedWindowTitles,
+      toolRiskOverrides,
+      externalMcpServers,
+      updatedAt: Number(row.updated_at ?? 0),
     }
   }
 

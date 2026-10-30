@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import path from 'node:path'
 import type { Plugin } from 'vite'
 import type {
+  ApprovalScope,
   ApprovableMemoryKind,
   AshyEmotion,
   AshyHostBridge,
@@ -9,6 +10,7 @@ import type {
   CompleteOnboardingInput,
   DeletableMemoryKind,
   EpisodicMemory,
+  ExternalMcpServerConfig,
   LlmProviderId,
   MemoryGovernanceCategory,
   PersonalityEvolutionRecord,
@@ -19,6 +21,7 @@ import type {
   SaveProviderConfigInput,
   SendTurnInput,
   TestProviderInput,
+  UpdateAgencyConsentInput,
   UpsertFactInput,
 } from '@ashy/shared'
 import type { AshyHostKernel, AshyHostKernelOptions } from './kernel'
@@ -79,6 +82,14 @@ const ALLOWED_RPC_METHODS = new Set<string>([
   'runCoreExperimentEval',
   'runDreamReflection',
   'revertTraitEvolution',
+  'getAgencySnapshot',
+  'callMcpTool',
+  'approvePendingAction',
+  'denyPendingAction',
+  'updateAgencyConsent',
+  'revokeSessionPermissions',
+  'captureAuthorizedScreen',
+  'registerExternalMcpServer',
 ])
 
 export class DisallowedRpcMethodError extends Error {
@@ -425,6 +436,132 @@ export async function dispatchHostRpc(
         128,
       )
       return kernel.revertTraitEvolution({ recordId })
+    }
+
+    case 'getAgencySnapshot': {
+      if (!kernel.getAgencySnapshot) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      return kernel.getAgencySnapshot()
+    }
+
+    case 'callMcpTool': {
+      if (!kernel.callMcpTool) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<{
+        toolName?: unknown
+        args?: unknown
+      }>(payload, method)
+      const toolName = assertSafeIdentifier(obj.toolName, 'callMcpTool.toolName', 160)
+      const args =
+        obj.args !== undefined && obj.args !== null
+          ? assertObjectPayload<Record<string, unknown>>(obj.args, 'callMcpTool.args')
+          : undefined
+      return kernel.callMcpTool({
+        toolName,
+        ...(args ? { args } : {}),
+      })
+    }
+
+    case 'approvePendingAction': {
+      if (!kernel.approvePendingAction) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<{
+        actionId?: unknown
+        scope?: unknown
+      }>(payload, method)
+      const actionId = assertSafeIdentifier(
+        obj.actionId,
+        'approvePendingAction.actionId',
+        128,
+      )
+      const scope: ApprovalScope | undefined =
+        obj.scope === 'once' || obj.scope === 'session'
+          ? obj.scope
+          : obj.scope === undefined
+            ? undefined
+            : (() => {
+                throw new Error(
+                  'Invalid RPC argument: approvePendingAction.scope must be "once" or "session"',
+                )
+              })()
+      return kernel.approvePendingAction({
+        actionId,
+        ...(scope ? { scope } : {}),
+      })
+    }
+
+    case 'denyPendingAction': {
+      if (!kernel.denyPendingAction) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<{
+        actionId?: unknown
+        reason?: unknown
+      }>(payload, method)
+      const actionId = assertSafeIdentifier(obj.actionId, 'denyPendingAction.actionId', 128)
+      const reason =
+        typeof obj.reason === 'string' && obj.reason.trim().length > 0
+          ? obj.reason.trim().slice(0, 512)
+          : undefined
+      return kernel.denyPendingAction({
+        actionId,
+        ...(reason ? { reason } : {}),
+      })
+    }
+
+    case 'updateAgencyConsent': {
+      if (!kernel.updateAgencyConsent) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<UpdateAgencyConsentInput>(payload, method)
+      return kernel.updateAgencyConsent(obj)
+    }
+
+    case 'revokeSessionPermissions': {
+      if (!kernel.revokeSessionPermissions) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      if (payload === undefined || payload === null) {
+        return kernel.revokeSessionPermissions()
+      }
+      const obj = assertObjectPayload<{ toolName?: unknown }>(payload, method)
+      const toolName =
+        obj.toolName !== undefined
+          ? assertSafeIdentifier(obj.toolName, 'revokeSessionPermissions.toolName', 160)
+          : undefined
+      return kernel.revokeSessionPermissions(toolName ? { toolName } : undefined)
+    }
+
+    case 'captureAuthorizedScreen': {
+      if (!kernel.captureAuthorizedScreen) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      if (payload === undefined || payload === null) {
+        return kernel.captureAuthorizedScreen()
+      }
+      const obj = assertObjectPayload<{
+        windowTitle?: unknown
+        frameFixtureId?: unknown
+        forceRefresh?: unknown
+      }>(payload, method)
+      return kernel.captureAuthorizedScreen({
+        ...(typeof obj.windowTitle === 'string' ? { windowTitle: obj.windowTitle } : {}),
+        ...(typeof obj.frameFixtureId === 'string'
+          ? { frameFixtureId: obj.frameFixtureId }
+          : {}),
+        ...(typeof obj.forceRefresh === 'boolean' ? { forceRefresh: obj.forceRefresh } : {}),
+      })
+    }
+
+    case 'registerExternalMcpServer': {
+      if (!kernel.registerExternalMcpServer) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<ExternalMcpServerConfig>(payload, method)
+      return kernel.registerExternalMcpServer(obj)
     }
 
     default:

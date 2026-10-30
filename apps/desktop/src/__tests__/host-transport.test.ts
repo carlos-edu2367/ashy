@@ -764,4 +764,103 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
     expect(fakeIpcMain.removeHandler).toHaveBeenCalledWith('ashy:setOverlayVisible')
     expect(fakeIpcMain.removeHandler).toHaveBeenCalledWith('ashy:getOverlayState')
   })
+
+  it('dispatches Phase 7 agency, vision, consent, and external MCP RPC methods over Preload IPC and HTTP bridges', async () => {
+    const dir = makeTempDir()
+    const kernel = await createAshyHostKernel({ userDataDir: dir })
+
+    type IpcRpcListener = (
+      event: unknown,
+      req: { method: string; payload?: unknown },
+    ) => Promise<unknown> | unknown
+    let rpcHandler: IpcRpcListener | null = null
+
+    const fakeIpcMain = {
+      handle: vi.fn((channel: string, handler: IpcRpcListener) => {
+        if (channel === 'ashy:rpc') {
+          rpcHandler = handler
+        }
+      }),
+      removeHandler: vi.fn(),
+    }
+
+    const cleanupIpc = registerAshyElectronIpc(fakeIpcMain, kernel, () => [])
+    const fakeIpcRenderer = {
+      invoke: vi.fn(async (channel: string, req: { method: string; payload?: unknown }) => {
+        if (channel !== 'ashy:rpc' || !rpcHandler) {
+          throw new Error(`No handler for ${channel}`)
+        }
+        return rpcHandler({}, req)
+      }),
+      on: vi.fn(),
+      removeListener: vi.fn(),
+    }
+
+    const bridge = createPreloadHostBridge(createAshyPreloadApi(fakeIpcRenderer))
+
+    const snap0 = await bridge.getAgencySnapshot!()
+    expect(snap0.exposedMetaToolsCount).toBe(3)
+    expect(snap0.registeredMcpToolsCount).toBe(5)
+
+    // Stage and deny an action over RPC
+    const staged = await bridge.callMcpTool!({
+      toolName: 'write_project_note',
+      args: { title: 'RPC Note', content: 'Conteúdo via RPC' },
+    })
+    expect(staged.status).toBe('staged')
+
+    const denied = await bridge.denyPendingAction!({
+      actionId: staged.pendingCard!.id,
+      reason: 'Cancelado no teste de transporte',
+    })
+    expect(denied.status).toBe('denied')
+
+    // Update consent to auto_accept & window vision over RPC
+    const updatedConsent = await bridge.updateAgencyConsent!({
+      eyesMode: 'window',
+      approvalPolicy: 'auto_accept',
+    })
+    expect(updatedConsent.consent.approvalPolicy).toBe('auto_accept')
+    expect(updatedConsent.consent.eyesMode).toBe('window')
+
+    // Capture screen over RPC
+    const cap = await bridge.captureAuthorizedScreen!({
+      windowTitle: 'VS Code — Transport Test',
+      frameFixtureId: 'changed-ide-frame',
+    })
+    expect(cap.observation.observed).toBe(true)
+
+    // Register external MCP server over RPC
+    const withExt = await bridge.registerExternalMcpServer!({
+      id: 'ext-local-docs',
+      name: 'local-docs-mcp',
+      description: 'Servidor MCP externo de documentação',
+      transport: 'http',
+      url: 'http://127.0.0.1:59999/mcp',
+      args: [],
+      enabled: true,
+    })
+    expect(withExt.consent.externalMcpServers.some((s) => s.id === 'ext-local-docs')).toBe(true)
+
+    // Revoke session permissions over RPC
+    const afterRevoke = await bridge.revokeSessionPermissions!()
+    expect(afterRevoke.sessionApprovedTools).toHaveLength(0)
+
+    // Adversarial: malformed RPC payloads for Phase 7 methods are rejected
+    await expect(dispatchHostRpc(kernel, 'callMcpTool', { toolName: '' })).rejects.toThrow(
+      /Invalid RPC argument/i,
+    )
+    await expect(
+      dispatchHostRpc(kernel, 'approvePendingAction', {
+        actionId: 'act-1',
+        scope: 'invalid-scope',
+      }),
+    ).rejects.toThrow(/Invalid RPC argument/i)
+    await expect(dispatchHostRpc(kernel, 'updateAgencyConsent', null)).rejects.toThrow(
+      /Invalid RPC argument/i,
+    )
+
+    cleanupIpc()
+    await kernel.stop()
+  })
 })

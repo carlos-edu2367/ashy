@@ -2,14 +2,21 @@ import {
   ActionGatekeeper,
   PrivacyController,
   ProgressiveMcpRegistry,
+  computeUnifiedDiffPreview,
+  createAuthorizedVisionSensor,
   type ActionAuditLogEntry,
+  type ActionRiskTier,
   type ApprovalScope,
+  type CapturedScreenFrame,
+  type ComputerActionsPolicy,
   type EyesMode,
   type GatekeeperExecutionResult,
   type McpToolCompactSummary,
   type MicMode,
   type PendingActionCard,
   type PrivacyState,
+  type VisionObservationResult,
+  type VisionTelemetryState,
 } from '@ashy/agency'
 import {
   applyEmotionSignalToMood,
@@ -46,6 +53,7 @@ import {
   DEFAULT_PROVIDER_CONFIGS,
   DEFAULT_VOICE_RUNTIME_SETTINGS,
   LLM_PROVIDER_IDS,
+  type AgencyToolSummary,
   type ApprovableMemoryKind,
   type AshyBootstrapSnapshot,
   type AshyEmotion,
@@ -61,6 +69,7 @@ import {
   type CoreExperimentEvalReport,
   type DeletableMemoryKind,
   type EpisodicMemory,
+  type ExternalMcpServerConfig,
   type Live2DBuiltinModelId,
   type LlmProviderId,
   type MemoryGovernanceCategory,
@@ -286,7 +295,7 @@ export interface AshyDesktopState {
   settingsSubTab: SettingsSubTab
   showDesktopAvatar: boolean
   computerActionsEnabled: boolean
-  computerActionsPolicy: 'ask' | 'session' | 'off'
+  computerActionsPolicy: ComputerActionsPolicy
   quietHoursRange: string
   preferencesSavedToast: boolean
   privacyState: PrivacyState
@@ -294,6 +303,11 @@ export interface AshyDesktopState {
   mcpSearchResults: McpToolCompactSummary[]
   exposedMetaToolsCount: number
   registeredMcpToolsCount: number
+  agencyTools: AgencyToolSummary[]
+  toolRiskOverrides: Record<string, ActionRiskTier>
+  sessionApprovedTools: string[]
+  visionTelemetry: VisionTelemetryState
+  externalMcpServers: ExternalMcpServerConfig[]
   pendingActions: PendingActionCard[]
   auditLog: ActionAuditLogEntry[]
   lastMcpResultSummary: string | null
@@ -383,7 +397,19 @@ export interface AshyDesktopState {
   setSettingsSubTab: (subTab: SettingsSubTab) => void
   setShowDesktopAvatar: (show: boolean) => void
   setComputerActionsEnabled: (enabled: boolean) => void
-  setComputerActionsPolicy: (policy: 'ask' | 'session' | 'off') => void
+  setComputerActionsPolicy: (policy: ComputerActionsPolicy) => void
+  toggleDontAskMode: (enabled?: boolean) => void
+  setToolRiskTierOverride: (toolName: string, riskTier: ActionRiskTier) => void
+  addAllowedPath: (rawPath: string) => void
+  removeAllowedPath: (rawPath: string) => void
+  addAllowedWindowTitle: (title: string) => void
+  removeAllowedWindowTitle: (title: string) => void
+  revokeSessionPermissions: (toolName?: string) => void
+  captureAuthorizedScreen: (input?: {
+    windowTitle?: string
+    frameFixtureId?: string
+  }) => Promise<VisionObservationResult>
+  registerExternalMcpServer: (config: ExternalMcpServerConfig) => void
   setQuietHoursRange: (range: string) => void
   saveUserPreferences: () => void
   setMicMode: (mode: MicMode | 'push-to-talk') => void
@@ -407,6 +433,43 @@ export interface AshyDesktopState {
   resetStoreForTesting: () => void
 }
 
+function buildRendererPatternFrame(
+  variant: 'default' | 'ide' | 'terminal' | number,
+  windowTitle: string,
+): CapturedScreenFrame {
+  const width = 36
+  const height = 32
+  const pixels = new Uint8Array(width * height * 4)
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 4
+      let lum = 0
+      if (variant === 'ide') {
+        lum = Math.max(0, 255 - Math.floor((x * 255) / width))
+      } else if (variant === 'terminal') {
+        lum = (Math.floor(x / 4) + Math.floor(y / 4)) % 2 === 0 ? 240 : 20
+      } else if (typeof variant === 'number') {
+        lum = ((x * (7 + variant * 5) + y * (13 + variant * 3)) ^ (variant * 41)) & 0xff
+      } else {
+        lum = Math.min(255, Math.floor((x * 255) / width))
+      }
+      pixels[idx] = lum
+      pixels[idx + 1] = lum
+      pixels[idx + 2] = lum
+      pixels[idx + 3] = 255
+    }
+  }
+
+  return {
+    width,
+    height,
+    pixels,
+    windowTitle,
+    sourceType: 'window',
+  }
+}
+
 function createAgencyRuntime() {
   const privacyController = new PrivacyController({
     micMode: 'continuous',
@@ -418,6 +481,63 @@ function createAgencyRuntime() {
 
   const gatekeeper = new ActionGatekeeper({
     privacyController,
+  })
+
+  let lastCapturedFrame: CapturedScreenFrame | null = null
+  let pendingCaptureOptions: {
+    windowTitle?: string
+    frameFixtureId?: string
+  } | null = null
+
+  function buildFrameForCapture(params?: {
+    windowTitle?: string
+    frameFixtureId?: string
+  }): CapturedScreenFrame {
+    const resolvedTitle =
+      params?.windowTitle?.trim() ||
+      privacyController.allowedWindowTitles[0] ||
+      'VS Code — Ashy Companion'
+
+    if (params?.frameFixtureId === 'static-frame' && lastCapturedFrame) {
+      return {
+        ...lastCapturedFrame,
+        windowTitle: resolvedTitle,
+      }
+    }
+
+    let frame: CapturedScreenFrame
+    if (params?.frameFixtureId === 'changed-ide-frame') {
+      frame = buildRendererPatternFrame('ide', resolvedTitle)
+    } else if (params?.frameFixtureId === 'changed-terminal-frame') {
+      frame = buildRendererPatternFrame('terminal', resolvedTitle)
+    } else {
+      frame = buildRendererPatternFrame('default', resolvedTitle)
+    }
+
+    lastCapturedFrame = frame
+    return frame
+  }
+
+  const visionSensor = createAuthorizedVisionSensor({
+    privacyController,
+    gatekeeper,
+    captureFrameFn: (windowTitle) => {
+      const opts = pendingCaptureOptions
+      pendingCaptureOptions = null
+      return buildFrameForCapture({
+        windowTitle: opts?.windowTitle ?? windowTitle,
+        frameFixtureId: opts?.frameFixtureId,
+      })
+    },
+    visionProvider: {
+      describeFrame(frame, ctx) {
+        const title = ctx.windowTitle ?? frame.windowTitle ?? 'Desktop'
+        return {
+          summary: `Janela ativa "${title}" observada (${frame.width}x${frame.height}, dHash ${ctx.dHashHex})`,
+          visionTokensSpent: 64,
+        }
+      },
+    },
   })
 
   const mcpRegistry = new ProgressiveMcpRegistry({
@@ -484,6 +604,7 @@ function createAgencyRuntime() {
         type: 'object',
         properties: {
           title: { type: 'string' },
+          path: { type: 'string' },
           content: { type: 'string' },
         },
         required: ['title'],
@@ -491,6 +612,7 @@ function createAgencyRuntime() {
       handler: (args) => ({
         saved: true,
         title: String(args.title ?? 'Untitled Note'),
+        path: String(args.path ?? '/workspace/ashy/notes/nota-arquitetura.md'),
       }),
     },
     {
@@ -516,6 +638,10 @@ function createAgencyRuntime() {
     privacyController,
     gatekeeper,
     mcpRegistry,
+    visionSensor,
+    setPendingCaptureOptions(opts?: { windowTitle?: string; frameFixtureId?: string }) {
+      pendingCaptureOptions = opts ? { ...opts } : null
+    },
   }
 }
 
@@ -801,6 +927,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     chatMessages?: readonly ChatTurnMessage[]
     interruptionControlNote?: string
     live2dModelControls?: Live2DModelControls
+    screenContext?: string
   }): ComposedTurnPrompt {
     const current = get()
     const userMessage =
@@ -850,6 +977,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     const activeControls =
       params?.live2dModelControls ?? current?.live2dModelControls ?? DEFAULT_LIVE2D_CONTROLS
 
+    const resolvedScreenContext =
+      params?.screenContext !== undefined
+        ? params.screenContext
+        : current?.visionTelemetry?.lastObservation?.summary ?? undefined
+
     return composeAshyTurnPrompt({
       userMessage,
       modelId,
@@ -871,6 +1003,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       eligibleMotifs,
       userHabits: habits,
       prospectiveIntents: intents,
+      screenContext: resolvedScreenContext,
       interruptionControlNote: params?.interruptionControlNote,
       stageControlsPromptBlock: formatLive2DControlPrompt(activeControls),
       conversationHistory: (params?.chatMessages ?? current?.chatMessages ?? []).map((m) => ({
@@ -1350,6 +1483,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     mcpSearchResults: agency.mcpRegistry.search_mcp_tools({ query: '', limit: 10 }),
     exposedMetaToolsCount: agency.mcpRegistry.getExposedMetaTools().length,
     registeredMcpToolsCount: agency.mcpRegistry.getRegisteredToolsCount(),
+    agencyTools: agency.mcpRegistry.listAllTools(),
+    toolRiskOverrides: agency.gatekeeper.getToolRiskOverrides(),
+    sessionApprovedTools: agency.gatekeeper.getSessionApprovedTools(),
+    visionTelemetry: agency.visionSensor.getTelemetry(),
+    externalMcpServers: [],
     pendingActions: agency.gatekeeper.getPendingActions(),
     auditLog: [...agency.gatekeeper.getAuditLog()],
     lastMcpResultSummary: null,
@@ -2441,7 +2579,172 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
 
     setComputerActionsPolicy(policy) {
-      set({ computerActionsPolicy: policy })
+      set({
+        computerActionsPolicy: policy,
+        computerActionsEnabled: policy !== 'off',
+      })
+      void agency.gatekeeper
+        .setApprovalPolicy(policy, { autoApprovePending: policy === 'auto_accept' })
+        .then(() => {
+          set({
+            computerActionsPolicy: policy,
+            computerActionsEnabled: policy !== 'off',
+            pendingActions: agency.gatekeeper.getPendingActions(),
+            auditLog: [...agency.gatekeeper.getAuditLog()],
+            sessionApprovedTools: agency.gatekeeper.getSessionApprovedTools(),
+          })
+        })
+      set({
+        pendingActions: agency.gatekeeper.getPendingActions(),
+        auditLog: [...agency.gatekeeper.getAuditLog()],
+        sessionApprovedTools: agency.gatekeeper.getSessionApprovedTools(),
+      })
+      void getAshyHostBridge()
+        .updateAgencyConsent?.({ approvalPolicy: policy })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
+    },
+
+    toggleDontAskMode(enabled) {
+      const currentPolicy = get().computerActionsPolicy
+      const shouldEnable = enabled !== undefined ? enabled : currentPolicy !== 'auto_accept'
+      get().setComputerActionsPolicy(shouldEnable ? 'auto_accept' : 'ask')
+    },
+
+    setToolRiskTierOverride(toolName, riskTier) {
+      agency.mcpRegistry.setToolRiskTier(toolName, riskTier)
+      const overrides = agency.gatekeeper.getToolRiskOverrides()
+      set({
+        agencyTools: agency.mcpRegistry.listAllTools(),
+        toolRiskOverrides: overrides,
+        mcpSearchResults: agency.mcpRegistry.search_mcp_tools({
+          query: get().mcpSearchQuery,
+          limit: 10,
+        }),
+      })
+      void getAshyHostBridge()
+        .updateAgencyConsent?.({ toolRiskOverrides: overrides })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
+    },
+
+    addAllowedPath(rawPath) {
+      const trimmed = rawPath.replace(/[\x00-\x1f\x7f]/g, '').trim()
+      if (!trimmed || trimmed.includes('..')) return
+      const nextPaths = Array.from(new Set([...agency.privacyController.allowedPaths, trimmed]))
+      agency.privacyController.setAllowedPaths(nextPaths)
+      set({ privacyState: agency.privacyController.getState() })
+      void getAshyHostBridge()
+        .updateAgencyConsent?.({ allowedPaths: [...agency.privacyController.allowedPaths] })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
+    },
+
+    removeAllowedPath(rawPath) {
+      const trimmed = rawPath.trim().replace(/\\/g, '/').replace(/\/+$/, '')
+      const nextPaths = agency.privacyController.allowedPaths.filter(
+        (p) => p.trim().replace(/\\/g, '/').replace(/\/+$/, '') !== trimmed,
+      )
+      if (nextPaths.length === 0) return
+      agency.privacyController.setAllowedPaths(nextPaths)
+      set({ privacyState: agency.privacyController.getState() })
+      void getAshyHostBridge()
+        .updateAgencyConsent?.({ allowedPaths: [...agency.privacyController.allowedPaths] })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
+    },
+
+    addAllowedWindowTitle(title) {
+      const trimmed = title.replace(/[\x00-\x1f\x7f]/g, '').trim()
+      if (!trimmed) return
+      const nextTitles = Array.from(
+        new Set([...agency.privacyController.allowedWindowTitles, trimmed]),
+      )
+      agency.privacyController.setAllowedWindowTitles(nextTitles)
+      set({ privacyState: agency.privacyController.getState() })
+      void getAshyHostBridge()
+        .updateAgencyConsent?.({
+          allowedWindowTitles: [...agency.privacyController.allowedWindowTitles],
+        })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
+    },
+
+    removeAllowedWindowTitle(title) {
+      const trimmed = title.trim()
+      const nextTitles = agency.privacyController.allowedWindowTitles.filter((t) => t !== trimmed)
+      agency.privacyController.setAllowedWindowTitles(nextTitles)
+      set({ privacyState: agency.privacyController.getState() })
+      void getAshyHostBridge()
+        .updateAgencyConsent?.({
+          allowedWindowTitles: [...agency.privacyController.allowedWindowTitles],
+        })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
+    },
+
+    revokeSessionPermissions(toolName) {
+      if (toolName && toolName.trim().length > 0) {
+        agency.gatekeeper.revokeSessionApproval(toolName)
+      } else {
+        agency.gatekeeper.revokeAllSessionApprovals()
+      }
+      set({
+        sessionApprovedTools: agency.gatekeeper.getSessionApprovedTools(),
+        auditLog: [...agency.gatekeeper.getAuditLog()],
+      })
+      void getAshyHostBridge()
+        .revokeSessionPermissions?.(toolName ? { toolName } : undefined)
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
+    },
+
+    async captureAuthorizedScreen(input) {
+      agency.setPendingCaptureOptions(input)
+      const observation = await agency.visionSensor.observeScreen({
+        windowTitle: input?.windowTitle,
+      })
+      const telemetry = agency.visionSensor.getTelemetry()
+      set((state) => ({
+        visionTelemetry: telemetry,
+        auditLog: [...agency.gatekeeper.getAuditLog()],
+        lastPrompt: observation.summary
+          ? compilePromptFromState({ screenContext: observation.summary })
+          : state.lastPrompt,
+      }))
+      void getAshyHostBridge()
+        .captureAuthorizedScreen?.(input)
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
+      return observation
+    },
+
+    registerExternalMcpServer(config) {
+      agency.mcpRegistry.registerServer({
+        name: config.name,
+        description: config.description ?? '',
+      })
+      set((state) => ({
+        externalMcpServers: [
+          ...state.externalMcpServers.filter((s) => s.id !== config.id),
+          config,
+        ],
+        registeredMcpToolsCount: agency.mcpRegistry.getRegisteredToolsCount(),
+        agencyTools: agency.mcpRegistry.listAllTools(),
+      }))
+      void getAshyHostBridge()
+        .registerExternalMcpServer?.(config)
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     setQuietHoursRange(range) {
@@ -2457,6 +2760,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       agency.privacyController.setMicMode(agencyMode)
       voiceRuntime.setMicMode(mode)
       set({ privacyState: agency.privacyController.getState() })
+      void getAshyHostBridge()
+        .updateAgencyConsent?.({ micMode: agencyMode })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     setActiveSttProvider(providerId) {
@@ -2520,17 +2828,42 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
     setEyesMode(mode) {
       agency.privacyController.setEyesMode(mode)
-      set({ privacyState: agency.privacyController.getState() })
+      set({
+        privacyState: agency.privacyController.getState(),
+        visionTelemetry: agency.visionSensor.getTelemetry(),
+      })
+      void getAshyHostBridge()
+        .updateAgencyConsent?.({ eyesMode: mode })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     setDndMode(enabled) {
       agency.privacyController.setDndMode(enabled)
       set({ privacyState: agency.privacyController.getState() })
+      void getAshyHostBridge()
+        .updateAgencyConsent?.({ dndMode: enabled })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     activateFullPrivacyShield() {
       const next = agency.privacyController.activatePrivacyShield()
-      set({ privacyState: next })
+      set({
+        privacyState: next,
+        visionTelemetry: agency.visionSensor.getTelemetry(),
+      })
+      void getAshyHostBridge()
+        .updateAgencyConsent?.({
+          eyesMode: 'off',
+          micMode: 'muted',
+          dndMode: true,
+        })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     searchMcpTools(query) {
@@ -2543,7 +2876,36 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
 
     async triggerMcpTool(toolName, args = {}) {
-      const res = await agency.mcpRegistry.call_mcp_tool({ toolName, args })
+      const safeArgs: Record<string, unknown> = { ...args }
+      if (toolName === 'write_project_note') {
+        const rawTitle =
+          typeof safeArgs.title === 'string' && safeArgs.title.trim().length > 0
+            ? safeArgs.title.trim()
+            : 'Nota de Arquitetura'
+        const slug =
+          rawTitle
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^a-z0-9-_]+/g, '-')
+            .replace(/^-+|-+$/g, '') || 'nota-arquitetura'
+        const targetPath =
+          typeof safeArgs.path === 'string' && safeArgs.path.trim().length > 0
+            ? safeArgs.path.trim()
+            : `/workspace/ashy/notes/${slug}.md`
+        if (typeof safeArgs.path !== 'string' || !safeArgs.path.trim()) {
+          safeArgs.path = targetPath
+        }
+        if (typeof safeArgs.diffPreview !== 'string') {
+          const nextContent =
+            typeof safeArgs.content === 'string' && safeArgs.content.trim().length > 0
+              ? safeArgs.content
+              : `# ${rawTitle}\n`
+          safeArgs.diffPreview = computeUnifiedDiffPreview(targetPath, null, nextContent)
+        }
+      }
+
+      const res = await agency.mcpRegistry.call_mcp_tool({ toolName, args: safeArgs })
       let summary = `Tool "${toolName}" -> ${res.status}`
       if (res.pendingCard?.blastRadiusWarning) {
         summary += ` (${res.pendingCard.blastRadiusWarning})`
@@ -2553,9 +2915,15 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
       set({
         pendingActions: agency.gatekeeper.getPendingActions(),
+        sessionApprovedTools: agency.gatekeeper.getSessionApprovedTools(),
         auditLog: [...agency.gatekeeper.getAuditLog()],
         lastMcpResultSummary: summary,
       })
+      void getAshyHostBridge()
+        .callMcpTool?.({ toolName, args: safeArgs })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
       return res
     },
 
@@ -2563,18 +2931,30 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       await agency.gatekeeper.approveAction(actionId, scope)
       set({
         pendingActions: agency.gatekeeper.getPendingActions(),
+        sessionApprovedTools: agency.gatekeeper.getSessionApprovedTools(),
         auditLog: [...agency.gatekeeper.getAuditLog()],
         lastMcpResultSummary: `Approved action ${actionId} (scope=${scope})`,
       })
+      void getAshyHostBridge()
+        .approvePendingAction?.({ actionId, scope })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     denyPendingAction(actionId, reason = 'Denied by user in Consent Center') {
       const res = agency.gatekeeper.denyAction(actionId, reason)
       set({
         pendingActions: agency.gatekeeper.getPendingActions(),
+        sessionApprovedTools: agency.gatekeeper.getSessionApprovedTools(),
         auditLog: [...agency.gatekeeper.getAuditLog()],
         lastMcpResultSummary: res.feedback,
       })
+      void getAshyHostBridge()
+        .denyPendingAction?.({ actionId, reason })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     resetStoreForTesting() {
@@ -2716,6 +3096,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         mcpSearchResults: agency.mcpRegistry.search_mcp_tools({ query: '', limit: 10 }),
         exposedMetaToolsCount: agency.mcpRegistry.getExposedMetaTools().length,
         registeredMcpToolsCount: agency.mcpRegistry.getRegisteredToolsCount(),
+        agencyTools: agency.mcpRegistry.listAllTools(),
+        toolRiskOverrides: agency.gatekeeper.getToolRiskOverrides(),
+        sessionApprovedTools: agency.gatekeeper.getSessionApprovedTools(),
+        visionTelemetry: agency.visionSensor.getTelemetry(),
+        externalMcpServers: [],
         pendingActions: agency.gatekeeper.getPendingActions(),
         auditLog: [...agency.gatekeeper.getAuditLog()],
         lastMcpResultSummary: null,

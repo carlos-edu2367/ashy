@@ -38,6 +38,7 @@ export interface TurnOrchestratorOptions {
   voiceStore: VoiceIdentityStore
   providerVault: ProviderVault
   getBootstrapSnapshot: () => AshyBootstrapSnapshot | Promise<AshyBootstrapSnapshot>
+  getActiveVisionContext?: () => string | undefined
   onPersistenceWarning?: (warning: string | null) => void
   onDominantEmotionChange?: (emotion: AshyEmotion) => void
   keepaliveIntervalMs?: number
@@ -363,12 +364,16 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
 
       const voiceIdentityMarkdown = voiceStore.read().content
       const activeConfig = providerState.configs[providerState.activeProviderId]
+      const effectiveScreenContext =
+        input.screenContext && input.screenContext.trim().length > 0
+          ? input.screenContext
+          : options.getActiveVisionContext?.()
 
       const compiled = cortex.compileTurnPrompt({
         userMessage: input.text,
         modelId: activeConfig?.modelId,
         voiceIdentityMarkdown,
-        screenContext: input.screenContext,
+        screenContext: effectiveScreenContext,
         interruptionControlNote: input.interruptionControlNote,
         conversationHistory: priorConversationHistory,
       })

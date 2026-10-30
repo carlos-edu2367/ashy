@@ -1,6 +1,8 @@
-import { type PrivacyController } from './privacy-controller'
+import { isPathWithinAllowed, type PrivacyController } from './privacy-controller'
 
 export type ActionRiskTier = 'observe-only' | 'read-safe' | 'staged-confirm'
+
+export type ComputerActionsPolicy = 'ask' | 'session' | 'auto_accept' | 'off'
 
 export type AuditDecision =
   | 'allowed'
@@ -9,6 +11,7 @@ export type AuditDecision =
   | 'denied'
   | 'blocked_privacy'
   | 'blocked_traversal'
+  | 'revoked'
 
 export type ApprovalScope = 'once' | 'session'
 
@@ -18,6 +21,9 @@ export interface PendingActionCard {
   readonly serverName: string
   readonly summary: string
   readonly argsPreview: string
+  readonly targetPath?: string
+  readonly commandPreview?: string
+  readonly diffPreview?: string
   readonly riskTier: ActionRiskTier
   readonly blastRadiusWarning?: string
   status: 'pending' | 'approved' | 'denied'
@@ -35,6 +41,9 @@ export interface ActionAuditLogEntry {
   readonly actionId?: string
   readonly reason?: string
   readonly blastRadiusWarning?: string
+  readonly targetPath?: string
+  readonly commandPreview?: string
+  readonly diffPreview?: string
 }
 
 export interface GatedToolDefinition {
@@ -46,7 +55,7 @@ export interface GatedToolDefinition {
 }
 
 export interface GatekeeperExecutionResult {
-  status: 'executed' | 'staged' | 'blocked_privacy' | 'blocked_traversal'
+  status: 'executed' | 'staged' | 'blocked_privacy' | 'blocked_traversal' | 'blocked_policy'
   output?: unknown
   pendingCard?: PendingActionCard
   reason?: string
@@ -67,7 +76,37 @@ export interface DenyActionResult {
 export interface ActionGatekeeperOptions {
   privacyController: PrivacyController
   nowFn?: () => number
+  approvalPolicy?: ComputerActionsPolicy
+  toolRiskOverrides?: Record<string, ActionRiskTier>
+  initialAuditLog?: readonly ActionAuditLogEntry[]
+  onAuditEntry?: (entry: ActionAuditLogEntry) => void
 }
+
+type NodeFsLike = typeof import('node:fs')
+type NodePathLike = typeof import('node:path')
+
+function getBuiltinModule<T>(id: string): T | null {
+  try {
+    const proc = (globalThis as { process?: { getBuiltinModule?: (modId: string) => unknown } })
+      .process
+    return (proc?.getBuiltinModule?.(id) as T | undefined) ?? null
+  } catch {
+    return null
+  }
+}
+
+const VALID_RISK_TIERS: ReadonlySet<ActionRiskTier> = new Set([
+  'observe-only',
+  'read-safe',
+  'staged-confirm',
+])
+
+const VALID_APPROVAL_POLICIES: ReadonlySet<ComputerActionsPolicy> = new Set([
+  'ask',
+  'session',
+  'auto_accept',
+  'off',
+])
 
 interface BlastRadiusRule {
   pattern: RegExp
@@ -170,6 +209,55 @@ export function detectBlastRadiusWarning(args: Record<string, unknown>): string 
   return undefined
 }
 
+/**
+ * Produces a unified diff preview (`--- a/...`, `+++ b/...`, `-old`, `+new`)
+ * for staged file/note creation or modification cards.
+ */
+export function computeUnifiedDiffPreview(
+  targetPath: string,
+  previousContent: string | null | undefined,
+  nextContent: string
+): string {
+  const normalizedPath = (targetPath || 'workspace/file')
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+
+  const prevLines =
+    typeof previousContent === 'string' && previousContent.length > 0
+      ? previousContent.replace(/\r\n/g, '\n').split('\n')
+      : []
+  const nextLines = (nextContent ?? '').replace(/\r\n/g, '\n').split('\n')
+
+  const header = [
+    `--- a/${normalizedPath}`,
+    `+++ b/${normalizedPath}`,
+    `@@ -${prevLines.length > 0 ? 1 : 0},${prevLines.length} +1,${nextLines.length} @@`,
+  ]
+
+  const body: string[] = []
+  const maxLines = Math.max(prevLines.length, nextLines.length)
+
+  for (let i = 0; i < maxLines; i++) {
+    const oldLine = i < prevLines.length ? prevLines[i] : undefined
+    const newLine = i < nextLines.length ? nextLines[i] : undefined
+
+    if (oldLine !== undefined && newLine !== undefined) {
+      if (oldLine === newLine) {
+        body.push(` ${oldLine}`)
+      } else {
+        body.push(`-${oldLine}`)
+        body.push(`+${newLine}`)
+      }
+    } else if (oldLine !== undefined) {
+      body.push(`-${oldLine}`)
+    } else if (newLine !== undefined) {
+      body.push(`+${newLine}`)
+    }
+  }
+
+  return [...header, ...body].join('\n')
+}
+
 function extractCandidatePaths(value: unknown, bucket: string[] = []): string[] {
   if (value === null || typeof value !== 'object') {
     return bucket
@@ -198,9 +286,71 @@ function extractCandidatePaths(value: unknown, bucket: string[] = []): string[] 
   return bucket
 }
 
+function deriveActionPreviews(
+  toolName: string,
+  safeArgs: Record<string, unknown>,
+  candidatePaths: readonly string[]
+): {
+  targetPath?: string
+  commandPreview?: string
+  diffPreview?: string
+} {
+  let targetPath: string | undefined = candidatePaths[0]
+  if (!targetPath && typeof safeArgs.title === 'string' && safeArgs.title.trim().length > 0) {
+    if (
+      typeof safeArgs.content === 'string' ||
+      toolName.toLowerCase().includes('note') ||
+      toolName.toLowerCase().includes('write')
+    ) {
+      const slug = safeArgs.title
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9-_]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+      targetPath = `notes/${slug || 'note'}.md`
+    }
+  }
+
+  const commandPreview =
+    typeof safeArgs.command === 'string' && safeArgs.command.trim().length > 0
+      ? safeArgs.command.trim()
+      : typeof safeArgs.cmd === 'string' && safeArgs.cmd.trim().length > 0
+        ? safeArgs.cmd.trim()
+        : typeof safeArgs.commandPreview === 'string' && safeArgs.commandPreview.trim().length > 0
+          ? safeArgs.commandPreview.trim()
+          : undefined
+
+  let diffPreview: string | undefined
+  if (typeof safeArgs.diffPreview === 'string' && safeArgs.diffPreview.trim().length > 0) {
+    diffPreview = safeArgs.diffPreview
+  } else if (typeof safeArgs.content === 'string') {
+    const prev = typeof safeArgs.previousContent === 'string' ? safeArgs.previousContent : null
+    diffPreview = computeUnifiedDiffPreview(targetPath ?? 'workspace/note.md', prev, safeArgs.content)
+  } else if (
+    typeof safeArgs.title === 'string' &&
+    safeArgs.title.trim().length > 0 &&
+    (toolName.toLowerCase().includes('note') || toolName.toLowerCase().includes('write'))
+  ) {
+    diffPreview = computeUnifiedDiffPreview(
+      targetPath ?? 'notes/note.md',
+      null,
+      `# ${safeArgs.title.trim()}\n`
+    )
+  }
+
+  return {
+    ...(targetPath ? { targetPath } : {}),
+    ...(commandPreview ? { commandPreview } : {}),
+    ...(diffPreview ? { diffPreview } : {}),
+  }
+}
+
 export class ActionGatekeeper {
   private readonly privacyController: PrivacyController
   private readonly nowFn: () => number
+  private readonly onAuditEntry?: (entry: ActionAuditLogEntry) => void
+  private approvalPolicy: ComputerActionsPolicy
+  private readonly toolRiskOverrides = new Map<string, ActionRiskTier>()
   private readonly tools = new Map<string, GatedToolDefinition>()
   private readonly pendingActions = new Map<
     string,
@@ -217,6 +367,38 @@ export class ActionGatekeeper {
   constructor(options: ActionGatekeeperOptions) {
     this.privacyController = options.privacyController
     this.nowFn = options.nowFn ?? (() => Date.now())
+    this.onAuditEntry = options.onAuditEntry
+    this.approvalPolicy =
+      options.approvalPolicy && VALID_APPROVAL_POLICIES.has(options.approvalPolicy)
+        ? options.approvalPolicy
+        : 'ask'
+
+    if (options.toolRiskOverrides) {
+      this.setToolRiskOverrides(options.toolRiskOverrides)
+    }
+
+    if (options.initialAuditLog) {
+      for (const item of options.initialAuditLog) {
+        if (!item || typeof item.id !== 'string') continue
+        this.auditLog.push(
+          Object.freeze({
+            id: item.id,
+            timestamp: item.timestamp,
+            toolName: item.toolName,
+            serverName: item.serverName,
+            riskTier: item.riskTier,
+            decision: item.decision,
+            argsPreview: item.argsPreview,
+            ...(item.actionId ? { actionId: item.actionId } : {}),
+            ...(item.reason ? { reason: item.reason } : {}),
+            ...(item.blastRadiusWarning ? { blastRadiusWarning: item.blastRadiusWarning } : {}),
+            ...(item.targetPath ? { targetPath: item.targetPath } : {}),
+            ...(item.commandPreview ? { commandPreview: item.commandPreview } : {}),
+            ...(item.diffPreview ? { diffPreview: item.diffPreview } : {}),
+          })
+        )
+      }
+    }
   }
 
   private nextId(prefix: string): string {
@@ -231,7 +413,105 @@ export class ActionGatekeeper {
       ...entry,
     })
     this.auditLog.push(frozen)
+    this.onAuditEntry?.(frozen)
     return frozen
+  }
+
+  recordAuditEntry(entry: Omit<ActionAuditLogEntry, 'id' | 'timestamp'>): ActionAuditLogEntry {
+    return this.recordAudit(entry)
+  }
+
+  getApprovalPolicy(): ComputerActionsPolicy {
+    return this.approvalPolicy
+  }
+
+  async setApprovalPolicy(
+    policy: ComputerActionsPolicy,
+    options?: { autoApprovePending?: boolean }
+  ): Promise<ApproveActionResult[]> {
+    if (!VALID_APPROVAL_POLICIES.has(policy)) {
+      throw new Error(`Invalid approvalPolicy: ${String(policy)}`)
+    }
+    this.approvalPolicy = policy
+    if (policy === 'auto_accept' && options?.autoApprovePending) {
+      return this.autoApproveAllPendingActions()
+    }
+    return []
+  }
+
+  async autoApproveAllPendingActions(): Promise<ApproveActionResult[]> {
+    const pendingIds = Array.from(this.pendingActions.entries())
+      .filter(([, entry]) => entry.card.status === 'pending')
+      .map(([id]) => id)
+
+    const results: ApproveActionResult[] = []
+    for (const id of pendingIds) {
+      const res = await this.approveAction(id, 'once')
+      results.push(res)
+    }
+    return results
+  }
+
+  setToolRiskTier(toolName: string, riskTier: ActionRiskTier): void {
+    const clean = toolName.trim()
+    if (!clean) {
+      throw new Error('toolName must be non-empty')
+    }
+    if (!VALID_RISK_TIERS.has(riskTier)) {
+      throw new Error(`Invalid riskTier: ${String(riskTier)}`)
+    }
+    this.toolRiskOverrides.set(clean, riskTier)
+  }
+
+  getToolRiskTier(toolName: string): ActionRiskTier | undefined {
+    const clean = toolName.trim()
+    return this.toolRiskOverrides.get(clean) ?? this.tools.get(clean)?.riskTier
+  }
+
+  getToolRiskOverrides(): Record<string, ActionRiskTier> {
+    return Object.fromEntries(this.toolRiskOverrides.entries())
+  }
+
+  setToolRiskOverrides(overrides: Record<string, ActionRiskTier>): void {
+    this.toolRiskOverrides.clear()
+    if (!overrides || typeof overrides !== 'object') return
+    for (const [toolName, tier] of Object.entries(overrides)) {
+      const clean = toolName.trim()
+      if (clean && VALID_RISK_TIERS.has(tier)) {
+        this.toolRiskOverrides.set(clean, tier)
+      }
+    }
+  }
+
+  getSessionApprovedTools(): string[] {
+    return Array.from(this.sessionApprovedTools)
+  }
+
+  revokeSessionApproval(toolName: string): void {
+    const clean = toolName.trim()
+    this.sessionApprovedTools.delete(clean)
+    const tool = this.tools.get(clean)
+    this.recordAudit({
+      toolName: clean || '*',
+      serverName: tool?.serverName ?? 'consent-center',
+      riskTier: this.getToolRiskTier(clean) ?? tool?.riskTier ?? 'staged-confirm',
+      decision: 'revoked',
+      argsPreview: '{}',
+      reason: `Session approval revoked for tool "${clean}"`,
+    })
+  }
+
+  revokeAllSessionApprovals(): void {
+    const count = this.sessionApprovedTools.size
+    this.sessionApprovedTools.clear()
+    this.recordAudit({
+      toolName: '*',
+      serverName: 'consent-center',
+      riskTier: 'staged-confirm',
+      decision: 'revoked',
+      argsPreview: '{}',
+      reason: `Revoked all session tool approvals (${count} cleared)`,
+    })
   }
 
   registerTool(definition: GatedToolDefinition): void {
@@ -239,6 +519,11 @@ export class ActionGatekeeper {
       throw new Error('Tool name must be non-empty')
     }
     this.tools.set(definition.toolName, { ...definition })
+  }
+
+  unregisterTool(toolName: string): void {
+    this.tools.delete(toolName)
+    this.sessionApprovedTools.delete(toolName)
   }
 
   getRegisteredTool(toolName: string): GatedToolDefinition | undefined {
@@ -255,6 +540,63 @@ export class ActionGatekeeper {
     return [...this.auditLog]
   }
 
+  private isPathAllowedWithSymlinkGuard(candidatePath: string): boolean {
+    if (!this.privacyController.isPathAllowed(candidatePath)) {
+      return false
+    }
+
+    const fs = getBuiltinModule<NodeFsLike>('node:fs')
+    const pathMod = getBuiltinModule<NodePathLike>('node:path')
+    if (!fs || !pathMod) {
+      return true
+    }
+
+    try {
+      const expandedAllowed: string[] = [...this.privacyController.allowedPaths]
+      for (const allowed of this.privacyController.allowedPaths) {
+        try {
+          if (fs.existsSync(allowed)) {
+            expandedAllowed.push(fs.realpathSync(allowed))
+          }
+        } catch {
+          // Ignore non-existent virtual allowed path
+        }
+      }
+
+      let lstat: ReturnType<NodeFsLike['lstatSync']> | null = null
+      try {
+        lstat = fs.lstatSync(candidatePath)
+      } catch {
+        lstat = null
+      }
+
+      if (lstat) {
+        try {
+          const realCandidate = fs.realpathSync(candidatePath)
+          return isPathWithinAllowed(realCandidate, expandedAllowed)
+        } catch {
+          if (lstat.isSymbolicLink()) {
+            const linkTarget = fs.readlinkSync(candidatePath)
+            const resolvedTarget = pathMod.resolve(pathMod.dirname(candidatePath), linkTarget)
+            return isPathWithinAllowed(resolvedTarget, expandedAllowed)
+          }
+          return false
+        }
+      }
+
+      const parentDir = pathMod.dirname(candidatePath)
+      if (parentDir && parentDir !== candidatePath && fs.existsSync(parentDir)) {
+        const realParent = fs.realpathSync(parentDir)
+        const realCandidate = pathMod.join(realParent, pathMod.basename(candidatePath))
+        return isPathWithinAllowed(realCandidate, expandedAllowed)
+      }
+    } catch {
+      // If OS FS inspection is unavailable for virtual test paths, rely on lexical check above
+    }
+
+    return true
+  }
+
   async executeTool(
     toolName: string,
     args: Record<string, unknown> = {}
@@ -267,9 +609,11 @@ export class ActionGatekeeper {
     const safeArgs = args && typeof args === 'object' ? args : {}
     const argsPreview = serializeArgsPreview(safeArgs)
     const blastWarning = detectBlastRadiusWarning(safeArgs)
+    const baseTier: ActionRiskTier = this.toolRiskOverrides.get(tool.toolName) ?? tool.riskTier
+    const effectiveTier: ActionRiskTier = blastWarning ? 'staged-confirm' : baseTier
 
     // 1. Check Privacy Shield / Screen Observation for 'observe-only'
-    if (tool.riskTier === 'observe-only') {
+    if (tool.riskTier === 'observe-only' || baseTier === 'observe-only') {
       const windowTitle =
         typeof safeArgs.windowTitle === 'string'
           ? safeArgs.windowTitle
@@ -282,7 +626,7 @@ export class ActionGatekeeper {
         this.recordAudit({
           toolName: tool.toolName,
           serverName: tool.serverName,
-          riskTier: tool.riskTier,
+          riskTier: effectiveTier,
           decision: 'blocked_privacy',
           argsPreview,
           reason,
@@ -294,35 +638,39 @@ export class ActionGatekeeper {
       }
     }
 
-    // 2. Check Path Traversal & Allowed Paths for 'read-safe' (including nested or array paths)
+    // 2. Check Path Traversal, Symlink Escape & Allowed Paths for 'read-safe' and 'staged-confirm'
     const candidatePaths = extractCandidatePaths(safeArgs)
-    if (tool.riskTier === 'read-safe') {
-      if (candidatePaths.length === 0) {
-        const reason = `Missing target path for read-safe tool "${tool.toolName}"`
-        this.recordAudit({
-          toolName: tool.toolName,
-          serverName: tool.serverName,
-          riskTier: tool.riskTier,
-          decision: 'blocked_traversal',
-          argsPreview,
-          reason,
-        })
-        return {
-          status: 'blocked_traversal',
-          reason,
-        }
-      }
+    const previews = deriveActionPreviews(tool.toolName, safeArgs, candidatePaths)
 
+    if ((tool.riskTier === 'read-safe' || baseTier === 'read-safe') && candidatePaths.length === 0) {
+      const reason = `Missing target path for read-safe tool "${tool.toolName}"`
+      this.recordAudit({
+        toolName: tool.toolName,
+        serverName: tool.serverName,
+        riskTier: effectiveTier,
+        decision: 'blocked_traversal',
+        argsPreview,
+        reason,
+        ...previews,
+      })
+      return {
+        status: 'blocked_traversal',
+        reason,
+      }
+    }
+
+    if (candidatePaths.length > 0) {
       for (const candidatePath of candidatePaths) {
-        if (!this.privacyController.isPathAllowed(candidatePath)) {
+        if (!this.isPathAllowedWithSymlinkGuard(candidatePath)) {
           const reason = `Path traversal or unauthorized path blocked: "${candidatePath}"`
           this.recordAudit({
             toolName: tool.toolName,
             serverName: tool.serverName,
-            riskTier: tool.riskTier,
+            riskTier: effectiveTier,
             decision: 'blocked_traversal',
             argsPreview,
             reason,
+            ...previews,
           })
           return {
             status: 'blocked_traversal',
@@ -332,9 +680,45 @@ export class ActionGatekeeper {
       }
     }
 
-    // 3. Determine effective risk tier (Blast-Radius Guard escalates to staged-confirm)
-    const effectiveTier: ActionRiskTier = blastWarning ? 'staged-confirm' : tool.riskTier
+    // 3. Global Policy 'off': block any non-observe-only action
+    if (this.approvalPolicy === 'off' && effectiveTier !== 'observe-only') {
+      const reason = 'Computer actions disabled by policy (off)'
+      this.recordAudit({
+        toolName: tool.toolName,
+        serverName: tool.serverName,
+        riskTier: effectiveTier,
+        decision: 'denied',
+        argsPreview,
+        reason,
+        ...(blastWarning ? { blastRadiusWarning: blastWarning } : {}),
+        ...previews,
+      })
+      return {
+        status: 'blocked_policy',
+        reason,
+      }
+    }
 
+    // 4. Global Policy 'auto_accept' ("Modo Não Pergunte"): auto-approve & execute immediately
+    if (this.approvalPolicy === 'auto_accept') {
+      const output = await tool.handler(safeArgs)
+      this.recordAudit({
+        toolName: tool.toolName,
+        serverName: tool.serverName,
+        riskTier: effectiveTier,
+        decision: 'allowed',
+        argsPreview,
+        reason: 'Auto-approved by user policy (auto_accept)',
+        ...(blastWarning ? { blastRadiusWarning: blastWarning } : {}),
+        ...previews,
+      })
+      return {
+        status: 'executed',
+        output,
+      }
+    }
+
+    // 5. Staged-confirm flow ('ask' or 'session' mode)
     if (effectiveTier === 'staged-confirm') {
       const canAutoApproveFromSession =
         !blastWarning && this.sessionApprovedTools.has(tool.toolName)
@@ -347,6 +731,7 @@ export class ActionGatekeeper {
           serverName: tool.serverName,
           summary: `${tool.serverName}/${tool.toolName}: ${tool.description}`,
           argsPreview,
+          ...previews,
           riskTier: 'staged-confirm',
           ...(blastWarning ? { blastRadiusWarning: blastWarning } : {}),
           status: 'pending',
@@ -367,6 +752,7 @@ export class ActionGatekeeper {
           argsPreview,
           actionId: cardId,
           ...(blastWarning ? { blastRadiusWarning: blastWarning } : {}),
+          ...previews,
         })
 
         return {
@@ -376,7 +762,7 @@ export class ActionGatekeeper {
       }
     }
 
-    // 4. Allowed immediately ('observe-only', 'read-safe', or session-approved without blast warning)
+    // 6. Allowed immediately ('observe-only', 'read-safe', or session-approved without blast warning)
     const output = await tool.handler(safeArgs)
     this.recordAudit({
       toolName: tool.toolName,
@@ -384,6 +770,7 @@ export class ActionGatekeeper {
       riskTier: effectiveTier,
       decision: 'allowed',
       argsPreview,
+      ...previews,
     })
 
     return {
@@ -408,7 +795,10 @@ export class ActionGatekeeper {
 
     pending.card.status = 'approved'
 
-    if (scope === 'session' && !pending.card.blastRadiusWarning) {
+    const effectiveScope: ApprovalScope =
+      scope === 'session' || this.approvalPolicy === 'session' ? 'session' : 'once'
+
+    if (effectiveScope === 'session' && !pending.card.blastRadiusWarning) {
       this.sessionApprovedTools.add(pending.tool.toolName)
     }
 
@@ -421,10 +811,13 @@ export class ActionGatekeeper {
       decision: 'approved',
       argsPreview: pending.card.argsPreview,
       actionId,
-      reason: `Approved by user (scope=${scope})`,
+      reason: `Approved by user (scope=${effectiveScope})`,
       ...(pending.card.blastRadiusWarning
         ? { blastRadiusWarning: pending.card.blastRadiusWarning }
         : {}),
+      ...(pending.card.targetPath ? { targetPath: pending.card.targetPath } : {}),
+      ...(pending.card.commandPreview ? { commandPreview: pending.card.commandPreview } : {}),
+      ...(pending.card.diffPreview ? { diffPreview: pending.card.diffPreview } : {}),
     })
 
     return {
@@ -459,6 +852,9 @@ export class ActionGatekeeper {
       ...(pending.card.blastRadiusWarning
         ? { blastRadiusWarning: pending.card.blastRadiusWarning }
         : {}),
+      ...(pending.card.targetPath ? { targetPath: pending.card.targetPath } : {}),
+      ...(pending.card.commandPreview ? { commandPreview: pending.card.commandPreview } : {}),
+      ...(pending.card.diffPreview ? { diffPreview: pending.card.diffPreview } : {}),
     })
 
     return {

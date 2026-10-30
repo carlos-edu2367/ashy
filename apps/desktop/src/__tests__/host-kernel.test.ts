@@ -537,4 +537,244 @@ describe('AshyHostKernel & TurnOrchestrator', () => {
 
     await kernel.stop()
   })
+
+  it('boots with Phase 7 agency snapshot (4 built-in servers, 3 meta-tools), stages write_project_note in ask mode, writes real file on approval, and persists audit log in ashy.db', async () => {
+    const dir = makeTempDir()
+    const kernel1 = await createAshyHostKernel({ userDataDir: dir })
+
+    const boot1 = await kernel1.getBootstrapSnapshot()
+    expect(boot1.agency).toBeDefined()
+    expect(boot1.agency?.exposedMetaToolsCount).toBe(3)
+    expect(boot1.agency?.registeredMcpToolsCount).toBe(5)
+    expect(boot1.agency?.consent.approvalPolicy).toBe('ask')
+    expect(boot1.agency?.consent.eyesMode).toBe('off')
+    expect(boot1.agency?.tools.map((t) => t.toolName)).toEqual(
+      expect.arrayContaining([
+        'get_active_window_title',
+        'capture_authorized_screen',
+        'read_workspace_file',
+        'write_project_note',
+        'run_cleanup_command',
+      ]),
+    )
+
+    const targetNotePath = path.join(dir, 'notes', 'phase-7-architecture.md').replace(/\\/g, '/')
+    const stageRes = await kernel1.callMcpTool!({
+      toolName: 'write_project_note',
+      args: {
+        title: 'Phase 7 Architecture',
+        path: targetNotePath,
+        content: '# Phase 7\n Decisão registrada com sucesso.',
+      },
+    })
+
+    expect(stageRes.status).toBe('staged')
+    expect(stageRes.pendingCard).toBeDefined()
+    expect(stageRes.pendingCard?.toolName).toBe('write_project_note')
+    expect(stageRes.pendingCard?.diffPreview).toContain('+# Phase 7')
+    expect(fs.existsSync(targetNotePath)).toBe(false)
+
+    const approveRes = await kernel1.approvePendingAction!({
+      actionId: stageRes.pendingCard!.id,
+      scope: 'once',
+    })
+    expect(approveRes.status).toBe('executed')
+    expect(fs.existsSync(targetNotePath)).toBe(true)
+    expect(fs.readFileSync(targetNotePath, 'utf8')).toContain('Decisão registrada com sucesso.')
+
+    const readRes = await kernel1.callMcpTool!({
+      toolName: 'read_workspace_file',
+      args: { path: targetNotePath },
+    })
+    expect(readRes.status).toBe('executed')
+    expect(JSON.stringify(readRes.output)).toContain('Decisão registrada com sucesso.')
+
+    // Adversarial: path traversal attempt on write_project_note is blocked and logged
+    const traversalRes = await kernel1.callMcpTool!({
+      toolName: 'write_project_note',
+      args: {
+        title: 'Evil Note',
+        path: '../../outside-sandbox.md',
+        content: 'pwned',
+      },
+    })
+    expect(traversalRes.status).toBe('blocked_traversal')
+
+    await kernel1.stop()
+
+    // Reboot kernel2 on same directory and verify audit trail persisted in SQLite
+    const kernel2 = await createAshyHostKernel({ userDataDir: dir })
+    const boot2 = await kernel2.getBootstrapSnapshot()
+    const decisions = boot2.agency?.auditLog.map((e) => `${e.toolName}:${e.decision}`) ?? []
+    expect(decisions).toContain('write_project_note:staged')
+    expect(decisions).toContain('write_project_note:approved')
+    expect(decisions).toContain('write_project_note:blocked_traversal')
+    expect(decisions).toContain('read_workspace_file:allowed')
+    await kernel2.stop()
+  })
+
+  it('supports Modo Não Pergunte (auto_accept) to auto-approve queued pending actions and immediately execute tools, plus risk overrides and session revocation', async () => {
+    const dir = makeTempDir()
+    const kernel = await createAshyHostKernel({ userDataDir: dir })
+
+    // Stage a pending note while in default 'ask' mode
+    const staged = await kernel.callMcpTool!({
+      toolName: 'write_project_note',
+      args: {
+        title: 'Queued Before Auto Accept',
+        content: 'Nota que estava aguardando aprovação.',
+      },
+    })
+    expect(staged.status).toBe('staged')
+    expect(staged.snapshot?.pendingActions).toHaveLength(1)
+
+    // Enable Modo Não Pergunte ('auto_accept') -> auto-approves queued action immediately
+    const snapAuto = await kernel.updateAgencyConsent!({
+      approvalPolicy: 'auto_accept',
+    })
+    expect(snapAuto.consent.approvalPolicy).toBe('auto_accept')
+    expect(snapAuto.pendingActions).toHaveLength(0)
+
+    const autoQueuedPath = path.join(dir, 'notes', 'queued-before-auto-accept.md')
+    expect(fs.existsSync(autoQueuedPath)).toBe(true)
+
+    // Subsequent write_project_note and run_cleanup_command execute immediately without asking
+    const directWrite = await kernel.callMcpTool!({
+      toolName: 'write_project_note',
+      args: {
+        title: 'Direct Auto Note',
+        content: 'Escrita direta em modo auto_accept.',
+      },
+    })
+    expect(directWrite.status).toBe('executed')
+    expect(directWrite.pendingCard).toBeUndefined()
+    expect(fs.existsSync(path.join(dir, 'notes', 'direct-auto-note.md'))).toBe(true)
+
+    const directCleanup = await kernel.callMcpTool!({
+      toolName: 'run_cleanup_command',
+      args: {
+        command: 'rm -rf ./dist-temp',
+      },
+    })
+    expect(directCleanup.status).toBe('executed')
+    expect(
+      directCleanup.snapshot?.auditLog.some(
+        (e) =>
+          e.toolName === 'run_cleanup_command' &&
+          e.decision === 'allowed' &&
+          (e.reason ?? '').includes('auto_accept'),
+      ),
+    ).toBe(true)
+
+    // Switch back to 'ask' and escalate read_workspace_file to 'staged-confirm'
+    await kernel.updateAgencyConsent!({
+      approvalPolicy: 'ask',
+      toolRiskOverrides: {
+        read_workspace_file: 'staged-confirm',
+      },
+    })
+
+    const escalatedRead = await kernel.callMcpTool!({
+      toolName: 'read_workspace_file',
+      args: { path: '/workspace/ashy/README.md' },
+    })
+    expect(escalatedRead.status).toBe('staged')
+
+    const approvedSession = await kernel.approvePendingAction!({
+      actionId: escalatedRead.pendingCard!.id,
+      scope: 'session',
+    })
+    expect(approvedSession.snapshot?.sessionApprovedTools).toContain('read_workspace_file')
+
+    const afterRevoke = await kernel.revokeSessionPermissions!()
+    expect(afterRevoke.sessionApprovedTools).toHaveLength(0)
+    expect(afterRevoke.auditLog.some((e) => e.decision === 'revoked')).toBe(true)
+
+    await kernel.stop()
+  })
+
+  it('enforces EyesMode privacy gate (0 frames when off), deduplicates static frames via 64-bit dHash, and wires vision summary into TurnOrchestrator screenContext', async () => {
+    const dir = makeTempDir()
+    let lastRequestBody: Record<string, unknown> | null = null
+
+    const mockFetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (typeof init?.body === 'string') {
+        lastRequestBody = JSON.parse(init.body) as Record<string, unknown>
+      }
+      const sse =
+        'data: {"choices":[{"delta":{"content":"Estou vendo seu VS Code aberto!"}}]}\n\ndata: [DONE]\n\n'
+      return new Response(sse, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    })
+
+    const kernel = await createAshyHostKernel({
+      userDataDir: dir,
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    })
+
+    const snap = await kernel.completeOnboarding({
+      userName: 'Carlos',
+      providerConfig: {
+        providerId: 'openrouter',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        modelId: 'anthropic/claude-3.7-sonnet',
+        apiKey: 'sk-or-v1-livekey1234',
+      },
+    })
+
+    // 1. eyesMode === 'off' -> 0 frames captured, blocked_privacy logged
+    const blockedObs = await kernel.captureAuthorizedScreen!({
+      windowTitle: 'VS Code — Ashy',
+    })
+    expect(blockedObs.observation.blockedByPrivacy).toBe(true)
+    expect(blockedObs.observation.observed).toBe(false)
+    expect(blockedObs.snapshot.vision.framesCapturedCount).toBe(0)
+    expect(blockedObs.snapshot.vision.blockedPrivacyCount).toBe(1)
+
+    // 2. Enable eyesMode === 'window' -> Frame 1 captured, Frame 2 static skipped by dHash (0 tokens)
+    await kernel.updateAgencyConsent!({
+      eyesMode: 'window',
+    })
+
+    const obs1 = await kernel.captureAuthorizedScreen!({
+      windowTitle: 'VS Code — Ashy',
+      frameFixtureId: 'changed-ide-frame',
+    })
+    expect(obs1.observation.observed).toBe(true)
+    expect(obs1.observation.skippedByDhash).toBe(false)
+    expect(obs1.observation.visionTokensSpent).toBeGreaterThan(0)
+    expect(obs1.snapshot.vision.framesCapturedCount).toBe(1)
+
+    const obs2 = await kernel.captureAuthorizedScreen!({
+      windowTitle: 'VS Code — Ashy',
+      frameFixtureId: 'static-frame',
+    })
+    expect(obs2.observation.observed).toBe(true)
+    expect(obs2.observation.skippedByDhash).toBe(true)
+    expect(obs2.observation.visionTokensSpent).toBe(0)
+    expect(obs2.snapshot.vision.framesSkippedByDhashCount).toBe(1)
+    expect(obs2.snapshot.vision.framesCapturedCount).toBe(1)
+
+    // 3. TurnOrchestrator automatically injects active vision summary as screenContext
+    const events: AshyHostStreamEvent[] = []
+    const unsub = kernel.onHostEvent((ev) => events.push(ev))
+
+    await kernel.sendTurn({
+      sessionId: snap.activeSession.id,
+      text: 'O que você acha do código que está na minha tela?',
+    })
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === 'turn:completed')).toBe(true)
+    })
+    unsub()
+
+    const serializedBody = JSON.stringify(lastRequestBody)
+    expect(serializedBody).toContain('Active Screen/Window:')
+    expect(serializedBody).toContain('VS Code — Ashy')
+
+    await kernel.stop()
+  })
 })

@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { embedTextSync128 } from '@ashy/llm'
+import { DEFAULT_PERSISTED_AGENCY_CONSENT_STATE } from '@ashy/shared'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   createCortexDatabase,
@@ -128,7 +129,7 @@ describe('@ashy/cortex Phase 1 persistence & Migration v2', () => {
 
     const db = createCortexDatabase({ filePath: dbPath })
     expect(db.isPersistent).toBe(true)
-    expect(db.getAppliedMigrations().map((m) => m.version)).toEqual([1, 2, 3])
+    expect(db.getAppliedMigrations().map((m) => m.version)).toEqual([1, 2, 3, 4])
 
     const files = fs.readdirSync(dir)
     expect(files.some((f) => f.startsWith('ashy.db.corrupt.'))).toBe(true)
@@ -264,7 +265,7 @@ describe('@ashy/cortex Phase 1 persistence & Migration v2', () => {
       )
 
       const migrations = db1.getAppliedMigrations()
-      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3])
+      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4])
       expect(migrations.find((m) => m.version === 3)?.name).toBe('v3_phase2_self_writing_memory')
       expect(db1.listSqlTables()).toContain('memory_governance_settings')
 
@@ -531,6 +532,148 @@ describe('@ashy/cortex Phase 1 persistence & Migration v2', () => {
         expect(db1.listProspectiveIntents()).toHaveLength(0)
         expect(db1.deleteMilestone('ms-temp')).toBe(true)
         expect(db1.listMilestones()).toHaveLength(0)
+        db1.close()
+      }
+    }
+  })
+
+  it('applies Migration v4 (v4_phase7_agency_audit_and_consent) and persists action_audit_log and agency_consent_state (including auto_accept / dont-ask mode) across restarts', () => {
+    const dir = makeTempDir()
+    const dbPath = path.join(dir, 'ashy-v4.db')
+
+    for (const forceMemoryFallback of [false, true]) {
+      const db1 = createCortexDatabase(
+        forceMemoryFallback ? { forceMemoryFallback: true } : { filePath: dbPath },
+      )
+
+      const migrations = db1.getAppliedMigrations()
+      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4])
+      expect(migrations.find((m) => m.version === 4)?.name).toBe(
+        'v4_phase7_agency_audit_and_consent',
+      )
+      expect(db1.listSqlTables()).toContain('action_audit_log')
+      expect(db1.listSqlTables()).toContain('agency_consent_state')
+
+      const initialConsent = db1.getAgencyConsentState()
+      expect(initialConsent.eyesMode).toBe(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.eyesMode)
+      expect(initialConsent.micMode).toBe(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.micMode)
+      expect(initialConsent.dndMode).toBe(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.dndMode)
+      expect(initialConsent.approvalPolicy).toBe(
+        DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.approvalPolicy,
+      )
+      expect(initialConsent.eyesMode).toBe('off')
+      expect(initialConsent.micMode).toBe('muted')
+      expect(initialConsent.dndMode).toBe(false)
+      expect(initialConsent.approvalPolicy).toBe('ask')
+
+      const savedConsent = db1.saveAgencyConsentState({
+        eyesMode: 'window',
+        approvalPolicy: 'auto_accept',
+        allowedPaths: ['/workspace/ashy', '/workspace/notes'],
+        allowedWindowTitles: ['VS Code', 'Cursor'],
+        toolRiskOverrides: { read_workspace_file: 'staged-confirm' },
+        externalMcpServers: [
+          {
+            id: 'ext-1',
+            name: 'local-git',
+            description: 'Git MCP',
+            transport: 'http',
+            url: 'http://127.0.0.1:4100/mcp',
+            args: [],
+            enabled: true,
+          },
+        ],
+      })
+      expect(savedConsent.eyesMode).toBe('window')
+      expect(savedConsent.approvalPolicy).toBe('auto_accept')
+      expect(savedConsent.allowedPaths).toEqual(['/workspace/ashy', '/workspace/notes'])
+      expect(savedConsent.allowedWindowTitles).toEqual(['VS Code', 'Cursor'])
+      expect(savedConsent.toolRiskOverrides).toEqual({
+        read_workspace_file: 'staged-confirm',
+      })
+      expect(savedConsent.externalMcpServers).toHaveLength(1)
+      expect(savedConsent.externalMcpServers[0]?.name).toBe('local-git')
+      expect(savedConsent.updatedAt).toBeGreaterThan(0)
+
+      db1.insertActionAuditLog({
+        id: 'audit-1',
+        timestamp: 1730010001000,
+        toolName: 'read_workspace_file',
+        serverName: 'workspace-fs',
+        riskTier: 'read-safe',
+        decision: 'allowed',
+        argsPreview: '{"path":"/workspace/ashy/README.md"}',
+        targetPath: '/workspace/ashy/README.md',
+        reason: 'Allowed read-safe within allowed path',
+      })
+
+      db1.insertActionAuditLog({
+        id: 'audit-2',
+        timestamp: 1730010002000,
+        toolName: 'write_project_note',
+        serverName: 'workspace-notes',
+        riskTier: 'staged-confirm',
+        decision: 'approved',
+        argsPreview: '{"path":"/workspace/ashy/notes/todo.md","content":"# Todo"}',
+        actionId: 'pending-act-1',
+        reason: 'Auto-approved by user policy (auto_accept)',
+        blastRadiusWarning: 'Overwrites existing project note file.',
+        targetPath: '/workspace/ashy/notes/todo.md',
+        commandPreview: 'write /workspace/ashy/notes/todo.md',
+        diffPreview: '--- a/todo.md\n+++ b/todo.md\n+# Todo',
+      })
+
+      const logsBeforeRestart = db1.listActionAuditLog(50)
+      expect(logsBeforeRestart).toHaveLength(2)
+      expect(logsBeforeRestart[0]?.id).toBe('audit-2')
+      expect(logsBeforeRestart[0]?.targetPath).toBe('/workspace/ashy/notes/todo.md')
+      expect(logsBeforeRestart[0]?.commandPreview).toBe('write /workspace/ashy/notes/todo.md')
+      expect(logsBeforeRestart[0]?.diffPreview).toContain('+# Todo')
+      expect(logsBeforeRestart[0]?.blastRadiusWarning).toBe(
+        'Overwrites existing project note file.',
+      )
+      expect(logsBeforeRestart[0]?.reason).toBe('Auto-approved by user policy (auto_accept)')
+      expect(logsBeforeRestart[0]?.actionId).toBe('pending-act-1')
+      expect(logsBeforeRestart[1]?.id).toBe('audit-1')
+
+      if (!forceMemoryFallback) {
+        db1.close()
+        const db2 = createCortexDatabase({ filePath: dbPath })
+        const reloadedConsent = db2.getAgencyConsentState()
+        expect(reloadedConsent.eyesMode).toBe('window')
+        expect(reloadedConsent.approvalPolicy).toBe('auto_accept')
+        expect(reloadedConsent.allowedPaths).toEqual(['/workspace/ashy', '/workspace/notes'])
+        expect(reloadedConsent.allowedWindowTitles).toEqual(['VS Code', 'Cursor'])
+        expect(reloadedConsent.toolRiskOverrides).toEqual({
+          read_workspace_file: 'staged-confirm',
+        })
+        expect(reloadedConsent.externalMcpServers).toEqual([
+          {
+            id: 'ext-1',
+            name: 'local-git',
+            description: 'Git MCP',
+            transport: 'http',
+            url: 'http://127.0.0.1:4100/mcp',
+            args: [],
+            enabled: true,
+          },
+        ])
+
+        const reloadedLogs = db2.listActionAuditLog(50)
+        expect(reloadedLogs).toHaveLength(2)
+        expect(reloadedLogs.map((l) => l.id)).toEqual(['audit-2', 'audit-1'])
+        expect(reloadedLogs[0]?.diffPreview).toContain('+# Todo')
+        expect(reloadedLogs[0]?.blastRadiusWarning).toBe(
+          'Overwrites existing project note file.',
+        )
+        expect(reloadedLogs[0]?.actionId).toBe('pending-act-1')
+
+        db2.clearActionAuditLog()
+        expect(db2.listActionAuditLog(50)).toHaveLength(0)
+        db2.close()
+      } else {
+        db1.clearActionAuditLog()
+        expect(db1.listActionAuditLog(50)).toHaveLength(0)
         db1.close()
       }
     }

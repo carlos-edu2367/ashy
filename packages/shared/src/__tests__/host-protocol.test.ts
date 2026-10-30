@@ -52,6 +52,21 @@ import {
   BUILTIN_LIVE2D_MODEL_PRESETS,
   PNGTUBER_SPRITE_STATE_KEYS,
   DEFAULT_STAGE_OVERLAY_RUNTIME_STATE,
+  COMPUTER_ACTIONS_POLICIES,
+  ComputerActionsPolicySchema,
+  ACTION_RISK_TIERS,
+  ActionRiskTierSchema,
+  AUDIT_DECISIONS,
+  AuditDecisionSchema,
+  APPROVAL_SCOPES,
+  ApprovalScopeSchema,
+  EYES_MODES,
+  EyesModeSchema,
+  MIC_MODES,
+  MicModeSchema,
+  ExternalMcpServerConfigSchema,
+  DEFAULT_PERSISTED_AGENCY_CONSENT_STATE,
+  UpdateAgencyConsentInputSchema,
 } from '../index'
 
 describe('@ashy/shared host-protocol', () => {
@@ -779,5 +794,226 @@ describe('@ashy/shared host-protocol', () => {
     expect(DEFAULT_STAGE_OVERLAY_RUNTIME_STATE.loadedLive2DModelName).toBe(
       'ashy-default.model3.json',
     )
+  })
+})
+
+
+describe('Phase 7 Desktop, Vision & MCP Shared Contracts', () => {
+  it('exposes COMPUTER_ACTIONS_POLICIES including auto_accept ("Não pergunte") and validates ComputerActionsPolicySchema', () => {
+    expect(COMPUTER_ACTIONS_POLICIES).toEqual(['ask', 'session', 'auto_accept', 'off'])
+    for (const policy of COMPUTER_ACTIONS_POLICIES) {
+      expect(v.safeParse(ComputerActionsPolicySchema, policy).success).toBe(true)
+    }
+    expect(v.parse(ComputerActionsPolicySchema, 'auto_accept')).toBe('auto_accept')
+    expect(v.safeParse(ComputerActionsPolicySchema, 'always_allow').success).toBe(false)
+    expect(v.safeParse(ComputerActionsPolicySchema, '').success).toBe(false)
+  })
+
+  it('exposes ACTION_RISK_TIERS, AUDIT_DECISIONS, APPROVAL_SCOPES, EYES_MODES, and MIC_MODES schemas', () => {
+    expect(ACTION_RISK_TIERS).toEqual(['observe-only', 'read-safe', 'staged-confirm'])
+    for (const tier of ACTION_RISK_TIERS) {
+      expect(v.safeParse(ActionRiskTierSchema, tier).success).toBe(true)
+    }
+    expect(v.safeParse(ActionRiskTierSchema, 'root-exec').success).toBe(false)
+
+    expect(AUDIT_DECISIONS).toEqual([
+      'allowed',
+      'staged',
+      'approved',
+      'denied',
+      'blocked_privacy',
+      'blocked_traversal',
+      'revoked',
+    ])
+    for (const decision of AUDIT_DECISIONS) {
+      expect(v.safeParse(AuditDecisionSchema, decision).success).toBe(true)
+    }
+    expect(v.safeParse(AuditDecisionSchema, 'unknown_decision').success).toBe(false)
+
+    expect(APPROVAL_SCOPES).toEqual(['once', 'session'])
+    expect(v.safeParse(ApprovalScopeSchema, 'once').success).toBe(true)
+    expect(v.safeParse(ApprovalScopeSchema, 'session').success).toBe(true)
+    expect(v.safeParse(ApprovalScopeSchema, 'forever').success).toBe(false)
+
+    expect(EYES_MODES).toEqual(['off', 'window', 'screen'])
+    for (const mode of EYES_MODES) {
+      expect(v.safeParse(EyesModeSchema, mode).success).toBe(true)
+    }
+    expect(v.safeParse(EyesModeSchema, 'webcam').success).toBe(false)
+
+    expect(MIC_MODES).toEqual(['muted', 'continuous', 'ptt'])
+    for (const mode of MIC_MODES) {
+      expect(v.safeParse(MicModeSchema, mode).success).toBe(true)
+    }
+    expect(v.safeParse(MicModeSchema, 'always_on').success).toBe(false)
+  })
+
+  it('validates UpdateAgencyConsentInputSchema for partial consent updates and rejects oversized/malformed arrays or invalid risk tiers', () => {
+    const validUpdate = v.safeParse(UpdateAgencyConsentInputSchema, {
+      eyesMode: 'window',
+      micMode: 'ptt',
+      dndMode: true,
+      approvalPolicy: 'auto_accept',
+      allowedPaths: ['  /workspace/ashy  ', 'C:/Users/User/project'],
+      allowedWindowTitles: ['  VS Code  ', 'Terminal'],
+      toolRiskOverrides: {
+        read_workspace_file: 'staged-confirm',
+        write_project_note: 'read-safe',
+      },
+    })
+    expect(validUpdate.success).toBe(true)
+    if (validUpdate.success) {
+      expect(validUpdate.output.approvalPolicy).toBe('auto_accept')
+      expect(validUpdate.output.allowedPaths).toEqual([
+        '/workspace/ashy',
+        'C:/Users/User/project',
+      ])
+      expect(validUpdate.output.allowedWindowTitles).toEqual(['VS Code', 'Terminal'])
+      expect(validUpdate.output.toolRiskOverrides).toEqual({
+        read_workspace_file: 'staged-confirm',
+        write_project_note: 'read-safe',
+      })
+    }
+
+    // Empty partial update is valid
+    expect(v.safeParse(UpdateAgencyConsentInputSchema, {}).success).toBe(true)
+
+    // Reject empty strings in allowedPaths or allowedWindowTitles
+    expect(
+      v.safeParse(UpdateAgencyConsentInputSchema, {
+        allowedPaths: ['   '],
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(UpdateAgencyConsentInputSchema, {
+        allowedWindowTitles: [''],
+      }).success,
+    ).toBe(false)
+
+    // Reject oversized arrays (> 64 items) or oversized elements
+    expect(
+      v.safeParse(UpdateAgencyConsentInputSchema, {
+        allowedPaths: Array.from({ length: 65 }, (_, i) => `/path/${i}`),
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(UpdateAgencyConsentInputSchema, {
+        allowedPaths: ['p'.repeat(513)],
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(UpdateAgencyConsentInputSchema, {
+        allowedWindowTitles: Array.from({ length: 65 }, (_, i) => `Win ${i}`),
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(UpdateAgencyConsentInputSchema, {
+        allowedWindowTitles: ['w'.repeat(257)],
+      }).success,
+    ).toBe(false)
+
+    // Reject invalid risk tiers or empty tool names in toolRiskOverrides
+    expect(
+      v.safeParse(UpdateAgencyConsentInputSchema, {
+        toolRiskOverrides: {
+          read_workspace_file: 'invalid-tier',
+        },
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(UpdateAgencyConsentInputSchema, {
+        toolRiskOverrides: {
+          '   ': 'read-safe',
+        },
+      }).success,
+    ).toBe(false)
+  })
+
+  it('validates ExternalMcpServerConfigSchema for http and stdio transports and rejects invalid configs', () => {
+    const httpServer = v.safeParse(ExternalMcpServerConfigSchema, {
+      id: '  ext-http-1  ',
+      name: '  Local Docs MCP  ',
+      transport: 'http',
+      url: 'http://127.0.0.1:4100/mcp',
+    })
+    expect(httpServer.success).toBe(true)
+    if (httpServer.success) {
+      expect(httpServer.output.id).toBe('ext-http-1')
+      expect(httpServer.output.name).toBe('Local Docs MCP')
+      expect(httpServer.output.description).toBe('')
+      expect(httpServer.output.args).toEqual([])
+      expect(httpServer.output.enabled).toBe(true)
+    }
+
+    const stdioServer = v.safeParse(ExternalMcpServerConfigSchema, {
+      id: 'ext-stdio-1',
+      name: 'Filesystem MCP',
+      description: 'Stdio MCP server',
+      transport: 'stdio',
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-filesystem', '/workspace'],
+      enabled: false,
+    })
+    expect(stdioServer.success).toBe(true)
+    if (stdioServer.success) {
+      expect(stdioServer.output.transport).toBe('stdio')
+      expect(stdioServer.output.command).toBe('npx')
+      expect(stdioServer.output.args).toEqual([
+        '-y',
+        '@modelcontextprotocol/server-filesystem',
+        '/workspace',
+      ])
+      expect(stdioServer.output.enabled).toBe(false)
+    }
+
+    // Reject empty id or name or invalid transport
+    expect(
+      v.safeParse(ExternalMcpServerConfigSchema, {
+        id: '   ',
+        name: 'Server',
+        transport: 'http',
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(ExternalMcpServerConfigSchema, {
+        id: 'srv-1',
+        name: '   ',
+        transport: 'stdio',
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(ExternalMcpServerConfigSchema, {
+        id: 'srv-1',
+        name: 'Server',
+        transport: 'websocket',
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(ExternalMcpServerConfigSchema, {
+        id: 'srv-1',
+        name: 'Server',
+        transport: 'stdio',
+        args: Array.from({ length: 33 }, () => '--flag'),
+      }).success,
+    ).toBe(false)
+  })
+
+  it('starts DEFAULT_PERSISTED_AGENCY_CONSENT_STATE with safe privacy-first defaults', () => {
+    expect(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.eyesMode).toBe('off')
+    expect(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.micMode).toBe('muted')
+    expect(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.dndMode).toBe(false)
+    expect(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.approvalPolicy).toBe('ask')
+    expect(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.allowedPaths).toEqual([
+      '/workspace/ashy',
+      'C:/Users/User/.gemini/antigravity/scratch/ashy',
+    ])
+    expect(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.allowedWindowTitles).toEqual([
+      'VS Code',
+      'Ashy',
+      'Terminal',
+    ])
+    expect(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.toolRiskOverrides).toEqual({})
+    expect(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.externalMcpServers).toEqual([])
+    expect(Object.isFrozen(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE)).toBe(true)
   })
 })

@@ -9,9 +9,11 @@ import {
   SEMANTIC_FACT_CATEGORIES,
   STT_PROVIDER_IDS,
   TTS_PROVIDER_IDS,
+  type ActionRiskTier,
   type ApprovableMemoryKind,
   type AshyEmotion,
   type AshyMotionPreset,
+  type ComputerActionsPolicy,
   type Live2DBuiltinModelId,
   type MemoryGovernanceCategory,
   type MilestoneCategory,
@@ -28,6 +30,7 @@ import {
   ChevronRight,
   ChevronUp,
   Database,
+  Eye,
   EyeOff,
   Folder,
   Ghost,
@@ -53,6 +56,7 @@ import {
   Send,
   Settings,
   Shield,
+  ShieldCheck,
   Sparkles,
   Square,
   Trash2,
@@ -191,6 +195,7 @@ export function App(): React.ReactElement {
     JSON.stringify(DEFAULT_ASHY_LIVE2D_MODEL3_JSON, null, 2),
   )
   const [live2dImportNotice, setLive2dImportNotice] = useState<string | null>(null)
+  const [allowedPathDraft, setAllowedPathDraft] = useState('')
 
   useEffect(() => {
     void useAshyStore.getState().bootstrapFromHost()
@@ -419,6 +424,100 @@ export function App(): React.ReactElement {
               </span>
             </div>
           </div>
+
+          {state.pendingActions.length > 0 && (
+            <div
+              data-testid="stage-pending-action-bubble"
+              data-ui-island="true"
+              style={{
+                width: '100%',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '8px',
+                padding: '10px 12px',
+                borderRadius: '12px',
+                background: 'rgba(28, 22, 38, 0.96)',
+                border: '1px solid rgba(242, 190, 121, 0.55)',
+              }}
+            >
+              <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--accent-peach)' }}>
+                Permissão solicitada pela Ashy ({state.pendingActions.length})
+              </div>
+              {state.pendingActions.map((card) => (
+                <div
+                  key={card.id}
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '6px',
+                    fontSize: '11.5px',
+                  }}
+                >
+                  <div>
+                    <strong>{card.toolName}</strong> — {card.summary}
+                  </div>
+                  {card.targetPath && (
+                    <div>
+                      Caminho: <code>{card.targetPath}</code>
+                    </div>
+                  )}
+                  {card.commandPreview && (
+                    <div>
+                      Comando: <code>{card.commandPreview}</code>
+                    </div>
+                  )}
+                  {card.diffPreview && (
+                    <pre
+                      style={{
+                        margin: 0,
+                        padding: '6px 8px',
+                        borderRadius: '8px',
+                        background: '#12101b',
+                        fontSize: '10.5px',
+                        overflowX: 'auto',
+                      }}
+                    >
+                      {card.diffPreview}
+                    </pre>
+                  )}
+                  {card.blastRadiusWarning && (
+                    <div style={{ color: 'var(--status-danger)', fontWeight: 600 }}>
+                      ⚠️ {card.blastRadiusWarning}
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      className="ashy-peach-btn"
+                      style={{ padding: '4px 10px', fontSize: '11px' }}
+                      data-testid={`btn-stage-approve-once-${card.id}`}
+                      onClick={() => void state.approvePendingAction(card.id, 'once')}
+                    >
+                      Aprovar uma vez
+                    </button>
+                    <button
+                      type="button"
+                      className="ashy-outline-btn"
+                      style={{ padding: '4px 10px', fontSize: '11px' }}
+                      data-testid={`btn-stage-approve-session-${card.id}`}
+                      onClick={() => void state.approvePendingAction(card.id, 'session')}
+                    >
+                      Permitir na sessão
+                    </button>
+                    <button
+                      type="button"
+                      className="ashy-danger-outline-btn"
+                      style={{ padding: '4px 10px', fontSize: '11px' }}
+                      data-testid={`btn-stage-deny-${card.id}`}
+                      onClick={() => state.denyPendingAction(card.id)}
+                    >
+                      Recusar
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
 
           <div
             data-ui-island="true"
@@ -1072,6 +1171,101 @@ export function App(): React.ReactElement {
                   </div>
                 )}
               </div>
+
+              {/* Inline Pending Actions Bar in Studio Chat */}
+              {state.pendingActions.length > 0 && (
+                <div
+                  data-testid="chat-pending-actions-bar"
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '8px',
+                    padding: '10px 14px',
+                    borderTop: '1px solid rgba(242, 190, 121, 0.35)',
+                    background: 'rgba(26, 22, 38, 0.92)',
+                  }}
+                >
+                  {state.pendingActions.map((card) => (
+                    <div
+                      key={card.id}
+                      data-testid={`chat-pending-action-${card.id}`}
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '6px',
+                        padding: '8px 10px',
+                        borderRadius: '10px',
+                        background: '#171421',
+                        border: '1px solid rgba(242, 190, 121, 0.45)',
+                        fontSize: '12px',
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px' }}>
+                        <strong>{card.summary}</strong>
+                        <span className="ashy-badge amber">{card.riskTier}</span>
+                      </div>
+                      {card.targetPath && (
+                        <div style={{ fontSize: '11.5px', color: 'var(--text-secondary)' }}>
+                          Arquivo: <code>{card.targetPath}</code>
+                        </div>
+                      )}
+                      {card.commandPreview && (
+                        <div style={{ fontSize: '11.5px', color: 'var(--text-secondary)' }}>
+                          Comando: <code>{card.commandPreview}</code>
+                        </div>
+                      )}
+                      {card.diffPreview && (
+                        <pre
+                          style={{
+                            margin: 0,
+                            padding: '6px 8px',
+                            borderRadius: '8px',
+                            background: '#12101b',
+                            fontSize: '11px',
+                            overflowX: 'auto',
+                          }}
+                        >
+                          {card.diffPreview}
+                        </pre>
+                      )}
+                      {card.blastRadiusWarning && (
+                        <div style={{ color: 'var(--status-danger)', fontWeight: 600 }}>
+                          ⚠️ {card.blastRadiusWarning}
+                        </div>
+                      )}
+                      <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                        <button
+                          type="button"
+                          className="ashy-peach-btn"
+                          style={{ padding: '4px 10px', fontSize: '11.5px' }}
+                          data-testid={`btn-chat-approve-once-${card.id}`}
+                          onClick={() => void state.approvePendingAction(card.id, 'once')}
+                        >
+                          Aprovar uma vez
+                        </button>
+                        <button
+                          type="button"
+                          className="ashy-outline-btn"
+                          style={{ padding: '4px 10px', fontSize: '11.5px' }}
+                          data-testid={`btn-chat-approve-session-${card.id}`}
+                          onClick={() => void state.approvePendingAction(card.id, 'session')}
+                        >
+                          Permitir na sessão
+                        </button>
+                        <button
+                          type="button"
+                          className="ashy-danger-outline-btn"
+                          style={{ padding: '4px 10px', fontSize: '11.5px' }}
+                          data-testid={`btn-chat-deny-${card.id}`}
+                          onClick={() => state.denyPendingAction(card.id)}
+                        >
+                          Recusar
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               {/* Bottom Chat Composer */}
               <div className="ashy-chat-composer-wrap">
@@ -3352,21 +3546,70 @@ export function App(): React.ReactElement {
                         }
                       />
                     </div>
-                    <div style={{ paddingLeft: '42px' }}>
+                    <div style={{ paddingLeft: '42px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                       <select
                         aria-label="Política de aprovação de ações"
+                        data-testid="select-computer-actions-policy"
                         className="ashy-select"
                         value={state.computerActionsPolicy}
                         onChange={(e) =>
                           state.setComputerActionsPolicy(
-                            e.target.value as 'ask' | 'session' | 'off',
+                            e.target.value as ComputerActionsPolicy,
                           )
                         }
                       >
-                        <option value="ask">Pedir aprovação antes de executar</option>
+                        <option value="ask">Pedir aprovação antes de executar (Padrão)</option>
                         <option value="session">Lembrar aprovação durante a sessão</option>
+                        <option value="auto_accept">
+                          Não perguntar (aceitar automaticamente qualquer permissão)
+                        </option>
                         <option value="off">Desativar execução de ações</option>
                       </select>
+
+                      {/* Modo Não Pergunte (Auto-Accept) Toggle & Badge */}
+                      <div
+                        className="ashy-setting-box"
+                        style={{
+                          padding: '10px 14px',
+                          borderColor:
+                            state.computerActionsPolicy === 'auto_accept'
+                              ? 'rgba(245, 158, 11, 0.55)'
+                              : 'var(--border-subtle)',
+                        }}
+                      >
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <span className="ashy-setting-title" style={{ fontSize: '12.5px' }}>
+                              Modo &ldquo;Não pergunte&rdquo; (Auto-Aceitar Permissões)
+                            </span>
+                            <span
+                              data-testid="dont-ask-mode-badge"
+                              className={`ashy-badge ${
+                                state.computerActionsPolicy === 'auto_accept' ? 'amber' : 'neutral'
+                              }`}
+                            >
+                              {state.computerActionsPolicy === 'auto_accept'
+                                ? 'Não pergunte ativo (Auto-Accept)'
+                                : 'Perguntar antes de agir'}
+                            </span>
+                          </div>
+                          <p className="ashy-setting-desc" style={{ fontSize: '11.5px', margin: 0 }}>
+                            Quando ativado, a Ashy executa ferramentas no computador (incluindo escrita e
+                            comandos) sem exibir prompts de confirmação, registrando tudo no Audit Log.
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={state.computerActionsPolicy === 'auto_accept'}
+                          aria-label="Alternar modo Não pergunte"
+                          data-testid="toggle-dont-ask-mode"
+                          className={`ashy-switch ${
+                            state.computerActionsPolicy === 'auto_accept' ? 'checked' : ''
+                          }`}
+                          onClick={() => state.toggleDontAskMode()}
+                        />
+                      </div>
                     </div>
                   </div>
 
@@ -3569,6 +3812,34 @@ export function App(): React.ReactElement {
                             <strong>{card.summary}</strong>
                             <span className="ashy-badge amber">{card.riskTier}</span>
                           </div>
+                          {card.targetPath && (
+                            <div style={{ fontSize: '11.5px', color: 'var(--text-secondary)' }}>
+                              Arquivo: <code>{card.targetPath}</code>
+                            </div>
+                          )}
+                          {card.commandPreview && (
+                            <div style={{ fontSize: '11.5px', color: 'var(--text-secondary)' }}>
+                              Comando: <code>{card.commandPreview}</code>
+                            </div>
+                          )}
+                          {card.diffPreview && (
+                            <pre
+                              data-testid={`pending-diff-${card.id}`}
+                              style={{
+                                margin: 0,
+                                padding: '8px 10px',
+                                borderRadius: '8px',
+                                background: 'rgba(10, 8, 16, 0.78)',
+                                border: '1px solid var(--border-subtle)',
+                                fontSize: '11px',
+                                color: '#e9d8ce',
+                                overflowX: 'auto',
+                                whiteSpace: 'pre-wrap',
+                              }}
+                            >
+                              {card.diffPreview}
+                            </pre>
+                          )}
                           <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
                             Detalhes: <code>{card.argsPreview}</code>
                           </div>
@@ -3644,6 +3915,291 @@ export function App(): React.ReactElement {
                         </div>
                       </div>
                     ))}
+                  </div>
+                </section>
+
+                {/* Card 4: Visão Autorizada & Deduplicação Perceptual dHash 64-bit */}
+                <section className="ashy-settings-card" data-testid="panel-vision-dhash">
+                  <div className="ashy-settings-section-head">
+                    <div className="ashy-settings-section-icon">
+                      <Eye size={20} />
+                    </div>
+                    <div>
+                      <h3 className="ashy-setting-title">
+                        Visão Autorizada &amp; Filtro Perceptual dHash 64-bit
+                      </h3>
+                      <p className="ashy-setting-desc">
+                        Captura sob demanda respeitando o modo de visão (EyesMode) e descartando
+                        quadros estáticos repetidos para economizar chamadas ao VLM.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(4, 1fr)',
+                      gap: '8px',
+                    }}
+                  >
+                    <div className="ashy-setting-box" style={{ flexDirection: 'column', alignItems: 'flex-start', padding: '10px 12px' }}>
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Quadros capturados</span>
+                      <strong data-testid="vision-frames-captured" style={{ fontSize: '15px' }}>
+                        {state.visionTelemetry.framesCapturedCount}
+                      </strong>
+                    </div>
+                    <div className="ashy-setting-box" style={{ flexDirection: 'column', alignItems: 'flex-start', padding: '10px 12px' }}>
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Filtrados (dHash)</span>
+                      <strong data-testid="vision-frames-skipped" style={{ fontSize: '15px' }}>
+                        {state.visionTelemetry.framesSkippedByDhashCount}
+                      </strong>
+                    </div>
+                    <div className="ashy-setting-box" style={{ flexDirection: 'column', alignItems: 'flex-start', padding: '10px 12px' }}>
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Bloqueios privacidade</span>
+                      <strong data-testid="vision-blocked-privacy" style={{ fontSize: '15px' }}>
+                        {state.visionTelemetry.blockedPrivacyCount}
+                      </strong>
+                    </div>
+                    <div className="ashy-setting-box" style={{ flexDirection: 'column', alignItems: 'flex-start', padding: '10px 12px' }}>
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>Último dHash 64-bit</span>
+                      <code data-testid="vision-last-dhash" style={{ fontSize: '11.5px', color: 'var(--accent-peach)' }}>
+                        {state.visionTelemetry.lastObservation?.dHashHex ?? 'nenhum'}
+                      </code>
+                    </div>
+                  </div>
+
+                  <div className="ashy-setting-box" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '4px' }}>
+                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                      Resumo da última observação visual:
+                    </span>
+                    <div data-testid="vision-last-summary" style={{ fontSize: '12.5px', color: 'var(--text-primary)' }}>
+                      {state.visionTelemetry.lastObservation?.summary ?? 'Nenhuma captura realizada'}
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      className="ashy-outline-btn"
+                      data-testid="btn-vision-capture-window"
+                      onClick={() =>
+                        void state.captureAuthorizedScreen({
+                          windowTitle: 'VS Code — Ashy Companion',
+                        })
+                      }
+                    >
+                      Capturar janela autorizada
+                    </button>
+                    <button
+                      type="button"
+                      className="ashy-outline-btn"
+                      data-testid="btn-vision-capture-static"
+                      onClick={() =>
+                        void state.captureAuthorizedScreen({
+                          windowTitle: 'VS Code — Ashy Companion',
+                          frameFixtureId: 'static-frame',
+                        })
+                      }
+                    >
+                      Testar quadro estático (dHash Skip)
+                    </button>
+                    <button
+                      type="button"
+                      className="ashy-outline-btn"
+                      data-testid="btn-vision-capture-changed"
+                      onClick={() =>
+                        void state.captureAuthorizedScreen({
+                          windowTitle: 'VS Code — Ashy Companion',
+                          frameFixtureId: 'changed-ide-frame',
+                        })
+                      }
+                    >
+                      Capturar nova tela (IDE alterada)
+                    </button>
+                  </div>
+                </section>
+
+                {/* Card 5: Consent Center & Governança de Ferramentas */}
+                <section className="ashy-settings-card" data-testid="panel-consent-center">
+                  <div className="ashy-settings-section-head">
+                    <div className="ashy-settings-section-icon">
+                      <ShieldCheck size={20} />
+                    </div>
+                    <div>
+                      <h3 className="ashy-setting-title">
+                        Consent Center &amp; Governança de Ferramentas
+                      </h3>
+                      <p className="ashy-setting-desc">
+                        Ajuste o nível de risco individual de cada ferramenta MCP, pastas autorizadas,
+                        permissões da sessão e histórico auditável de consentimento.
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Per-Tool Risk Tier Matrix */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-secondary)' }}>
+                      Classificação de Risco por Ferramenta MCP
+                    </div>
+                    {state.agencyTools.map((tool) => {
+                      const effectiveTier =
+                        state.toolRiskOverrides[tool.toolName] ?? tool.effectiveRiskTier
+                      return (
+                        <div
+                          key={tool.toolName}
+                          className="ashy-setting-box"
+                          style={{ padding: '8px 12px' }}
+                        >
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                            <strong style={{ fontSize: '12.5px' }}>{tool.toolName}</strong>
+                            <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                              {tool.description}
+                            </span>
+                          </div>
+                          <select
+                            aria-label={`Nível de risco para ${tool.toolName}`}
+                            data-testid={`select-tool-risk-${tool.toolName}`}
+                            className="ashy-select"
+                            style={{ width: '170px', flexShrink: 0 }}
+                            value={effectiveTier}
+                            onChange={(e) =>
+                              state.setToolRiskTierOverride(
+                                tool.toolName,
+                                e.target.value as ActionRiskTier,
+                              )
+                            }
+                          >
+                            <option value="observe-only">observe-only</option>
+                            <option value="read-safe">read-safe</option>
+                            <option value="staged-confirm">staged-confirm</option>
+                          </select>
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  {/* Allowed Paths Editor */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-secondary)' }}>
+                      Pastas Autorizadas (Sandbox de Arquivos)
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <input
+                        type="text"
+                        data-testid="input-allowed-path"
+                        className="ashy-input"
+                        placeholder="/workspace/notes"
+                        value={allowedPathDraft}
+                        onChange={(e) => setAllowedPathDraft(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="ashy-outline-btn"
+                        data-testid="btn-add-allowed-path"
+                        onClick={() => {
+                          if (allowedPathDraft.trim()) {
+                            state.addAllowedPath(allowedPathDraft.trim())
+                            setAllowedPathDraft('')
+                          }
+                        }}
+                      >
+                        Adicionar pasta
+                      </button>
+                    </div>
+                    <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                      {state.privacyState.allowedPaths.map((p) => (
+                        <span key={p} className="ashy-badge neutral" style={{ gap: '6px' }}>
+                          <code>{p}</code>
+                          {state.privacyState.allowedPaths.length > 1 && (
+                            <button
+                              type="button"
+                              aria-label={`Remover pasta ${p}`}
+                              style={{
+                                background: 'transparent',
+                                border: 'none',
+                                color: 'inherit',
+                                cursor: 'pointer',
+                                padding: 0,
+                                fontSize: '11px',
+                              }}
+                              onClick={() => state.removeAllowedPath(p)}
+                            >
+                              ×
+                            </button>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Session Approved Tools & Revoke */}
+                  <div className="ashy-setting-box" style={{ justifyContent: 'space-between' }}>
+                    <div>
+                      <div className="ashy-setting-title" style={{ fontSize: '12.5px' }}>
+                        Permissões lembradas nesta sessão ({state.sessionApprovedTools.length})
+                      </div>
+                      <p className="ashy-setting-desc" style={{ fontSize: '11.5px', margin: 0 }}>
+                        {state.sessionApprovedTools.length > 0
+                          ? `Ferramentas liberadas: ${state.sessionApprovedTools.join(', ')}`
+                          : 'Nenhuma ferramenta com aprovação automática de sessão.'}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      className="ashy-danger-outline-btn"
+                      data-testid="btn-revoke-session-permissions"
+                      onClick={() => state.revokeSessionPermissions()}
+                    >
+                      Revogar permissões da sessão
+                    </button>
+                  </div>
+
+                  {/* Audit Ledger */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-secondary)' }}>
+                      Histórico de Consentimento e Auditoria ({state.auditLog.length})
+                    </div>
+                    <div
+                      data-testid="consent-audit-ledger"
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '6px',
+                        maxHeight: '200px',
+                        overflowY: 'auto',
+                      }}
+                    >
+                      {state.auditLog.length === 0 ? (
+                        <div style={{ fontSize: '11.5px', color: 'var(--text-muted)' }}>
+                          Nenhuma execução auditada ainda.
+                        </div>
+                      ) : (
+                        state.auditLog.map((entry) => (
+                          <div
+                            key={entry.id}
+                            style={{
+                              padding: '8px 10px',
+                              borderRadius: '8px',
+                              background: '#181523',
+                              border: '1px solid var(--border-subtle)',
+                              fontSize: '11.5px',
+                              display: 'flex',
+                              justifyContent: 'space-between',
+                              alignItems: 'center',
+                              gap: '8px',
+                            }}
+                          >
+                            <div>
+                              <strong>{entry.toolName}</strong> — <span>{entry.reason}</span>
+                              <div style={{ fontSize: '10.5px', color: 'var(--text-muted)' }}>
+                                <code>{entry.argsPreview}</code>
+                              </div>
+                            </div>
+                            <span className="ashy-badge neutral">{entry.decision}</span>
+                          </div>
+                        ))
+                      )}
+                    </div>
                   </div>
                 </section>
               </div>

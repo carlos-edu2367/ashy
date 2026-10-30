@@ -25,6 +25,11 @@ export interface McpToolCompactSummary {
   riskTier: ActionRiskTier
 }
 
+export interface McpToolSummaryWithRiskState extends McpToolCompactSummary {
+  defaultRiskTier: ActionRiskTier
+  effectiveRiskTier: ActionRiskTier
+}
+
 export interface McpToolDetails extends McpToolCompactSummary {
   inputSchema: Record<string, unknown>
 }
@@ -63,6 +68,21 @@ export class ProgressiveMcpRegistry {
     this.servers.set(server.name, { ...server })
   }
 
+  unregisterServer(serverName: string): void {
+    const clean = serverName.trim()
+    this.servers.delete(clean)
+    for (const [toolName, tool] of this.tools.entries()) {
+      if (tool.serverName === clean) {
+        this.tools.delete(toolName)
+        this.gatekeeper.unregisterTool(toolName)
+      }
+    }
+  }
+
+  listServers(): McpServerInfo[] {
+    return Array.from(this.servers.values()).map((s) => ({ ...s }))
+  }
+
   registerTools(registrations: readonly McpToolRegistration[]): void {
     for (const reg of registrations) {
       if (!reg.toolName || reg.toolName.trim().length === 0) {
@@ -77,6 +97,24 @@ export class ProgressiveMcpRegistry {
         handler: reg.handler,
       })
     }
+  }
+
+  setToolRiskTier(toolName: string, riskTier: ActionRiskTier): void {
+    this.gatekeeper.setToolRiskTier(toolName, riskTier)
+  }
+
+  listAllTools(): McpToolSummaryWithRiskState[] {
+    return Array.from(this.tools.values()).map((tool) => {
+      const effectiveRiskTier = this.gatekeeper.getToolRiskTier(tool.toolName) ?? tool.riskTier
+      return {
+        toolName: tool.toolName,
+        serverName: tool.serverName,
+        description: tool.description,
+        riskTier: effectiveRiskTier,
+        defaultRiskTier: tool.riskTier,
+        effectiveRiskTier,
+      }
+    })
   }
 
   getRegisteredToolsCount(): number {
@@ -144,7 +182,7 @@ export class ProgressiveMcpRegistry {
           toolName: t.toolName,
           serverName: t.serverName,
           description: t.description,
-          riskTier: t.riskTier,
+          riskTier: this.gatekeeper.getToolRiskTier(t.toolName) ?? t.riskTier,
         }))
     }
 
@@ -192,7 +230,7 @@ export class ProgressiveMcpRegistry {
       toolName: tool.toolName,
       serverName: tool.serverName,
       description: tool.description,
-      riskTier: tool.riskTier,
+      riskTier: this.gatekeeper.getToolRiskTier(tool.toolName) ?? tool.riskTier,
     }))
   }
 
@@ -208,7 +246,7 @@ export class ProgressiveMcpRegistry {
       toolName: tool.toolName,
       serverName: tool.serverName,
       description: tool.description,
-      riskTier: tool.riskTier,
+      riskTier: this.gatekeeper.getToolRiskTier(tool.toolName) ?? tool.riskTier,
       inputSchema: structuredClone(tool.inputSchema),
     }
   }

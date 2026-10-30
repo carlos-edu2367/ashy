@@ -1,4 +1,6 @@
 import type {
+  AgencySnapshot,
+  ApprovalScope,
   ApprovableMemoryKind,
   AshyBootstrapSnapshot,
   AshyEmotion,
@@ -12,6 +14,7 @@ import type {
   DeletableMemoryKind,
   DreamReflectionCycleResult,
   EpisodicMemory,
+  ExternalMcpServerConfig,
   LlmProviderId,
   MemoryGovernanceCategory,
   MemoryGovernancePolicy,
@@ -25,8 +28,11 @@ import type {
   SaveProviderConfigInput,
   SemanticFact,
   SendTurnInput,
+  SharedPendingActionCard,
   TestProviderInput,
+  UpdateAgencyConsentInput,
   UpsertFactInput,
+  VisionObservationResult,
 } from '@ashy/shared'
 import type { AshyPreloadApi } from '../preload/index'
 
@@ -187,6 +193,62 @@ export function createPreloadHostBridge(
       recordId: string
     }): Promise<AshyBootstrapSnapshot> {
       return invoke<AshyBootstrapSnapshot>('revertTraitEvolution', input)
+    },
+    getAgencySnapshot(): Promise<AgencySnapshot> {
+      return invoke<AgencySnapshot>('getAgencySnapshot')
+    },
+    callMcpTool(input: {
+      toolName: string
+      args?: Record<string, unknown>
+    }): Promise<{
+      status: 'executed' | 'staged' | 'blocked_privacy' | 'blocked_traversal' | 'blocked_policy'
+      output?: unknown
+      pendingCard?: SharedPendingActionCard
+      reason?: string
+      snapshot?: AgencySnapshot
+    }> {
+      return invoke('callMcpTool', input)
+    },
+    approvePendingAction(input: {
+      actionId: string
+      scope?: ApprovalScope
+    }): Promise<{
+      status: 'executed'
+      card: SharedPendingActionCard
+      output: unknown
+      snapshot?: AgencySnapshot
+    }> {
+      return invoke('approvePendingAction', input)
+    },
+    denyPendingAction(input: {
+      actionId: string
+      reason?: string
+    }): Promise<{
+      status: 'denied'
+      card: SharedPendingActionCard
+      feedback: string
+      snapshot?: AgencySnapshot
+    }> {
+      return invoke('denyPendingAction', input)
+    },
+    updateAgencyConsent(input: UpdateAgencyConsentInput): Promise<AgencySnapshot> {
+      return invoke<AgencySnapshot>('updateAgencyConsent', input)
+    },
+    revokeSessionPermissions(input?: { toolName?: string }): Promise<AgencySnapshot> {
+      return invoke<AgencySnapshot>('revokeSessionPermissions', input)
+    },
+    captureAuthorizedScreen(input?: {
+      windowTitle?: string
+      frameFixtureId?: string
+      forceRefresh?: boolean
+    }): Promise<{
+      observation: VisionObservationResult
+      snapshot: AgencySnapshot
+    }> {
+      return invoke('captureAuthorizedScreen', input)
+    },
+    registerExternalMcpServer(input: ExternalMcpServerConfig): Promise<AgencySnapshot> {
+      return invoke<AgencySnapshot>('registerExternalMcpServer', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       return preloadApi.onEvent(listener)
@@ -403,6 +465,62 @@ export function createHttpSseHostBridge(
       recordId: string
     }): Promise<AshyBootstrapSnapshot> {
       return rpc<AshyBootstrapSnapshot>('revertTraitEvolution', input)
+    },
+    getAgencySnapshot(): Promise<AgencySnapshot> {
+      return rpc<AgencySnapshot>('getAgencySnapshot')
+    },
+    callMcpTool(input: {
+      toolName: string
+      args?: Record<string, unknown>
+    }): Promise<{
+      status: 'executed' | 'staged' | 'blocked_privacy' | 'blocked_traversal' | 'blocked_policy'
+      output?: unknown
+      pendingCard?: SharedPendingActionCard
+      reason?: string
+      snapshot?: AgencySnapshot
+    }> {
+      return rpc('callMcpTool', input)
+    },
+    approvePendingAction(input: {
+      actionId: string
+      scope?: ApprovalScope
+    }): Promise<{
+      status: 'executed'
+      card: SharedPendingActionCard
+      output: unknown
+      snapshot?: AgencySnapshot
+    }> {
+      return rpc('approvePendingAction', input)
+    },
+    denyPendingAction(input: {
+      actionId: string
+      reason?: string
+    }): Promise<{
+      status: 'denied'
+      card: SharedPendingActionCard
+      feedback: string
+      snapshot?: AgencySnapshot
+    }> {
+      return rpc('denyPendingAction', input)
+    },
+    updateAgencyConsent(input: UpdateAgencyConsentInput): Promise<AgencySnapshot> {
+      return rpc<AgencySnapshot>('updateAgencyConsent', input)
+    },
+    revokeSessionPermissions(input?: { toolName?: string }): Promise<AgencySnapshot> {
+      return rpc<AgencySnapshot>('revokeSessionPermissions', input)
+    },
+    captureAuthorizedScreen(input?: {
+      windowTitle?: string
+      frameFixtureId?: string
+      forceRefresh?: boolean
+    }): Promise<{
+      observation: VisionObservationResult
+      snapshot: AgencySnapshot
+    }> {
+      return rpc('captureAuthorizedScreen', input)
+    },
+    registerExternalMcpServer(input: ExternalMcpServerConfig): Promise<AgencySnapshot> {
+      return rpc<AgencySnapshot>('registerExternalMcpServer', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       listeners.add(listener)

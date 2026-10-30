@@ -7,6 +7,8 @@ import { runCoreExperimentM2 } from '@ashy/evals'
 import {
   CompleteOnboardingInputSchema,
   RunCoreExperimentInputSchema,
+  type AgencySnapshot,
+  type ApprovalScope,
   type ApprovableMemoryKind,
   type AshyBootstrapSnapshot,
   type AshyEmotion,
@@ -20,6 +22,7 @@ import {
   type DeletableMemoryKind,
   type DreamReflectionCycleResult,
   type EpisodicMemory,
+  type ExternalMcpServerConfig,
   type LlmProviderId,
   type MemoryGovernanceCategory,
   type MemoryGovernancePolicy,
@@ -34,10 +37,14 @@ import {
   type SaveProviderConfigInput,
   type SemanticFact,
   type SendTurnInput,
+  type SharedPendingActionCard,
   type TestProviderInput,
+  type UpdateAgencyConsentInput,
   type UpsertFactInput,
+  type VisionObservationResult,
 } from '@ashy/shared'
 import { seedAshyDemoFixtures } from '../test/fixtures/demo-seed'
+import { createHostAgencyRuntime, type HostAgencyRuntime } from './agency-runtime'
 import { createProviderVault, type ProviderVault } from './provider-vault'
 import type { SecretProtector } from './secret-protector'
 import { createTurnOrchestrator, type TurnOrchestrator } from './turn-orchestrator'
@@ -57,6 +64,7 @@ export interface AshyHostKernel extends AshyHostBridge {
   readonly cortex: AshyCortex
   readonly voiceStore: VoiceIdentityStore
   readonly providerVault: ProviderVault
+  readonly agencyRuntime: HostAgencyRuntime
   readonly turnOrchestrator: TurnOrchestrator
   start(): Promise<void>
   stop(): Promise<void>
@@ -137,18 +145,36 @@ export async function createAshyHostKernel(
       }),
   })
 
+  const agencyRuntimeToken = container.provide('agencyRuntime', {
+    dependsOn: {
+      cortex: cortexToken,
+    },
+    build: ({ cortex }) =>
+      createHostAgencyRuntime({
+        cortex,
+        userDataDir: options.userDataDir,
+        fetchImpl: options.fetchImpl,
+      }),
+    onStop: async (instance) => {
+      await instance.close()
+    },
+  })
+
   const turnOrchestratorToken = container.provide('turnOrchestrator', {
     dependsOn: {
       cortex: cortexToken,
       voiceStore: voiceStoreToken,
       providerVault: providerVaultToken,
+      agencyRuntime: agencyRuntimeToken,
     },
-    build: ({ cortex, voiceStore, providerVault }) =>
+    build: ({ cortex, voiceStore, providerVault, agencyRuntime }) =>
       createTurnOrchestrator({
         cortex,
         voiceStore,
         providerVault,
-        getBootstrapSnapshot: () => buildSnapshot(cortex, voiceStore, providerVault),
+        getBootstrapSnapshot: () =>
+          buildSnapshot(cortex, voiceStore, providerVault, agencyRuntime),
+        getActiveVisionContext: () => agencyRuntime.getActiveVisionContextForTurn(),
         onPersistenceWarning: (warning) => {
           lastPersistenceWarning = warning
         },
@@ -166,6 +192,7 @@ export async function createAshyHostKernel(
     cortex: AshyCortex,
     voiceStore: VoiceIdentityStore,
     providerVault: ProviderVault,
+    agencyRuntime?: HostAgencyRuntime,
   ): AshyBootstrapSnapshot {
     let sessions = cortex.listChatSessions()
     if (sessions.length === 0) {
@@ -268,12 +295,14 @@ export async function createAshyHostKernel(
         lastPersistenceWarning,
       },
       lastEvalReport,
+      agency: (agencyRuntime ?? agencyRuntimeInstance)?.getSnapshot(),
     }
   }
 
   let cortexInstance!: AshyCortex
   let voiceStoreInstance!: VoiceIdentityStore
   let providerVaultInstance!: ProviderVault
+  let agencyRuntimeInstance!: HostAgencyRuntime
   let turnOrchestratorInstance!: TurnOrchestrator
   let dreamIdleTimer: ReturnType<typeof setTimeout> | null = null
   let turnOrchestratorUnsub: (() => void) | null = null
@@ -315,6 +344,7 @@ export async function createAshyHostKernel(
     cortexInstance = await container.resolve(cortexToken)
     voiceStoreInstance = await container.resolve(voiceStoreToken)
     providerVaultInstance = await container.resolve(providerVaultToken)
+    agencyRuntimeInstance = await container.resolve(agencyRuntimeToken)
     turnOrchestratorInstance = await container.resolve(turnOrchestratorToken)
     started = true
     turnOrchestratorUnsub = turnOrchestratorInstance.onEvent((event) => {
@@ -355,6 +385,9 @@ export async function createAshyHostKernel(
     },
     get providerVault() {
       return providerVaultInstance
+    },
+    get agencyRuntime() {
+      return agencyRuntimeInstance
     },
     get turnOrchestrator() {
       return turnOrchestratorInstance
@@ -705,6 +738,70 @@ export async function createAshyHostKernel(
     }): Promise<AshyBootstrapSnapshot> {
       cortexInstance.revertTrait(input.recordId.trim(), Date.now())
       return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)
+    },
+
+    async getAgencySnapshot(): Promise<AgencySnapshot> {
+      return agencyRuntimeInstance.getSnapshot()
+    },
+
+    async callMcpTool(input: {
+      toolName: string
+      args?: Record<string, unknown>
+    }): Promise<{
+      status: 'executed' | 'staged' | 'blocked_privacy' | 'blocked_traversal' | 'blocked_policy'
+      output?: unknown
+      pendingCard?: SharedPendingActionCard
+      reason?: string
+      snapshot?: AgencySnapshot
+    }> {
+      return agencyRuntimeInstance.callMcpTool(input)
+    },
+
+    async approvePendingAction(input: {
+      actionId: string
+      scope?: ApprovalScope
+    }): Promise<{
+      status: 'executed'
+      card: SharedPendingActionCard
+      output: unknown
+      snapshot?: AgencySnapshot
+    }> {
+      return agencyRuntimeInstance.approvePendingAction(input)
+    },
+
+    async denyPendingAction(input: {
+      actionId: string
+      reason?: string
+    }): Promise<{
+      status: 'denied'
+      card: SharedPendingActionCard
+      feedback: string
+      snapshot?: AgencySnapshot
+    }> {
+      return agencyRuntimeInstance.denyPendingAction(input)
+    },
+
+    async updateAgencyConsent(input: UpdateAgencyConsentInput): Promise<AgencySnapshot> {
+      return agencyRuntimeInstance.updateConsent(input)
+    },
+
+    async revokeSessionPermissions(input?: { toolName?: string }): Promise<AgencySnapshot> {
+      return agencyRuntimeInstance.revokeSessionPermissions(input)
+    },
+
+    async captureAuthorizedScreen(input?: {
+      windowTitle?: string
+      frameFixtureId?: string
+      forceRefresh?: boolean
+    }): Promise<{
+      observation: VisionObservationResult
+      snapshot: AgencySnapshot
+    }> {
+      return agencyRuntimeInstance.captureAuthorizedScreen(input)
+    },
+
+    async registerExternalMcpServer(input: ExternalMcpServerConfig): Promise<AgencySnapshot> {
+      return agencyRuntimeInstance.registerExternalMcpServer(input)
     },
 
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
