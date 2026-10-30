@@ -38,6 +38,16 @@ import {
   VOICE_FIXTURE_IDS,
   VoiceFixtureIdSchema,
   DEFAULT_VOICE_RUNTIME_SETTINGS,
+  ASHY_MOTION_PRESETS,
+  ASHY_VISEME_KEYS,
+  ASHY_EYE_LAYER_STATES,
+  AshyMotionPresetSchema,
+  AshyVisemeKeySchema,
+  AshyEyeLayerStateSchema,
+  SetStageOverlayIgnoreMouseInputSchema,
+  SetStageOverlayVisibleInputSchema,
+  DEFAULT_STAGE_SHORTCUTS,
+  DEFAULT_STAGE_OVERLAY_RUNTIME_STATE,
 } from '../index'
 
 describe('@ashy/shared host-protocol', () => {
@@ -682,5 +692,67 @@ describe('@ashy/shared host-protocol', () => {
       interruptionControlNote: 'n'.repeat(1025),
     })
     expect(oversizedNote.success).toBe(false)
+  })
+
+  it('validates Phase 6 motion presets, viseme keys, eye states, and overlay IPC schemas', () => {
+    expect(ASHY_MOTION_PRESETS).toEqual([
+      'idle',
+      'tease',
+      'nod',
+      'shake',
+      'bounce',
+      'think',
+      'laugh',
+      'shrug',
+      'sparkle',
+    ])
+    expect(ASHY_VISEME_KEYS).toEqual(['closed', 'A', 'E', 'I', 'O', 'U'])
+    expect(ASHY_EYE_LAYER_STATES).toEqual(['open', 'half', 'closed', 'wink'])
+
+    expect(v.parse(AshyMotionPresetSchema, 'tease')).toBe('tease')
+    expect(() => v.parse(AshyMotionPresetSchema, 'backflip')).toThrow()
+
+    expect(v.parse(AshyVisemeKeySchema, 'A')).toBe('A')
+    expect(() => v.parse(AshyVisemeKeySchema, 'Z')).toThrow()
+
+    expect(v.parse(AshyEyeLayerStateSchema, 'wink')).toBe('wink')
+    expect(() => v.parse(AshyEyeLayerStateSchema, 'crossed')).toThrow()
+
+    expect(
+      v.parse(SetStageOverlayIgnoreMouseInputSchema, {
+        ignore: true,
+        forward: true,
+      }),
+    ).toEqual({ ignore: true, forward: true })
+    expect(
+      v.parse(SetStageOverlayIgnoreMouseInputSchema, {
+        ignore: false,
+      }),
+    ).toEqual({ ignore: false, forward: true })
+    expect(() =>
+      v.parse(SetStageOverlayIgnoreMouseInputSchema, {
+        ignore: 'yes',
+      }),
+    ).toThrow()
+
+    expect(
+      v.parse(SetStageOverlayVisibleInputSchema, {
+        visible: false,
+      }),
+    ).toEqual({ visible: false })
+    expect(() =>
+      v.parse(SetStageOverlayVisibleInputSchema, {
+        visible: 1,
+      }),
+    ).toThrow()
+
+    expect(DEFAULT_STAGE_SHORTCUTS.toggleHideStage).toBe('Alt+H')
+    expect(DEFAULT_STAGE_SHORTCUTS.electronGlobalHideStage).toBe('CommandOrControl+Shift+H')
+    expect(DEFAULT_STAGE_OVERLAY_RUNTIME_STATE.isOverlayVisible).toBe(true)
+    expect(DEFAULT_STAGE_OVERLAY_RUNTIME_STATE.ignoringMouseEvents).toBe(false)
+    expect(DEFAULT_STAGE_OVERLAY_RUNTIME_STATE.activeStageMode).toBe('tachie')
+    expect(DEFAULT_STAGE_OVERLAY_RUNTIME_STATE.loadedLive2DModelName).toBe(
+      'ashy-default.model3.json',
+    )
   })
 })

@@ -58,6 +58,82 @@ export const VOICE_FIXTURE_IDS = [
 export type VoiceFixtureId = (typeof VOICE_FIXTURE_IDS)[number]
 export const VoiceFixtureIdSchema = v.picklist(VOICE_FIXTURE_IDS)
 
+export const ASHY_MOTION_PRESETS = [
+  'idle',
+  'tease',
+  'nod',
+  'shake',
+  'bounce',
+  'think',
+  'laugh',
+  'shrug',
+  'sparkle',
+] as const
+export type AshyMotionPreset = (typeof ASHY_MOTION_PRESETS)[number]
+export const AshyMotionPresetSchema = v.picklist(ASHY_MOTION_PRESETS)
+
+export const ASHY_VISEME_KEYS = ['closed', 'A', 'E', 'I', 'O', 'U'] as const
+export type AshyVisemeKey = (typeof ASHY_VISEME_KEYS)[number]
+export const AshyVisemeKeySchema = v.picklist(ASHY_VISEME_KEYS)
+
+export const ASHY_EYE_LAYER_STATES = ['open', 'half', 'closed', 'wink'] as const
+export type AshyEyeLayerState = (typeof ASHY_EYE_LAYER_STATES)[number]
+export const AshyEyeLayerStateSchema = v.picklist(ASHY_EYE_LAYER_STATES)
+
+export interface StageShortcutBindings {
+  toggleMic: string
+  toggleEyes: string
+  toggleDnd: string
+  toggleHideStage: string
+  electronGlobalMic: string
+  electronGlobalEyes: string
+  electronGlobalDnd: string
+  electronGlobalHideStage: string
+}
+
+export const DEFAULT_STAGE_SHORTCUTS: Readonly<StageShortcutBindings> = Object.freeze({
+  toggleMic: 'Alt+M',
+  toggleEyes: 'Alt+E',
+  toggleDnd: 'Alt+D',
+  toggleHideStage: 'Alt+H',
+  electronGlobalMic: 'CommandOrControl+Shift+M',
+  electronGlobalEyes: 'CommandOrControl+Shift+E',
+  electronGlobalDnd: 'CommandOrControl+Shift+D',
+  electronGlobalHideStage: 'CommandOrControl+Shift+H',
+})
+
+export interface StageOverlayRuntimeState {
+  isOverlayVisible: boolean
+  ignoringMouseEvents: boolean
+  activeStageMode: 'tachie' | 'live2d'
+  loadedLive2DModelName: string
+  shortcuts: StageShortcutBindings
+}
+
+export const DEFAULT_STAGE_OVERLAY_RUNTIME_STATE: Readonly<StageOverlayRuntimeState> =
+  Object.freeze({
+    isOverlayVisible: true,
+    ignoringMouseEvents: false,
+    activeStageMode: 'tachie',
+    loadedLive2DModelName: 'ashy-default.model3.json',
+    shortcuts: DEFAULT_STAGE_SHORTCUTS,
+  })
+
+export const SetStageOverlayIgnoreMouseInputSchema = v.object({
+  ignore: v.boolean(),
+  forward: v.optional(v.boolean(), true),
+})
+export type SetStageOverlayIgnoreMouseInput = v.InferOutput<
+  typeof SetStageOverlayIgnoreMouseInputSchema
+>
+
+export const SetStageOverlayVisibleInputSchema = v.object({
+  visible: v.boolean(),
+})
+export type SetStageOverlayVisibleInput = v.InferOutput<
+  typeof SetStageOverlayVisibleInputSchema
+>
+
 export interface TtfaTelemetryRecord {
   providerId: TtsProviderId
   lastTtfaMs: number | null
