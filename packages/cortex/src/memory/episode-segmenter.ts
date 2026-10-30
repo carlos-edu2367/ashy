@@ -30,6 +30,115 @@ export interface DetectEpisodeBoundaryOptions {
   sessionSwitch?: boolean
 }
 
+const TOPIC_STOPWORDS = new Set([
+  'para',
+  'como',
+  'isso',
+  'essa',
+  'esse',
+  'este',
+  'esta',
+  'isto',
+  'aquilo',
+  'aquele',
+  'aquela',
+  'voce',
+  'voces',
+  'mais',
+  'menos',
+  'muito',
+  'muita',
+  'quando',
+  'onde',
+  'qual',
+  'quais',
+  'quem',
+  'porque',
+  'estou',
+  'estava',
+  'fazer',
+  'fazendo',
+  'coisa',
+  'coisas',
+  'algum',
+  'alguma',
+  'nenhum',
+  'nenhuma',
+  'apareceu',
+  'quero',
+  'saber',
+  'sabe',
+  'achou',
+  'ideia',
+  'coloquei',
+  'umas',
+  'novas',
+  'nova',
+  'novo',
+  'novos',
+  'mesmo',
+  'mesma',
+  'tudo',
+  'nada',
+  'aqui',
+  'ali',
+  'ainda',
+  'entendi',
+  'entendii',
+  'nah',
+  'nahh',
+  'opa',
+  'nossa',
+  'rapaz',
+  'cara',
+  'mano',
+  'amigo',
+  'amiga',
+  'gente',
+  'tranquilo',
+  'tranquila',
+  'beleza',
+  'contigo',
+  'comigo',
+  'hoje',
+  'agora',
+  'entao',
+  'valeu',
+  'obrigado',
+  'obrigada',
+  'suave',
+  'firmeza',
+  'tarde',
+  'noite',
+])
+
+/**
+ * Returns true only when a user message contains enough substantive topical content
+ * (>= 4 non-stopword tokens of length >= 4, excluding laughter and short meta/banter turns)
+ * to be eligible for semantic `topic_shift` episode boundary segmentation.
+ */
+export function isSubstantiveTopicMessage(text: string): boolean {
+  if (typeof text !== 'string') return false
+  const normalized = text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  if (normalized.length < 20) return false
+
+  const tokens = normalized.split(' ').filter((tok) => {
+    if (tok.length < 4) return false
+    if (TOPIC_STOPWORDS.has(tok)) return false
+    if (/^(k+|h[aei]+h[aei]*|rs+|entendi+|nah+|opa+|oi+|ola+)$/i.test(tok)) return false
+    return true
+  })
+
+  return tokens.length >= 4
+}
+
 /**
  * Evaluates unconsolidated chat messages in a session and determines whether
  * a soft (>= 30m idle gap, >= 6 turns, or topic shift < 0.18 cosine similarity)
@@ -136,11 +245,16 @@ export function detectEpisodeBoundary(
     }
   }
 
-  // Semantic topic shift check across consecutive user turns (requires at least 2 user turns)
+  // Semantic topic shift check across consecutive user turns (requires at least 2 substantive user turns)
   if (userMessages.length >= 2) {
     for (let i = 1; i < userMessages.length; i++) {
-      const prevVec = embedTextSync128(userMessages[i - 1]!.content)
-      const currVec = embedTextSync128(userMessages[i]!.content)
+      const prevContent = userMessages[i - 1]!.content
+      const currContent = userMessages[i]!.content
+      if (!isSubstantiveTopicMessage(prevContent) || !isSubstantiveTopicMessage(currContent)) {
+        continue
+      }
+      const prevVec = embedTextSync128(prevContent)
+      const currVec = embedTextSync128(currContent)
       const similarity = computeCosineSimilarity128(prevVec, currVec)
       if (similarity < TOPIC_SHIFT_THRESHOLD) {
         return {

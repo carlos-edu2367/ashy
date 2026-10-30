@@ -60,13 +60,6 @@ const USAGE_STOPWORDS = new Set([
   'muito',
   'mais',
   'como',
-  'banco',
-  'codigo',
-  'projeto',
-  'local',
-  'ajustamos',
-  'configuracao',
-  'configuramos',
 ])
 
 export interface TurnMemoryEvaluationItem {
@@ -174,7 +167,7 @@ export function evaluateTurnMemoryUsage(
       }
     }
 
-    const denom = Math.max(1, Math.min(5, memoryTokens.length))
+    const denom = Math.max(1, Math.min(6, memoryTokens.length))
     const lexicalOverlap = Math.min(1, matchedCount / denom)
 
     let usageScore = 0
@@ -182,10 +175,15 @@ export function evaluateTurnMemoryUsage(
       usageScore = Math.max(lexicalOverlap, 1.0)
     } else if (matchedCount > 0) {
       const memVec =
-        memory.embedding && memory.embedding.length === 128
+        memory.embedding && memory.embedding.length > 0
           ? memory.embedding
           : embedTextSync128(memoryDoc)
-      const semanticSim = Math.max(0, computeCosineSimilarity128(assistantVec, memVec))
+      const semanticSim = Math.max(
+        0,
+        memVec.length === assistantVec.length
+          ? computeCosineSimilarity128(assistantVec, memVec)
+          : computeCosineSimilarity128(assistantVec, embedTextSync128(memoryDoc)),
+      )
       usageScore = Number(
         Math.min(1, Math.max(lexicalOverlap, lexicalOverlap * 0.85 + semanticSim * 0.25)).toFixed(4),
       )

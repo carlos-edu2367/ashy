@@ -1,12 +1,22 @@
-import React, { useState } from 'react'
-import { LLM_PROVIDER_IDS, type LlmProviderId, type ProviderHealthResult } from '@ashy/shared'
-import { KeyRound, Sparkles, Wifi } from 'lucide-react'
+import React, { useEffect, useState } from 'react'
+import {
+  FALLBACK_PROVIDER_MODELS,
+  LLM_PROVIDER_IDS,
+  type LlmProviderId,
+  type ProviderHealthResult,
+  type ReasoningEffort,
+} from '@ashy/shared'
+import { KeyRound, RefreshCw, Search, Sparkles, Wifi } from 'lucide-react'
 import { useAshyStore } from '../store/useAshyStore'
+import { REASONING_EFFORT_OPTIONS } from './ModelsSettingsPanel'
 
 export function FirstMeetingWizard(): React.ReactElement {
   const providers = useAshyStore((s) => s.providers)
   const completeOnboarding = useAshyStore((s) => s.completeOnboarding)
   const testProviderConnection = useAshyStore((s) => s.testProviderConnection)
+  const providerModelCatalog = useAshyStore((s) => s.providerModelCatalog)
+  const isLoadingProviderModels = useAshyStore((s) => s.isLoadingProviderModels)
+  const listProviderModels = useAshyStore((s) => s.listProviderModels)
 
   const initialProvider: LlmProviderId = providers.activeProviderId ?? 'openrouter'
   const initialConfig = providers.configs[initialProvider]
@@ -18,13 +28,37 @@ export function FirstMeetingWizard(): React.ReactElement {
   const [modelId, setModelId] = useState(
     initialConfig?.modelId ?? 'anthropic/claude-3.7-sonnet',
   )
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(
+    initialConfig?.reasoningEffort ?? 'none',
+  )
   const [apiKey, setApiKey] = useState('')
+  const [modelSearch, setModelSearch] = useState('')
   const [testResult, setTestResult] = useState<ProviderHealthResult | null>(null)
   const [isTesting, setIsTesting] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
   const currentProviderMeta = providers.configs[selectedProvider]
+  const currentCatalog =
+    providerModelCatalog[selectedProvider] ?? FALLBACK_PROVIDER_MODELS[selectedProvider] ?? []
+  const filteredCatalog = currentCatalog.filter((m) => {
+    const q = modelSearch.trim().toLowerCase()
+    if (!q) return true
+    return m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q)
+  })
+  const isLoadingCatalog = isLoadingProviderModels
+
+  useEffect(() => {
+    void listProviderModels({ providerId: selectedProvider })
+  }, [selectedProvider, listProviderModels])
+
+  const handleRefreshCatalog = () => {
+    void listProviderModels({
+      providerId: selectedProvider,
+      baseUrl: baseUrl.trim() || currentProviderMeta?.baseUrl,
+      ...(apiKey.trim().length > 0 ? { apiKey: apiKey.trim() } : {}),
+    })
+  }
 
   const handleProviderChange = (nextId: LlmProviderId) => {
     setSelectedProvider(nextId)
@@ -32,6 +66,7 @@ export function FirstMeetingWizard(): React.ReactElement {
     if (nextCfg) {
       setBaseUrl(nextCfg.baseUrl)
       setModelId(nextCfg.modelId)
+      setReasoningEffort(nextCfg.reasoningEffort ?? 'none')
     }
     setTestResult(null)
     setErrorMsg(null)
@@ -45,6 +80,7 @@ export function FirstMeetingWizard(): React.ReactElement {
         providerId: selectedProvider,
         baseUrl: baseUrl.trim() || currentProviderMeta.baseUrl,
         modelId: modelId.trim() || currentProviderMeta.modelId,
+        reasoningEffort,
         ...(apiKey.trim().length > 0 ? { apiKey: apiKey.trim() } : {}),
       })
       setTestResult(res)
@@ -81,6 +117,7 @@ export function FirstMeetingWizard(): React.ReactElement {
                 providerId: selectedProvider,
                 baseUrl: baseUrl.trim() || currentProviderMeta.baseUrl,
                 modelId: modelId.trim() || currentProviderMeta.modelId,
+                reasoningEffort,
                 ...(trimmedKey.length > 0 ? { apiKey: trimmedKey } : {}),
               },
             }
@@ -234,7 +271,7 @@ export function FirstMeetingWizard(): React.ReactElement {
           </div>
 
           <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-            <div style={{ flex: 1, minWidth: '170px' }}>
+            <div style={{ flex: 1, minWidth: '150px' }}>
               <label
                 htmlFor="onboarding-provider-select"
                 style={{
@@ -261,7 +298,7 @@ export function FirstMeetingWizard(): React.ReactElement {
               </select>
             </div>
 
-            <div style={{ flex: 1, minWidth: '200px' }}>
+            <div style={{ flex: 1, minWidth: '180px' }}>
               <label
                 htmlFor="onboarding-model-id-input"
                 style={{
@@ -281,6 +318,97 @@ export function FirstMeetingWizard(): React.ReactElement {
                 value={modelId}
                 onChange={(e) => setModelId(e.target.value)}
               />
+            </div>
+
+            <div style={{ flex: 1, minWidth: '180px' }}>
+              <label
+                htmlFor="onboarding-reasoning-effort-select"
+                style={{
+                  display: 'block',
+                  fontSize: '11.5px',
+                  color: 'var(--text-secondary)',
+                  marginBottom: '4px',
+                }}
+              >
+                Raciocínio (Thinking)
+              </label>
+              <select
+                id="onboarding-reasoning-effort-select"
+                data-testid="onboarding-reasoning-effort-select"
+                className="ashy-select"
+                value={reasoningEffort}
+                onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort)}
+              >
+                {REASONING_EFFORT_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div
+            data-testid="onboarding-model-suggestions"
+            style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <div style={{ position: 'relative', flex: 1 }}>
+                <Search
+                  size={12}
+                  style={{
+                    position: 'absolute',
+                    left: '9px',
+                    top: '50%',
+                    transform: 'translateY(-50%)',
+                    color: 'var(--text-muted)',
+                  }}
+                />
+                <input
+                  data-testid="onboarding-model-search-input"
+                  type="text"
+                  className="ashy-input"
+                  style={{ paddingLeft: '26px', height: '28px', fontSize: '11.5px' }}
+                  placeholder="Filtrar modelos do catálogo..."
+                  value={modelSearch}
+                  onChange={(e) => setModelSearch(e.target.value)}
+                />
+              </div>
+              <button
+                type="button"
+                data-testid="wizard-refresh-models-btn"
+                className="ashy-outline-btn"
+                style={{ padding: '4px 10px', fontSize: '11px' }}
+                disabled={isLoadingCatalog}
+                onClick={handleRefreshCatalog}
+              >
+                <RefreshCw size={11} />
+                <span>{isLoadingCatalog ? 'Buscando...' : 'Buscar da API'}</span>
+              </button>
+            </div>
+
+            <div
+              data-testid="onboarding-model-catalog-list"
+              style={{
+                display: 'flex',
+                gap: '6px',
+                flexWrap: 'wrap',
+                maxHeight: '110px',
+                overflowY: 'auto',
+              }}
+            >
+              {filteredCatalog.map((m) => (
+                <button
+                  key={m.id}
+                  type="button"
+                  data-testid={`onboarding-model-option-${m.id}`}
+                  className={`ashy-filter-pill ${modelId.trim() === m.id ? 'active' : ''}`}
+                  style={{ padding: '3px 8px', fontSize: '11px' }}
+                  onClick={() => setModelId(m.id)}
+                >
+                  {m.id}
+                </button>
+              ))}
             </div>
           </div>
 

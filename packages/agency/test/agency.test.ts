@@ -726,6 +726,10 @@ describe('@ashy/agency — Phase 7: Auto-Accept Mode, Risk Overrides, Diff Previ
           )
         }
 
+        if (body.method === 'notifications/initialized') {
+          return new Response(null, { status: 202 })
+        }
+
         if (body.method === 'tools/list') {
           return new Response(
             JSON.stringify({
@@ -809,7 +813,12 @@ describe('@ashy/agency — Phase 7: Auto-Accept Mode, Risk Overrides, Diff Previ
         content: [{ type: 'text', text: 'clean working tree on branch main' }],
         isError: false,
       })
-      expect(rpcCalls.map((c) => c.method)).toEqual(['initialize', 'tools/list', 'tools/call'])
+      expect(rpcCalls.map((c) => c.method)).toEqual([
+        'initialize',
+        'notifications/initialized',
+        'tools/list',
+        'tools/call',
+      ])
     })
 
     it('communicates via JSON-RPC 2.0 over Stdio with shell:false and framing', async () => {

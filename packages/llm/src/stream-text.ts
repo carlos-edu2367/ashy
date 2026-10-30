@@ -1,5 +1,7 @@
 import * as v from 'valibot'
 
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high'
+
 export interface TokenUsage {
   promptTokens: number
   completionTokens: number
@@ -81,6 +83,7 @@ export interface LanguageModelRequest {
   system?: string
   temperature?: number
   maxTokens?: number
+  reasoningEffort?: ReasoningEffort
   signal?: AbortSignal
 }
 
@@ -120,6 +123,7 @@ export interface StreamTextOptions {
   maxSteps?: number
   temperature?: number
   maxTokens?: number
+  reasoningEffort?: ReasoningEffort
   signal?: AbortSignal
   preToolCall?: (
     ctx: PreToolCallContext,
@@ -288,6 +292,7 @@ export function streamText(
           system: options.system,
           temperature: options.temperature,
           maxTokens: options.maxTokens,
+          reasoningEffort: options.reasoningEffort,
           signal: options.signal,
         })
       } catch (err) {
@@ -358,10 +363,10 @@ export function streamText(
         while (true) {
           const { done, value } = await reader.read()
           if (done) {
-            if (inlineTagCandidate === '<' && !inInlineReasoning) {
-              stepText += '<'
-              fullText += '<'
-              yield { type: 'text-delta', text: '<', stepIndex }
+            if (inlineTagCandidate.length > 0 && !inInlineReasoning) {
+              stepText += inlineTagCandidate
+              fullText += inlineTagCandidate
+              yield { type: 'text-delta', text: inlineTagCandidate, stepIndex }
             }
             inlineTagCandidate = ''
             break

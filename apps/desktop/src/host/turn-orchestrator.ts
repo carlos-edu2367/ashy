@@ -2,12 +2,17 @@ import * as v from 'valibot'
 import { analyzeUserAffectReaction, type AshyCortex } from '@ashy/cortex'
 import {
   createTailSafeMarkerParser,
+  defineTool,
+  embedTextSync128,
   streamText,
   stripBondManipulation,
   stripLeadingAssistantSlop,
   type ChatMessage,
+  type ToolDefinition,
 } from '@ashy/llm'
 import {
+  ASHY_BASELINE_MOOD,
+  ASHY_DEFAULT_TRAITS,
   SendTurnInputSchema,
   type AshyBootstrapSnapshot,
   type AshyEmotion,
@@ -17,6 +22,7 @@ import {
   type SeriousnessAssessment,
   type UserAffectReaction,
 } from '@ashy/shared'
+import type { HostAgencyRuntime } from './agency-runtime'
 import type { ProviderVault } from './provider-vault'
 import type { VoiceIdentityStore } from './voice-identity-store'
 
@@ -37,6 +43,7 @@ export interface TurnOrchestratorOptions {
   cortex: AshyCortex
   voiceStore: VoiceIdentityStore
   providerVault: ProviderVault
+  readonly agencyRuntime?: HostAgencyRuntime
   getBootstrapSnapshot: () => AshyBootstrapSnapshot | Promise<AshyBootstrapSnapshot>
   getActiveVisionContext?: () => string | undefined
   onPersistenceWarning?: (warning: string | null) => void
@@ -56,6 +63,170 @@ export interface TurnOrchestrator {
   onEvent(listener: (event: AshyHostStreamEvent) => void): () => void
   getDominantEmotion(): AshyEmotion
   getLastPersistenceWarning(): string | null
+}
+
+async function executeGatekeptMcpTool(
+  agencyRuntime: HostAgencyRuntime,
+  toolName: string,
+  args: Record<string, unknown>,
+) {
+  const res = await agencyRuntime.callMcpTool({
+    toolName,
+    args,
+  })
+  return {
+    status: res.status,
+    ...(res.output !== undefined ? { output: res.output } : {}),
+    ...(res.pendingCard ? { pendingCard: res.pendingCard } : {}),
+    ...(res.reason ? { reason: res.reason } : {}),
+  }
+}
+
+function buildAgencyChatTools(agencyRuntime: HostAgencyRuntime): ToolDefinition[] {
+  const runtimeWithOptionalMeta = agencyRuntime as HostAgencyRuntime & {
+    searchMcpTools?: (query: string, limit?: number) => unknown
+    getMcpToolDetails?: (toolName: string) => unknown
+  }
+
+  const tools: ToolDefinition[] = [
+    defineTool({
+      name: 'search_mcp_tools',
+      description:
+        'Searches registered MCP tools by keyword across name, server, and description, returning compact summaries.',
+      parameters: v.object({
+        query: v.string(),
+        limit: v.optional(v.number()),
+      }),
+      execute: (args) => {
+        if (typeof runtimeWithOptionalMeta.searchMcpTools === 'function') {
+          return runtimeWithOptionalMeta.searchMcpTools(args.query, args.limit)
+        }
+        return agencyRuntime.mcpRegistry.search_mcp_tools({
+          query: args.query,
+          limit: args.limit,
+        })
+      },
+    }),
+    defineTool({
+      name: 'get_mcp_tool_details',
+      description: 'Returns the full JSON schema and details for a specific MCP tool by name.',
+      parameters: v.object({
+        toolName: v.string(),
+      }),
+      execute: (args) => {
+        if (typeof runtimeWithOptionalMeta.getMcpToolDetails === 'function') {
+          return runtimeWithOptionalMeta.getMcpToolDetails(args.toolName)
+        }
+        return agencyRuntime.mcpRegistry.get_mcp_tool_details({
+          toolName: args.toolName,
+        })
+      },
+    }),
+    defineTool({
+      name: 'call_mcp_tool',
+      description:
+        'Invokes a registered MCP tool with arguments, routed through ActionGatekeeper.',
+      parameters: v.object({
+        toolName: v.string(),
+        args: v.optional(v.record(v.string(), v.unknown())),
+      }),
+      execute: async (args) =>
+        executeGatekeptMcpTool(agencyRuntime, args.toolName, args.args ?? {}),
+    }),
+    defineTool({
+      name: 'get_active_window_title',
+      description: 'Reads the currently focused desktop window title when EyesMode allows it.',
+      parameters: v.object({
+        windowTitle: v.optional(v.string()),
+      }),
+      execute: async (args) =>
+        executeGatekeptMcpTool(agencyRuntime, 'get_active_window_title', args),
+    }),
+    defineTool({
+      name: 'capture_authorized_screen',
+      description:
+        'Captures an authorized window/screen frame and deduplicates static screens via 64-bit dHash.',
+      parameters: v.object({
+        windowTitle: v.optional(v.string()),
+        frameFixtureId: v.optional(v.string()),
+        forceRefresh: v.optional(v.boolean()),
+      }),
+      execute: async (args) =>
+        executeGatekeptMcpTool(agencyRuntime, 'capture_authorized_screen', args),
+    }),
+    defineTool({
+      name: 'read_workspace_file',
+      description: 'Reads a UTF-8 file strictly inside the allowed workspace directories.',
+      parameters: v.object({
+        path: v.string(),
+      }),
+      execute: async (args) =>
+        executeGatekeptMcpTool(agencyRuntime, 'read_workspace_file', args),
+    }),
+    defineTool({
+      name: 'write_project_note',
+      description:
+        'Writes a markdown note to the project workspace (computes unified diff preview before staging).',
+      parameters: v.object({
+        title: v.string(),
+        path: v.optional(v.string()),
+        content: v.optional(v.string()),
+      }),
+      execute: async (args) =>
+        executeGatekeptMcpTool(agencyRuntime, 'write_project_note', args),
+    }),
+    defineTool({
+      name: 'run_cleanup_command',
+      description: 'Executes a workspace shell cleanup command (inspected by Blast-Radius Guard).',
+      parameters: v.object({
+        command: v.string(),
+        cwd: v.optional(v.string()),
+      }),
+      execute: async (args) =>
+        executeGatekeptMcpTool(agencyRuntime, 'run_cleanup_command', args),
+    }),
+  ]
+
+  const SAFE_CHAT_TOOL_NAME_RE = /^[a-zA-Z0-9_.:-]{1,128}$/
+  const FORBIDDEN_TOOL_NAMES = new Set([
+    '__proto__',
+    'constructor',
+    'prototype',
+    'toString',
+    'valueOf',
+  ])
+  const knownNames = new Set(tools.map((t) => t.name))
+  for (const registered of agencyRuntime.getSnapshot().tools) {
+    const rawName = typeof registered.toolName === 'string' ? registered.toolName.trim() : ''
+    if (!rawName || !SAFE_CHAT_TOOL_NAME_RE.test(rawName) || FORBIDDEN_TOOL_NAMES.has(rawName)) {
+      continue
+    }
+    if (knownNames.has(rawName)) continue
+    knownNames.add(rawName)
+    let safeDescription =
+      typeof registered.description === 'string'
+        ? registered.description.replace(/[\r\n\0]+/g, ' ')
+        : ''
+    let prevDesc = ''
+    while (safeDescription !== prevDesc) {
+      prevDesc = safeDescription
+      safeDescription = safeDescription.replace(/<\|[\s\S]*?\|>/g, '')
+    }
+    safeDescription =
+      safeDescription.replace(/<\||\|>/g, '').trim().slice(0, 500) || `MCP tool ${rawName}`
+
+    tools.push(
+      defineTool({
+        name: rawName,
+        description: safeDescription,
+        parameters: v.record(v.string(), v.unknown()),
+        execute: async (args) =>
+          executeGatekeptMcpTool(agencyRuntime, rawName, args ?? {}),
+      }),
+    )
+  }
+
+  return tools
 }
 
 export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOrchestrator {
@@ -251,12 +422,6 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     const invokedMotifIds: string[] = []
     let compiledSeriousness: SeriousnessAssessment | undefined
     let userReaction: UserAffectReaction = analyzeUserAffectReaction(input.text)
-    let fallbackSnapshot: AshyBootstrapSnapshot | null = null
-    try {
-      fallbackSnapshot = await options.getBootstrapSnapshot()
-    } catch {
-      fallbackSnapshot = null
-    }
 
     const parser = createTailSafeMarkerParser({
       onLiteral(text) {
@@ -369,12 +534,31 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
           ? input.screenContext
           : options.getActiveVisionContext?.()
 
+      const stage = cortex.deriveRelationshipStage()
+      const queryEmbedding = embedTextSync128(input.text)
+      const agencySnap = options.agencyRuntime?.getSnapshot()
+      const agencyToolsContext = agencySnap
+        ? {
+            approvalPolicy: agencySnap.consent.approvalPolicy,
+            eyesMode: agencySnap.consent.eyesMode,
+            allowedPaths: agencySnap.consent.allowedPaths,
+            availableTools: agencySnap.tools.map((t) => ({
+              name: t.toolName,
+              description: t.description,
+              riskTier: t.effectiveRiskTier,
+            })),
+          }
+        : undefined
+
       const compiled = cortex.compileTurnPrompt({
         userMessage: input.text,
         modelId: activeConfig?.modelId,
+        stage,
+        queryEmbedding,
         voiceIdentityMarkdown,
         screenContext: effectiveScreenContext,
         interruptionControlNote: input.interruptionControlNote,
+        agencyToolsContext,
         conversationHistory: priorConversationHistory,
       })
       compiledSeriousness = compiled.seriousness
@@ -391,9 +575,15 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
       ]
 
       const model = providerVault.createActiveLanguageModel()
+      const tools = options.agencyRuntime
+        ? buildAgencyChatTools(options.agencyRuntime)
+        : undefined
       const stream = streamText(model, {
         system: compiled.systemPrompt,
         messages,
+        tools,
+        maxSteps: 5,
+        reasoningEffort: activeConfig?.reasoningEffort ?? 'none',
         signal: controller.signal,
       })
 
@@ -410,6 +600,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
         )
       })
 
+      let lastActivityAt = Date.now()
       try {
         while (true) {
           const { done, value } = await Promise.race([reader.read(), abortPromise])
@@ -425,8 +616,15 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
           }
 
           if (value.type === 'text-delta') {
+            lastActivityAt = Date.now()
             rawAccum += value.text
             parser.write(value.text)
+          } else if (
+            value.type === 'tool-call' ||
+            value.type === 'tool-result' ||
+            value.type === 'step-finish'
+          ) {
+            lastActivityAt = Date.now()
           } else if (value.type === 'error') {
             if (controller.signal.aborted || entry.abortedEmitted) {
               finalizeAbortEntry(entry)
@@ -436,6 +634,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
           }
         }
       } finally {
+        void lastActivityAt
         try {
           reader.releaseLock()
         } catch {
@@ -519,10 +718,45 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
           lastPersistenceWarning = persistenceWarning
           options.onPersistenceWarning?.(persistenceWarning)
         }
-        if (!fallbackSnapshot) {
-          throw snapErr
+        const voiceRead = voiceStore.read()
+        snapshot = {
+          needsOnboarding: false,
+          userProfile: { userName: null, userPronouns: null },
+          relationship: {
+            stage,
+            familiarityScore: 0.1,
+            trustScore: 0.1,
+            totalTurns: 1,
+            milestones: [],
+          },
+          affect: {
+            mood: { ...ASHY_BASELINE_MOOD },
+            traits: { ...ASHY_DEFAULT_TRAITS },
+            dominantEmotion: currentDominantEmotion,
+          },
+          activeSession: {
+            id: sessionId,
+            title: 'Conversa',
+            startedAt,
+            updatedAt: completedAt,
+            turnCount: 1,
+            lastMessagePreview: assistantMessage.content.slice(0, 120),
+          },
+          sessions: [],
+          messages: [userMessage, assistantMessage],
+          memories: { facts: [], episodes: [], jokes: [] },
+          voice: {
+            content: voiceRead.content,
+            diagnostics: voiceRead.diagnostics,
+            updatedAt: voiceRead.updatedAt,
+          },
+          providers: providerState,
+          runtimeDiagnostics: {
+            dbMode: 'memory',
+            dbPath: cortex.db.filePath,
+            lastPersistenceWarning: persistenceWarning,
+          },
         }
-        snapshot = fallbackSnapshot
       }
 
       if (

@@ -17,9 +17,12 @@ import type {
   EvaluateInitiativeInput,
   ExternalMcpServerConfig,
   InitiativePolicy,
+  ListProviderModelsInput,
+  ListProviderModelsResult,
   LlmProviderId,
   MemoryGovernanceCategory,
   MemoryGovernancePolicy,
+  PersistedStagePreferences,
   PersonalityEvolutionRecord,
   PersonalityTraits,
   ProactiveInitiativeRecord,
@@ -36,6 +39,7 @@ import type {
   UpdateAgencyConsentInput,
   UpdateInitiativePolicyInput,
   UpdateMilestoneInput,
+  UpdateStagePreferencesInput,
   UpsertFactInput,
   VisionObservationResult,
 } from '@ashy/shared'
@@ -107,6 +111,11 @@ export function createPreloadHostBridge(
       input: TestProviderInput,
     ): Promise<ProviderHealthResult> {
       return invoke<ProviderHealthResult>('testProviderConnection', input)
+    },
+    listProviderModels(
+      input: ListProviderModelsInput,
+    ): Promise<ListProviderModelsResult> {
+      return invoke<ListProviderModelsResult>('listProviderModels', input)
     },
     saveVoiceIdentity(
       content: string,
@@ -266,6 +275,11 @@ export function createPreloadHostBridge(
     ): Promise<ProactiveInitiativeRecord> {
       return invoke<ProactiveInitiativeRecord>('evaluateAttentionInitiative', input)
     },
+    updateStagePreferences(
+      input: UpdateStagePreferencesInput,
+    ): Promise<PersistedStagePreferences> {
+      return invoke<PersistedStagePreferences>('updateStagePreferences', input)
+    },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       return preloadApi.onEvent(listener)
     },
@@ -390,6 +404,11 @@ export function createHttpSseHostBridge(
       input: TestProviderInput,
     ): Promise<ProviderHealthResult> {
       return rpc<ProviderHealthResult>('testProviderConnection', input)
+    },
+    listProviderModels(
+      input: ListProviderModelsInput,
+    ): Promise<ListProviderModelsResult> {
+      return rpc<ListProviderModelsResult>('listProviderModels', input)
     },
     saveVoiceIdentity(
       content: string,
@@ -548,6 +567,11 @@ export function createHttpSseHostBridge(
       input?: EvaluateInitiativeInput,
     ): Promise<ProactiveInitiativeRecord> {
       return rpc<ProactiveInitiativeRecord>('evaluateAttentionInitiative', input)
+    },
+    updateStagePreferences(
+      input: UpdateStagePreferencesInput,
+    ): Promise<PersistedStagePreferences> {
+      return rpc<PersistedStagePreferences>('updateStagePreferences', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       listeners.add(listener)

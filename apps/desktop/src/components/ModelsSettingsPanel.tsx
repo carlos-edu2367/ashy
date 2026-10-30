@@ -1,13 +1,31 @@
 import React, { useEffect, useState } from 'react'
-import { LLM_PROVIDER_IDS, type LlmProviderId, type ProviderHealthResult } from '@ashy/shared'
-import { Box, CheckCircle2, KeyRound, Save, Trash2, Wifi } from 'lucide-react'
+import {
+  FALLBACK_PROVIDER_MODELS,
+  LLM_PROVIDER_IDS,
+  type LlmProviderId,
+  type ProviderHealthResult,
+  type ReasoningEffort,
+} from '@ashy/shared'
+import { Box, CheckCircle2, KeyRound, RefreshCw, Save, Search, Trash2, Wifi } from 'lucide-react'
 import { useAshyStore } from '../store/useAshyStore'
+
+export const REASONING_EFFORT_OPTIONS: Array<{ value: ReasoningEffort; label: string }> = [
+  { value: 'none', label: 'Desativado (Resposta Imediata)' },
+  { value: 'minimal', label: 'Mínimo' },
+  { value: 'low', label: 'Baixo' },
+  { value: 'medium', label: 'Médio' },
+  { value: 'high', label: 'Alto (Raciocínio Profundo)' },
+]
 
 export function ModelsSettingsPanel(): React.ReactElement {
   const providers = useAshyStore((s) => s.providers)
+  const providerModelCatalog = useAshyStore((s) => s.providerModelCatalog)
+  const providerModelCatalogSource = useAshyStore((s) => s.providerModelCatalogSource)
+  const isLoadingProviderModels = useAshyStore((s) => s.isLoadingProviderModels)
   const saveProviderConfig = useAshyStore((s) => s.saveProviderConfig)
   const setActiveProvider = useAshyStore((s) => s.setActiveProvider)
   const testProviderConnection = useAshyStore((s) => s.testProviderConnection)
+  const listProviderModels = useAshyStore((s) => s.listProviderModels)
 
   const [selectedProvider, setSelectedProvider] = useState<LlmProviderId>(
     providers.activeProviderId ?? 'openrouter',
@@ -17,6 +35,10 @@ export function ModelsSettingsPanel(): React.ReactElement {
 
   const [baseUrl, setBaseUrl] = useState(currentConfig?.baseUrl ?? '')
   const [modelId, setModelId] = useState(currentConfig?.modelId ?? '')
+  const [modelSearchQuery, setModelSearchQuery] = useState('')
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(
+    currentConfig?.reasoningEffort ?? 'none',
+  )
   const [apiKey, setApiKey] = useState('')
   const [testResult, setTestResult] = useState<ProviderHealthResult | null>(null)
   const [isTesting, setIsTesting] = useState(false)
@@ -28,8 +50,41 @@ export function ModelsSettingsPanel(): React.ReactElement {
     if (cfg) {
       setBaseUrl(cfg.baseUrl)
       setModelId(cfg.modelId)
+      setReasoningEffort(cfg.reasoningEffort ?? 'none')
     }
-  }, [selectedProvider, providers.configs])
+  }, [
+    selectedProvider,
+    currentConfig?.baseUrl,
+    currentConfig?.modelId,
+    currentConfig?.reasoningEffort,
+  ])
+
+  useEffect(() => {
+    void listProviderModels({ providerId: selectedProvider })
+  }, [selectedProvider, listProviderModels])
+
+  const catalogModels =
+    providerModelCatalog[selectedProvider] ?? FALLBACK_PROVIDER_MODELS[selectedProvider] ?? []
+  const catalogSource = providerModelCatalogSource[selectedProvider] ?? 'fallback'
+  const normalizedSearch = modelSearchQuery.trim().toLowerCase()
+  const filteredCatalogModels = (
+    normalizedSearch
+      ? catalogModels.filter(
+          (m) =>
+            m.id.toLowerCase().includes(normalizedSearch) ||
+            m.name.toLowerCase().includes(normalizedSearch),
+        )
+      : catalogModels
+  ).slice(0, 60)
+
+  const handleRefreshCatalog = async () => {
+    const trimmedKey = apiKey.trim()
+    await listProviderModels({
+      providerId: selectedProvider,
+      ...(baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {}),
+      ...(trimmedKey ? { apiKey: trimmedKey } : {}),
+    })
+  }
 
   const handleSelectProvider = (providerId: LlmProviderId) => {
     setSelectedProvider(providerId)
@@ -37,7 +92,9 @@ export function ModelsSettingsPanel(): React.ReactElement {
     if (cfg) {
       setBaseUrl(cfg.baseUrl)
       setModelId(cfg.modelId)
+      setReasoningEffort(cfg.reasoningEffort ?? 'none')
     }
+    setModelSearchQuery('')
     setApiKey('')
     setTestResult(null)
     setSavedNotice(null)
@@ -53,6 +110,7 @@ export function ModelsSettingsPanel(): React.ReactElement {
         providerId: selectedProvider,
         baseUrl: baseUrl.trim() || currentConfig.baseUrl,
         modelId: modelId.trim() || currentConfig.modelId,
+        reasoningEffort,
         ...(trimmedKey.length > 0 ? { apiKey: trimmedKey } : {}),
       })
       await setActiveProvider(selectedProvider)
@@ -74,6 +132,7 @@ export function ModelsSettingsPanel(): React.ReactElement {
         providerId: selectedProvider,
         baseUrl: baseUrl.trim() || currentConfig.baseUrl,
         modelId: modelId.trim() || currentConfig.modelId,
+        reasoningEffort,
         clearApiKey: true,
       })
       setApiKey('')
@@ -94,6 +153,7 @@ export function ModelsSettingsPanel(): React.ReactElement {
         providerId: selectedProvider,
         baseUrl: baseUrl.trim() || currentConfig.baseUrl,
         modelId: modelId.trim() || currentConfig.modelId,
+        reasoningEffort,
         ...(trimmedKey.length > 0 ? { apiKey: trimmedKey } : {}),
       })
       setTestResult(res)
@@ -279,6 +339,143 @@ export function ModelsSettingsPanel(): React.ReactElement {
               value={modelId}
               onChange={(e) => setModelId(e.target.value)}
             />
+          </div>
+
+          <div style={{ flex: 1, minWidth: '210px' }}>
+            <label
+              htmlFor="provider-reasoning-effort-select"
+              style={{
+                display: 'block',
+                fontSize: '11.5px',
+                color: 'var(--text-secondary)',
+                marginBottom: '4px',
+              }}
+            >
+              Raciocínio (Thinking Effort)
+            </label>
+            <select
+              id="provider-reasoning-effort-select"
+              data-testid="provider-reasoning-effort-select"
+              className="ashy-select"
+              value={reasoningEffort}
+              onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort)}
+            >
+              {REASONING_EFFORT_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {/* Provider Model Catalog Search & Interactive Selector */}
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '8px',
+            padding: '10px 12px',
+            borderRadius: '10px',
+            background: '#12101b',
+            border: '1px solid var(--border-subtle)',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '8px',
+              flexWrap: 'wrap',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1 }}>
+              <Search size={14} style={{ color: 'var(--text-muted)' }} />
+              <input
+                type="text"
+                data-testid="provider-model-search-input"
+                className="ashy-input"
+                style={{ padding: '6px 10px', fontSize: '12px' }}
+                placeholder={`Buscar modelos em ${currentConfig?.label ?? selectedProvider} (ex.: qwen, deepseek, claude)...`}
+                value={modelSearchQuery}
+                onChange={(e) => setModelSearchQuery(e.target.value)}
+              />
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span
+                data-testid="provider-catalog-source-badge"
+                className={`ashy-badge ${catalogSource === 'remote' ? 'emerald' : 'neutral'}`}
+              >
+                {catalogSource === 'remote' ? 'Catálogo da API' : 'Catálogo sugerido'} (
+                {catalogModels.length})
+              </span>
+              <button
+                type="button"
+                data-testid="refresh-provider-models-btn"
+                className="ashy-outline-btn"
+                style={{ padding: '5px 10px', fontSize: '11.5px' }}
+                disabled={isLoadingProviderModels}
+                onClick={() => void handleRefreshCatalog()}
+              >
+                <RefreshCw size={12} />
+                <span>{isLoadingProviderModels ? 'Buscando...' : 'Buscar Modelos na API'}</span>
+              </button>
+            </div>
+          </div>
+
+          <div
+            data-testid="provider-model-catalog-list"
+            style={{
+              display: 'flex',
+              gap: '6px',
+              flexWrap: 'wrap',
+              maxHeight: '148px',
+              overflowY: 'auto',
+              paddingTop: '2px',
+            }}
+          >
+            {filteredCatalogModels.length === 0 ? (
+              <span style={{ fontSize: '11.5px', color: 'var(--text-muted)' }}>
+                Nenhum modelo encontrado no catálogo para &ldquo;{modelSearchQuery}&rdquo;. Você pode
+                digitar qualquer Model ID manualmente no campo acima.
+              </span>
+            ) : (
+              filteredCatalogModels.map((m) => {
+                const isPicked = modelId.trim() === m.id
+                return (
+                  <button
+                    key={m.id}
+                    type="button"
+                    data-testid={`provider-model-option-${m.id}`}
+                    className={`ashy-filter-pill ${isPicked ? 'active' : ''}`}
+                    style={{
+                      padding: '4px 10px',
+                      fontSize: '11.5px',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                    }}
+                    onClick={() => setModelId(m.id)}
+                    title={`${m.name} (${m.id})`}
+                  >
+                    <span>{m.id}</span>
+                    {m.supportsReasoning && (
+                      <span
+                        style={{
+                          fontSize: '9.5px',
+                          opacity: 0.75,
+                          color: 'var(--accent-peach)',
+                        }}
+                      >
+                        • Thinking
+                      </span>
+                    )}
+                  </button>
+                )
+              })
+            )}
           </div>
         </div>
 

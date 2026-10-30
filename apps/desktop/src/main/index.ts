@@ -36,10 +36,24 @@ export interface ElectronBrowserWindowInstanceLike {
   webContents: ElectronWebContentsLike
   loadURL(url: string): Promise<void>
   loadFile?(filePath: string): Promise<void>
+  isDestroyed?(): boolean
   setIgnoreMouseEvents?(ignore: boolean, options?: { forward?: boolean }): void
   show?(): void
   hide?(): void
   isVisible?(): boolean
+  minimize?(): void
+  maximize?(): void
+  unmaximize?(): void
+  isMaximized?(): boolean
+  close?(): void
+}
+
+function isWindowUsable(
+  win: ElectronBrowserWindowInstanceLike | null | undefined,
+): win is ElectronBrowserWindowInstanceLike {
+  if (!win) return false
+  if (typeof win.isDestroyed === 'function' && win.isDestroyed()) return false
+  return true
 }
 
 export interface ElectronBrowserWindowConstructorLike {
@@ -86,6 +100,8 @@ export interface RegisterAshyElectronIpcOverlayOptions {
   overlayController?: AshyElectronOverlayController
   overlayWindow?: ElectronBrowserWindowInstanceLike | null
   getOverlayWindow?: () => ElectronBrowserWindowInstanceLike | null | undefined
+  hubWindow?: ElectronBrowserWindowInstanceLike | null
+  getHubWindow?: () => ElectronBrowserWindowInstanceLike | null | undefined
 }
 
 export function registerAshyElectronIpc(
@@ -96,8 +112,14 @@ export function registerAshyElectronIpc(
 ): () => void {
   const overlayController =
     overlayOptions?.overlayController ?? createAshyElectronOverlayConfig()
-  const resolveOverlayWindow = () =>
-    overlayOptions?.getOverlayWindow?.() ?? overlayOptions?.overlayWindow ?? null
+  const resolveOverlayWindow = (): ElectronBrowserWindowInstanceLike | null => {
+    const candidate = overlayOptions?.getOverlayWindow?.() ?? overlayOptions?.overlayWindow ?? null
+    return isWindowUsable(candidate) ? candidate : null
+  }
+  const resolveHubWindow = (): ElectronBrowserWindowInstanceLike | null => {
+    const candidate = overlayOptions?.getHubWindow?.() ?? overlayOptions?.hubWindow ?? null
+    return isWindowUsable(candidate) ? candidate : null
+  }
 
   ipcMain.handle('ashy:rpc', async (_event, request) => {
     if (
@@ -147,6 +169,26 @@ export function registerAshyElectronIpc(
     return overlayController.getState()
   })
 
+  ipcMain.handle('ashy:windowMinimize', async () => {
+    resolveHubWindow()?.minimize?.()
+    return { minimized: true }
+  })
+
+  ipcMain.handle('ashy:windowMaximize', async () => {
+    const win = resolveHubWindow()
+    if (win?.isMaximized?.()) {
+      win.unmaximize?.()
+      return { maximized: false }
+    }
+    win?.maximize?.()
+    return { maximized: true }
+  })
+
+  ipcMain.handle('ashy:windowClose', async () => {
+    resolveHubWindow()?.close?.()
+    return { closed: true }
+  })
+
   const unsubscribe = kernel.onHostEvent((event) => {
     const targets = getWebContents()
     for (const target of targets) {
@@ -172,6 +214,9 @@ export function registerAshyElectronIpc(
     ipcMain.removeHandler('ashy:setOverlayIgnoreMouse')
     ipcMain.removeHandler('ashy:setOverlayVisible')
     ipcMain.removeHandler('ashy:getOverlayState')
+    ipcMain.removeHandler('ashy:windowMinimize')
+    ipcMain.removeHandler('ashy:windowMaximize')
+    ipcMain.removeHandler('ashy:windowClose')
   }
 }
 
@@ -194,6 +239,7 @@ export async function bootAshyElectronMain(
 
   const activeWindows: ElectronBrowserWindowInstanceLike[] = []
   const overlayController = createAshyElectronOverlayConfig()
+  let hubWindowRef: ElectronBrowserWindowInstanceLike | null = null
   let overlayWindowRef: ElectronBrowserWindowInstanceLike | null = null
 
   // airi invariant: register all ipcMain.handle channels strictly BEFORE window.loadURL / loadFile
@@ -204,6 +250,7 @@ export async function bootAshyElectronMain(
     {
       overlayController,
       getOverlayWindow: () => overlayWindowRef,
+      getHubWindow: () => hubWindowRef,
     },
   )
 
@@ -227,6 +274,7 @@ export async function bootAshyElectronMain(
       sandbox: true,
     },
   })
+  hubWindowRef = hubWindow
 
   const overlayWindow = new deps.BrowserWindow({
     ...overlayController.browserWindowOptions,
@@ -243,23 +291,89 @@ export async function bootAshyElectronMain(
   await overlayWindow.loadURL(overlayUrl)
 
   if (deps.globalShortcut) {
+    const broadcastShortcutEvent = (
+      action: 'toggleMic' | 'toggleEyes' | 'toggleDnd' | 'toggleHideStage',
+    ) => {
+      const evt: AshyHostStreamEvent = {
+        type: 'shortcut:triggered',
+        action,
+      }
+      if (typeof kernel.emitHostEvent === 'function') {
+        kernel.emitHostEvent(evt)
+      } else {
+        for (const win of activeWindows) {
+          if (isWindowUsable(win) && !win.webContents.isDestroyed?.()) {
+            win.webContents.send('ashy:event', evt)
+          }
+        }
+      }
+    }
+
     deps.globalShortcut.register(DEFAULT_STAGE_SHORTCUTS.electronGlobalMic, () => {
-      // Global shortcut for mic toggle
+      void (async () => {
+        try {
+          const snap = await kernel.getAgencySnapshot?.()
+          if (snap) {
+            const nextMic = snap.consent.micMode === 'muted' ? 'continuous' : 'muted'
+            await kernel.updateAgencyConsent?.({ micMode: nextMic })
+          }
+          broadcastShortcutEvent('toggleMic')
+        } catch {
+          // ignore shortcut error
+        }
+      })()
     })
     deps.globalShortcut.register(DEFAULT_STAGE_SHORTCUTS.electronGlobalEyes, () => {
-      // Global shortcut for eyes toggle
+      void (async () => {
+        try {
+          const snap = await kernel.getAgencySnapshot?.()
+          if (snap) {
+            const nextEyes =
+              snap.consent.eyesMode === 'window'
+                ? 'screen'
+                : snap.consent.eyesMode === 'screen'
+                  ? 'off'
+                  : 'window'
+            await kernel.updateAgencyConsent?.({ eyesMode: nextEyes })
+          }
+          broadcastShortcutEvent('toggleEyes')
+        } catch {
+          // ignore shortcut error
+        }
+      })()
     })
     deps.globalShortcut.register(DEFAULT_STAGE_SHORTCUTS.electronGlobalDnd, () => {
-      // Global shortcut for DND toggle
+      void (async () => {
+        try {
+          const snap = await kernel.getAgencySnapshot?.()
+          if (snap) {
+            const nextDnd = !snap.consent.dndMode
+            await kernel.updateAgencyConsent?.({ dndMode: nextDnd })
+          }
+          broadcastShortcutEvent('toggleDnd')
+        } catch {
+          // ignore shortcut error
+        }
+      })()
     })
     deps.globalShortcut.register(DEFAULT_STAGE_SHORTCUTS.electronGlobalHideStage, () => {
-      const nextVisible = !overlayController.getState().isOverlayVisible
-      overlayController.setOverlayVisible(nextVisible)
-      if (nextVisible) {
-        overlayWindow.show?.()
-      } else {
-        overlayWindow.hide?.()
-      }
+      void (async () => {
+        try {
+          const nextVisible = !overlayController.getState().isOverlayVisible
+          overlayController.setOverlayVisible(nextVisible)
+          if (isWindowUsable(overlayWindow)) {
+            if (nextVisible) {
+              overlayWindow.show?.()
+            } else {
+              overlayWindow.hide?.()
+            }
+          }
+          await kernel.updateStagePreferences?.({ isStageHidden: !nextVisible })
+          broadcastShortcutEvent('toggleHideStage')
+        } catch {
+          // ignore shortcut error
+        }
+      })()
     })
   }
 

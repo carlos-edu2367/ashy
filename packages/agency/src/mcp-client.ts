@@ -118,16 +118,32 @@ const FORBIDDEN_TOOL_NAMES: ReadonlySet<string> = new Set([
   'valueOf',
 ])
 
+const SAFE_MCP_TOOL_NAME_RE = /^[a-zA-Z0-9_.:-]{1,128}$/
+
+function sanitizeToolDescription(raw: string): string {
+  let cleaned = raw.replace(/[\r\n\0]+/g, ' ')
+  let prev = ''
+  while (cleaned !== prev) {
+    prev = cleaned
+    cleaned = cleaned.replace(/<\|[\s\S]*?\|>/g, '')
+  }
+  return cleaned
+    .replace(/<\||\|>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 1000)
+}
+
 function sanitizeDiscoveredTool(raw: unknown): McpDiscoveredTool | null {
   if (!raw || typeof raw !== 'object') return null
   const record = raw as Record<string, unknown>
   const name = typeof record.name === 'string' ? record.name.trim() : ''
-  if (!name || name.length > 160 || /[\0\r\n]/.test(name) || FORBIDDEN_TOOL_NAMES.has(name)) {
+  if (!name || !SAFE_MCP_TOOL_NAME_RE.test(name) || FORBIDDEN_TOOL_NAMES.has(name)) {
     return null
   }
   const description =
-    typeof record.description === 'string'
-      ? record.description.trim().slice(0, 1000)
+    typeof record.description === 'string' && record.description.trim().length > 0
+      ? sanitizeToolDescription(record.description) || `MCP tool ${name}`
       : `MCP tool ${name}`
   const inputSchema =
     record.inputSchema && typeof record.inputSchema === 'object' && !Array.isArray(record.inputSchema)
@@ -199,6 +215,38 @@ export function createHttpMcpClient(options: HttpMcpClientOptions): McpProtocolC
   const timeoutMs = Math.max(250, options.timeoutMs ?? 10_000)
   const maxResponseBytes = Math.max(1024, options.maxResponseBytes ?? 1_048_576)
   let rpcId = 0
+  let initialized = false
+
+  async function sendNotification(
+    method: string,
+    params: Record<string, unknown> = {}
+  ): Promise<void> {
+    if (typeof fetchFn !== 'function') {
+      return
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      await fetchFn(parsedUrl.toString(), {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          ...(options.headers ?? {}),
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          method,
+          params,
+        }),
+        signal: controller.signal,
+      })
+    } catch {
+      // Ignore non-fatal notification errors
+    } finally {
+      clearTimeout(timer)
+    }
+  }
 
   async function sendRpc(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
     if (typeof fetchFn !== 'function') {
@@ -260,7 +308,23 @@ export function createHttpMcpClient(options: HttpMcpClientOptions): McpProtocolC
         }
       }
 
-      const parsed = JSON.parse(jsonPayload) as JsonRpcResponse
+      if (!jsonPayload) {
+        throw new Error(`Invalid JSON-RPC response from MCP HTTP server "${serverName}": empty body`)
+      }
+
+      let parsedUnknown: unknown
+      try {
+        parsedUnknown = JSON.parse(jsonPayload)
+      } catch (err) {
+        throw new Error(
+          `Invalid JSON-RPC response from MCP HTTP server "${serverName}": ${err instanceof Error ? err.message : String(err)}`
+        )
+      }
+      if (!parsedUnknown || typeof parsedUnknown !== 'object' || Array.isArray(parsedUnknown)) {
+        throw new Error(`Invalid JSON-RPC response from MCP HTTP server "${serverName}"`)
+      }
+
+      const parsed = parsedUnknown as JsonRpcResponse
       if (parsed.error) {
         throw new Error(
           `MCP JSON-RPC error (${parsed.error.code ?? -1}): ${parsed.error.message ?? 'Unknown error'}`
@@ -281,6 +345,8 @@ export function createHttpMcpClient(options: HttpMcpClientOptions): McpProtocolC
         capabilities: {},
         clientInfo: { name: '@ashy/agency-mcp-client', version: '0.1.0' },
       })
+      await sendNotification('notifications/initialized', {})
+      initialized = true
       return normalizeInitializeResult(res, serverName)
     },
     async listTools(): Promise<McpDiscoveredTool[]> {
@@ -309,6 +375,9 @@ export function createHttpMcpClient(options: HttpMcpClientOptions): McpProtocolC
       registry: ProgressiveMcpRegistry,
       defaultRiskTier: ActionRiskTier = 'staged-confirm'
     ): Promise<McpDiscoveredTool[]> {
+      if (!initialized) {
+        await this.initialize()
+      }
       const tools = await this.listTools()
       registry.registerServer({
         name: serverName,
@@ -327,7 +396,7 @@ export function createHttpMcpClient(options: HttpMcpClientOptions): McpProtocolC
       return tools
     },
     async close(): Promise<void> {
-      // Stateless HTTP transport
+      initialized = false
     },
   }
 }
@@ -353,6 +422,7 @@ export function createStdioMcpClient(options: StdioMcpClientOptions): McpProtoco
 
   let childProc: StdioChildProcessLike | null = null
   let rpcId = 0
+  let initialized = false
   let stdoutBuffer = ''
   const pendingRequests = new Map<
     number,
@@ -446,6 +516,7 @@ export function createStdioMcpClient(options: StdioMcpClientOptions): McpProtoco
       }
       pendingRequests.clear()
       childProc = null
+      initialized = false
     })
 
     childProc = proc
@@ -491,6 +562,19 @@ export function createStdioMcpClient(options: StdioMcpClientOptions): McpProtoco
         capabilities: {},
         clientInfo: { name: '@ashy/agency-mcp-client', version: '0.1.0' },
       })
+      try {
+        const proc = ensureProcess()
+        proc.stdin?.write(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'notifications/initialized',
+            params: {},
+          }) + '\n'
+        )
+      } catch {
+        // Ignore non-fatal notification write failure
+      }
+      initialized = true
       return normalizeInitializeResult(res, serverName)
     },
     async listTools(): Promise<McpDiscoveredTool[]> {
@@ -519,6 +603,9 @@ export function createStdioMcpClient(options: StdioMcpClientOptions): McpProtoco
       registry: ProgressiveMcpRegistry,
       defaultRiskTier: ActionRiskTier = 'staged-confirm'
     ): Promise<McpDiscoveredTool[]> {
+      if (!initialized) {
+        await this.initialize()
+      }
       const tools = await this.listTools()
       registry.registerServer({
         name: serverName,
@@ -537,6 +624,7 @@ export function createStdioMcpClient(options: StdioMcpClientOptions): McpProtoco
       return tools
     },
     async close(): Promise<void> {
+      initialized = false
       if (childProc) {
         try {
           childProc.stdin?.end?.()

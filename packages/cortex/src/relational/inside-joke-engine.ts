@@ -109,16 +109,20 @@ export function computeMotifRelevance(
   const lexicalScore = Math.min(1, score)
 
   const contextVec =
-    queryEmbedding && queryEmbedding.length === 128
+    queryEmbedding && queryEmbedding.length > 0
       ? queryEmbedding
       : embedTextSync128(contextText)
 
+  const motifDoc = [motif.motif, motif.originSummary ?? '', ...motif.triggerCues].join(' ')
   const motifVec =
-    motif.embedding && motif.embedding.length === 128
+    motif.embedding && motif.embedding.length > 0
       ? motif.embedding
-      : embedTextSync128([motif.motif, motif.originSummary ?? '', ...motif.triggerCues].join(' '))
+      : embedTextSync128(motifDoc)
 
-  const semanticSim = computeCosineSimilarity128(contextVec, motifVec)
+  const semanticSim =
+    contextVec.length === motifVec.length
+      ? computeCosineSimilarity128(contextVec, motifVec)
+      : computeCosineSimilarity128(embedTextSync128(contextText), embedTextSync128(motifDoc))
   const combined = Math.min(
     1,
     Math.max(
@@ -155,7 +159,7 @@ export function selectEligibleMotifs(
 
   const minRelevance = options?.minRelevance ?? 0.2
   const precomputedQueryVec =
-    options?.queryEmbedding && options.queryEmbedding.length === 128
+    options?.queryEmbedding && options.queryEmbedding.length > 0
       ? options.queryEmbedding
       : typeof contextText === 'string' && contextText.trim().length > 0
         ? embedTextSync128(contextText)

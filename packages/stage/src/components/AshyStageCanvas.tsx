@@ -419,11 +419,19 @@ export interface AshyStageCanvasProps {
   onIgnoreMouseChange?: (shouldIgnore: boolean) => void
 }
 
+const DEFAULT_RAW_VOWELS: Readonly<Partial<Record<VowelKey | 'S', number>>> = Object.freeze({
+  A: 0,
+  E: 0,
+  I: 0,
+  O: 0,
+  U: 0,
+})
+
 export function AshyStageCanvas({
   emotion = 'neutral',
   emotionIntensity = 0.85,
   isSpeaking = false,
-  rawVowels = { A: 0, E: 0, I: 0, O: 0, U: 0 },
+  rawVowels = DEFAULT_RAW_VOWELS,
   rawVolume = 0,
   ambientLuminance = 0.35,
   gazeTarget = null,
@@ -442,21 +450,93 @@ export function AshyStageCanvas({
   onIgnoreMouseChange,
 }: AshyStageCanvasProps): React.ReactElement {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const live2dCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const vowelDriverRef = useRef(createWinnerRunnerUpVowelDriver())
   const visemeBlenderRef = useRef(createDynamicVisemeBlender())
   const blinkDriverRef = useRef(createAutoBlinkDriver())
-  const saccadeDriverRef = useRef(createEyeSaccadeDriver())
+  const saccadeDriverRef = useRef(
+    createEyeSaccadeDriver({
+      maxSaccadeAmplitudeX: 0.18,
+      maxSaccadeAmplitudeY: 0.1,
+      eyeLerpFactor: 0.3,
+      headCouplingFactor: 0.5,
+    }),
+  )
   const squintDriverRef = useRef(createRetinalLightSquint({ initialLuminance: ambientLuminance }))
-  const headSpringRef = useRef(createSubsteppedSpring2D({ x: 0, y: 0 }))
-  const bubbleSpringRef = useRef(createSubsteppedSpring2D({ x: 0, y: 0 }))
+  const headFocusSpringRef = useRef(
+    createSubsteppedSpring2D({ x: 0, y: 0 }, { stiffness: 36, damping: 12 }),
+  )
+  const eyeFocusSpringRef = useRef(
+    createSubsteppedSpring2D({ x: 0, y: 0 }, { stiffness: 56, damping: 15 }),
+  )
+  const headSpringRef = useRef(
+    createSubsteppedSpring2D({ x: 0, y: 0 }, { stiffness: 32, damping: 11.5 }),
+  )
+  const bubbleSpringRef = useRef(
+    createSubsteppedSpring2D({ x: 0, y: 0 }, { stiffness: 28, damping: 10.5 }),
+  )
   const silhouetteMaskRef = useRef<Uint8Array>(
     buildAvatarSilhouetteMask({ centerX: 0.5, centerY: 0.58, scale: 1 }),
   )
   const lastIgnoreMouseRef = useRef<boolean | null>(null)
+  const pointerGazeRef = useRef<Point2D | null>(null)
+  const rafTickCountRef = useRef<number>(0)
+
+  const propGazeX = gazeTarget?.x ?? null
+  const propGazeY = gazeTarget?.y ?? null
+  const explicitGazeTarget = useMemo<Point2D | null>(
+    () => (propGazeX !== null && propGazeY !== null ? { x: propGazeX, y: propGazeY } : null),
+    [propGazeX, propGazeY],
+  )
+
+  const vowelA = rawVowels?.A ?? 0
+  const vowelE = rawVowels?.E ?? 0
+  const vowelI = rawVowels?.I ?? 0
+  const vowelO = rawVowels?.O ?? 0
+  const vowelU = rawVowels?.U ?? 0
+  const vowelS = rawVowels?.S ?? 0
+  const stableRawVowels = useMemo<Partial<Record<VowelKey | 'S', number>>>(
+    () => ({ A: vowelA, E: vowelE, I: vowelI, O: vowelO, U: vowelU, S: vowelS }),
+    [vowelA, vowelE, vowelI, vowelO, vowelU, vowelS],
+  )
+
+  const latestInputsRef = useRef({
+    emotion,
+    emotionIntensity,
+    isSpeaking,
+    stableRawVowels,
+    rawVolume,
+    ambientLuminance,
+    explicitGazeTarget,
+    motionPreset,
+  })
+  latestInputsRef.current = {
+    emotion,
+    emotionIntensity,
+    isSpeaking,
+    stableRawVowels,
+    rawVolume,
+    ambientLuminance,
+    explicitGazeTarget,
+    motionPreset,
+  }
+
+  const [motionElapsedSec, setMotionElapsedSec] = useState<number>(0.12)
+  const motionElapsedRef = useRef<number>(0.12)
+  const prevMotionKeyRef = useRef<string>(`${emotion}:${motionPreset ?? ''}`)
+
+  useEffect(() => {
+    const nextKey = `${emotion}:${motionPreset ?? ''}`
+    if (prevMotionKeyRef.current !== nextKey) {
+      prevMotionKeyRef.current = nextKey
+      motionElapsedRef.current = 0.05
+      setMotionElapsedSec(0.05)
+    }
+  }, [emotion, motionPreset])
 
   const initialSynchronizedFrame = useMemo(() => {
     const vFrame = vowelDriverRef.current.step({
-      rawVowels,
+      rawVowels: stableRawVowels,
       rawVolume: isSpeaking ? rawVolume : 0,
       dtSeconds: 1 / 60,
     })
@@ -468,9 +548,11 @@ export function AshyStageCanvas({
       vowels: vFrame.vowels,
     })
     const blinkL = blinkDriverRef.current.step(1 / 60, blended.eyeOpenL)
-    const saccade = saccadeDriverRef.current.step(1 / 60, gazeTarget)
+    const activeGaze = explicitGazeTarget ?? pointerGazeRef.current
+    const saccade = saccadeDriverRef.current.step(1 / 60, activeGaze)
     const squint = squintDriverRef.current.step(ambientLuminance, 1 / 60)
     const breath = sampleBreathCycle(0.18)
+    const curSpring = headSpringRef.current.getState()
 
     return computeStageFrameState({
       emotion,
@@ -482,9 +564,17 @@ export function AshyStageCanvas({
       headFocus: saccade.headFocus,
       breathValue: breath,
       squintAmount: squint.squintAmount,
-      springOffset: { x: 0, y: 0 },
+      springOffset: { x: curSpring.x, y: curSpring.y },
     })
-  }, [emotion, emotionIntensity, isSpeaking, rawVowels, rawVolume, ambientLuminance, gazeTarget])
+  }, [
+    emotion,
+    emotionIntensity,
+    isSpeaking,
+    stableRawVowels,
+    rawVolume,
+    ambientLuminance,
+    explicitGazeTarget,
+  ])
 
   const [frame, setFrame] = useState<ComputedStageFrameState>(initialSynchronizedFrame)
   const [bubbleOffset, setBubbleOffset] = useState<Point2D>({ x: 0, y: 0 })
@@ -503,42 +593,58 @@ export function AshyStageCanvas({
     let elapsedSec = 0
 
     const tick = (nowMs: number) => {
+      rafTickCountRef.current += 1
       const dtSeconds = Math.min(0.1, Math.max(0.001, (nowMs - lastTimeMs) / 1000))
       lastTimeMs = nowMs
       elapsedSec += dtSeconds
+      motionElapsedRef.current += dtSeconds
+
+      const inputs = latestInputsRef.current
+      const activeGaze = inputs.explicitGazeTarget ?? pointerGazeRef.current
 
       const vFrame = vowelDriverRef.current.step({
-        rawVowels,
-        rawVolume: isSpeaking ? rawVolume : 0,
+        rawVowels: inputs.stableRawVowels,
+        rawVolume: inputs.isSpeaking ? inputs.rawVolume : 0,
         dtSeconds,
       })
 
-      const exprPose = interpolateEmotionPose(emotion, emotionIntensity)
+      const exprPose = interpolateEmotionPose(inputs.emotion, inputs.emotionIntensity)
       const blended = visemeBlenderRef.current.step({
-        isSpeaking,
+        isSpeaking: inputs.isSpeaking,
         dtSeconds,
         expression: exprPose,
         vowels: vFrame.vowels,
       })
 
       const blinkState = blinkDriverRef.current.step(dtSeconds, blended.eyeOpenL)
-      const saccadeState = saccadeDriverRef.current.step(dtSeconds, gazeTarget)
-      const squintState = squintDriverRef.current.step(ambientLuminance, dtSeconds)
+      const saccadeState = saccadeDriverRef.current.step(dtSeconds, activeGaze)
+      const squintState = squintDriverRef.current.step(inputs.ambientLuminance, dtSeconds)
       const breathValue = sampleBreathCycle(elapsedSec / 3.8)
-      const activeMotion = motionPreset ?? 'idle'
-      const motionImp = computeMotionImpulseOffset(activeMotion, elapsedSec)
+      const activeMotion = inputs.motionPreset ?? 'idle'
+      const motionImp = computeMotionImpulseOffset(activeMotion, motionElapsedRef.current)
+      setMotionElapsedSec(motionElapsedRef.current)
+
+      const headScale = activeGaze ? 1.0 : 0.35
+      const smoothedHeadFocus = headFocusSpringRef.current.step(
+        {
+          x: saccadeState.headFocus.x * headScale,
+          y: saccadeState.headFocus.y * headScale,
+        },
+        dtSeconds,
+      )
+      const smoothedEyeFocus = eyeFocusSpringRef.current.step(saccadeState.eyeFocus, dtSeconds)
 
       const springState = headSpringRef.current.step(
         {
-          x: saccadeState.headFocus.x * 18 + motionImp.x,
-          y: saccadeState.headFocus.y * 12 - breathValue * 5 + motionImp.y,
+          x: smoothedHeadFocus.x * 14 + motionImp.x,
+          y: smoothedHeadFocus.y * 10 - breathValue * 4 + motionImp.y,
         },
         dtSeconds,
       )
 
       const bSpring = bubbleSpringRef.current.step(
         {
-          x: saccadeState.headFocus.x * 8,
+          x: smoothedHeadFocus.x * 8,
           y: -breathValue * 3,
         },
         dtSeconds,
@@ -547,13 +653,13 @@ export function AshyStageCanvas({
       setBubbleOffset({ x: bSpring.x, y: bSpring.y })
       setFrame(
         computeStageFrameState({
-          emotion,
-          emotionIntensity,
-          isSpeaking,
+          emotion: inputs.emotion,
+          emotionIntensity: inputs.emotionIntensity,
+          isSpeaking: inputs.isSpeaking,
           vowels: blended.vowels,
           blinkFactor: blinkState.blinkFactor,
-          eyeFocus: saccadeState.eyeFocus,
-          headFocus: saccadeState.headFocus,
+          eyeFocus: { x: smoothedEyeFocus.x, y: smoothedEyeFocus.y },
+          headFocus: { x: smoothedHeadFocus.x, y: smoothedHeadFocus.y },
           breathValue,
           squintAmount: squintState.squintAmount,
           springOffset: { x: springState.x, y: springState.y },
@@ -567,24 +673,15 @@ export function AshyStageCanvas({
     return () => {
       window.cancelAnimationFrame(rafId)
     }
-  }, [
-    emotion,
-    emotionIntensity,
-    isSpeaking,
-    rawVowels,
-    rawVolume,
-    ambientLuminance,
-    gazeTarget,
-    motionPreset,
-  ])
+  }, [])
 
   const resolvedLayers = useMemo(
     () => resolveTachieActiveLayers(frame, motionPreset),
     [frame, motionPreset],
   )
   const motionImpulse = useMemo(
-    () => computeMotionImpulseOffset(resolvedLayers.motionPreset, 0.12),
-    [resolvedLayers.motionPreset],
+    () => computeMotionImpulseOffset(resolvedLayers.motionPreset, motionElapsedSec),
+    [resolvedLayers.motionPreset, motionElapsedSec],
   )
   const live2dParams = useMemo(() => computeLive2DParameterMap(frame), [frame])
   const effectiveLive2dControls = useMemo(
@@ -615,31 +712,32 @@ export function AshyStageCanvas({
 
   // Render onto <canvas> when 2D context is available (Red-Team M4 jsdom guard)
   useEffect(() => {
-    const canvas = canvasRef.current
+    const canvas = mode === 'tachie' ? canvasRef.current : null
     if (!canvas) return
     if (typeof navigator !== 'undefined' && /jsdom/i.test(navigator.userAgent)) {
       return
     }
     try {
-      const ctx = canvas.getContext('2d')
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })
       if (ctx) {
         renderTachieStageToCanvas(ctx, frame, resolvedLayers, width, height)
       }
     } catch {
       // Ignore canvas context errors in headless environments
     }
-  }, [frame, resolvedLayers, width, height])
+  }, [mode, frame, resolvedLayers, width, height])
 
   // Refresh 128x72 silhouette mask at 4 Hz (250ms)
+  // IMPORTANT: Never call .getContext('2d') on live2dCanvasRef (WebGL canvas), as HTML5 locks a canvas to a single context type and breaks PIXI WebGL initialization!
   useEffect(() => {
     const refreshSilhouette = () => {
-      const canvas = canvasRef.current
+      const canvas = mode === 'tachie' ? canvasRef.current : null
       if (
         canvas &&
         (typeof navigator === 'undefined' || !/jsdom/i.test(navigator.userAgent))
       ) {
         try {
-          const ctx = canvas.getContext('2d')
+          const ctx = canvas.getContext('2d', { willReadFrequently: true })
           if (ctx && typeof ctx.getImageData === 'function') {
             const imgData = ctx.getImageData(0, 0, canvas.width || width, canvas.height || height)
             if (imgData && imgData.data && imgData.data.length > 0) {
@@ -672,18 +770,43 @@ export function AshyStageCanvas({
   }, [headTx, headTy, width, height, motionImpulse.scale])
 
   const handleMouseMove = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (!onIgnoreMouseChange) return
     const rect = event.currentTarget.getBoundingClientRect()
+    const vw = rect.width || width
+    const vh = rect.height || height
     const clientX = event.clientX - rect.left
     const clientY = event.clientY - rect.top
+
+    const rawNormX = vw > 0 ? (clientX / vw) * 2 - 1 : 0
+    const rawNormY = vh > 0 ? (clientY / vh) * 2 - 1 : 0
+    if (Number.isFinite(rawNormX) && Number.isFinite(rawNormY)) {
+      const normX = Math.max(-1, Math.min(1, rawNormX))
+      const normY = Math.max(-1, Math.min(1, rawNormY))
+      const nextPointerGaze: Point2D = {
+        x: Number(normX.toFixed(3)),
+        y: Number(normY.toFixed(3)),
+      }
+      pointerGazeRef.current = nextPointerGaze
+      // Only update frame synchronously when RAF loop hasn't ticked (e.g., synchronous jsdom unit tests)
+      if (rafTickCountRef.current === 0) {
+        const activeGaze = explicitGazeTarget ?? nextPointerGaze
+        const saccade = saccadeDriverRef.current.step(1 / 60, activeGaze)
+        setFrame((prev) => ({
+          ...prev,
+          eyeFocus: saccade.eyeFocus,
+          headFocus: saccade.headFocus,
+        }))
+      }
+    }
+
+    if (!onIgnoreMouseChange) return
     const targetEl = event.target as HTMLElement | null
     const isOverUiIsland = Boolean(targetEl?.closest?.('[data-ui-island="true"]'))
 
     const ignore = shouldIgnoreMouseEvent({
       clientX,
       clientY,
-      viewportWidth: rect.width || width,
-      viewportHeight: rect.height || height,
+      viewportWidth: vw,
+      viewportHeight: vh,
       silhouetteMask: silhouetteMaskRef.current,
       isOverUiIsland,
       uiIslandRects,
@@ -693,6 +816,18 @@ export function AshyStageCanvas({
     if (ignore !== lastIgnoreMouseRef.current) {
       lastIgnoreMouseRef.current = ignore
       onIgnoreMouseChange(ignore)
+    }
+  }
+
+  const handleMouseLeave = () => {
+    pointerGazeRef.current = null
+    if (!explicitGazeTarget && rafTickCountRef.current === 0) {
+      saccadeDriverRef.current.reset()
+      setFrame((prev) => ({
+        ...prev,
+        eyeFocus: { x: 0, y: 0 },
+        headFocus: { x: 0, y: 0 },
+      }))
     }
   }
 
@@ -707,7 +842,11 @@ export function AshyStageCanvas({
       data-motion-preset={resolvedLayers.motionPreset}
       data-brow-preset={resolvedLayers.browPreset}
       data-accessory-fx={resolvedLayers.accessoryFx}
+      data-gaze-x={frame.eyeFocus.x.toFixed(2)}
+      data-gaze-y={frame.eyeFocus.y.toFixed(2)}
+      data-motion-impulse-y={motionImpulse.y.toFixed(2)}
       onMouseMove={handleMouseMove}
+      onMouseLeave={handleMouseLeave}
       style={{
         position: 'relative',
         width: fullBleed ? '100%' : `${width}px`,
@@ -735,6 +874,10 @@ export function AshyStageCanvas({
             params={live2dParams}
             emotion={emotion}
             motionPreset={resolvedLayers.motionPreset}
+            controls={effectiveLive2dControls}
+            onCanvasReady={(c) => {
+              live2dCanvasRef.current = c
+            }}
             width={width}
             height={height}
           />

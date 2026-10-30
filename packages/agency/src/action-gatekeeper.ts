@@ -642,7 +642,18 @@ export class ActionGatekeeper {
     const candidatePaths = extractCandidatePaths(safeArgs)
     const previews = deriveActionPreviews(tool.toolName, safeArgs, candidatePaths)
 
-    if ((tool.riskTier === 'read-safe' || baseTier === 'read-safe') && candidatePaths.length === 0) {
+    const requiresTargetPath =
+      tool.toolName === 'read_workspace_file' ||
+      tool.toolName === 'fs_read_file' ||
+      tool.serverName === 'workspace-fs' ||
+      tool.serverName === 'fs-mcp' ||
+      Object.keys(safeArgs).some((k) => PATH_ARG_KEYS.has(k))
+
+    if (
+      (tool.riskTier === 'read-safe' || baseTier === 'read-safe') &&
+      requiresTargetPath &&
+      (candidatePaths.length === 0 || candidatePaths.some((p) => !p.trim()))
+    ) {
       const reason = `Missing target path for read-safe tool "${tool.toolName}"`
       this.recordAudit({
         toolName: tool.toolName,
@@ -783,6 +794,11 @@ export class ActionGatekeeper {
     actionId: string,
     scope: ApprovalScope = 'once'
   ): Promise<ApproveActionResult> {
+    if (this.approvalPolicy === 'off') {
+      throw new Error(
+        `Cannot approve action ${actionId}: computer actions are disabled by policy (off)`
+      )
+    }
     const pending = this.pendingActions.get(actionId)
     if (!pending) {
       throw new Error(`Pending action not found: ${actionId}`)
@@ -793,16 +809,16 @@ export class ActionGatekeeper {
       )
     }
 
-    pending.card.status = 'approved'
-
     const effectiveScope: ApprovalScope =
       scope === 'session' || this.approvalPolicy === 'session' ? 'session' : 'once'
+
+    const output = await pending.tool.handler(pending.args)
+
+    pending.card.status = 'approved'
 
     if (effectiveScope === 'session' && !pending.card.blastRadiusWarning) {
       this.sessionApprovedTools.add(pending.tool.toolName)
     }
-
-    const output = await pending.tool.handler(pending.args)
 
     this.recordAudit({
       toolName: pending.tool.toolName,

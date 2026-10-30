@@ -49,7 +49,13 @@ flowchart LR
     F5 --> F6["Fase 6\nCorpo digital\ne presença"]
     F4 & F6 --> F7["Fase 7\nDesktop, visão\ne MCP"]
     F7 --> F8["Fase 8\nIniciativa e\nmundo próprio"]
-    F8 --> F9["Fase 9\nProtótipo público"]
+    F8 --> F81["Fase 8.1\nLatência, Thinking\n& Adapters LLM"]
+    F81 --> F82["Fase 8.2\nUnificação Modelos,\nCatálogo & UI"]
+    F82 --> F83["Fase 8.3\nMemória Seletiva,\nFim DEMO_* & Córtex"]
+    F83 --> F84["Fase 8.4\nLive2D Universal,\nPalco & Electron"]
+    F84 --> F85["Fase 8.5\nTools no Chat,\nPermissões & Visão"]
+    F85 --> F86["Fase 8.6\nPipeline Real Voz\n(Local + Nuvem)"]
+    F86 --> F9["Fase 9\nProtótipo público"]
     F9 --> F10["Fase 10\n3D / XR\n(futuro)"]
 ```
 
@@ -63,6 +69,12 @@ flowchart LR
 | 6 | Corpo digital e presença | §8 | **M3 — Companheira com voz e corpo** |
 | 7 | Desktop, visão e MCP | §10 | |
 | 8 | Iniciativa contextual e mundo próprio | §11 | **M4 — Presença completa** |
+| 8.1 | Latência, Controle de Thinking & Adapters LLM | §9, §14 | ✅ Concluída |
+| 8.2 | Unificação de Modelos LLM, Catálogo/Busca & Limpeza UI | §9 | |
+| 8.3 | Memória Seletiva Real, Fim de `DEMO_*` & Córtex/Dream Real | §4, §5, §11 | |
+| 8.4 | Estado Universal da Personagem (Live2D), Palco & Electron | §8 | |
+| 8.5 | Tools/MCP no Chat, Permissões Unificadas & Visão/Desktop Reais | §10 | |
+| 8.6 | Pipeline 100% Real de Voz (STT/TTS Local + Nuvem, Mic, Lip-Sync) | §7, §8 | **M4.5 — Zero Mocks em Produção** |
 | 9 | Protótipo público | §15 | **M5 — Release 1.0** |
 | 10 | 3D e XR | §8 (futuro) | |
 
@@ -237,6 +249,65 @@ flowchart LR
 
 ---
 
+## Estabilização e Desmockagem Pré-Fase 9 (Fases 8.1 a 8.6 — **Marco M4.5**)
+
+**Objetivo:** eliminar todos os mocks, simulações, estados hardcoded, *split-brains* de configuração e gargalos de latência identificados na auditoria pós-Fase 8, garantindo que 100% dos fluxos de conversação, memória, avatar Live2D, tools e voz operem de verdade antes da Release 1.0.
+
+### Fase 8.1 — Latência, Controle de Thinking & Adapters LLM 100% Reais (✅ Concluída)
+1. **Controle de `reasoningEffort` (`'none' | 'minimal' | 'low' | 'medium' | 'high'`):** suporte nos adapters (`@ashy/llm`) e no `ProviderVault` para enviar `reasoning: { enabled: false }` / `reasoning: { effort }` (OpenRouter), `reasoning_effort` (OpenAI/compatíveis), `enable_thinking: false` (Qwen/Ollama) e `thinking` (Anthropic), com **default `'none'`** para conversação instantânea (TTFT < 1.5s) e seletor na UI de modelos.
+2. **Remoção do overhead síncrono pré-turno:** eliminar o `await options.getBootstrapSnapshot()` bloqueante do início de `runTurnPipeline` em `turn-orchestrator.ts`, cachear chaves descriptografadas em memória no `ProviderVault`, passar `stage: relationship.stage` e `queryEmbedding` real em `compileTurnPrompt`, e inserir a mensagem do usuário otimisticamente no Zustand antes do retorno do RPC.
+3. **Correção do Adapter Anthropic & JSON Schema de Tools:** serializar `m.toolCalls` como blocos `tool_use` em `createAnthropicMessagesModel`, repassar `temperature` e capturar `usage` real; expandir `valibotSchemaToJsonSchema` para suportar `union`, `literal`, `record` e `description`.
+
+### Fase 8.2 — Unificação de Modelos LLM, Catálogo/Busca por Provider & Limpeza da UI de Configurações (✅ Concluída)
+1. **Fim do Split-Brain (`SUPPORTED_MODELS`):** remover `SUPPORTED_MODELS` e `activeModelId` hardcoded de `useAshyStore.ts` e `App.tsx`, conectando toda a UI (topbar, stage overlay, popover de contexto e configurações) diretamente ao `ProviderVault` (`state.providers`).
+2. **Seletor e Pesquisa Dinâmica de Modelos por Provider:** criar RPC `listProviderModels` em `provider-vault.ts` consultando `GET /v1/models` (OpenRouter, OpenAI, NVIDIA NIM, Anthropic) e `/api/tags` (Ollama local) com combobox pesquisável, filtro por nome/ID e botão de atualizar catálogo em `ModelsSettingsPanel.tsx` e `FirstMeetingWizard.tsx`.
+3. **Sub-abas Funcionais & Limpeza de Botões de Simulação na UI:** fazer as sub-abas `Geral`, `Voz`, `Modelos` e `Privacidade` filtrarem os cards correspondentes; tornar real o botão `"Salvar preferências"` (`saveUserPreferences`); exibir relógio/data reais na pré-visualização; e remover da UI de produção os botões falsos de cenários/benchmarks (`btn-scenario-*`, `<div style={{ display: 'none' }}>`, painel M2 em Nossa História, botões de iniciativa `14:00`/`02:30`, fixtures `.wav`, ataques MCP e fixtures de visão).
+
+### Fase 8.3 — Memória Seletiva Real, Fim de `DEMO_*` & Desmockagem do Córtex/Dream/Proatividade (✅ Concluída)
+1. **Fim do Spam de "Momentos":** parar de criar rascunhos `ep-turn-*` para qualquer mensagem `>= 12` chars em `indexTurnMemory`, filtrar rascunhos fora de `mapEpisodesToMemoryCards` e corrigir o detector de `topic_shift` em `detectEpisodeBoundary` para ignorar saudações/mensagens curtas (`"opa"`).
+2. **Extração Estruturada & Dream Worker com LLM Real:** conectar `resolveDreamJsonGenerator` e `consolidateSessionMemories` ao modelo ativo com gate `shouldSaveEpisode: boolean` (descartando conversas triviais), classificação real de categoria (`momentos`, `sobre_voce`, `referencias`, `planos`), visual distinto por categoria (fim da imagem repetida `/assets/mem-first-chat.jpg`), e reflexão noturna (`DreamJournalEntry` + evolução dos 5 traços incluindo `chaosEnergy`) gerada pelo LLM em vez de templates/regex, além de configurar `DEFAULT_DREAM_IDLE_TIMEOUT_MS`.
+3. **Remoção de `demo-seed.ts` de Produção, Embeddings Reais & Iniciativa Proativa Real:**
+   - Remover `DEMO_MEMORY_CARDS`, `seedAshyDemoFixtures` e `buildRoomTrophies` hardcoded de produção, além do fallback `'Carlos'` / `/assets/carlos-avatar.jpg`;
+   - Corrigir o formulário `"O que aprendi sobre você"` (`App.tsx`) para permitir escolher categoria e predicado reais em vez de fixar `favorite_stack_is`;
+   - Remover a trava `embedding.length === 128` em `inside-joke-engine.ts`, `dream-worker.ts` e `fsrs-turn-loop.ts`, remover as stopwords técnicas de teste (`banco`, `codigo`, `projeto`) e integrar `EmbeddingProvider` real;
+   - Conectar o `AttentionLoop` a um timer real no `kernel.ts` que consulta o LLM ativo (removendo `buildDefaultGroundedReply` estático), grava as mensagens proativas no SQLite e emite evento SSE/IPC.
+4. **Higiene da Construção do Prompt (`[Context]`) & Correção dos Bugs Diagnosticados pela Própria Ashy:**
+   - Corrigir o pareamento em `extractEpisodeDeterministic` (`episode-extractor.ts`) para nunca juntar `userMessages[0]` (pergunta do Turno 1) com `assistantMessages[last]` (resposta do Turno N), pareando sempre a fala do usuário com a resposta imediatamente subsequente da Ashy;
+   - Impedir que mensagens proativas (`msg-proactive-*`) sem fala do usuário sejam consolidadas como `Usuário: <fala da Ashy> | Ashy: <fala da Ashy>`, marcando-as como consolidadas ao nascer;
+   - Filtrar de `compileTurnPrompt` memórias que já estão visíveis no `conversationHistory` da sessão ativa e instruir explicitamente em `buildStaticSoulSystemPrompt` (`[INTERNAL CORTEX RECALL — HOW TO READ [Context]]`) que o bloco `[Context]` é memória silenciosa do próprio córtex (e não texto colado pelo usuário);
+   - Executar higienização automática (`pruneCorruptedAndTrivialEpisodes`) no boot do `AshyCortex` para limpar episódios corrompidos/triviais legados do `ashy.db` local e reparar resumos com turnos trocados.
+
+### Fase 8.4 — Estado Universal da Personagem (Live2D), Palco 100% Real & Shell Electron (✅ Concluída)
+1. **Avatar Universal em Toda a UI:** substituir as tags `<img src="/assets/ashy-hero.jpg">` hardcoded na Sidebar (`App.tsx:763-774`) e no card de Pré-visualização de Configurações (`App.tsx:4852-4870`) pelo componente universal conectado ao `AshyStageCanvas`.
+2. **Persistência e Sincronização Multi-Janela:** persistir `stageMode`, `live2dPresetId`, `live2dModelUrl`, `live2dModelControls`, `ambientLuminance` e `showDesktopAvatar` no Host e sincronizar via IPC/SSE entre a janela principal e a `overlayWindow`.
+3. **Desmockagem de `@ashy/stage` e Electron:**
+   - Conectar o rastreamento do mouse ao `gazeTarget` em `AshyStageCanvas.tsx`;
+   - Corrigir `motionImpulse` congelado em `t = 0.12`;
+   - Acionar `model.expression(...)` e `model.motion(...)` reais no Cubism 4 em `Live2DWebGLStage.tsx`, carregar controles do `.model3.json` real e extrair a silhueta real do canvas para click-through;
+   - Importar `'electron'` corretamente em `preload/index.ts`, implementar os 3 atalhos globais (`Mic`, `Eyes`, `DND`) em `main/index.ts`, remover `src/electron/*` duplicado e conectar os botões `Minimizar / Maximizar / Fechar` da janela.
+
+### Fase 8.5 — Conexão das Tools/MCP ao Chat, Permissões Unificadas & Visão/Desktop Reais (✅ Concluída)
+1. **Injeção de Tools no Chat (`TurnOrchestrator` + `SoulComposer`):** injetar o `agencyRuntime` em `turn-orchestrator.ts`, passando `tools` (`search_mcp_tools`, `get_mcp_tool_details`, `call_mcp_tool` e tools autorizadas) para `streamText` e descrevendo as capacidades no prompt, roteando toda execução pelo `ActionGatekeeper` e `AuditLog`.
+2. **Eliminação do Runtime Duplicado no Browser & Persistência de Permissões:** remover `let agency = createAgencyRuntime()` de `useAshyStore.ts`, hidratar `snapshot.agency` no `applyBootstrapSnapshot`, remover os `.catch(() => {})` silenciosos e conectar todos os switches (`Mostrar avatar`, `Ações no computador`, `Horários de silêncio`) ao Host.
+3. **Desmockagem das Tools Nativas, Visão e MCP Externo em `agency-runtime.ts`:**
+   - Substituir `buildPatternFrame` (36x32 falso) e o `visionProvider` stubado por captura real de tela/janela (`desktopCapturer` no Electron / `getDisplayMedia` no browser) e chamada real ao modelo de visão/VLM ativo;
+   - Tornar reais `get_active_window_title` (janela ativa real do SO), `read_workspace_file` (remover fallback falso `export const PACKAGE_NAME = "@ashy/desktop"`, incluir `process.cwd()` em `allowedPaths`) e `run_cleanup_command` (executar comando real via `child_process` após aprovação no Gatekeeper);
+   - Enviar `notifications/initialized` em `mcp-client.ts` e reconectar `externalMcpServers` salvos no boot do Host.
+
+### Fase 8.6 — Pipeline 100% Real de Voz (Modelos Locais & Nuvem de STT/TTS, Microfone, VAD e Lip-Sync)
+1. **Suporte Completo a Modelos Locais e em Nuvem (STT & TTS) via Host Bridge & Cofre Seguro:**
+   - **STT Local da escolha do usuário:** servidores locais OpenAI-compatible (`faster-whisper-server` / Speaches, `whisper.cpp`, LocalAI, Ollama) com Base URL + Model ID customizável e listagem de modelos, além de **Web Speech API nativa** (`SpeechRecognition` PT-BR).
+   - **STT em Nuvem:** OpenAI Audio (`gpt-4o-mini-transcribe`, `gpt-4o-transcribe`, `whisper-1`), Groq Whisper (`whisper-large-v3-turbo`), integrados ao `ProviderVault`.
+   - **TTS Local da escolha do usuário:** Kokoro-FastAPI, Piper HTTP, OpenedAI-Speech, Coqui XTTS / AllTalk (com Base URL + seleção de modelo e voz) + **Web Speech Synthesis nativo** (`speechSynthesis` listando vozes PT-BR do sistema).
+   - **TTS em Nuvem:** OpenAI TTS (`gpt-4o-mini-tts`, `tts-1`, `tts-1-hd` + vozes `coral`, `nova`, `shimmer`, etc.) e ElevenLabs (`eleven_multilingual_v2`, `eleven_flash_v2_5` + listagem de vozes da conta), decodificando `WAV`/`MP3`/`Opus`/`PCM` via `AudioContext.decodeAudioData`.
+   - Desativar `allowOfflineFallback: true` silencioso para `deterministic-wav-stt` e `local-synth-fallback`, e atualizar `DEFAULT_VOICE_RUNTIME_SETTINGS`.
+2. **UI Completa de Configuração de Voz:** seletores reais de provedor (Local vs. Nuvem), modelo, voz, microfone físico (`enumerateDevices`), Base URL/API Key, toggle `"Falar respostas automaticamente"` e botões reais de `"Testar Microfone"` e `"Testar Voz"`.
+3. **Captura Real de Microfone, VAD ONNX, Turn-Taking com LLM & Lip-Sync Acústico no Live2D:**
+   - Implementar `getUserMedia` + `AudioContext` + `AudioWorkletNode` em `voice-session-runtime.ts`, integrar Silero VAD ONNX em `vad-engine.ts`, injetar `llmJudgeFn`/`llmRephraseFn` reais em `turn-intelligence.ts` e remover o hack de `advanceSilence(1200)`;
+   - Ligar os botões `"Conversar por voz"` e `"Voz local"` à escuta real (removendo `toggleSimulatedSpeech()`), disparar `sendUserMessage` automaticamente em `onTurnSealed`, remover a frase falsa de `triggerBargeIn`, sintetizar o áudio real das respostas em `createPipelineForTurn` e sincronizar o lip-sync do Live2D e as `WAVEFORM_BARS` com o áudio real no `AudioContext` (voltando `isSpeaking: false` ao fim do playback).
+
+---
+
 ## Fase 9 — Protótipo público (**Marco M5 — Release 1.0**)
 
 **Objetivo:** tornar a Ashy instalável, segura e compreensível para outras pessoas.
@@ -273,11 +344,11 @@ Expansão desejada, não requisito do protótipo (§8): renderer VRM respeitando
 | Decisão | Fase em que precisa estar fechada |
 | :--- | :--- |
 | Temperamento inicial exato (a spec propõe energética/provocadora + Seriousness Gate) | Fase 1 (afeta os *Golden Dialogue Exemplars*); calibrar com dados na Fase 3 |
-| Quais memórias são guardadas automaticamente × exigem escolha do usuário | Fase 2 |
-| Até onde a personalidade pode evoluir sem perder a identidade | Fase 4 |
-| Identidade visual, voz e linguagem corporal | Fases 5 e 6 |
-| Quando ela pode iniciar uma conversa por conta própria | Fase 8 |
-| Funcionalidades indispensáveis para o primeiro protótipo público | Antes da Fase 9 |
+| Quais memórias são guardadas automaticamente × exigem escolha do usuário | Fase 2 / Fase 8.3 |
+| Até onde a personalidade pode evoluir sem perder a identidade | Fase 4 / Fase 8.3 |
+| Identidade visual, voz e linguagem corporal | Fases 5, 6, 8.4 e 8.6 |
+| Quando ela pode iniciar uma conversa por conta própria | Fase 8 / Fase 8.3 |
+| Funcionalidades indispensáveis para o primeiro protótipo público | Antes da Fase 9 (Fases 8.1 a 8.6) |
 
 ## 6. O que evitar
 

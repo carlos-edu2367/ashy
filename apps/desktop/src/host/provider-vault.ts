@@ -3,15 +3,22 @@ import fs from 'node:fs'
 import path from 'node:path'
 import * as v from 'valibot'
 import {
+  FALLBACK_PROVIDER_MODELS,
+  ListProviderModelsInputSchema,
   LLM_PROVIDER_IDS,
   maskApiKey,
+  REASONING_EFFORT_LEVELS,
   SaveProviderConfigInputSchema,
   TestProviderInputSchema,
   type AshyBootstrapSnapshot,
   type ConfigDiagnostics,
+  type ListProviderModelsInput,
+  type ListProviderModelsResult,
   type LlmProviderId,
   type ProviderHealthResult,
+  type ProviderModelCatalogItem,
   type PublicProviderConfig,
+  type ReasoningEffort,
   type SaveProviderConfigInput,
   type TestProviderInput,
 } from '@ashy/shared'
@@ -29,6 +36,7 @@ interface StoredProviderEntry {
   label: string
   baseUrl: string
   modelId: string
+  reasoningEffort: ReasoningEffort
   requiresApiKey: boolean
   lastVerifiedAt: number | null
   lastError: string | null
@@ -53,36 +61,47 @@ export const DEFAULT_PROVIDER_CONFIGS: Record<
     label: 'OpenRouter',
     baseUrl: 'https://openrouter.ai/api/v1',
     modelId: 'anthropic/claude-3.7-sonnet',
+    reasoningEffort: 'none',
     requiresApiKey: true,
   },
   anthropic: {
     label: 'Anthropic',
     baseUrl: 'https://api.anthropic.com/v1',
     modelId: 'claude-3-7-sonnet-latest',
+    reasoningEffort: 'none',
     requiresApiKey: true,
   },
   openai: {
     label: 'OpenAI',
     baseUrl: 'https://api.openai.com/v1',
     modelId: 'gpt-4o-mini',
+    reasoningEffort: 'none',
     requiresApiKey: true,
   },
   'nvidia-nim': {
     label: 'NVIDIA NIM',
     baseUrl: 'https://integrate.api.nvidia.com/v1',
     modelId: 'meta/llama-3.3-70b-instruct',
+    reasoningEffort: 'none',
     requiresApiKey: true,
   },
   ollama: {
     label: 'Ollama (Local)',
     baseUrl: 'http://127.0.0.1:11434/v1',
     modelId: 'qwen2.5:14b',
+    reasoningEffort: 'none',
     requiresApiKey: false,
   },
 }
 
+export { FALLBACK_PROVIDER_MODELS }
+
 function isLlmProviderId(value: unknown): value is LlmProviderId {
   return typeof value === 'string' && (LLM_PROVIDER_IDS as readonly string[]).includes(value)
+}
+
+function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return typeof value === 'string' && (REASONING_EFFORT_LEVELS as readonly string[]).includes(value)
 }
 
 function createDefaultProvidersDocument(): StoredProvidersDocument {
@@ -94,6 +113,7 @@ function createDefaultProvidersDocument(): StoredProvidersDocument {
       label: def.label,
       baseUrl: def.baseUrl,
       modelId: def.modelId,
+      reasoningEffort: def.reasoningEffort,
       requiresApiKey: def.requiresApiKey,
       lastVerifiedAt: null,
       lastError: null,
@@ -146,11 +166,16 @@ function parseAndValidateProviders(raw: string): StoredProvidersDocument {
       throw new Error(`providers.json entry ${id} has empty baseUrl or modelId`)
     }
 
+    const reasoningEffort: ReasoningEffort = isReasoningEffort(entry.reasoningEffort)
+      ? entry.reasoningEffort
+      : def.reasoningEffort
+
     providers[id] = {
       providerId: id,
       label: def.label,
       baseUrl,
       modelId,
+      reasoningEffort,
       requiresApiKey: def.requiresApiKey,
       lastVerifiedAt:
         typeof entry.lastVerifiedAt === 'number' && Number.isFinite(entry.lastVerifiedAt)
@@ -198,6 +223,7 @@ function parseAndValidateSecrets(raw: string): StoredSecretsDocument {
 export interface ProviderModelOverrides {
   baseUrl?: string
   modelId?: string
+  reasoningEffort?: ReasoningEffort
   apiKey?: string
 }
 
@@ -214,6 +240,7 @@ export interface ProviderVault {
   ): LanguageModel
   createActiveLanguageModel(): LanguageModel
   testProviderConnection(input: TestProviderInput): Promise<ProviderHealthResult>
+  listProviderModels(input: ListProviderModelsInput): Promise<ListProviderModelsResult>
 }
 
 export interface ProviderVaultOptions {
@@ -232,6 +259,42 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
   const defaultSecretsJson = JSON.stringify(createDefaultSecretsDocument(), null, 2)
 
   const inFlightProbes = new Map<string, Promise<ProviderHealthResult>>()
+  const inFlightCatalogRequests = new Map<string, Promise<ListProviderModelsResult>>()
+  const decryptedKeyCache = new Map<string, string | null>()
+
+  function validateHttpBaseUrl(rawUrl: string): URL {
+    let parsedUrl: URL
+    try {
+      parsedUrl = new URL(rawUrl)
+    } catch {
+      throw new Error(`Invalid provider baseUrl: ${rawUrl}`)
+    }
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+      throw new Error(`Invalid provider baseUrl protocol: ${parsedUrl.protocol}`)
+    }
+    return parsedUrl
+  }
+
+  function resolveEffectiveApiKey(
+    providerId: LlmProviderId,
+    storedBaseUrl: string,
+    effectiveBaseUrl: string,
+    inputApiKey?: string,
+  ): string | null {
+    if (typeof inputApiKey === 'string' && inputApiKey.trim().length > 0) {
+      return inputApiKey.trim()
+    }
+    try {
+      const storedOrigin = new URL(storedBaseUrl).origin
+      const targetOrigin = new URL(effectiveBaseUrl).origin
+      if (storedOrigin !== targetOrigin) {
+        return null
+      }
+    } catch {
+      return null
+    }
+    return getDecryptedApiKey(providerId)
+  }
 
   function readProvidersWithHeal() {
     return readWithAutoHeal({
@@ -271,9 +334,21 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
     if (!cipherText || typeof cipherText !== 'string' || cipherText.trim().length === 0) {
       return null
     }
+    const normalizedCipherText = cipherText.trim()
+    if (decryptedKeyCache.has(normalizedCipherText)) {
+      return decryptedKeyCache.get(normalizedCipherText) ?? null
+    }
     try {
-      const decrypted = secretProtector.decrypt(cipherText).trim()
-      return decrypted.length > 0 ? decrypted : null
+      const decrypted = secretProtector.decrypt(normalizedCipherText).trim()
+      const result = decrypted.length > 0 ? decrypted : null
+      if (decryptedKeyCache.size >= 64) {
+        const firstKey = decryptedKeyCache.keys().next().value
+        if (firstKey !== undefined) {
+          decryptedKeyCache.delete(firstKey)
+        }
+      }
+      decryptedKeyCache.set(normalizedCipherText, result)
+      return result
     } catch {
       return null
     }
@@ -289,6 +364,7 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
       label: entry.label,
       baseUrl: entry.baseUrl,
       modelId: entry.modelId,
+      reasoningEffort: entry.reasoningEffort,
       requiresApiKey: entry.requiresApiKey,
       hasApiKey,
       maskedApiKey: hasApiKey ? maskApiKey(decryptedKey) : null,
@@ -343,7 +419,7 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
 
   function saveProviderConfig(rawInput: SaveProviderConfigInput): PublicProviderConfig {
     const parsed = v.parse(SaveProviderConfigInputSchema, rawInput)
-    const { providerId, baseUrl, modelId, apiKey, clearApiKey } = parsed
+    const { providerId, baseUrl, modelId, reasoningEffort, apiKey, clearApiKey } = parsed
 
     const providersDoc = loadProvidersForMutation()
     const secretsDoc = loadSecretsForMutation()
@@ -353,14 +429,25 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
       ...existing,
       baseUrl,
       modelId,
+      reasoningEffort: reasoningEffort ?? existing.reasoningEffort ?? 'none',
     }
     providersDoc.providers[providerId] = updatedEntry
 
+    const prevCipher = secretsDoc.secrets[providerId]?.trim()
     if (clearApiKey === true) {
+      if (prevCipher) {
+        decryptedKeyCache.delete(prevCipher)
+      }
       delete secretsDoc.secrets[providerId]
       writeAtomicWithBackup(secretsFilePath, JSON.stringify(secretsDoc, null, 2))
     } else if (typeof apiKey === 'string' && apiKey.trim().length > 0) {
-      secretsDoc.secrets[providerId] = secretProtector.encrypt(apiKey.trim())
+      if (prevCipher) {
+        decryptedKeyCache.delete(prevCipher)
+      }
+      const trimmedKey = apiKey.trim()
+      const encrypted = secretProtector.encrypt(trimmedKey)
+      secretsDoc.secrets[providerId] = encrypted
+      decryptedKeyCache.set(encrypted.trim(), trimmedKey)
       writeAtomicWithBackup(secretsFilePath, JSON.stringify(secretsDoc, null, 2))
     }
 
@@ -401,16 +488,18 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
       typeof overrides?.modelId === 'string' && overrides.modelId.trim().length > 0
         ? overrides.modelId.trim()
         : stored.modelId
+    const reasoningEffort: ReasoningEffort =
+      overrides?.reasoningEffort ?? stored.reasoningEffort ?? 'none'
     const apiKey =
-      typeof overrides?.apiKey === 'string' && overrides.apiKey.trim().length > 0
-        ? overrides.apiKey.trim()
-        : (getDecryptedApiKey(targetProviderId) ?? undefined)
+      resolveEffectiveApiKey(targetProviderId, stored.baseUrl, baseUrl, overrides?.apiKey) ??
+      undefined
 
     if (targetProviderId === 'anthropic') {
       return createAnthropicMessagesModel({
         baseUrl,
         apiKey,
         model: modelId,
+        reasoningEffort,
         fetchImpl: options.fetchImpl,
       })
     }
@@ -419,6 +508,7 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
       baseUrl,
       apiKey,
       model: modelId,
+      reasoningEffort,
       fetchImpl: options.fetchImpl,
     })
   }
@@ -442,14 +532,18 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
       typeof input.modelId === 'string' && input.modelId.trim().length > 0
         ? input.modelId.trim()
         : stored.modelId
-    const effectiveApiKey =
-      typeof input.apiKey === 'string' && input.apiKey.trim().length > 0
-        ? input.apiKey.trim()
-        : getDecryptedApiKey(input.providerId)
+    const reasoningEffort: ReasoningEffort =
+      input.reasoningEffort ?? stored.reasoningEffort ?? 'none'
+    const effectiveApiKey = resolveEffectiveApiKey(
+      input.providerId,
+      stored.baseUrl,
+      baseUrl,
+      input.apiKey,
+    )
 
     const dedupeKey = crypto
       .createHash('sha256')
-      .update(`${input.providerId}|${baseUrl}|${modelId}|${effectiveApiKey ?? ''}`)
+      .update(`${input.providerId}|${baseUrl}|${modelId}|${reasoningEffort}|${effectiveApiKey ?? ''}`)
       .digest('hex')
 
     const existingProbe = inFlightProbes.get(dedupeKey)
@@ -460,6 +554,7 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
     const probePromise = (async (): Promise<ProviderHealthResult> => {
       const startedAt = Date.now()
       try {
+        validateHttpBaseUrl(baseUrl)
         if (stored.requiresApiKey && !effectiveApiKey) {
           throw new Error(`API key is required for provider ${stored.label}`)
         }
@@ -467,6 +562,7 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
         const model = createLanguageModel(input.providerId, {
           baseUrl,
           modelId,
+          reasoningEffort: 'none',
           apiKey: effectiveApiKey ?? undefined,
         })
 
@@ -474,6 +570,7 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
           messages: [{ role: 'user', content: 'ping' }],
           maxTokens: 8,
           maxSteps: 1,
+          reasoningEffort: 'none',
           signal: AbortSignal.timeout(10_000),
         })
 
@@ -530,6 +627,246 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
     return probePromise
   }
 
+  function listProviderModels(
+    rawInput: ListProviderModelsInput,
+  ): Promise<ListProviderModelsResult> {
+    const input = v.parse(ListProviderModelsInputSchema, rawInput)
+    const providersDoc = fs.existsSync(providersFilePath)
+      ? readProvidersWithHeal().value
+      : createDefaultProvidersDocument()
+    const stored = providersDoc.providers[input.providerId]
+
+    const baseUrl =
+      typeof input.baseUrl === 'string' && input.baseUrl.trim().length > 0
+        ? input.baseUrl.trim()
+        : stored.baseUrl
+    const effectiveApiKey = resolveEffectiveApiKey(
+      input.providerId,
+      stored.baseUrl,
+      baseUrl,
+      input.apiKey,
+    )
+
+    const dedupeKey = crypto
+      .createHash('sha256')
+      .update(`${input.providerId}|${baseUrl}|${effectiveApiKey ?? ''}`)
+      .digest('hex')
+
+    const existingRequest = inFlightCatalogRequests.get(dedupeKey)
+    if (existingRequest) {
+      return existingRequest
+    }
+
+    const fetchFn: typeof fetch =
+      options.fetchImpl ?? ((...args) => globalThis.fetch(...args))
+
+    function parseOpenAiCompatibleData(
+      rawList: unknown,
+      providerId: LlmProviderId,
+    ): ProviderModelCatalogItem[] {
+      if (!Array.isArray(rawList)) return []
+      const seen = new Set<string>()
+      const items: ProviderModelCatalogItem[] = []
+      for (const rawItem of rawList) {
+        if (items.length >= 500) break
+        if (typeof rawItem !== 'object' || rawItem === null) continue
+        const obj = rawItem as Record<string, unknown>
+        const id = typeof obj.id === 'string' ? obj.id.trim() : ''
+        if (!id || id.length > 256 || seen.has(id)) continue
+        seen.add(id)
+        const rawName =
+          typeof obj.display_name === 'string' && obj.display_name.trim().length > 0
+            ? obj.display_name.trim()
+            : typeof obj.name === 'string' && obj.name.trim().length > 0
+              ? obj.name.trim()
+              : id
+        const name = rawName.slice(0, 256)
+        const rawContext =
+          typeof obj.context_length === 'number' && Number.isFinite(obj.context_length)
+            ? obj.context_length
+            : typeof obj.contextLength === 'number' && Number.isFinite(obj.contextLength)
+              ? obj.contextLength
+              : null
+        const contextLength = rawContext !== null ? Math.max(0, Math.trunc(rawContext)) : null
+        const supportedParams = Array.isArray(obj.supported_parameters)
+          ? obj.supported_parameters.filter((p): p is string => typeof p === 'string')
+          : null
+
+        items.push({
+          id,
+          name,
+          providerId,
+          contextLength,
+          ...(supportedParams
+            ? {
+                supportsTools: supportedParams.includes('tools'),
+                supportsReasoning:
+                  supportedParams.includes('reasoning') ||
+                  supportedParams.includes('include_reasoning'),
+              }
+            : {}),
+        })
+      }
+      return items
+    }
+
+    const catalogPromise = (async (): Promise<ListProviderModelsResult> => {
+      try {
+        validateHttpBaseUrl(baseUrl)
+        if (stored.requiresApiKey && !effectiveApiKey) {
+          throw new Error(`API key is required for provider ${stored.label}`)
+        }
+
+        if (input.providerId === 'ollama') {
+          const tagsBase = baseUrl.replace(/\/v1\/?$/, '').replace(/\/+$/, '')
+          const tagsUrl = `${tagsBase}/api/tags`
+          let models: ProviderModelCatalogItem[] = []
+          let tagsError: string | null = null
+
+          try {
+            const tagsRes = await fetchFn(tagsUrl, {
+              method: 'GET',
+              signal: AbortSignal.timeout(8_000),
+            })
+            if (!tagsRes.ok) {
+              tagsError = `HTTP ${tagsRes.status}: ${tagsRes.statusText || 'Failed to fetch Ollama tags'}`
+            } else {
+              const tagsJson = (await tagsRes.json()) as Record<string, unknown>
+              if (Array.isArray(tagsJson?.models)) {
+                const seen = new Set<string>()
+                for (const rawModel of tagsJson.models) {
+                  if (models.length >= 500) break
+                  if (typeof rawModel !== 'object' || rawModel === null) continue
+                  const m = rawModel as Record<string, unknown>
+                  const id =
+                    typeof m.model === 'string' && m.model.trim().length > 0
+                      ? m.model.trim()
+                      : typeof m.name === 'string' && m.name.trim().length > 0
+                        ? m.name.trim()
+                        : ''
+                  if (!id || id.length > 256 || seen.has(id)) continue
+                  seen.add(id)
+                  const rawName =
+                    typeof m.name === 'string' && m.name.trim().length > 0 ? m.name.trim() : id
+                  models.push({
+                    id,
+                    name: rawName.slice(0, 256),
+                    providerId: 'ollama',
+                    contextLength: null,
+                  })
+                }
+              }
+            }
+          } catch (err) {
+            tagsError = err instanceof Error ? err.message : String(err)
+          }
+
+          if (models.length === 0 && !tagsError) {
+            const openAiModelsUrl = `${baseUrl.replace(/\/+$/, '')}/models`
+            const fallbackRes = await fetchFn(openAiModelsUrl, {
+              method: 'GET',
+              signal: AbortSignal.timeout(8_000),
+            })
+            if (!fallbackRes.ok) {
+              throw new Error(
+                `HTTP ${fallbackRes.status}: ${fallbackRes.statusText || 'Failed to fetch Ollama models'}`,
+              )
+            }
+            const fallbackJson = (await fallbackRes.json()) as Record<string, unknown>
+            models = parseOpenAiCompatibleData(fallbackJson?.data, 'ollama')
+          }
+
+          if (tagsError && models.length === 0) {
+            throw new Error(tagsError)
+          }
+          if (models.length === 0) {
+            throw new Error('No local models installed in Ollama')
+          }
+
+          return {
+            providerId: 'ollama',
+            models,
+            source: 'remote',
+            fetchedAt: Date.now(),
+            error: null,
+          }
+        }
+
+        if (input.providerId === 'anthropic') {
+          const modelsUrl = `${baseUrl.replace(/\/+$/, '')}/models`
+          const res = await fetchFn(modelsUrl, {
+            method: 'GET',
+            headers: {
+              'x-api-key': effectiveApiKey ?? '',
+              'anthropic-version': '2023-06-01',
+            },
+            signal: AbortSignal.timeout(8_000),
+          })
+          if (!res.ok) {
+            throw new Error(
+              `HTTP ${res.status}: ${res.statusText || 'Failed to fetch Anthropic models'}`,
+            )
+          }
+          const json = (await res.json()) as Record<string, unknown>
+          const models = parseOpenAiCompatibleData(json?.data, 'anthropic')
+          if (models.length === 0) {
+            throw new Error('Anthropic API returned no models')
+          }
+          return {
+            providerId: 'anthropic',
+            models,
+            source: 'remote',
+            fetchedAt: Date.now(),
+            error: null,
+          }
+        }
+
+        const modelsUrl = `${baseUrl.replace(/\/+$/, '')}/models`
+        const headers: Record<string, string> = {}
+        if (effectiveApiKey) {
+          headers.Authorization = `Bearer ${effectiveApiKey}`
+        }
+        const res = await fetchFn(modelsUrl, {
+          method: 'GET',
+          headers,
+          signal: AbortSignal.timeout(8_000),
+        })
+        if (!res.ok) {
+          throw new Error(
+            `HTTP ${res.status}: ${res.statusText || `Failed to fetch ${stored.label} models`}`,
+          )
+        }
+        const json = (await res.json()) as Record<string, unknown>
+        const models = parseOpenAiCompatibleData(json?.data, input.providerId)
+        if (models.length === 0) {
+          throw new Error(`${stored.label} API returned no models`)
+        }
+
+        return {
+          providerId: input.providerId,
+          models,
+          source: 'remote',
+          fetchedAt: Date.now(),
+          error: null,
+        }
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : String(err)
+        return {
+          providerId: input.providerId,
+          models: FALLBACK_PROVIDER_MODELS[input.providerId].map((m) => ({ ...m })),
+          source: 'fallback',
+          fetchedAt: Date.now(),
+          error: errorMessage,
+        }
+      }
+    })().finally(() => {
+      inFlightCatalogRequests.delete(dedupeKey)
+    })
+
+    inFlightCatalogRequests.set(dedupeKey, catalogPromise)
+    return catalogPromise
+  }
+
   return {
     providersFilePath,
     secretsFilePath,
@@ -540,5 +877,6 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
     createLanguageModel,
     createActiveLanguageModel,
     testProviderConnection,
+    listProviderModels,
   }
 }

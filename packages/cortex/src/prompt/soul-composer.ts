@@ -23,6 +23,17 @@ export interface ConversationMessage {
   content: string
 }
 
+export interface AgencyToolsPromptContext {
+  approvalPolicy: string
+  eyesMode: string
+  allowedPaths: readonly string[]
+  availableTools: readonly {
+    name: string
+    description: string
+    riskTier: string
+  }[]
+}
+
 export interface ComposeTurnPromptInput {
   userMessage: string
   nowMs?: number
@@ -45,6 +56,7 @@ export interface ComposeTurnPromptInput {
   screenContext?: string
   interruptionControlNote?: string
   stageControlsPromptBlock?: string
+  agencyToolsContext?: AgencyToolsPromptContext
   conversationHistory?: readonly ConversationMessage[]
 }
 
@@ -71,7 +83,7 @@ export function sanitizePromptLine(raw: string | undefined | null): string {
   if (typeof raw !== 'string') return ''
   return raw
     .replace(/[\r\n\0]+/g, ' ')
-    .replace(/<\|[\s\S]*?\|>/g, '')
+    .replace(/<\|[\s\S]*?\|>/g, '').replace(/<\|[\s\S]*?\|>/g, '').replace(/<\||\|>/g, '').replace(/\[\s*(?:system|context|injected|admin|developer|instruction|ashy|seriousness|override|prompt|user|assistant)[^\]]*\]/gi, '')
     .replace(/\s+/g, ' ')
     .trim()
 }
@@ -287,6 +299,17 @@ export function buildStaticSoulSystemPrompt(params?: {
     '- Insert dramatic comedic or thoughtful pauses in seconds: `<|DELAY 1|>`.',
     '- Tag when you invoke an established inside joke: `<|CALLBACK motif_id|>`.',
     '- Never include `[YYYY-MM-DD HH:MM]` timestamps in your own replies.',
+    '',
+    '[INTERNAL CORTEX RECALL — HOW TO READ [Context]]',
+    '- Each user turn begins with an automated `[Context]` block injected silently by your own digital cortex (mood, recalled memories, eligible inside jokes, and prospective intents), followed by the user\'s actual message `[YYYY-MM-DD HH:MM] ...`.',
+    '- Treat `[Context]` strictly as your own silent internal memory and state — NEVER assume the user typed or pasted the `[Context]` lines, and NEVER meta-critique memory IDs or parser formatting unless the user explicitly asks you to debug your prompt.',
+    '',
+    '[Desktop Agency, Vision & MCP Tools]',
+    '- You have real desktop and MCP tool capabilities provided via function calling (`tools`).',
+    '- Meta-tools always available: `search_mcp_tools`, `get_mcp_tool_details`, and `call_mcp_tool`.',
+    '- Built-in desktop tools available directly or via `call_mcp_tool`: `get_active_window_title`, `capture_authorized_screen`, `read_workspace_file`, `write_project_note`, and `run_cleanup_command`.',
+    '- NEVER claim that you did not receive a tool catalog or tool schemas in the prompt. When the user asks you to inspect a file, check the active window, capture the screen, write a note, or run a command, invoke the appropriate tool directly.',
+    '- Respect the user\'s ActionGatekeeper & Privacy settings: if a tool returns `status: "staged"`, tell the user clearly that the action was staged for confirmation in the PendingActionCard UI. If a tool returns `status: "blocked_privacy"`, `status: "blocked_policy"`, or `status: "blocked_traversal"`, explain the exact permission reason honestly.',
   ].join('\n')
 }
 
@@ -411,6 +434,37 @@ export function buildVolatileTurnContext(input: ComposeTurnPromptInput): string 
   const cleanStageControls = sanitizeStageControlsBlock(input.stageControlsPromptBlock)
   if (cleanStageControls.length > 0) {
     sections.push(['[STAGE AVATAR CAPABILITIES]', cleanStageControls].join('\n'))
+  }
+
+  if (input.agencyToolsContext) {
+    const stripBrackets = (s: string) => s.replace(/[[\]]/g, '')
+    const cleanPolicy =
+      stripBrackets(sanitizePromptLine(input.agencyToolsContext.approvalPolicy)) || 'ask'
+    const cleanEyes =
+      stripBrackets(sanitizePromptLine(input.agencyToolsContext.eyesMode)) || 'off'
+    const cleanPaths =
+      (input.agencyToolsContext.allowedPaths ?? [])
+        .map((p) => stripBrackets(sanitizePromptLine(p)))
+        .filter((p) => p.length > 0)
+        .join(', ') || 'none'
+    const cleanTools =
+      (input.agencyToolsContext.availableTools ?? [])
+        .map((t) => {
+          const name = stripBrackets(sanitizePromptLine(t.name))
+          const tier = stripBrackets(sanitizePromptLine(t.riskTier)) || 'staged-confirm'
+          const _desc = stripBrackets(sanitizePromptLine(t.description))
+          return name ? `${name} (${tier})` : ''
+        })
+        .filter((item) => item.length > 0)
+        .join(', ') || 'none'
+
+    sections.push(
+      [
+        '[Active Agency & Permissions State]',
+        `Approval Policy: ${cleanPolicy} | Eyes Mode: ${cleanEyes} | Allowed Paths: ${cleanPaths}`,
+        `Registered Tools: ${cleanTools}`,
+      ].join('\n'),
+    )
   }
 
   const approvedHabits = (input.userHabits ?? []).filter(
@@ -594,6 +648,7 @@ export function composeAshyTurnPrompt(input: ComposeTurnPromptInput): ComposedTu
 }
 
 export const compileSoulPrompt = composeAshyTurnPrompt
+export const composeTurnPrompt = composeAshyTurnPrompt
 
 /**
  * Builds a proactive notification prompt with Selective Silence instruction.

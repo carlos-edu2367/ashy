@@ -12,6 +12,7 @@ import type {
   EpisodicMemory,
   EvaluateInitiativeInput,
   ExternalMcpServerConfig,
+  ListProviderModelsInput,
   LlmProviderId,
   MemoryGovernanceCategory,
   PersonalityEvolutionRecord,
@@ -25,6 +26,7 @@ import type {
   UpdateAgencyConsentInput,
   UpdateInitiativePolicyInput,
   UpdateMilestoneInput,
+  UpdateStagePreferencesInput,
   UpsertFactInput,
 } from '@ashy/shared'
 import type { AshyHostKernel, AshyHostKernelOptions } from './kernel'
@@ -67,6 +69,7 @@ const ALLOWED_RPC_METHODS = new Set<string>([
   'saveProviderConfig',
   'setActiveProvider',
   'testProviderConnection',
+  'listProviderModels',
   'saveVoiceIdentity',
   'resetVoiceIdentity',
   'upsertSemanticFact',
@@ -96,6 +99,7 @@ const ALLOWED_RPC_METHODS = new Set<string>([
   'updateMilestone',
   'updateInitiativePolicy',
   'evaluateAttentionInitiative',
+  'updateStagePreferences',
 ])
 
 export class DisallowedRpcMethodError extends Error {
@@ -217,6 +221,11 @@ export async function dispatchHostRpc(
     case 'testProviderConnection':
       return kernel.testProviderConnection(
         assertObjectPayload<TestProviderInput>(payload, method),
+      )
+
+    case 'listProviderModels':
+      return kernel.listProviderModels(
+        assertObjectPayload<ListProviderModelsInput>(payload, method),
       )
 
     case 'saveVoiceIdentity':
@@ -609,6 +618,14 @@ export async function dispatchHostRpc(
       return kernel.evaluateAttentionInitiative(obj)
     }
 
+    case 'updateStagePreferences': {
+      if (!kernel.updateStagePreferences) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<UpdateStagePreferencesInput>(payload, method)
+      return kernel.updateStagePreferences(obj)
+    }
+
     default:
       throw new DisallowedRpcMethodError(method)
   }
@@ -888,6 +905,12 @@ export function createAshyViteHostPlugin(
     configureServer(server) {
       ssrLoader = (url) => server.ssrLoadModule(url)
       server.middlewares.use(middleware)
+      server.watcher.on('change', (changedPath) => {
+        const norm = changedPath.replace(/\\/g, '/')
+        if (norm.includes('/packages/') || norm.includes('/src/host/')) {
+          void stopKernel()
+        }
+      })
       server.httpServer?.once('close', () => {
         void stopKernel()
       })

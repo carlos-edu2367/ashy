@@ -266,8 +266,8 @@ function episodeCombinedText(ep: EpisodicMemory): string {
   return `${ep.title} ${ep.summary ?? ''} ${ep.content} ${(ep.tags ?? []).join(' ')}`
 }
 
-function getEpisodeVector128(ep: EpisodicMemory): readonly number[] {
-  if (ep.embedding && ep.embedding.length === 128) {
+function getEpisodeVector(ep: EpisodicMemory): readonly number[] {
+  if (ep.embedding && ep.embedding.length > 0) {
     return ep.embedding
   }
   return embedTextSync128(episodeCombinedText(ep))
@@ -291,7 +291,7 @@ function inferSharedThemeFromTexts(textA: string, textB: string): string {
 }
 
 /**
- * Compares pairs of approved permanent episodes by shared tags and 128-d cosine similarity,
+ * Compares pairs of approved permanent episodes by shared tags and cosine similarity,
  * returning the top thematic cross-episode links (`<= 10`).
  */
 export function detectCrossEpisodeLinks(
@@ -300,7 +300,7 @@ export function detectCrossEpisodeLinks(
   const reflectable = episodes.filter(isReflectablePermanentEpisode)
   if (reflectable.length < 2) return []
 
-  const vectors = reflectable.map((ep) => getEpisodeVector128(ep))
+  const vectors = reflectable.map((ep) => getEpisodeVector(ep))
   const texts = reflectable.map((ep) => episodeCombinedText(ep))
   const links: CrossEpisodeLink[] = []
 
@@ -318,7 +318,15 @@ export function detectCrossEpisodeLinks(
         .filter((t) => t.length >= 2 && !GENERIC_EPISODE_TAGS.has(t))
 
       const sharedTag = tagsB.find((t) => tagSetA.has(t))
-      const rawSim = computeCosineSimilarity128(vectors[i]!, vectors[j]!)
+      const vecA = vectors[i]!
+      const vecB = vectors[j]!
+      const rawSim =
+        vecA.length === vecB.length
+          ? computeCosineSimilarity128(vecA, vecB)
+          : computeCosineSimilarity128(
+              embedTextSync128(texts[i]!),
+              embedTextSync128(texts[j]!),
+            )
       const sim = Number.isFinite(rawSim) ? Math.max(0, Math.min(1, rawSim)) : 0
 
       if (sharedTag || sim >= 0.45) {
@@ -358,7 +366,7 @@ function computeCandidatePriority(ep: EpisodicMemory): number {
   return score
 }
 
-function classifyEpisodeTraitDelta(ep: EpisodicMemory): {
+export function classifyEpisodeTraitDelta(ep: EpisodicMemory): {
   trait: PersonalityTraitKey
   delta: number
   explanation: string
@@ -418,6 +426,17 @@ function classifyEpisodeTraitDelta(ep: EpisodicMemory): {
       trait: 'proactivity',
       delta: 0.02,
       explanation: `Reflexão sobre "${ep.title}": acompanhamento de metas reforçou a proatividade.`,
+    }
+  }
+
+  if (
+    ['chaos', 'playful', 'improv'].some((t) => lowerTags.has(t)) ||
+    /\b(?:caos|travessura|ca[oó]tico|improviso|zoeira)\b/i.test(text)
+  ) {
+    return {
+      trait: 'chaosEnergy',
+      delta: 0.014,
+      explanation: `Reflexão sobre "${ep.title}": energia criativa e improviso elevaram a espontaneidade.`,
     }
   }
 

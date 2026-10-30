@@ -182,7 +182,7 @@ describe('@ashy/desktop — Phase 7 Companion Hub, Floating Stage Overlay & Full
   it('4. switching LLM provider preserves Ashy soul, memories, traits, and Golden Style Exemplars in compileTurnPrompt', () => {
     const store = useAshyStore.getState()
     const initialSystemPrompt = store.lastPrompt.systemPrompt
-    expect(store.activeModelId).toBe('claude-3-7-sonnet')
+    expect(store.activeModelId).toBe('anthropic/claude-3.7-sonnet')
 
     store.setActiveModelId('gpt-4.1')
     expect(useAshyStore.getState().activeModelId).toBe('gpt-4.1')
@@ -396,24 +396,27 @@ describe('@ashy/desktop — Phase 7 Companion Hub, Floating Stage Overlay & Full
     store.setActiveTab('memories')
     const memHtml = renderToStaticMarkup(<App />)
     expect(memHtml).toContain('O que fica com a gente')
-    expect(memHtml).toContain('O fantasma no backend')
-    expect(memHtml).toContain('Orin e Ashy')
-    expect(memHtml).toContain('Seu jeito de trabalhar')
-    expect(memHtml).toContain('Primeira conversa')
-    expect(memHtml).toContain('Retomar o protótipo')
+    expect(memHtml).toContain('Saved Production Database at 03:14 AM')
+    expect(memHtml).toContain('O Exorcismo do Backend (Padre no NPM)')
+    expect(memHtml).toContain('Migração do Chroma Key para Quad-Fitter')
     expect(memHtml).toContain('Suas memórias ficam neste dispositivo.')
     expect(memHtml).toContain('Local primeiro. Sempre nossa.')
 
-    // Select "Orin e Ashy" and verify drawer updates
-    store.setSelectedMemoryId('ep-orin-ashy')
-    const orinHtml = renderToStaticMarkup(<App />)
-    expect(orinHtml).toContain('Conversa de 5 de outubro')
+    // Select "ep-padre-npm-origin" and verify drawer updates
+    store.setSelectedMemoryId('ep-padre-npm-origin')
+    const padreHtml = renderToStaticMarkup(<App />)
+    expect(padreHtml).toContain('O Exorcismo do Backend (Padre no NPM)')
+    expect(padreHtml).toContain('Conversa de ')
 
     // Edit memory story and create new memory
-    store.updateMemoryStory('ep-orin-ashy', 'Orin e Ashy v2', 'História atualizada com carinho.')
+    store.updateMemoryStory(
+      'ep-padre-npm-origin',
+      'O Exorcismo do Backend v2',
+      'História atualizada com carinho.',
+    )
     expect(
-      useAshyStore.getState().memoryCards.find((c) => c.id === 'ep-orin-ashy')?.title,
-    ).toBe('Orin e Ashy v2')
+      useAshyStore.getState().memoryCards.find((c) => c.id === 'ep-padre-npm-origin')?.title,
+    ).toBe('O Exorcismo do Backend v2')
 
     const createdCard = store.createMemoryCard({
       title: 'Noite de chuva no estúdio',

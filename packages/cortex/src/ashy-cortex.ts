@@ -1,3 +1,4 @@
+import { embedTextSync128 } from '@ashy/llm'
 import {
   EvaluateInitiativeInputSchema,
   type ApprovableMemoryKind,
@@ -51,7 +52,11 @@ import {
   type CandidateSemanticFactInput,
   type ConsolidationResult,
 } from './dream/dream-worker'
-import { extractStructuredEpisode } from './memory/episode-extractor'
+import {
+  classifyEpisodeCategory,
+  extractStructuredEpisode,
+  isTrivialConversationTurn,
+} from './memory/episode-extractor'
 import {
   detectEpisodeBoundary,
   type EpisodeBoundaryDecision,
@@ -68,6 +73,7 @@ import {
 } from './memory/fsrs-turn-loop'
 import {
   composeAshyTurnPrompt,
+  type AgencyToolsPromptContext,
   type ComposedTurnPrompt,
   type ConversationMessage,
 } from './prompt/soul-composer'
@@ -130,6 +136,26 @@ export interface ConsolidateSessionMemoriesResult {
   milestones: AutobiographicalMilestone[]
 }
 
+export interface CompileTurnPromptInput {
+  userMessage: string
+  modelId?: string
+  nowMs?: number
+  timeOfDayLabel?: string
+  stage?: RelationshipStage
+  voiceIdentityMarkdown?: string
+  userName?: string | null
+  userPronouns?: string | null
+  queryEmbedding?: readonly number[]
+  screenContext?: string
+  interruptionControlNote?: string
+  stageControlsPromptBlock?: string
+  agencyToolsContext?: AgencyToolsPromptContext
+  conversationHistory?: readonly ConversationMessage[]
+  topKMemories?: number
+  userHabits?: readonly UserHabit[]
+  prospectiveIntents?: readonly ProspectiveIntent[]
+}
+
 export class AshyCortex {
   public readonly db: CortexDatabase
   private readonly consolidationLocks = new Map<string, Promise<ConsolidateSessionMemoriesResult>>()
@@ -137,6 +163,97 @@ export class AshyCortex {
   constructor(options?: CortexDatabaseOptions) {
     this.db = createCortexDatabase(options)
     this.db.seedDefaultGoldenExemplars()
+    this.pruneCorruptedAndTrivialEpisodes()
+  }
+
+  public pruneCorruptedAndTrivialEpisodes(): void {
+    try {
+      const episodes = this.db.listEpisodicMemories(500)
+      if (episodes.length === 0) return
+
+      const referencedEpisodeIds = new Set<string>()
+      for (const ms of this.db.listMilestones()) {
+        if (ms.episodeId && !ms.id.startsWith('ms-evo-')) {
+          referencedEpisodeIds.add(ms.episodeId)
+        }
+      }
+      for (const f of this.db.listSemanticFacts()) {
+        for (const eid of f.sourceEpisodeIds) referencedEpisodeIds.add(eid)
+      }
+      for (const m of this.db.listRelationalMotifs()) {
+        if (m.originEpisodeId) referencedEpisodeIds.add(m.originEpisodeId)
+      }
+      for (const h of this.db.listUserHabits()) {
+        if (h.sourceEpisodeId) referencedEpisodeIds.add(h.sourceEpisodeId)
+      }
+      for (const i of this.db.listProspectiveIntents()) {
+        if (i.sourceEpisodeId) referencedEpisodeIds.add(i.sourceEpisodeId)
+      }
+
+      for (const ep of episodes) {
+        // 1. Delete corrupted proactive echo episodes (e.g. `ep-*-msg-proactive-*` or Usuário echoing Ashy verbatim)
+        const echoMatch = /^Usuário:\s*(.+?)\s*\|\s*Ashy:\s*(.+)$/i.exec(ep.summary.trim())
+        const isVerbatimEcho =
+          echoMatch !== null &&
+          echoMatch[1]!.trim().toLowerCase() === echoMatch[2]!.trim().toLowerCase()
+        if (ep.id.includes('-msg-proactive-') || isVerbatimEcho) {
+          this.db.deleteEpisodicMemory(ep.id)
+          continue
+        }
+
+        // 2. Delete unreferenced auto-generated episodes whose title is trivial chitchat
+        const isAutoSessionOrTurn =
+          ep.id.startsWith('ep-session-') || ep.id.startsWith('ep-turn-')
+        if (
+          isAutoSessionOrTurn &&
+          !ep.isFlashbulb &&
+          !referencedEpisodeIds.has(ep.id) &&
+          isTrivialConversationTurn(ep.title)
+        ) {
+          for (const ms of this.db.listMilestones()) {
+            if (ms.episodeId === ep.id && ms.id.startsWith('ms-evo-')) {
+              this.db.deleteMilestone(ms.id)
+            }
+          }
+          this.db.deleteEpisodicMemory(ep.id)
+          continue
+        }
+
+        // 3. Repair legacy multi-turn episodes where summary paired Turn 1's question with Turn N's answer
+        if (ep.id.startsWith('ep-session-') && ep.content.includes('\n')) {
+          const lines = ep.content
+            .split('\n')
+            .map((l) => l.trim())
+            .filter(Boolean)
+          const firstUserLineIdx = lines.findIndex((l) => l.startsWith('Usuário:'))
+          if (firstUserLineIdx >= 0) {
+            const firstUserContent = lines[firstUserLineIdx]!.slice('Usuário:'.length).trim()
+            const pairedAshyLine = lines
+              .slice(firstUserLineIdx + 1)
+              .find((l) => l.startsWith('Ashy:'))
+            if (pairedAshyLine) {
+              const pairedAshyContent = pairedAshyLine.slice('Ashy:'.length).trim()
+              const expectedSummary = `Usuário: ${firstUserContent.slice(0, 180)} | Ashy: ${pairedAshyContent.slice(0, 180)}`.slice(
+                0,
+                500,
+              )
+              if (
+                ep.summary.startsWith('Usuário:') &&
+                ep.summary.includes('| Ashy:') &&
+                ep.summary !== expectedSummary
+              ) {
+                this.db.upsertEpisodicMemory({
+                  ...ep,
+                  summary: expectedSummary,
+                })
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Fault-isolated boot sanitation
+    }
   }
 
   // Session & message pass-through helpers
@@ -234,25 +351,37 @@ export class AshyCortex {
     return result
   }
 
-  public compileTurnPrompt(params: {
-    userMessage: string
-    modelId?: string
-    nowMs?: number
-    timeOfDayLabel?: string
-    stage?: RelationshipStage
-    voiceIdentityMarkdown?: string
-    userName?: string | null
-    userPronouns?: string | null
-    queryEmbedding?: readonly number[]
-    screenContext?: string
-    interruptionControlNote?: string
-    stageControlsPromptBlock?: string
-    conversationHistory?: readonly ConversationMessage[]
-    topKMemories?: number
-    userHabits?: readonly UserHabit[]
-    prospectiveIntents?: readonly ProspectiveIntent[]
-  }): ComposedTurnPrompt {
+  public deriveRelationshipStage(): RelationshipStage {
+    const sessions = this.db.listChatSessions()
+    const totalTurns = sessions.reduce((acc, s) => acc + Math.max(0, s.turnCount), 0)
+    const milestonesCount = this.db.listMilestones().length
+    const episodesCount = this.db
+      .listEpisodicMemories()
+      .filter((ep) => ep.approvalStatus !== 'pending_review').length
+    const motifs = this.db
+      .listRelationalMotifs()
+      .filter((m) => m.approvalStatus !== 'pending_review')
+    const hasEstablishedJoke = motifs.some(
+      (m) => m.stage === 'inside_joke' || m.stage === 'legendary',
+    )
+
+    if (totalTurns >= 40 || milestonesCount >= 5) {
+      return 'companion'
+    }
+    if (totalTurns >= 15 || hasEstablishedJoke) {
+      return 'close_friend'
+    }
+    if (totalTurns >= 3 || episodesCount >= 2) {
+      return 'acquaintance'
+    }
+    return 'stranger'
+  }
+
+  public compileTurnPrompt(params: CompileTurnPromptInput): ComposedTurnPrompt {
     const nowMs = params.nowMs ?? Date.now()
+    const resolvedStage = params.stage ?? this.deriveRelationshipStage()
+    const resolvedQueryEmbedding =
+      params.queryEmbedding ?? embedTextSync128(params.userMessage)
     const state = this.db.getAffectiveState()
     const elapsedMinutes =
       state.updatedAt > 0 ? Math.max(0, (nowMs - state.updatedAt) / 60_000) : 0
@@ -265,14 +394,30 @@ export class AshyCortex {
     this.db.saveAffectiveState({ ...state, mood: reactedMood, updatedAt: nowMs })
     const effectiveMood = reactedMood
 
-    const retrievedMemories = this.db.searchEpisodicMemoriesHybrid(
+    const rawRetrievedMemories = this.db.searchEpisodicMemoriesHybrid(
       params.userMessage,
-      params.queryEmbedding,
+      resolvedQueryEmbedding,
       {
         nowMs,
-        limit: params.topKMemories ?? 4,
+        limit: (params.topKMemories ?? 4) + 4,
       },
     )
+    const activeHistoryUserTexts = new Set(
+      (params.conversationHistory ?? [])
+        .filter((m) => m.role === 'user')
+        .map((m) => m.content.trim().toLowerCase())
+        .filter((t) => t.length > 0),
+    )
+    const retrievedMemories = rawRetrievedMemories
+      .filter((item) => {
+        if (activeHistoryUserTexts.size === 0) return true
+        const titleNorm = item.memory.title.trim().toLowerCase()
+        if (activeHistoryUserTexts.has(titleNorm)) {
+          return false
+        }
+        return true
+      })
+      .slice(0, params.topKMemories ?? 4)
 
     const eligibleMotifs = selectEligibleMotifs(
       this.db.listRelationalMotifs(),
@@ -280,7 +425,7 @@ export class AshyCortex {
       nowMs,
       {
         isSeriousContext: seriousness.isSeriousOrDelicate,
-        queryEmbedding: params.queryEmbedding,
+        queryEmbedding: resolvedQueryEmbedding,
       },
     )
 
@@ -291,7 +436,7 @@ export class AshyCortex {
         : (identityFacts
             .filter(
               (f) =>
-                f.subject === 'user' &&
+                f.subject.toLowerCase() === 'user' &&
                 (f.predicate === 'name' || f.predicate === 'user_name'),
             )
             .at(-1)?.object ?? null)
@@ -302,7 +447,7 @@ export class AshyCortex {
         : (identityFacts
             .filter(
               (f) =>
-                f.subject === 'user' &&
+                f.subject.toLowerCase() === 'user' &&
                 (f.predicate === 'pronouns' || f.predicate === 'user_pronouns'),
             )
             .at(-1)?.object ?? null)
@@ -312,7 +457,7 @@ export class AshyCortex {
       nowMs,
       timeOfDayLabel: params.timeOfDayLabel,
       modelId: params.modelId,
-      stage: params.stage,
+      stage: resolvedStage,
       voiceIdentityMarkdown: params.voiceIdentityMarkdown,
       userName,
       userPronouns,
@@ -330,6 +475,7 @@ export class AshyCortex {
       screenContext: params.screenContext,
       interruptionControlNote: params.interruptionControlNote,
       stageControlsPromptBlock: params.stageControlsPromptBlock,
+      agencyToolsContext: params.agencyToolsContext,
       conversationHistory: params.conversationHistory,
     })
   }
@@ -348,35 +494,6 @@ export class AshyCortex {
     const cleanAssistantText = (input.assistantText ?? '').replace(/\0/g, '').trim()
     const episodeId = `ep-turn-${cleanTurnId}`
     const policy = this.db.getMemoryGovernancePolicy()
-
-    let episodeCreated = false
-    if (cleanUserText.length >= 12) {
-      const tokens = tokenizeForSearch(cleanUserText).filter((w) => w.length >= 4)
-      const uniqueTags = Array.from(new Set(tokens)).slice(0, 8)
-      const tags = uniqueTags.length > 0 ? uniqueTags : ['conversation']
-
-      const isHighAffect =
-        input.emotion === 'excited' ||
-        input.emotion === 'sad' ||
-        input.emotion === 'concerned' ||
-        input.emotion === 'surprised'
-
-      this.db.upsertEpisodicMemory({
-        id: episodeId,
-        title: cleanUserText.slice(0, 60),
-        summary: `Usuário: ${cleanUserText.slice(0, 120)} | Ashy: ${cleanAssistantText.slice(0, 120)}`,
-        content: `Usuário: ${cleanUserText}\nAshy: ${cleanAssistantText}`,
-        createdAt: now,
-        lastReviewedAt: now,
-        stability: 3.0,
-        difficulty: 4.5,
-        surprise: isHighAffect ? 0.65 : 0.4,
-        isFlashbulb: false,
-        tags,
-        approvalStatus: policy.episodes ? 'pending_review' : 'approved',
-      })
-      episodeCreated = true
-    }
 
     let factsCreated = 0
 
@@ -513,7 +630,34 @@ export class AshyCortex {
       }
     }
 
-    if (factsCreated > 0 && !episodeCreated && cleanUserText.length > 0) {
+    const isHighAffect =
+      input.emotion === 'excited' ||
+      input.emotion === 'sad' ||
+      input.emotion === 'concerned' ||
+      input.emotion === 'surprised'
+    const intentMatch =
+      /\b(?:amanhã|semana\s+que\s+vem|me\s+lembra\s+de|depois\s+preciso|segunda|terça|quarta|quinta|sexta|sábado|domingo)\b/i.test(
+        cleanUserText,
+      )
+    const isTrivial = isTrivialConversationTurn(cleanUserText)
+
+    let episodeCreated = false
+    if (
+      cleanUserText.length >= 12 &&
+      (!isTrivial || factsCreated > 0 || Boolean(intentMatch))
+    ) {
+      const tokens = tokenizeForSearch(cleanUserText).filter((w) => w.length >= 4)
+      const uniqueTags = Array.from(new Set(tokens)).slice(0, 8)
+      const baseTags = uniqueTags.length > 0 ? uniqueTags : ['conversation']
+      const category = classifyEpisodeCategory({
+        userText: cleanUserText,
+        tags: baseTags,
+        factsCount: factsCreated,
+        motifsCount: 0,
+        intentsCount: intentMatch ? 1 : 0,
+      })
+      const tags = [...baseTags, `category:${category}`]
+
       this.db.upsertEpisodicMemory({
         id: episodeId,
         title: cleanUserText.slice(0, 60),
@@ -523,9 +667,9 @@ export class AshyCortex {
         lastReviewedAt: now,
         stability: 3.0,
         difficulty: 4.5,
-        surprise: 0.4,
+        surprise: isHighAffect ? 0.65 : 0.4,
         isFlashbulb: false,
-        tags: ['conversation'],
+        tags,
         approvalStatus: policy.episodes ? 'pending_review' : 'approved',
       })
       episodeCreated = true
@@ -613,6 +757,32 @@ export class AshyCortex {
       )
       if (matchesTurnSlug || (inTimeWindow && matchesBatchContent)) {
         supersededDraftIds.add(ep.id)
+      }
+    }
+
+    if (
+      extracted.shouldSaveEpisode === false &&
+      extracted.facts.length === 0 &&
+      extracted.motifs.length === 0 &&
+      extracted.habits.length === 0 &&
+      extracted.intents.length === 0
+    ) {
+      for (const draftId of supersededDraftIds) {
+        this.db.deleteEpisodicMemory(draftId)
+      }
+      this.db.markChatMessagesConsolidated(
+        batch.map((m) => m.id),
+        `skipped-trivial-${safeNow}`,
+      )
+      return {
+        consolidated: false,
+        boundary,
+        episode: null,
+        facts: [],
+        motifs: [],
+        habits: [],
+        intents: [],
+        milestones: [],
       }
     }
 
@@ -1052,9 +1222,42 @@ export class AshyCortex {
               ? `Reflexão sobre ${reflectable.length} episódio(s): ${evoRes.records.map((r) => r.explanation).join(' ')}`
               : `Síntese reflexiva sobre ${reflectable.length} memória(s) permanente(s) do estúdio.`
 
+      let finalSummary = summary
+      if (params?.generateJsonFn) {
+        try {
+          const reflectionPrompt = [
+            'Você é Ashy escrevendo uma nota curta em primeira pessoa para o seu Diário de Sonhos após refletir sobre memórias recentes.',
+            `Episódios refletidos: ${reflectable.slice(0, 6).map((e) => `"${e.title}" (${e.summary})`).join('; ')}`,
+            crossEpisodeLinks.length > 0
+              ? `Conexões temáticas: ${crossEpisodeLinks.slice(0, 4).map((l) => l.sharedTheme).join(', ')}`
+              : '',
+            evoRes.records.length > 0
+              ? `Evoluções de traço: ${evoRes.records.map((r) => `${r.trait} (${r.explanation})`).join('; ')}`
+              : '',
+            'Retorne APENAS um JSON válido no formato {"summary": "..."} em primeira pessoa (máximo 400 caracteres).',
+          ]
+            .filter(Boolean)
+            .join('\n')
+          const rawJson = await params.generateJsonFn(reflectionPrompt)
+          const trimmed = rawJson.trim()
+          const firstBrace = trimmed.indexOf('{')
+          const lastBrace = trimmed.lastIndexOf('}')
+          const jsonSlice =
+            firstBrace >= 0 && lastBrace > firstBrace
+              ? trimmed.slice(firstBrace, lastBrace + 1)
+              : trimmed
+          const parsed = JSON.parse(jsonSlice) as { summary?: unknown }
+          if (typeof parsed?.summary === 'string' && parsed.summary.trim().length >= 10) {
+            finalSummary = parsed.summary.replace(/\0/g, '').trim().slice(0, 500)
+          }
+        } catch {
+          // Keep deterministic summary fallback
+        }
+      }
+
       this.db.insertDreamJournalEntry({
-        id: `dream-journal-${safeNow}-${existingJournal.length + 1}`,
-        summary,
+        id: `dream-journal-${safeNow}-${existingJournal.length + 1}-${Math.random().toString(36).slice(2, 7)}`,
+        summary: finalSummary,
         sourceEpisodeIds,
         crossLinksCount: crossEpisodeLinks.length,
         traitEvolutionsCount: evoRes.records.length,

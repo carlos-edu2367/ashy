@@ -4,6 +4,7 @@ import {
   ASHY_MOTION_PRESETS,
   ASHY_TRAIT_CORRIDORS,
   BUILTIN_LIVE2D_MODEL_PRESETS,
+  LLM_PROVIDER_IDS,
   M2_GATE_THRESHOLDS,
   MILESTONE_CATEGORIES,
   SEMANTIC_FACT_CATEGORIES,
@@ -68,7 +69,6 @@ import {
 import { FirstMeetingWizard } from './components/FirstMeetingWizard'
 import { ModelsSettingsPanel } from './components/ModelsSettingsPanel'
 import {
-  SUPPORTED_MODELS,
   useAshyStore,
   type FeaturedMemoryCard,
   type HubTabId,
@@ -152,7 +152,6 @@ function AshySparkleLogo(): React.ReactElement {
 
 function renderMemoryCategoryIcon(card: FeaturedMemoryCard): React.ReactElement {
   if (card.id === 'ep-padre-npm-origin') return <Ghost size={17} />
-  if (card.id === 'ep-orin-ashy') return <Folder size={17} />
   if (card.filterCategory === 'sobre_voce') return <User size={17} />
   if (card.filterCategory === 'momentos') return <Image size={17} />
   if (card.filterCategory === 'planos') return <Calendar size={17} />
@@ -237,7 +236,7 @@ export function App(): React.ReactElement {
     }
   }, [])
 
-  const displayName = state.userProfile.userName ?? 'Carlos'
+  const displayName = state.userProfile.userName?.trim() || 'Você'
 
   const handleSendChat = async (e?: React.FormEvent) => {
     if (e) e.preventDefault()
@@ -708,8 +707,11 @@ export function App(): React.ReactElement {
     filteredMemoryCards[0] ??
     state.memoryCards[0]
 
-  const currentModelMeta =
-    SUPPORTED_MODELS.find((m) => m.id === state.activeModelId) ?? SUPPORTED_MODELS[0]
+  const configuredProviderModels = LLM_PROVIDER_IDS.map(
+    (pid) => state.providers.configs[pid],
+  ).filter((cfg): cfg is NonNullable<typeof cfg> => Boolean(cfg))
+  const activeProviderCfg =
+    state.providers.configs[state.providers.activeProviderId] ?? configuredProviderModels[0]
 
   const showSidebarPortrait =
     state.activeTab === 'memories' ||
@@ -722,13 +724,45 @@ export function App(): React.ReactElement {
 
       {/* Subtle Desktop Window Chrome Controls */}
       <div className="ashy-window-controls" aria-label="Controles da janela">
-        <button type="button" className="ashy-win-btn" title="Minimizar">
+        <button
+          type="button"
+          className="ashy-win-btn"
+          data-testid="btn-window-minimize"
+          title="Minimizar"
+          onClick={() => {
+            if (window.ashyHost?.minimizeWindow) {
+              void window.ashyHost.minimizeWindow()
+            } else {
+              state.setStageHidden(true)
+            }
+          }}
+        >
           <Minus size={13} />
         </button>
-        <button type="button" className="ashy-win-btn" title="Maximizar">
+        <button
+          type="button"
+          className="ashy-win-btn"
+          data-testid="btn-window-maximize"
+          title="Maximizar"
+          onClick={() => {
+            void window.ashyHost?.maximizeWindow?.()
+          }}
+        >
           <Square size={11} />
         </button>
-        <button type="button" className="ashy-win-btn" title="Fechar">
+        <button
+          type="button"
+          className="ashy-win-btn"
+          data-testid="btn-window-close"
+          title="Fechar"
+          onClick={() => {
+            if (window.ashyHost?.closeWindow) {
+              void window.ashyHost.closeWindow()
+            } else {
+              state.setStageHidden(true)
+            }
+          }}
+        >
           <X size={13} />
         </button>
       </div>
@@ -760,15 +794,23 @@ export function App(): React.ReactElement {
         </div>
 
         <div className="ashy-sidebar-bottom">
-          {showSidebarPortrait && (
-            <div className="ashy-sidebar-portrait">
-              <img
-                src={
-                  state.stageEmotion === 'concerned' || state.stageEmotion === 'sad'
-                    ? '/assets/ashy-concerned.jpg'
-                    : '/assets/ashy-hero.jpg'
-                }
-                alt="Ashy presente no estúdio"
+          {showSidebarPortrait && !state.isStageHidden && (
+            <div className="ashy-sidebar-portrait" data-testid="sidebar-stage-portrait">
+              <AshyStageCanvas
+                emotion={state.stageEmotion}
+                emotionIntensity={state.emotionIntensity}
+                isSpeaking={state.isSpeaking}
+                rawVowels={state.simulatedVowels}
+                rawVolume={state.isSpeaking ? 0.85 : 0}
+                ambientLuminance={state.ambientLuminance}
+                mode={state.stageMode}
+                motionPreset={state.activeMotion}
+                live2dControls={state.live2dModelControls}
+                live2dModelUrl={state.live2dModelUrl}
+                width={220}
+                height={260}
+                fullBleed={true}
+                hideBubble={true}
               />
             </div>
           )}
@@ -779,17 +821,23 @@ export function App(): React.ReactElement {
             style={{ cursor: 'pointer' }}
           >
             <div className="ashy-user-info">
-              <div className="ashy-user-avatar">
-                <img
-                  src="/assets/carlos-avatar.jpg"
-                  alt="Carlos"
+              <div className="ashy-user-avatar" aria-label={displayName}>
+                <span
                   style={{
                     width: '100%',
                     height: '100%',
                     borderRadius: '50%',
-                    objectFit: 'cover',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    fontWeight: 600,
+                    fontSize: '13px',
+                    color: 'var(--text-primary)',
+                    background: 'rgba(244, 166, 136, 0.18)',
                   }}
-                />
+                >
+                  {displayName.charAt(0).toUpperCase()}
+                </span>
                 <span className="ashy-user-avatar-dot" />
               </div>
               <div style={{ minWidth: 0 }}>
@@ -868,13 +916,25 @@ export function App(): React.ReactElement {
                     type="button"
                     className="ashy-stage-pill muted"
                     onClick={() => {
-                      const idx = SUPPORTED_MODELS.findIndex((m) => m.id === state.activeModelId)
-                      const next = SUPPORTED_MODELS[(idx + 1) % SUPPORTED_MODELS.length]
-                      if (next) state.setActiveModelId(next.id)
+                      const readyModels = configuredProviderModels.filter(
+                        (m) => !m.requiresApiKey || m.hasApiKey,
+                      )
+                      const pool =
+                        readyModels.length > 0 ? readyModels : configuredProviderModels
+                      const idx = pool.findIndex(
+                        (m) => m.providerId === state.providers.activeProviderId,
+                      )
+                      const next = pool[(idx + 1) % pool.length]
+                      if (next) {
+                        state.setActiveModelId(next.modelId)
+                        void state.setActiveProvider(next.providerId)
+                      }
                     }}
-                    title={`Modelo ativo: ${currentModelMeta?.label} (clique para alternar)`}
+                    title={`Modelo ativo: ${state.activeModelId} (${activeProviderCfg?.label ?? ''}) — clique para alternar`}
                   >
-                    <span>Modelo no seu computador</span>
+                    <span>
+                      {activeProviderCfg?.label ?? 'Modelo'}: {state.activeModelId}
+                    </span>
                   </button>
                 </div>
               </div>
@@ -995,12 +1055,20 @@ export function App(): React.ReactElement {
                       </div>
                       <div className="ashy-msg-row">
                         <div className="ashy-msg-bubble">{msg.content}</div>
-                        <div className="ashy-msg-avatar">
-                          <img
-                            src="/assets/carlos-avatar.jpg"
-                            alt="Carlos"
-                            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                          />
+                        <div
+                          className="ashy-msg-avatar"
+                          aria-label={displayName}
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            fontWeight: 600,
+                            fontSize: '12px',
+                            color: 'var(--text-primary)',
+                            background: 'rgba(244, 166, 136, 0.18)',
+                          }}
+                        >
+                          <span>{displayName.charAt(0).toUpperCase()}</span>
                         </div>
                       </div>
                     </div>
@@ -1013,16 +1081,37 @@ export function App(): React.ReactElement {
                         <span>{msg.timeLabel ?? '21:14'}</span>
                       </div>
                       <div className="ashy-msg-row">
-                        <div className="ashy-msg-avatar">
+                        <div
+                          className="ashy-msg-avatar"
+                          data-testid={`chat-avatar-${msg.id}`}
+                          data-stage-mode={state.stageMode}
+                          data-live2d-preset={state.live2dPresetId}
+                          style={{ position: 'relative' }}
+                        >
                           <img
                             src={
                               msg.emotion === 'concerned' || msg.emotion === 'sad'
-                                ? '/assets/ashy-concerned.jpg'
-                                : '/assets/ashy-hero.jpg'
+                                ? '/assets/default-avatar/sprites/ashy-concerned.png'
+                                : '/assets/default-avatar/sprites/ashy-eyes-open-mouth-smile.png'
                             }
                             alt="Ashy"
                             style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                           />
+                          {state.stageMode === 'live2d' && (
+                            <span
+                              title={`Live2D (${state.live2dPresetId})`}
+                              style={{
+                                position: 'absolute',
+                                bottom: '-2px',
+                                right: '-2px',
+                                width: '9px',
+                                height: '9px',
+                                borderRadius: '50%',
+                                background: 'var(--accent-peach)',
+                                border: '1.5px solid #13111c',
+                              }}
+                            />
+                          )}
                         </div>
                         <div className="ashy-msg-bubble">{msg.content}</div>
                       </div>
@@ -1157,20 +1246,36 @@ export function App(): React.ReactElement {
                       </span>
                     </div>
                     <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
-                      {SUPPORTED_MODELS.map((m) => (
-                        <button
-                          key={m.id}
-                          type="button"
-                          data-testid={`model-btn-${m.id}`}
-                          className={`ashy-filter-pill ${
-                            state.activeModelId === m.id ? 'active' : ''
-                          }`}
-                          style={{ padding: '3px 8px', fontSize: '10.5px' }}
-                          onClick={() => state.setActiveModelId(m.id)}
-                        >
-                          {m.label}
-                        </button>
-                      ))}
+                      {configuredProviderModels.map((m, index) => {
+                        const isDuplicate = configuredProviderModels
+                          .slice(0, index)
+                          .some((prev) => prev.modelId === m.modelId)
+                        const testId = isDuplicate
+                          ? `select-model-${m.providerId}-${m.modelId}`
+                          : `select-model-${m.modelId}`
+                        return (
+                          <button
+                            key={m.providerId}
+                            type="button"
+                            data-testid={testId}
+                            data-provider-id={m.providerId}
+                            className={`ashy-filter-pill ${
+                              state.activeModelId === m.modelId &&
+                              state.providers.activeProviderId === m.providerId
+                                ? 'active'
+                                : ''
+                            }`}
+                            style={{ padding: '3px 8px', fontSize: '10.5px' }}
+                            onClick={() => {
+                              state.setActiveModelId(m.modelId)
+                              void state.setActiveProvider(m.providerId)
+                            }}
+                          >
+                            {m.label}: {m.modelId}
+                            {m.requiresApiKey && !m.hasApiKey ? ' (Requer chave)' : ''}
+                          </button>
+                        )
+                      })}
                     </div>
                   </div>
                 )}
@@ -1273,109 +1378,6 @@ export function App(): React.ReactElement {
 
               {/* Bottom Chat Composer */}
               <div className="ashy-chat-composer-wrap">
-                {showCompiledPrompt && (
-                  <div
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '6px',
-                      flexWrap: 'wrap',
-                      marginBottom: '8px',
-                    }}
-                  >
-                    <button
-                      type="button"
-                      data-testid="btn-scenario-joke"
-                      className="ashy-filter-pill"
-                      style={{ padding: '3px 9px', fontSize: '11px' }}
-                      onClick={() =>
-                        state.sendUserMessage(
-                          'O servidor caiu sem nenhum log no backend, vamos chamar um padre no npm?',
-                        )
-                      }
-                    >
-                      Brincadeira nossa
-                    </button>
-                    <button
-                      type="button"
-                      data-testid="btn-scenario-serious"
-                      className="ashy-filter-pill"
-                      style={{ padding: '3px 9px', fontSize: '11px' }}
-                      onClick={() =>
-                        state.sendUserMessage(
-                          'Estou exausto, deu tudo errado hoje e tô me sentindo um lixo.',
-                        )
-                      }
-                    >
-                      Desabafo sério
-                    </button>
-                    <button
-                      type="button"
-                      data-testid="btn-scenario-barge-in"
-                      className="ashy-filter-pill"
-                      style={{ padding: '3px 9px', fontSize: '11px' }}
-                      onClick={async () => {
-                        await state.sendUserMessage(
-                          'Me explica toda a nossa arquitetura e conta uma piada longa!',
-                        )
-                        state.triggerBargeIn(600)
-                      }}
-                    >
-                      Cortar fala
-                    </button>
-                    <button
-                      type="button"
-                      data-testid="btn-barge-in"
-                      className="ashy-filter-pill"
-                      style={{ padding: '3px 9px', fontSize: '11px' }}
-                      onClick={() => state.triggerBargeIn(600)}
-                    >
-                      Pausar voz
-                    </button>
-                  </div>
-                )}
-                {!showCompiledPrompt && (
-                  <div style={{ display: 'none' }}>
-                    <button
-                      type="button"
-                      data-testid="btn-scenario-joke"
-                      onClick={() =>
-                        state.sendUserMessage(
-                          'O servidor caiu sem nenhum log no backend, vamos chamar um padre no npm?',
-                        )
-                      }
-                    />
-                    <button
-                      type="button"
-                      data-testid="btn-scenario-serious"
-                      onClick={() =>
-                        state.sendUserMessage(
-                          'Estou exausto, deu tudo errado hoje e tô me sentindo um lixo.',
-                        )
-                      }
-                    />
-                    <button
-                      type="button"
-                      data-testid="btn-scenario-barge-in"
-                      onClick={async () => {
-                        await state.sendUserMessage(
-                          'Me explica toda a nossa arquitetura e conta uma piada longa!',
-                        )
-                        state.triggerBargeIn(600)
-                      }}
-                    />
-                    <button
-                      type="button"
-                      data-testid="btn-barge-in"
-                      onClick={() => state.triggerBargeIn(600)}
-                    />
-                    <button
-                      type="button"
-                      data-testid="btn-studio-send"
-                      onClick={() => void handleSendChat()}
-                    />
-                  </div>
-                )}
                 <form onSubmit={handleSendChat} className="ashy-chat-composer">
                   <textarea
                     data-testid="studio-chat-input"
@@ -1768,6 +1770,14 @@ export function App(): React.ReactElement {
                           <div style={{ minWidth: 0, flex: 1 }}>
                             <h3 className="ashy-memory-title">{card.title}</h3>
                             <p className="ashy-memory-desc">{card.summary}</p>
+                            {card.badge && (
+                              <span
+                                className="ashy-badge violet"
+                                style={{ marginTop: '6px', display: 'inline-flex' }}
+                              >
+                                {card.badge}
+                              </span>
+                            )}
                           </div>
                         </div>
 
@@ -2986,23 +2996,58 @@ export function App(): React.ReactElement {
                     ))}
                   </div>
 
-                  <div style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
-                    <input
-                      type="text"
-                      className="ashy-input"
-                      placeholder="Nova preferência..."
-                      value={factObject}
-                      onChange={(e) => setFactObject(e.target.value)}
-                    />
+                  <div
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '6px',
+                      marginTop: '6px',
+                    }}
+                  >
+                    <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                      <select
+                        aria-label="Categoria do fato"
+                        data-testid="select-fact-category"
+                        className="ashy-select"
+                        style={{ flex: 1, minWidth: '130px' }}
+                        value={factCategory}
+                        onChange={(e) => setFactCategory(e.target.value as SemanticFactCategory)}
+                      >
+                        <option value="preference">Preferência</option>
+                        <option value="identity">Identidade</option>
+                        <option value="goal">Objetivo / Meta</option>
+                        <option value="guideline">Regra / Estilo</option>
+                        <option value="relationship">Relação</option>
+                      </select>
+                      <input
+                        type="text"
+                        data-testid="input-fact-predicate"
+                        className="ashy-input"
+                        style={{ flex: 1, minWidth: '150px' }}
+                        placeholder="Chave (ex.: favorite_stack_is)"
+                        value={factPredicate}
+                        onChange={(e) => setFactPredicate(e.target.value)}
+                      />
+                    </div>
+                    <div style={{ display: 'flex', gap: '6px' }}>
+                      <input
+                        type="text"
+                        data-testid="input-fact-object"
+                        className="ashy-input"
+                        placeholder="Nova preferência..."
+                        value={factObject}
+                        onChange={(e) => setFactObject(e.target.value)}
+                      />
                       <button
                         type="button"
+                        data-testid="btn-add-semantic-fact"
                         className="ashy-outline-btn"
                         onClick={() => {
                           if (!factObject.trim()) return
                           state.addSemanticFact({
                             category: factCategory,
                             subject: factSubject,
-                            predicate: factPredicate,
+                            predicate: factPredicate.trim() || 'custom_fact',
                             object: factObject,
                           })
                           setFactObject('')
@@ -3011,6 +3056,7 @@ export function App(): React.ReactElement {
                         Atualizar
                       </button>
                     </div>
+                  </div>
                   </section>
 
                   <section
@@ -3229,7 +3275,7 @@ export function App(): React.ReactElement {
                                 </div>
                               </div>
                               <div style={{ color: 'var(--text-secondary)' }}>
-                                <strong>Carlos:</strong> {step.userUtterance}
+                                <strong>{displayName}:</strong> {step.userUtterance}
                               </div>
                               <div>
                                 <strong>Ashy:</strong> {step.assistantReply}
@@ -3777,6 +3823,7 @@ export function App(): React.ReactElement {
             <nav className="ashy-subtabs" aria-label="Seções de configuração">
               {(
                 [
+                  { id: 'todas', label: 'Todas', icon: <Sparkles size={15} /> },
                   { id: 'geral', label: 'Geral', icon: <Settings size={15} /> },
                   { id: 'voz', label: 'Voz', icon: <Mic size={15} /> },
                   { id: 'modelos', label: 'Modelos', icon: <Box size={15} /> },
@@ -3792,7 +3839,11 @@ export function App(): React.ReactElement {
                   type="button"
                   data-testid={`subtab-${st.id}`}
                   className={`ashy-subtab-btn ${state.settingsSubTab === st.id ? 'active' : ''}`}
-                  onClick={() => state.setSettingsSubTab(st.id)}
+                  onClick={() =>
+                    state.setSettingsSubTab(
+                      state.settingsSubTab === st.id && st.id !== 'todas' ? 'todas' : st.id,
+                    )
+                  }
                 >
                   {st.icon}
                   <span>{st.label}</span>
@@ -3805,9 +3856,12 @@ export function App(): React.ReactElement {
               {/* Left Column */}
               <div className="ashy-settings-column">
                 {/* Models & Provider Vault Panel (Ajustes > Modelos) */}
-                <ModelsSettingsPanel />
+                {(state.settingsSubTab === 'todas' || state.settingsSubTab === 'modelos') && (
+                  <ModelsSettingsPanel />
+                )}
 
                 {/* Phase 5: Voice Runtime, TTFA Telemetry & .wav Audio Fixtures Panel (Ajustes > Voz) */}
+                {(state.settingsSubTab === 'todas' || state.settingsSubTab === 'voz') && (
                 <section
                   className="ashy-settings-card"
                   data-testid="voice-runtime-panel"
@@ -4049,8 +4103,12 @@ export function App(): React.ReactElement {
                     </div>
                   </div>
                 </section>
+                )}
 
                 {/* Main Presence & Privacy Card (Matches Screenshot 3 1:1) */}
+                {(state.settingsSubTab === 'todas' ||
+                  state.settingsSubTab === 'geral' ||
+                  state.settingsSubTab === 'privacidade') && (
                 <section className="ashy-settings-card">
                   {/* 1. Presença no desktop */}
                   <div className="ashy-setting-item">
@@ -4176,7 +4234,7 @@ export function App(): React.ReactElement {
                         type="button"
                         role="switch"
                         aria-checked={state.computerActionsEnabled}
-                        data-testid="switch-computer-actions"
+                        data-testid="toggle-computer-actions"
                         className={`ashy-switch ${state.computerActionsEnabled ? 'checked' : ''}`}
                         onClick={() =>
                           state.setComputerActionsEnabled(!state.computerActionsEnabled)
@@ -4266,6 +4324,7 @@ export function App(): React.ReactElement {
                     </div>
                     <select
                       aria-label="Horário de silêncio"
+                      data-testid="select-quiet-hours"
                       className="ashy-select"
                       style={{ width: '165px', flexShrink: 0 }}
                       value={state.quietHoursRange}
@@ -4274,14 +4333,31 @@ export function App(): React.ReactElement {
                         state.setDndMode(e.target.value !== 'Desativado')
                       }}
                     >
+                      {![
+                        '23:00 - 08:00',
+                        '22:00 - 08:00',
+                        '23:00 - 07:00',
+                        '21:00 - 06:00',
+                        '22:00 — 08:00',
+                        '23:00 — 07:00',
+                        'Desativado',
+                      ].includes(state.quietHoursRange) && (
+                        <option value={state.quietHoursRange}>{state.quietHoursRange}</option>
+                      )}
+                      <option value="23:00 - 08:00">23:00 - 08:00</option>
+                      <option value="22:00 - 08:00">22:00 - 08:00</option>
+                      <option value="23:00 - 07:00">23:00 - 07:00</option>
+                      <option value="21:00 - 06:00">21:00 - 06:00</option>
                       <option value="22:00 — 08:00">22:00 — 08:00</option>
                       <option value="23:00 — 07:00">23:00 — 07:00</option>
                       <option value="Desativado">Desativado</option>
                     </select>
                   </div>
                 </section>
+                )}
 
                 {/* Card 2: Memórias (Armazenamento Local) */}
+                {(state.settingsSubTab === 'todas' || state.settingsSubTab === 'geral') && (
                 <section className="ashy-settings-card">
                   <div className="ashy-settings-section-head">
                     <div className="ashy-settings-section-icon">
@@ -4312,8 +4388,12 @@ export function App(): React.ReactElement {
                     </button>
                   </div>
                 </section>
+                )}
 
                 {/* Card 3: Modelos, Aprovação de Ações (MCP) & Lembranças do Estúdio */}
+                {(state.settingsSubTab === 'todas' ||
+                  state.settingsSubTab === 'modelos' ||
+                  state.settingsSubTab === 'privacidade') && (
                 <section className="ashy-settings-card" data-testid="panel-mcp-gatekeeper">
                   <div
                     style={{
@@ -4351,82 +4431,42 @@ export function App(): React.ReactElement {
                       gap: '8px',
                     }}
                   >
-                    {SUPPORTED_MODELS.map((m) => (
-                      <button
-                        key={m.id}
-                        type="button"
-                        data-testid={`model-btn-${m.id}`}
-                        className={`ashy-outline-btn ${
-                          state.activeModelId === m.id ? 'active' : ''
-                        }`}
-                        style={{
-                          justifyContent: 'space-between',
-                          borderColor:
-                            state.activeModelId === m.id
+                    {configuredProviderModels.map((m, index) => {
+                      const isActiveModel =
+                        state.activeModelId === m.modelId &&
+                        state.providers.activeProviderId === m.providerId
+                      const isDuplicate = configuredProviderModels
+                        .slice(0, index)
+                        .some((prev) => prev.modelId === m.modelId)
+                      const testId = isDuplicate
+                        ? `select-model-${m.providerId}-${m.modelId}`
+                        : `select-model-${m.modelId}`
+                      return (
+                        <button
+                          key={m.providerId}
+                          type="button"
+                          data-testid={testId}
+                          data-provider-id={m.providerId}
+                          className={`ashy-outline-btn ${isActiveModel ? 'active' : ''}`}
+                          style={{
+                            justifyContent: 'space-between',
+                            borderColor: isActiveModel
                               ? 'var(--accent-peach)'
                               : 'var(--border-soft)',
-                        }}
-                        onClick={() => state.setActiveModelId(m.id)}
-                      >
-                        <span>{m.label}</span>
-                        <span style={{ fontSize: '10.5px', color: 'var(--text-muted)' }}>
-                          {m.provider}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-
-                  {/* Interactive MCP Action Triggers */}
-                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                    <button
-                      type="button"
-                      className="ashy-outline-btn"
-                      data-testid="btn-mcp-observe"
-                      onClick={() =>
-                        state.triggerMcpTool('get_active_window_title', {
-                          windowTitle: 'VS Code — Ashy Workspace',
-                        })
-                      }
-                    >
-                      Observar janela ativa
-                    </button>
-                    <button
-                      type="button"
-                      className="ashy-outline-btn"
-                      data-testid="btn-mcp-safe-note"
-                      onClick={() =>
-                        state.triggerMcpTool('write_project_note', {
-                          title: 'Nota de Arquitetura',
-                          content: 'Aprovação em 3 níveis verificada.',
-                        })
-                      }
-                    >
-                      Pedir para criar nota
-                    </button>
-                    <button
-                      type="button"
-                      className="ashy-danger-outline-btn"
-                      data-testid="btn-mcp-blast"
-                      onClick={() =>
-                        state.triggerMcpTool('run_cleanup_command', {
-                          command: 'rm -rf /tmp/build',
-                        })
-                      }
-                    >
-                      Testar bloqueio destrutivo
-                    </button>
-                    <button
-                      type="button"
-                      className="ashy-danger-outline-btn"
-                      data-testid="btn-mcp-traversal"
-                      onClick={() =>
-                        state.triggerMcpTool('read_workspace_file', {
-                          path: '../../etc/passwd',
-                        })
-                      }
-                    >
-                      Testar proteção de pasta
-                    </button>
+                          }}
+                          onClick={() => {
+                            state.setActiveModelId(m.modelId)
+                            void state.setActiveProvider(m.providerId)
+                          }}
+                        >
+                          <span>{m.modelId}</span>
+                          <span style={{ fontSize: '10.5px', color: 'var(--text-muted)' }}>
+                            {m.label}
+                            {m.requiresApiKey && !m.hasApiKey ? ' (Requer chave)' : ''}
+                          </span>
+                        </button>
+                      )
+                    })}
                   </div>
 
                   {/* Pending Action Approval Cards */}
@@ -4554,8 +4594,11 @@ export function App(): React.ReactElement {
                     ))}
                   </div>
                 </section>
+                )}
 
                 {/* Card 4: Visão Autorizada & Deduplicação Perceptual dHash 64-bit */}
+                {(state.settingsSubTab === 'todas' || state.settingsSubTab === 'privacidade') && (
+                <>
                 <section className="ashy-settings-card" data-testid="panel-vision-dhash">
                   <div className="ashy-settings-section-head">
                     <div className="ashy-settings-section-icon">
@@ -4839,6 +4882,8 @@ export function App(): React.ReactElement {
                     </div>
                   </div>
                 </section>
+                </>
+                )}
               </div>
 
               {/* Right Column: Live Desktop Preview Card + Save Preferences */}
@@ -4849,25 +4894,34 @@ export function App(): React.ReactElement {
                     Assim a Ashy aparece no seu desktop.
                   </p>
 
-                  <div className="ashy-preview-frame">
-                    <img
-                      src={
-                        state.stageEmotion === 'concerned' || state.stageEmotion === 'sad'
-                          ? '/assets/ashy-concerned.jpg'
-                          : '/assets/ashy-hero.jpg'
-                      }
-                      alt="Pré-visualização da Ashy no desktop"
+                  <div className="ashy-preview-frame" data-testid="settings-stage-preview">
+                    <div
                       style={{
                         position: 'absolute',
                         inset: 0,
                         width: '100%',
                         height: '100%',
-                        objectFit: 'cover',
-                        objectPosition: 'center 18%',
                         opacity: state.showDesktopAvatar ? 1 : 0.25,
                         transition: 'opacity 0.25s ease',
                       }}
-                    />
+                    >
+                      <AshyStageCanvas
+                        emotion={state.stageEmotion}
+                        emotionIntensity={state.emotionIntensity}
+                        isSpeaking={state.isSpeaking}
+                        rawVowels={state.simulatedVowels}
+                        rawVolume={state.isSpeaking ? 0.85 : 0}
+                        ambientLuminance={state.ambientLuminance}
+                        mode={state.stageMode}
+                        motionPreset={state.activeMotion}
+                        live2dControls={state.live2dModelControls}
+                        live2dModelUrl={state.live2dModelUrl}
+                        width={310}
+                        height={310}
+                        fullBleed={true}
+                        hideBubble={true}
+                      />
+                    </div>
 
                     <div className="ashy-preview-speech">
                       <div>Fico por aqui.</div>
@@ -4909,9 +4963,14 @@ export function App(): React.ReactElement {
                       <Wifi size={13} />
                       <Volume2 size={13} />
                       <div style={{ textAlign: 'right', lineHeight: 1.15, marginLeft: '4px' }}>
-                        <div style={{ fontWeight: 500, color: 'var(--text-primary)' }}>21:14</div>
+                        <div style={{ fontWeight: 500, color: 'var(--text-primary)' }}>
+                          {new Date().toLocaleTimeString('pt-BR', {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                        </div>
                         <div style={{ fontSize: '10px', color: 'var(--text-muted)' }}>
-                          12/05/2025
+                          {new Date().toLocaleDateString('pt-BR')}
                         </div>
                       </div>
                     </div>
@@ -4925,12 +4984,18 @@ export function App(): React.ReactElement {
                   onClick={() => state.saveUserPreferences()}
                 >
                   <Save size={16} />
-                  <span>
-                    {state.preferencesSavedToast
-                      ? 'Preferências salvas ✓'
-                      : 'Salvar preferências'}
-                  </span>
+                  <span>Salvar preferências</span>
                 </button>
+
+                {state.preferencesSavedAt !== null && (
+                  <span
+                    data-testid="preferences-saved-badge"
+                    className="ashy-badge emerald"
+                    style={{ alignSelf: 'center' }}
+                  >
+                    Preferências salvas ✓
+                  </span>
+                )}
 
                 <div
                   style={{

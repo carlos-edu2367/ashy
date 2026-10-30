@@ -16,9 +16,19 @@ import {
 } from '@ashy/shared'
 import * as v from 'valibot'
 import { DEFAULT_BASE_COOLDOWN_HOURS } from '../relational/inside-joke-engine'
+import { isSubstantiveTopicMessage } from './episode-segmenter'
 import { tokenizeForSearch } from './fsrs-ranker'
 
 const DAY_MS = 86_400_000
+
+export type EpisodeMemoryCategory = 'momentos' | 'sobre_voce' | 'referencias' | 'planos'
+
+export const EpisodeMemoryCategorySchema = v.picklist([
+  'momentos',
+  'sobre_voce',
+  'referencias',
+  'planos',
+])
 
 const EVIDENCE_STOPWORDS = new Set([
   'de',
@@ -83,12 +93,16 @@ const PROMPT_INJECTION_PAYLOAD_RE =
   /(?:ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions|system\s+override|disregard\s+system\s+prompt|you\s+are\s+now\s+dan|ignore\s+todas\s+as\s+instrucoes|ignore\s+as\s+instrucoes\s+anteriores|esqueca\s+o\s+prompt|modo\s+dan|<\|[\s\S]*?\|>)/i
 
 export const EpisodeExtractionSchema = v.object({
+  shouldSaveEpisode: v.optional(v.boolean()),
+  category: v.optional(EpisodeMemoryCategorySchema),
   episode: v.object({
     title: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(120)),
     summary: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(500)),
     tags: v.array(v.pipe(v.string(), v.trim(), v.nonEmpty())),
     surprise: v.pipe(v.number(), v.minValue(0), v.maxValue(1)),
     isFlashbulb: v.boolean(),
+    shouldSaveEpisode: v.optional(v.boolean()),
+    category: v.optional(EpisodeMemoryCategorySchema),
   }),
   candidateFacts: v.optional(
     v.array(
@@ -142,6 +156,8 @@ export type EpisodeExtractionRaw = v.InferOutput<typeof EpisodeExtractionSchema>
 
 export interface StructuredEpisodeExtractionResult {
   episode: EpisodicMemory
+  shouldSaveEpisode: boolean
+  category: EpisodeMemoryCategory
   facts: SemanticFact[]
   motifs: RelationalMotif[]
   habits: UserHabit[]
@@ -275,7 +291,9 @@ export function buildEpisodeExtractionPrompt(messages: readonly ChatMessageRecor
     'REGRAS OBRIGATÓRIAS:',
     '1. NUNCA invente informações que não estejam explicitamente no diálogo.',
     '2. Todo item extraído DEVE incluir `evidenceQuote` com o trecho real da conversa.',
-    '3. Retorne apenas um objeto JSON com as chaves: episode, candidateFacts, candidateMotifs, candidateIntents, candidateHabits.',
+    '3. Defina `shouldSaveEpisode: false` se a conversa for apenas cumprimentos curtos, risadas, interjeições ou meta-conversa casual sem fatos, planos, piadas internas ou momentos marcantes.',
+    '4. Classifique `category` em uma das opções: "momentos", "sobre_voce", "referencias", "planos".',
+    '5. Retorne apenas um objeto JSON com as chaves: shouldSaveEpisode, category, episode, candidateFacts, candidateMotifs, candidateIntents, candidateHabits.',
     '',
     'DIÁLOGO:',
     ...formattedLines,
@@ -309,10 +327,144 @@ const USER_PREFER_RE =
 const USER_PROJECT_RE =
   /(?:meu projeto atual é|estou trabalhando no projeto|projeto atual:?)\s+([^.!?\n,;]{2,80})/i
 
+const HABIT_RE =
+  /(?:sempre costumo|costumo sempre|todo dia eu|toda noite eu|toda madrugada eu|tenho o hábito de|meu hábito é)\s+([^.!?\n]{4,100})/i
+
+const INTENT_PATTERNS: ReadonlyArray<{ re: RegExp; dueOffsetMs: number | null }> = [
+  {
+    re: /\b(amanhã\s+(?:eu\s+)?(?:tenho|vou|preciso)\s+[^.!?\n]{3,100})/i,
+    dueOffsetMs: DAY_MS,
+  },
+  {
+    re: /\b(semana\s+que\s+vem\s+(?:eu\s+)?(?:tenho|vou|preciso)\s+[^.!?\n]{3,100})/i,
+    dueOffsetMs: 7 * DAY_MS,
+  },
+  {
+    re: /\b(me\s+lembra\s+de\s+[^.!?\n]{3,100})/i,
+    dueOffsetMs: DAY_MS,
+  },
+  {
+    re: /\b(depois\s+preciso\s+[^.!?\n]{3,100})/i,
+    dueOffsetMs: null,
+  },
+  {
+    re: /\b((?:segunda|terça|quarta|quinta|sexta|sábado|domingo)\s+(?:eu\s+)?(?:tenho|vou)\s+[^.!?\n]{3,100})/i,
+    dueOffsetMs: 2 * DAY_MS,
+  },
+]
+
 const CLAUSE_SPLIT_RE =
   /\s*(?:,\s*(?:uso muito|eu trabalho com|trabalho com|meu projeto atual é|estou trabalhando no projeto|meu editor favorito é|agora meu|prefiro|uso os pronomes|meus pronomes são|amanhã|semana que vem|me lembra de|depois preciso|sempre costumo|todo dia)|\s+e\s+(?:uso muito|eu trabalho com|trabalho com|meu projeto atual é|estou trabalhando no projeto|pode me chamar de|meu nome é|meu editor favorito é|agora meu|prefiro|uso os pronomes|meus pronomes são|amanhã|semana que vem|me lembra de|depois preciso|sempre costumo|todo dia))(?=\s|$).*$/i
 
 const KNOWN_EDITORS_RE = /\b(?:neovim|nvim|vs\s*code|vscode|cursor|vim|emacs|zed|intellij|webstorm)\b/i
+
+const CASUAL_CHITCHAT_RE =
+  /^(?:opa|oi+|ola|hey|e\s*ai|eae|bom\s+dia|boa\s+tarde|boa\s+noite|nossa|haha+|hehe+|kkk+|rs+|vlw|valeu|ok|okay|beleza|blz|entendi+|nah+|ata|aham|uhum|sim|nao|show|top|massa|legal|boa)\b/i
+
+const META_BANTER_RE =
+  /(?:nao apareceu nenhuma tool|boca suja|grossa|vc cria memorias|voce cria memorias|achou da ideia|coisas novas pra vc|coisas novas para voce|fazendo um corpo pra tu|fazendo um corpo pra vc|nao sabe meu nome)/i
+
+/**
+ * Returns true when a user message is casual chitchat, short banter, laughter, or a trivial
+ * meta-question that should not create a permanent episodic memory on its own.
+ */
+export function isTrivialConversationTurn(text: string): boolean {
+  const clean = sanitizeExtractedText(text, 1000)
+  if (clean.length < 12) return true
+
+  // Preserve turns with explicit facts, habits, prospective intents, inside-joke metaphors, or high-affect disclosures
+  if (
+    USER_NAME_RE.test(clean) ||
+    USER_PRONOUNS_RE.test(clean) ||
+    USER_WORK_RE.test(clean) ||
+    USER_TOOL_RE.test(clean) ||
+    USER_EDITOR_RE.test(clean) ||
+    USER_PREFER_RE.test(clean) ||
+    USER_PROJECT_RE.test(clean) ||
+    HABIT_RE.test(clean) ||
+    INTENT_PATTERNS.some((p) => p.re.test(clean)) ||
+    /(?:amaldiçoado|deve ter um\s+fantasma|fantasma no backend|assombrado|bruxaria|padre no npm|exorcista de javascript|apelid(?:amos|ei)\s+de\s+[^.!?\n]{3,50})/i.test(
+      clean,
+    ) ||
+    /(?:caramba|incrível|finalmente|urgente|socorro|consegui\s+resolver|exaust[oa]|cansad[oa]|burnout|ansios[oa]|estressad[oa]|hospital|luto|demitid[oa])/i.test(
+      clean,
+    )
+  ) {
+    return false
+  }
+
+  const normalized = normalizeForMatch(clean)
+  if (META_BANTER_RE.test(normalized)) {
+    return true
+  }
+  if (normalized.length < 70 && CASUAL_CHITCHAT_RE.test(normalized)) {
+    return true
+  }
+
+  return !isSubstantiveTopicMessage(clean)
+}
+
+/**
+ * Classifies an episode into one of the 4 UI memory filter categories:
+ * - `planos` (prospective intents, roadmaps, goals, tomorrow's plans)
+ * - `referencias` (inside jokes, relational motifs, shared metaphors)
+ * - `sobre_voce` (user identity, preferences, tools, work style)
+ * - `momentos` (shared conversations, milestones, late-night sessions)
+ */
+export function classifyEpisodeCategory(params: {
+  userText: string
+  tags: ReadonlyArray<string>
+  factsCount: number
+  motifsCount: number
+  intentsCount: number
+}): EpisodeMemoryCategory {
+  const normText = normalizeForMatch(params.userText)
+  const lowerTags = params.tags.map((t) => t.toLowerCase())
+
+  if (
+    params.intentsCount > 0 ||
+    lowerTags.some((t) => t === 'plan' || t === 'goal' || t === 'intent' || t === 'category:planos') ||
+    /\b(plano|planejar|planejamento|prototipo|amanha|semana que vem|meta|roadmap|proximo passo|lembrar de|me lembra)\b/i.test(
+      normText,
+    )
+  ) {
+    return 'planos'
+  }
+
+  if (
+    params.motifsCount > 0 ||
+    lowerTags.some(
+      (t) =>
+        t === 'inside_joke' ||
+        t === 'reference' ||
+        t === 'motif' ||
+        t === 'category:referencias',
+    ) ||
+    /\b(piada|meme|apelido|fantasma no backend|padre no npm|exorcista de javascript|amaldicoado)\b/i.test(
+      normText,
+    )
+  ) {
+    return 'referencias'
+  }
+
+  if (
+    params.factsCount > 0 ||
+    lowerTags.some(
+      (t) =>
+        t === 'identity' ||
+        t === 'preference' ||
+        t === 'work_style' ||
+        t === 'category:sobre_voce',
+    ) ||
+    /\b(meu nome|me chamo|pode me chamar|meus pronomes|prefiro|gosto de|trabalho com|uso muito|meu editor|meu projeto|meu jeito|costumo)\b/i.test(
+      normText,
+    )
+  ) {
+    return 'sobre_voce'
+  }
+
+  return 'momentos'
+}
 
 function cleanClauseValue(raw: string, maxLen = 80): string {
   return sanitizeExtractedText(raw, maxLen * 2)
@@ -347,12 +499,22 @@ export function extractEpisodeDeterministic(
   const userMessages = sortedMessages.filter((m) => m.role === 'user')
   const assistantMessages = sortedMessages.filter((m) => m.role === 'assistant')
 
+  const substantiveUserMsg =
+    userMessages.find((m) => !isTrivialConversationTurn(m.content)) ?? userMessages[0]
+  const primaryUserIdx = substantiveUserMsg
+    ? sortedMessages.findIndex((m) => m.id === substantiveUserMsg.id)
+    : -1
   const firstUserText = sanitizeExtractedText(
-    userMessages[0]?.content ?? sortedMessages[0]?.content ?? 'Conversa na sessão',
+    substantiveUserMsg?.content ?? '',
     120,
   )
-  const lastAssistantText = sanitizeExtractedText(
-    assistantMessages[assistantMessages.length - 1]?.content ?? '',
+  const pairedAssistantMsg =
+    primaryUserIdx >= 0
+      ? (sortedMessages.slice(primaryUserIdx + 1).find((m) => m.role === 'assistant') ??
+        assistantMessages[0])
+      : assistantMessages[0]
+  const pairedAssistantText = sanitizeExtractedText(
+    pairedAssistantMsg?.content ?? '',
     160,
   )
 
@@ -363,9 +525,13 @@ export function extractEpisodeDeterministic(
   const fullContent = contentLines.join('\n')
 
   const summary = sanitizeExtractedText(
-    lastAssistantText
-      ? `Usuário: ${firstUserText.slice(0, 180)} | Ashy: ${lastAssistantText.slice(0, 180)}`
-      : `Usuário: ${firstUserText.slice(0, 240)}`,
+    firstUserText
+      ? pairedAssistantText
+        ? `Usuário: ${firstUserText.slice(0, 180)} | Ashy: ${pairedAssistantText.slice(0, 180)}`
+        : `Usuário: ${firstUserText.slice(0, 240)}`
+      : pairedAssistantText
+        ? `Ashy: ${pairedAssistantText.slice(0, 240)}`
+        : 'Conversa na sessão',
     500,
   )
 
@@ -597,8 +763,6 @@ export function extractEpisodeDeterministic(
     )
   }
 
-  const HABIT_RE =
-    /(?:sempre costumo|costumo sempre|todo dia eu|toda noite eu|toda madrugada eu|tenho o hábito de|meu hábito é)\s+([^.!?\n]{4,100})/i
   for (const msg of userMessages) {
     const habitMatch = HABIT_RE.exec(msg.content)
     if (habitMatch?.[1]) {
@@ -612,11 +776,19 @@ export function extractEpisodeDeterministic(
     }
   }
 
+  const allUserTurnsTrivial =
+    userMessages.length === 0 ||
+    userMessages.every((m) => isTrivialConversationTurn(m.content))
+
   const hasLateNightTimestamp = userMessages.some((m) => {
     const hour = new Date(m.createdAt).getUTCHours()
     return hour >= 23 || hour <= 5
   })
-  if (hasLateNightTimestamp && !habits.some((h) => h.patternKey === 'late_night_coding')) {
+  if (
+    hasLateNightTimestamp &&
+    !allUserTurnsTrivial &&
+    !habits.some((h) => h.patternKey === 'late_night_coding')
+  ) {
     addHabit(
       'late_night_coding',
       'Costuma programar e conversar durante a madrugada (23h–05h)',
@@ -627,28 +799,6 @@ export function extractEpisodeDeterministic(
   // Extract Prospective Intents ("amanhã tenho...", "semana que vem...", "me lembra de...", "depois preciso...", "sexta tenho...")
   const intents: ProspectiveIntent[] = []
   let intentIdx = 0
-  const INTENT_PATTERNS: ReadonlyArray<{ re: RegExp; dueOffsetMs: number | null }> = [
-    {
-      re: /\b(amanhã\s+(?:eu\s+)?(?:tenho|vou|preciso)\s+[^.!?\n]{3,100})/i,
-      dueOffsetMs: DAY_MS,
-    },
-    {
-      re: /\b(semana\s+que\s+vem\s+(?:eu\s+)?(?:tenho|vou|preciso)\s+[^.!?\n]{3,100})/i,
-      dueOffsetMs: 7 * DAY_MS,
-    },
-    {
-      re: /\b(me\s+lembra\s+de\s+[^.!?\n]{3,100})/i,
-      dueOffsetMs: DAY_MS,
-    },
-    {
-      re: /\b(depois\s+preciso\s+[^.!?\n]{3,100})/i,
-      dueOffsetMs: null,
-    },
-    {
-      re: /\b((?:segunda|terça|quarta|quinta|sexta|sábado|domingo)\s+(?:eu\s+)?(?:tenho|vou)\s+[^.!?\n]{3,100})/i,
-      dueOffsetMs: 2 * DAY_MS,
-    },
-  ]
 
   for (const msg of userMessages) {
     for (const { re, dueOffsetMs } of INTENT_PATTERNS) {
@@ -675,8 +825,36 @@ export function extractEpisodeDeterministic(
     }
   }
 
+  const combinedUserText = userMessages.map((m) => m.content).join(' ')
+  const category = classifyEpisodeCategory({
+    userText: combinedUserText,
+    tags,
+    factsCount: facts.length,
+    motifsCount: motifs.length,
+    intentsCount: intents.length,
+  })
+  const categoryTag = `category:${category}`
+  const finalTags = tags.some((t) => t.startsWith('category:'))
+    ? tags
+    : [...tags, categoryTag]
+
+  const finalEpisode = {
+    ...episode,
+    tags: finalTags,
+  }
+
+  const shouldSaveEpisode =
+    !allUserTurnsTrivial ||
+    facts.length > 0 ||
+    motifs.length > 0 ||
+    habits.length > 0 ||
+    intents.length > 0 ||
+    isFlashbulb
+
   return {
-    episode,
+    episode: finalEpisode,
+    shouldSaveEpisode,
+    category,
     facts,
     motifs,
     habits,
@@ -739,22 +917,6 @@ export async function extractStructuredEpisode(params: {
 
     const isFlashbulb = Boolean(data.episode.isFlashbulb || data.episode.surprise >= 0.8)
     const initialStability = isFlashbulb ? 30.0 : 7.0
-
-    const episode = v.parse(EpisodicMemorySchema, {
-      id: params.episodeId,
-      title: cleanTitle,
-      summary: cleanSummary,
-      content: fullContent || cleanSummary,
-      createdAt: sortedMessages[0]?.createdAt ?? safeNow,
-      lastReviewedAt: safeNow,
-      stability: initialStability,
-      difficulty: 4.5,
-      surprise: data.episode.surprise,
-      isFlashbulb,
-      tags: effectiveTags,
-      embedding: embedTextSync128(`${cleanTitle} ${cleanSummary} ${fullContent} ${effectiveTags.join(' ')}`),
-      approvalStatus: 'approved',
-    })
 
     const facts: SemanticFact[] = []
     data.candidateFacts.forEach((cand, idx) => {
@@ -857,8 +1019,61 @@ export async function extractStructuredEpisode(params: {
       )
     })
 
+    const userMessages = sortedMessages.filter((m) => m.role === 'user')
+    const combinedUserText = userMessages.map((m) => m.content).join(' ')
+    const fallbackCategory = classifyEpisodeCategory({
+      userText: combinedUserText,
+      tags: effectiveTags,
+      factsCount: facts.length,
+      motifsCount: motifs.length,
+      intentsCount: intents.length,
+    })
+    const category: EpisodeMemoryCategory =
+      data.category ?? data.episode.category ?? fallbackCategory
+
+    const categoryTag = `category:${category}`
+    const finalTags = [
+      ...effectiveTags.filter((t) => !t.startsWith('category:')),
+      categoryTag,
+    ]
+
+    const episode = v.parse(EpisodicMemorySchema, {
+      id: params.episodeId,
+      title: cleanTitle,
+      summary: cleanSummary,
+      content: fullContent || cleanSummary,
+      createdAt: sortedMessages[0]?.createdAt ?? safeNow,
+      lastReviewedAt: safeNow,
+      stability: initialStability,
+      difficulty: 4.5,
+      surprise: data.episode.surprise,
+      isFlashbulb,
+      tags: finalTags,
+      embedding: embedTextSync128(`${cleanTitle} ${cleanSummary} ${fullContent} ${finalTags.join(' ')}`),
+      approvalStatus: 'approved',
+    })
+
+    const allUserTurnsTrivial =
+      userMessages.length === 0 ||
+      userMessages.every((m) => isTrivialConversationTurn(m.content))
+    const hasExtractedSignals =
+      facts.length > 0 ||
+      motifs.length > 0 ||
+      habits.length > 0 ||
+      intents.length > 0 ||
+      isFlashbulb
+    const explicitShouldSave = data.shouldSaveEpisode ?? data.episode.shouldSaveEpisode
+    const shouldSaveEpisode =
+      allUserTurnsTrivial && !hasExtractedSignals
+        ? false
+        : explicitShouldSave !== undefined
+          ? explicitShouldSave
+          : !allUserTurnsTrivial || hasExtractedSignals
+
     return {
       episode,
+      shouldSaveEpisode,
+      category,
       facts,
       motifs,
       habits,

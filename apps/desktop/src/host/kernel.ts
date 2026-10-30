@@ -4,12 +4,16 @@ import * as v from 'valibot'
 import { createContainer, type DIContainer } from '@ashy/bus'
 import { createAshyCortex, type AshyCortex } from '@ashy/cortex'
 import { runCoreExperimentM2 } from '@ashy/evals'
+import { generateText } from '@ashy/llm'
 import {
   CompleteOnboardingInputSchema,
+  DEFAULT_PERSISTED_STAGE_PREFERENCES,
   EvaluateInitiativeInputSchema,
+  PersistedStagePreferencesSchema,
   RunCoreExperimentInputSchema,
   UpdateInitiativePolicyInputSchema,
   UpdateMilestoneInputSchema,
+  UpdateStagePreferencesInputSchema,
   type AgencySnapshot,
   type ApprovalScope,
   type ApprovableMemoryKind,
@@ -28,9 +32,12 @@ import {
   type EvaluateInitiativeInput,
   type ExternalMcpServerConfig,
   type InitiativePolicy,
+  type ListProviderModelsInput,
+  type ListProviderModelsResult,
   type LlmProviderId,
   type MemoryGovernanceCategory,
   type MemoryGovernancePolicy,
+  type PersistedStagePreferences,
   type PersonalityEvolutionRecord,
   type PersonalityTraits,
   type ProactiveInitiativeRecord,
@@ -48,15 +55,19 @@ import {
   type UpdateAgencyConsentInput,
   type UpdateInitiativePolicyInput,
   type UpdateMilestoneInput,
+  type UpdateStagePreferencesInput,
   type UpsertFactInput,
   type VisionObservationResult,
 } from '@ashy/shared'
 import { seedAshyDemoFixtures } from '../test/fixtures/demo-seed'
 import { createHostAgencyRuntime, type HostAgencyRuntime } from './agency-runtime'
+import { writeAtomicWithBackup } from './atomic-file'
 import { createProviderVault, type ProviderVault } from './provider-vault'
 import type { SecretProtector } from './secret-protector'
 import { createTurnOrchestrator, type TurnOrchestrator } from './turn-orchestrator'
 import { createVoiceIdentityStore, type VoiceIdentityStore } from './voice-identity-store'
+
+export const DEFAULT_DREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000
 
 export interface AshyHostKernelOptions {
   userDataDir: string
@@ -74,6 +85,7 @@ export interface AshyHostKernel extends AshyHostBridge {
   readonly providerVault: ProviderVault
   readonly agencyRuntime: HostAgencyRuntime
   readonly turnOrchestrator: TurnOrchestrator
+  emitHostEvent?(event: AshyHostStreamEvent): void
   start(): Promise<void>
   stop(): Promise<void>
 }
@@ -128,6 +140,36 @@ export async function createAshyHostKernel(
   let sessionSequence = 0
   let started = false
 
+  const stagePreferencesPath = path.join(options.userDataDir, 'stage-preferences.json')
+  function loadPersistedStagePreferences(): PersistedStagePreferences {
+    if (!fs.existsSync(stagePreferencesPath)) {
+      return { ...DEFAULT_PERSISTED_STAGE_PREFERENCES }
+    }
+    try {
+      const raw = fs.readFileSync(stagePreferencesPath, 'utf8')
+      if (!raw.trim() || raw.includes('\0')) {
+        return { ...DEFAULT_PERSISTED_STAGE_PREFERENCES }
+      }
+      const parsed = JSON.parse(raw) as unknown
+      return v.parse(PersistedStagePreferencesSchema, parsed)
+    } catch {
+      return { ...DEFAULT_PERSISTED_STAGE_PREFERENCES }
+    }
+  }
+
+  let currentStagePreferences: PersistedStagePreferences = loadPersistedStagePreferences()
+  const hostEventListeners = new Set<(event: AshyHostStreamEvent) => void>()
+
+  function emitHostEvent(event: AshyHostStreamEvent): void {
+    for (const listener of hostEventListeners) {
+      try {
+        listener(event)
+      } catch {
+        // Isolate listener error
+      }
+    }
+  }
+
   const container = createContainer()
 
   const cortexToken = container.provide('cortex', {
@@ -156,13 +198,15 @@ export async function createAshyHostKernel(
   const agencyRuntimeToken = container.provide('agencyRuntime', {
     dependsOn: {
       cortex: cortexToken,
+      providerVault: providerVaultToken,
     },
-    build: ({ cortex }) =>
+    build: ({ cortex, providerVault }) =>
       createHostAgencyRuntime({
         cortex,
+        providerVault,
         userDataDir: options.userDataDir,
         fetchImpl: options.fetchImpl,
-      }),
+      } as Parameters<typeof createHostAgencyRuntime>[0]),
     onStop: async (instance) => {
       await instance.close()
     },
@@ -180,6 +224,7 @@ export async function createAshyHostKernel(
         cortex,
         voiceStore,
         providerVault,
+        agencyRuntime: agencyRuntime as HostAgencyRuntime,
         getBootstrapSnapshot: () =>
           buildSnapshot(cortex, voiceStore, providerVault, agencyRuntime),
         getActiveVisionContext: () => agencyRuntime.getActiveVisionContextForTurn(),
@@ -309,6 +354,7 @@ export async function createAshyHostKernel(
       },
       lastEvalReport,
       agency: (agencyRuntime ?? agencyRuntimeInstance)?.getSnapshot(),
+      stagePreferences: currentStagePreferences,
     }
   }
 
@@ -328,11 +374,49 @@ export async function createAshyHostKernel(
   }
 
   function resolveDreamJsonGenerator(): ((prompt: string) => Promise<string>) | undefined {
-    return undefined
+    if (!providerVaultInstance?.getPublicState().hasActiveReadyProvider) {
+      return undefined
+    }
+    return async (prompt: string) => {
+      const model = providerVaultInstance.createActiveLanguageModel() as unknown as {
+        generateText?: (opts: {
+          messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
+          temperature?: number
+          maxTokens?: number
+          reasoningEffort?: 'none'
+        }) => Promise<{ text: string }>
+      }
+      if (typeof model.generateText === 'function') {
+        const res = await model.generateText({
+          messages: [
+            { role: 'system', content: 'Responda apenas com JSON válido.' },
+            { role: 'user', content: prompt },
+          ],
+          temperature: 0.2,
+          maxTokens: 600,
+          reasoningEffort: 'none',
+        })
+        return res.text
+      }
+      const res = await generateText(
+        model as unknown as Parameters<typeof generateText>[0],
+        {
+          messages: [
+            { role: 'system', content: 'Responda apenas com JSON válido.' },
+            { role: 'user', content: prompt },
+          ],
+          temperature: 0.2,
+          maxTokens: 600,
+          reasoningEffort: 'none',
+        },
+      )
+      return res.text
+    }
   }
 
   function scheduleDreamIdleTimer(): void {
-    if (!started || !options.dreamIdleTimeoutMs || options.dreamIdleTimeoutMs <= 0) {
+    const timeoutMs = options.dreamIdleTimeoutMs ?? DEFAULT_DREAM_IDLE_TIMEOUT_MS
+    if (!started || timeoutMs <= 0) {
       return
     }
     clearDreamIdleTimer()
@@ -348,7 +432,8 @@ export async function createAshyHostKernel(
           generateJsonFn: resolveDreamJsonGenerator(),
         })
         .catch(() => undefined)
-    }, options.dreamIdleTimeoutMs)
+    }, timeoutMs)
+    dreamIdleTimer.unref?.()
   }
 
   async function start(): Promise<void> {
@@ -378,6 +463,7 @@ export async function createAshyHostKernel(
         sessionId: activeSessionId,
         force: true,
         sessionSwitch: true,
+        generateJsonFn: resolveDreamJsonGenerator(),
       })
     } catch {
       // Fault-isolated: do not block shutdown if consolidation fails
@@ -405,6 +491,7 @@ export async function createAshyHostKernel(
     get turnOrchestrator() {
       return turnOrchestratorInstance
     },
+    emitHostEvent,
     start,
     stop,
 
@@ -487,6 +574,7 @@ export async function createAshyHostKernel(
             sessionId: activeSessionId,
             force: true,
             sessionSwitch: true,
+            generateJsonFn: resolveDreamJsonGenerator(),
           })
         } catch {
           // Fault-isolated: do not block session switch if consolidation fails
@@ -531,6 +619,10 @@ export async function createAshyHostKernel(
 
     async testProviderConnection(input: TestProviderInput): Promise<ProviderHealthResult> {
       return providerVaultInstance.testProviderConnection(input)
+    },
+
+    async listProviderModels(input: ListProviderModelsInput): Promise<ListProviderModelsResult> {
+      return providerVaultInstance.listProviderModels(input)
     },
 
     async saveVoiceIdentity(content: string): Promise<AshyBootstrapSnapshot['voice']> {
@@ -661,6 +753,7 @@ export async function createAshyHostKernel(
       await cortexInstance.consolidateSessionMemories({
         sessionId: normalizedSessionId,
         force: input?.force ?? true,
+        generateJsonFn: resolveDreamJsonGenerator(),
       })
       return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)
     },
@@ -858,10 +951,52 @@ export async function createAshyHostKernel(
         throw new Error(`Invalid RPC argument: ${message}`)
       }
       const dndMode = parsed.forceDnd ?? agencyRuntimeInstance.privacyController.dndMode
-      const record = cortexInstance.evaluateAttentionInitiative({
+      let record = cortexInstance.evaluateAttentionInitiative({
         ...parsed,
         forceDnd: dndMode,
       })
+      if (
+        record.decision === 'spoken' &&
+        !parsed.simulatedReplyText &&
+        providerVaultInstance.getPublicState().hasActiveReadyProvider
+      ) {
+        try {
+          const model = providerVaultInstance.createActiveLanguageModel()
+          const res = await generateText(
+            model as unknown as Parameters<typeof generateText>[0],
+            {
+              messages: [
+                {
+                  role: 'system',
+                  content:
+                    'Você é Ashy no Cozy Night Studio. Escreva apenas a fala proativa curta (1 a 2 frases naturais em português) para iniciar conversa a partir do lembrete abaixo.',
+                },
+                {
+                  role: 'user',
+                  content: record.noticePrompt || record.sourceTitle,
+                },
+              ],
+              temperature: 0.4,
+              maxTokens: 160,
+              reasoningEffort: 'none',
+            },
+          )
+          const candidateReply = res.text
+            .replace(/<\|ACT\s+[^|]+\|>/g, '')
+            .replace(/<\|DELAY\s+[^|]+\|>/g, '')
+            .replace(/<\|CALLBACK\s+[^|]+\|>/g, '')
+            .replace(/\0/g, '')
+            .trim()
+          if (candidateReply.length >= 8 && !candidateReply.startsWith('data:')) {
+            record = cortexInstance.db.insertProactiveInitiativeLog({
+              ...record,
+              replyText: candidateReply.slice(0, 500),
+            })
+          }
+        } catch {
+          // Keep grounded deterministic replyText fallback on error
+        }
+      }
       if (record.decision === 'spoken' && record.replyText) {
         let sessions = cortexInstance.listChatSessions()
         if (sessions.length === 0) {
@@ -884,12 +1019,61 @@ export async function createAshyHostKernel(
           markersJson: '[]',
           createdAt: record.createdAt,
         })
+        cortexInstance.db.markChatMessagesConsolidated(
+          [`msg-proactive-${record.id}`],
+          `proactive-${record.id}`,
+        )
       }
       return record
     },
 
+    async updateStagePreferences(
+      rawInput: UpdateStagePreferencesInput,
+    ): Promise<PersistedStagePreferences> {
+      let parsed: UpdateStagePreferencesInput
+      try {
+        parsed = v.parse(UpdateStagePreferencesInputSchema, rawInput)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        throw new Error(`Invalid RPC argument: ${message}`)
+      }
+
+      currentStagePreferences = {
+        ...currentStagePreferences,
+        ...(parsed.stageMode !== undefined ? { stageMode: parsed.stageMode } : {}),
+        ...(parsed.live2dPresetId !== undefined ? { live2dPresetId: parsed.live2dPresetId } : {}),
+        ...(parsed.live2dModelUrl !== undefined ? { live2dModelUrl: parsed.live2dModelUrl } : {}),
+        ...(parsed.loadedLive2DModelName !== undefined
+          ? { loadedLive2DModelName: parsed.loadedLive2DModelName }
+          : {}),
+        ...(parsed.live2dModelControls !== undefined
+          ? { live2dModelControls: parsed.live2dModelControls }
+          : {}),
+        ...(parsed.ambientLuminance !== undefined
+          ? { ambientLuminance: parsed.ambientLuminance }
+          : {}),
+        ...(parsed.showDesktopAvatar !== undefined
+          ? { showDesktopAvatar: parsed.showDesktopAvatar }
+          : {}),
+        ...(parsed.isStageHidden !== undefined ? { isStageHidden: parsed.isStageHidden } : {}),
+        updatedAt: Date.now(),
+      }
+
+      writeAtomicWithBackup(stagePreferencesPath, JSON.stringify(currentStagePreferences, null, 2))
+      emitHostEvent({
+        type: 'stage:updated',
+        stagePreferences: currentStagePreferences,
+      })
+      return currentStagePreferences
+    },
+
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
-      return turnOrchestratorInstance.onEvent(listener)
+      hostEventListeners.add(listener)
+      const unsubOrchestrator = turnOrchestratorInstance.onEvent(listener)
+      return () => {
+        hostEventListeners.delete(listener)
+        unsubOrchestrator()
+      }
     },
   }
 }

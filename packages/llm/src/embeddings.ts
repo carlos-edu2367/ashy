@@ -848,6 +848,8 @@ export function computeCosineSimilarity128(
   return Math.max(-1, Math.min(1, raw))
 }
 
+export const computeCosineSimilarity = computeCosineSimilarity128
+
 /**
  * Creates the local deterministic 128-D semantic embedding provider.
  */

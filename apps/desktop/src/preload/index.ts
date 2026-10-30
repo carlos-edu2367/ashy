@@ -1,4 +1,9 @@
-import type { AshyHostStreamEvent, StageOverlayRuntimeState } from '@ashy/shared'
+import type {
+  AshyHostStreamEvent,
+  ListProviderModelsInput,
+  ListProviderModelsResult,
+  StageOverlayRuntimeState,
+} from '@ashy/shared'
 
 export interface IpcRendererLike {
   invoke(channel: string, request?: unknown): Promise<unknown>
@@ -18,6 +23,7 @@ export interface ContextBridgeLike {
 
 export interface AshyPreloadApi {
   invoke(method: string, payload?: unknown): Promise<unknown>
+  listProviderModels?(input: ListProviderModelsInput): Promise<ListProviderModelsResult>
   runDreamReflection?(input?: {
     sessionId?: string
     force?: boolean
@@ -30,6 +36,9 @@ export interface AshyPreloadApi {
   }): Promise<StageOverlayRuntimeState>
   setOverlayVisible?(input: { visible: boolean }): Promise<StageOverlayRuntimeState>
   getOverlayState?(): Promise<StageOverlayRuntimeState>
+  minimizeWindow?(): Promise<{ minimized: boolean }>
+  maximizeWindow?(): Promise<{ maximized: boolean }>
+  closeWindow?(): Promise<{ closed: boolean }>
   onEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
 
@@ -39,6 +48,12 @@ export function createAshyPreloadApi(
   return {
     invoke(method: string, payload?: unknown): Promise<unknown> {
       return ipcRenderer.invoke('ashy:rpc', { method, payload })
+    },
+    listProviderModels(input: ListProviderModelsInput): Promise<ListProviderModelsResult> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'listProviderModels',
+        payload: input,
+      }) as Promise<ListProviderModelsResult>
     },
     runDreamReflection(input?: {
       sessionId?: string
@@ -74,6 +89,15 @@ export function createAshyPreloadApi(
     getOverlayState(): Promise<StageOverlayRuntimeState> {
       return ipcRenderer.invoke('ashy:getOverlayState') as Promise<StageOverlayRuntimeState>
     },
+    minimizeWindow(): Promise<{ minimized: boolean }> {
+      return ipcRenderer.invoke('ashy:windowMinimize') as Promise<{ minimized: boolean }>
+    },
+    maximizeWindow(): Promise<{ maximized: boolean }> {
+      return ipcRenderer.invoke('ashy:windowMaximize') as Promise<{ maximized: boolean }>
+    },
+    closeWindow(): Promise<{ closed: boolean }> {
+      return ipcRenderer.invoke('ashy:windowClose') as Promise<{ closed: boolean }>
+    },
     onEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       const wrapped = (_event: unknown, payload: AshyHostStreamEvent) => {
         listener(payload)
@@ -108,4 +132,17 @@ if (maybeGlobalElectron.contextBridge && maybeGlobalElectron.ipcRenderer) {
     maybeGlobalElectron.contextBridge,
     maybeGlobalElectron.ipcRenderer,
   )
+} else {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const electron = require('electron') as {
+      contextBridge?: ContextBridgeLike
+      ipcRenderer?: IpcRendererLike
+    }
+    if (electron.contextBridge && electron.ipcRenderer) {
+      exposeAshyPreload(electron.contextBridge, electron.ipcRenderer)
+    }
+  } catch {
+    // Non-Electron environment
+  }
 }

@@ -9,7 +9,7 @@ import {
   stripLeadingAssistantSlop, detectBondManipulation, stripBondManipulation, HEALTHY_BOND_FALLBACK_PT_BR, type BondManipulationCategory, type BondManipulationDetection,
   defineTool,
   streamText,
-  generateText,
+  generateText, valibotSchemaToJsonSchema,
   createOpenAICompatibleModel,
   createAnthropicMessagesModel,
   createScriptedMockModel,
@@ -676,5 +676,279 @@ describe('Healthy Bond & Anti-Manipulation Guardrails (Phase 4)', () => {
     expect(stripBondManipulation(unaccentedAndDecimals)).toBe(
       '<|ACT {"emotion":"happy","intensity":0.88}|> A acurácia subiu para 0.95 na v1.2.0!',
     )
+  })
+})
+
+describe('@ashy/llm — Phase 8.1: Reasoning Effort Control, Anthropic Tool Use & Schema Introspection', () => {
+  function buildSseResponse(lines: string[]): Response {
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const line of lines) {
+          controller.enqueue(encoder.encode(`${line}\n\n`))
+        }
+        controller.close()
+      },
+    })
+    return new Response(stream, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })
+  }
+
+  it('sends reasoning: { enabled: false, effort: "none" } to OpenRouter when reasoningEffort is "none" and { enabled: true, effort } when enabled', async () => {
+    const capturedBodies: Array<Record<string, unknown>> = []
+    const fetchMock: typeof fetch = async (_input, init) => {
+      capturedBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return buildSseResponse([
+        'data: {"choices":[{"delta":{"content":"Oi!"},"finish_reason":"stop"}]}',
+        'data: [DONE]',
+      ])
+    }
+
+    const modelNone = createOpenAICompatibleModel({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'sk-or-test',
+      model: 'qwen/qwen3.8-flash',
+      reasoningEffort: 'none',
+      fetchImpl: fetchMock,
+    })
+
+    const resNone = await generateText(modelNone, {
+      messages: [{ role: 'user', content: 'opa' }],
+    })
+    expect(resNone.text).toBe('Oi!')
+    expect(capturedBodies[0]?.reasoning).toEqual({
+      enabled: false,
+      effort: 'none',
+    })
+
+    const resLow = await generateText(modelNone, {
+      messages: [{ role: 'user', content: 'pense rápido' }],
+      reasoningEffort: 'low',
+    })
+    expect(resLow.text).toBe('Oi!')
+    expect(capturedBodies[1]?.reasoning).toEqual({
+      enabled: true,
+      effort: 'low',
+    })
+  })
+
+  it('disables thinking on Ollama / Qwen local endpoints when reasoningEffort is "none" and retries cleanly if an endpoint rejects unknown reasoning fields', async () => {
+    const capturedBodies: Array<Record<string, unknown>> = []
+    let callCount = 0
+    const fetchMock: typeof fetch = async (_input, init) => {
+      callCount += 1
+      const parsed = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+      capturedBodies.push(parsed)
+      if (callCount === 2 && ('reasoning' in parsed || 'chat_template_kwargs' in parsed || 'think' in parsed)) {
+        return new Response(
+          JSON.stringify({ error: { message: 'Unrecognized request argument supplied: chat_template_kwargs' } }),
+          { status: 400 },
+        )
+      }
+      return buildSseResponse([
+        'data: {"choices":[{"delta":{"content":"Resposta rápida"},"finish_reason":"stop"}]}',
+        'data: [DONE]',
+      ])
+    }
+
+    const ollamaModel = createOpenAICompatibleModel({
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      model: 'qwen3:8b',
+      reasoningEffort: 'none',
+      fetchImpl: fetchMock,
+    })
+
+    const res1 = await generateText(ollamaModel, {
+      messages: [{ role: 'user', content: 'oi' }],
+    })
+    expect(res1.text).toBe('Resposta rápida')
+    expect(capturedBodies[0]?.think).toBe(false)
+    expect(capturedBodies[0]?.chat_template_kwargs).toEqual({ enable_thinking: false })
+
+    // Call 2 simulates a strict server returning HTTP 400 on chat_template_kwargs, which should auto-retry without reasoning params
+    const res2 = await generateText(ollamaModel, {
+      messages: [{ role: 'user', content: 'oi de novo' }],
+    })
+    expect(res2.text).toBe('Resposta rápida')
+    expect(capturedBodies).toHaveLength(3)
+    expect(capturedBodies[2]?.chat_template_kwargs).toBeUndefined()
+    expect(capturedBodies[2]?.think).toBeUndefined()
+  })
+
+  it('serializes assistant tool_use blocks on multi-step Anthropic calls, forwards temperature, and extracts usage tokens', async () => {
+    const capturedBodies: Array<Record<string, unknown>> = []
+    let step = 0
+    const fetchMock: typeof fetch = async (_input, init) => {
+      step += 1
+      capturedBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      if (step === 1) {
+        return buildSseResponse([
+          'data: {"type":"message_start","message":{"usage":{"input_tokens":42}}}',
+          'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+          'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Vou checar."}}',
+          'data: {"type":"content_block_stop","index":0}',
+          'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_123","name":"get_time"}}',
+          'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"tz\\":\\"UTC\\"}"}}',
+          'data: {"type":"content_block_stop","index":1}',
+          'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":18}}',
+          'data: {"type":"message_stop"}',
+        ])
+      }
+      return buildSseResponse([
+        'data: {"type":"message_start","message":{"usage":{"input_tokens":60}}}',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" São 12:00 UTC."}}',
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}',
+        'data: {"type":"message_stop"}',
+      ])
+    }
+
+    const anthropicModel = createAnthropicMessagesModel({
+      apiKey: 'sk-ant-test',
+      model: 'claude-3-7-sonnet-latest',
+      reasoningEffort: 'none',
+      fetchImpl: fetchMock,
+    })
+
+    const getTimeTool = defineTool({
+      name: 'get_time',
+      description: 'Retorna a hora',
+      parameters: v.object({ tz: v.string() }),
+      execute: async ({ tz }) => ({ time: `12:00 ${tz}` }),
+    })
+
+    const result = await generateText(anthropicModel, {
+      messages: [{ role: 'user', content: 'Que horas são?' }],
+      tools: [getTimeTool],
+      temperature: 0.4,
+      maxSteps: 3,
+    })
+
+    expect(result.text).toBe('Vou checar. São 12:00 UTC.')
+    expect(result.usage).toEqual({
+      promptTokens: 60,
+      completionTokens: 10,
+      totalTokens: 70,
+    })
+    expect(capturedBodies[0]?.temperature).toBe(0.4)
+    expect(capturedBodies[0]?.thinking).toBeUndefined()
+
+    const secondStepMessages = capturedBodies[1]?.messages as Array<Record<string, unknown>>
+    const assistantMsg = secondStepMessages.find((m) => m.role === 'assistant')
+    expect(assistantMsg).toBeDefined()
+    expect(assistantMsg?.content).toEqual([
+      { type: 'text', text: 'Vou checar.' },
+      {
+        type: 'tool_use',
+        id: 'toolu_123',
+        name: 'get_time',
+        input: { tz: 'UTC' },
+      },
+    ])
+  })
+
+  it('converts literal, union, record, tuple, and piped descriptions/constraints in valibotSchemaToJsonSchema', () => {
+    const complexSchema = v.object({
+      mode: v.literal('fast'),
+      target: v.union([v.literal('window'), v.literal('screen')]),
+      tags: v.record(v.string(), v.number()),
+      coords: v.tuple([v.number(), v.number()]),
+      query: v.pipe(
+        v.string(),
+        v.minLength(2),
+        v.maxLength(100),
+        v.description('Termo de busca principal'),
+      ),
+    })
+
+    const jsonSchema = valibotSchemaToJsonSchema(complexSchema)
+    const props = jsonSchema.properties as Record<string, Record<string, unknown>>
+
+    expect(props.mode).toEqual({ type: 'string', const: 'fast' })
+    expect(props.target).toEqual({
+      anyOf: [
+        { type: 'string', const: 'window' },
+        { type: 'string', const: 'screen' },
+      ],
+    })
+    expect(props.tags).toEqual({
+      type: 'object',
+      additionalProperties: { type: 'number' },
+    })
+    expect(props.coords).toEqual({
+      type: 'array',
+      items: [{ type: 'number' }, { type: 'number' }],
+      minItems: 2,
+      maxItems: 2,
+    })
+    expect(props.query).toEqual({
+      type: 'string',
+      minLength: 2,
+      maxLength: 100,
+      description: 'Termo de busca principal',
+    })
+  })
+
+  it('[Red-Team] guarantees Anthropic max_tokens > thinking.budget_tokens on medium/high, retries without thinking on HTTP 400, and flushes multi-char partial inline tags at EOF', async () => {
+    const capturedBodies: Array<Record<string, unknown>> = []
+    let callCount = 0
+
+    const fetchMock: typeof fetch = async (_input, init) => {
+      callCount += 1
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+      capturedBodies.push(body)
+
+      // On 2nd call (haiku model that rejects thinking with 400), return HTTP 400 first, then 200 on retry
+      if (callCount === 2 && body.thinking !== undefined) {
+        return new Response('{"error":{"type":"invalid_request_error","message":"thinking is not supported for this model"}}', {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      return buildSseResponse([
+        'data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Resultado 2 <th"}}',
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}',
+        'data: {"type":"message_stop"}',
+      ])
+    }
+
+    const sonnetHigh = createAnthropicMessagesModel({
+      apiKey: 'sk-ant-test',
+      model: 'claude-3-7-sonnet-latest',
+      reasoningEffort: 'high',
+      fetchImpl: fetchMock,
+    })
+
+    const r1 = await generateText(sonnetHigh, {
+      messages: [{ role: 'user', content: 'Teste high' }],
+      temperature: 0.5,
+    })
+
+    // 1. max_tokens MUST be strictly greater than budget_tokens (8192) and temperature omitted when thinking enabled
+    expect((capturedBodies[0]?.thinking as { budget_tokens: number })?.budget_tokens).toBe(8192)
+    expect(Number(capturedBodies[0]?.max_tokens)).toBeGreaterThan(8192)
+    expect(capturedBodies[0]?.temperature).toBeUndefined()
+    // 2. Trailing multi-char partial tag "2 <th" must NOT be dropped by splitInlineReasoning at EOF
+    expect(r1.text).toBe('Resultado 2 <th')
+
+    // 3. Model that returns HTTP 400 on thinking must retry without thinking and restore temperature
+    const haikuWithThinking = createAnthropicMessagesModel({
+      apiKey: 'sk-ant-test',
+      model: 'claude-3-5-haiku-latest',
+      reasoningEffort: 'medium',
+      fetchImpl: fetchMock,
+    })
+
+    const r2 = await generateText(haikuWithThinking, {
+      messages: [{ role: 'user', content: 'Teste fallback 400' }],
+      temperature: 0.3,
+    })
+    expect(r2.text).toBe('Resultado 2 <th')
+    expect(capturedBodies[1]?.thinking).toBeDefined()
+    expect(capturedBodies[2]?.thinking).toBeUndefined()
+    expect(capturedBodies[2]?.temperature).toBe(0.3)
   })
 })

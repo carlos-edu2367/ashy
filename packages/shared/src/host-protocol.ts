@@ -31,6 +31,17 @@ export const LLM_PROVIDER_IDS = [
 export type LlmProviderId = (typeof LLM_PROVIDER_IDS)[number]
 export const LlmProviderIdSchema = v.picklist(LLM_PROVIDER_IDS)
 
+export const REASONING_EFFORT_LEVELS = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+] as const
+
+export type ReasoningEffort = (typeof REASONING_EFFORT_LEVELS)[number]
+export const ReasoningEffortSchema = v.picklist(REASONING_EFFORT_LEVELS)
+
 export const STT_PROVIDER_IDS = [
   'openai-whisper',
   'local-whisper-http',
@@ -96,6 +107,7 @@ export interface Live2DModelPreset {
   cubismVersion: 4
   scale: number
   offsetY: number
+  manifestJson?: Record<string, unknown>
 }
 
 export const BUILTIN_LIVE2D_MODEL_PRESETS: readonly Live2DModelPreset[] = [
@@ -107,6 +119,34 @@ export const BUILTIN_LIVE2D_MODEL_PRESETS: readonly Live2DModelPreset[] = [
     cubismVersion: 4,
     scale: 0.24,
     offsetY: 0.08,
+    manifestJson: {
+      Version: 3,
+      FileReferences: {
+        Moc: 'Hiyori.moc3',
+        Textures: ['Hiyori.2048/texture_00.png', 'Hiyori.2048/texture_01.png'],
+        Physics: 'Hiyori.physics3.json',
+        Pose: 'Hiyori.pose3.json',
+        UserData: 'Hiyori.userdata3.json',
+        DisplayInfo: 'Hiyori.cdi3.json',
+        Motions: {
+          Idle: [
+            { File: 'motions/Hiyori_m01.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+            { File: 'motions/Hiyori_m02.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+            { File: 'motions/Hiyori_m03.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+            { File: 'motions/Hiyori_m05.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+            { File: 'motions/Hiyori_m06.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+            { File: 'motions/Hiyori_m07.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+            { File: 'motions/Hiyori_m08.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+            { File: 'motions/Hiyori_m09.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+            { File: 'motions/Hiyori_m10.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          ],
+          TapBody: [
+            { File: 'motions/Hiyori_m04.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          ],
+        },
+      },
+      HitAreas: [{ Id: 'HitArea', Name: 'Body' }],
+    },
   },
   {
     id: 'haru',
@@ -116,6 +156,43 @@ export const BUILTIN_LIVE2D_MODEL_PRESETS: readonly Live2DModelPreset[] = [
     cubismVersion: 4,
     scale: 0.24,
     offsetY: 0.06,
+    manifestJson: {
+      Version: 3,
+      FileReferences: {
+        Moc: 'Haru.moc3',
+        Textures: ['Haru.2048/texture_00.png', 'Haru.2048/texture_01.png'],
+        Physics: 'Haru.physics3.json',
+        Pose: 'Haru.pose3.json',
+        DisplayInfo: 'Haru.cdi3.json',
+        Expressions: [
+          { Name: 'F01', File: 'expressions/F01.exp3.json' },
+          { Name: 'F02', File: 'expressions/F02.exp3.json' },
+          { Name: 'F03', File: 'expressions/F03.exp3.json' },
+          { Name: 'F04', File: 'expressions/F04.exp3.json' },
+          { Name: 'F05', File: 'expressions/F05.exp3.json' },
+          { Name: 'F06', File: 'expressions/F06.exp3.json' },
+          { Name: 'F07', File: 'expressions/F07.exp3.json' },
+          { Name: 'F08', File: 'expressions/F08.exp3.json' },
+        ],
+        Motions: {
+          Idle: [
+            { File: 'motions/haru_g_idle.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+            { File: 'motions/haru_g_m15.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          ],
+          TapBody: [
+            { File: 'motions/haru_g_m26.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+            { File: 'motions/haru_g_m06.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+            { File: 'motions/haru_g_m20.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+            { File: 'motions/haru_g_m09.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          ],
+        },
+        UserData: 'Haru.userdata3.json',
+      },
+      HitAreas: [
+        { Id: 'HitArea', Name: 'Head' },
+        { Id: 'HitArea2', Name: 'Body' },
+      ],
+    },
   },
   {
     id: 'mao',
@@ -125,6 +202,44 @@ export const BUILTIN_LIVE2D_MODEL_PRESETS: readonly Live2DModelPreset[] = [
     cubismVersion: 4,
     scale: 0.2,
     offsetY: 0.1,
+    manifestJson: {
+      Version: 3,
+      FileReferences: {
+        Moc: 'Mao.moc3',
+        Textures: ['Mao.2048/texture_00.png'],
+        Physics: 'Mao.physics3.json',
+        Pose: 'Mao.pose3.json',
+        DisplayInfo: 'Mao.cdi3.json',
+        Expressions: [
+          { Name: 'exp_01', File: 'expressions/exp_01.exp3.json' },
+          { Name: 'exp_02', File: 'expressions/exp_02.exp3.json' },
+          { Name: 'exp_03', File: 'expressions/exp_03.exp3.json' },
+          { Name: 'exp_04', File: 'expressions/exp_04.exp3.json' },
+          { Name: 'exp_05', File: 'expressions/exp_05.exp3.json' },
+          { Name: 'exp_06', File: 'expressions/exp_06.exp3.json' },
+          { Name: 'exp_07', File: 'expressions/exp_07.exp3.json' },
+          { Name: 'exp_08', File: 'expressions/exp_08.exp3.json' },
+        ],
+        Motions: {
+          Idle: [
+            { File: 'motions/mtn_01.motion3.json' },
+            { File: 'motions/sample_01.motion3.json' },
+          ],
+          TapBody: [
+            { File: 'motions/mtn_02.motion3.json' },
+            { File: 'motions/mtn_03.motion3.json' },
+            { File: 'motions/mtn_04.motion3.json' },
+            { File: 'motions/special_01.motion3.json' },
+            { File: 'motions/special_02.motion3.json' },
+            { File: 'motions/special_03.motion3.json' },
+          ],
+        },
+      },
+      HitAreas: [
+        { Id: 'HitAreaHead', Name: 'Head' },
+        { Id: 'HitAreaBody', Name: 'Body' },
+      ],
+    },
   },
 ] as const
 
@@ -294,6 +409,7 @@ export interface PublicProviderConfig {
   label: string
   baseUrl: string
   modelId: string
+  reasoningEffort?: ReasoningEffort
   requiresApiKey: boolean
   hasApiKey: boolean
   maskedApiKey: string | null
@@ -602,6 +718,77 @@ const TimestampSchema = v.pipe(
   v.minValue(0),
 )
 
+export const Live2DModelControlsSchema = v.object({
+  version: v.pipe(v.number(), v.finite()),
+  expressions: v.array(v.pipe(v.string(), v.trim(), v.maxLength(80))),
+  motionGroups: v.array(
+    v.object({
+      name: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(80)),
+      count: v.pipe(v.number(), v.integer(), v.minValue(0)),
+    }),
+  ),
+  hitAreas: v.array(v.pipe(v.string(), v.trim(), v.maxLength(80))),
+})
+
+export function isSafeLive2DModelUrl(value: string): boolean {
+  const trimmed = value.trim()
+  if (!trimmed || trimmed.length > 512) return false
+  if (/[\x00-\x1f\x7f\\]/.test(trimmed)) return false
+  if (trimmed.includes('..') || trimmed.startsWith('//')) return false
+  return /^\/live2d\/[a-zA-Z0-9._/-]+\.model3\.json$/.test(trimmed)
+}
+
+export const PersistedStagePreferencesSchema = v.object({
+  stageMode: v.picklist(['tachie', 'live2d'] as const),
+  live2dPresetId: v.picklist(LIVE2D_BUILTIN_MODEL_IDS),
+  live2dModelUrl: v.pipe(
+    v.string(),
+    v.trim(),
+    v.nonEmpty(),
+    v.maxLength(512),
+    v.check(isSafeLive2DModelUrl, 'Invalid or unsafe Live2D model URL.'),
+  ),
+  loadedLive2DModelName: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256)),
+  live2dModelControls: v.optional(Live2DModelControlsSchema),
+  ambientLuminance: v.pipe(v.number(), v.finite(), v.minValue(0), v.maxValue(1)),
+  showDesktopAvatar: v.boolean(),
+  isStageHidden: v.boolean(),
+  updatedAt: TimestampSchema,
+})
+export type PersistedStagePreferences = v.InferOutput<typeof PersistedStagePreferencesSchema>
+
+export const DEFAULT_PERSISTED_STAGE_PREFERENCES: Readonly<PersistedStagePreferences> =
+  Object.freeze({
+    stageMode: 'tachie',
+    live2dPresetId: 'hiyori',
+    live2dModelUrl: '/live2d/models/hiyori/Hiyori.model3.json',
+    loadedLive2DModelName: 'ashy-default.model3.json',
+    ambientLuminance: 0.35,
+    showDesktopAvatar: true,
+    isStageHidden: false,
+    updatedAt: 0,
+  })
+
+export const UpdateStagePreferencesInputSchema = v.object({
+  stageMode: v.optional(v.picklist(['tachie', 'live2d'] as const)),
+  live2dPresetId: v.optional(v.picklist(LIVE2D_BUILTIN_MODEL_IDS)),
+  live2dModelUrl: v.optional(
+    v.pipe(
+      v.string(),
+      v.trim(),
+      v.nonEmpty(),
+      v.maxLength(512),
+      v.check(isSafeLive2DModelUrl, 'Invalid or unsafe Live2D model URL.'),
+    ),
+  ),
+  loadedLive2DModelName: v.optional(v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256))),
+  live2dModelControls: v.optional(Live2DModelControlsSchema),
+  ambientLuminance: v.optional(v.pipe(v.number(), v.finite(), v.minValue(0), v.maxValue(1))),
+  showDesktopAvatar: v.optional(v.boolean()),
+  isStageHidden: v.optional(v.boolean()),
+})
+export type UpdateStagePreferencesInput = v.InferOutput<typeof UpdateStagePreferencesInputSchema>
+
 const NonNegativeIntSchema = v.pipe(
   v.number(),
   v.integer(),
@@ -871,6 +1058,7 @@ export interface AshyBootstrapSnapshot {
   }
   lastEvalReport?: CoreExperimentEvalReport | null
   agency?: AgencySnapshot
+  stagePreferences?: PersistedStagePreferences
 }
 
 export const CompleteOnboardingInputSchema = v.object({
@@ -881,6 +1069,7 @@ export const CompleteOnboardingInputSchema = v.object({
       providerId: LlmProviderIdSchema,
       baseUrl: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(512)),
       modelId: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256)),
+      reasoningEffort: v.optional(ReasoningEffortSchema),
       apiKey: v.optional(v.string()),
     }),
   ),
@@ -892,6 +1081,7 @@ export const SaveProviderConfigInputSchema = v.object({
   providerId: LlmProviderIdSchema,
   baseUrl: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(512)),
   modelId: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256)),
+  reasoningEffort: v.optional(ReasoningEffortSchema),
   apiKey: v.optional(v.string()),
   clearApiKey: v.optional(v.boolean()),
 })
@@ -902,10 +1092,85 @@ export const TestProviderInputSchema = v.object({
   providerId: LlmProviderIdSchema,
   baseUrl: v.optional(v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(512))),
   modelId: v.optional(v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256))),
+  reasoningEffort: v.optional(ReasoningEffortSchema),
   apiKey: v.optional(v.string()),
 })
 
 export type TestProviderInput = v.InferOutput<typeof TestProviderInputSchema>
+
+export const ProviderModelCatalogItemSchema = v.object({
+  id: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256)),
+  name: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256)),
+  providerId: LlmProviderIdSchema,
+  contextLength: v.optional(v.nullable(v.pipe(v.number(), v.integer(), v.minValue(0)))),
+  supportsTools: v.optional(v.boolean()),
+  supportsReasoning: v.optional(v.boolean()),
+})
+
+export type ProviderModelCatalogItem = v.InferOutput<typeof ProviderModelCatalogItemSchema>
+
+export const ListProviderModelsInputSchema = v.object({
+  providerId: LlmProviderIdSchema,
+  baseUrl: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(512))),
+  apiKey: v.optional(v.string()),
+})
+
+export type ListProviderModelsInput = v.InferOutput<typeof ListProviderModelsInputSchema>
+
+export const ListProviderModelsResultSchema = v.object({
+  providerId: LlmProviderIdSchema,
+  models: v.array(ProviderModelCatalogItemSchema),
+  source: v.picklist(['remote', 'fallback'] as const),
+  fetchedAt: TimestampSchema,
+  error: v.optional(v.nullable(v.string()), null),
+})
+
+export type ListProviderModelsResult = v.InferOutput<typeof ListProviderModelsResultSchema>
+
+export const ASHY_HOST_RPC_METHODS = [
+  'getBootstrapSnapshot',
+  'completeOnboarding',
+  'createSession',
+  'selectSession',
+  'sendTurn',
+  'abortTurn',
+  'saveProviderConfig',
+  'setActiveProvider',
+  'testProviderConnection',
+  'listProviderModels',
+  'saveVoiceIdentity',
+  'resetVoiceIdentity',
+  'upsertSemanticFact',
+  'upsertEpisodicMemory',
+  'upsertMilestone',
+  'upsertRelationalMotif',
+  'upsertProspectiveIntent',
+  'recordEmotionPulse',
+  'persistDreamConsolidation',
+  'persistTraitRevert',
+  'deleteMemoryItem',
+  'consolidateSessionMemories',
+  'approveMemoryItem',
+  'setMemoryGovernancePolicy',
+  'seedDemoFixtures',
+  'runCoreExperimentEval',
+  'runDreamReflection',
+  'revertTraitEvolution',
+  'getAgencySnapshot',
+  'callMcpTool',
+  'approvePendingAction',
+  'denyPendingAction',
+  'updateAgencyConsent',
+  'revokeSessionPermissions',
+  'captureAuthorizedScreen',
+  'registerExternalMcpServer',
+  'updateMilestone',
+  'updateInitiativePolicy',
+  'evaluateAttentionInitiative',
+  'updateStagePreferences',
+] as const
+
+export type AshyHostRpcMethod = (typeof ASHY_HOST_RPC_METHODS)[number]
 
 export const SendTurnInputSchema = v.object({
   sessionId: v.pipe(v.string(), v.trim(), v.nonEmpty()),
@@ -989,6 +1254,14 @@ export type AshyHostStreamEvent =
       message: string
       recoverable: boolean
     }
+  | {
+      type: 'stage:updated'
+      stagePreferences: PersistedStagePreferences
+    }
+  | {
+      type: 'shortcut:triggered'
+      action: 'toggleMic' | 'toggleEyes' | 'toggleDnd' | 'toggleHideStage'
+    }
 
 export interface AshyHostBridge {
   getBootstrapSnapshot(): Promise<AshyBootstrapSnapshot>
@@ -1009,6 +1282,7 @@ export interface AshyHostBridge {
   }>
   setActiveProvider(providerId: LlmProviderId): Promise<AshyBootstrapSnapshot['providers']>
   testProviderConnection(input: TestProviderInput): Promise<ProviderHealthResult>
+  listProviderModels(input: ListProviderModelsInput): Promise<ListProviderModelsResult>
   saveVoiceIdentity(content: string): Promise<AshyBootstrapSnapshot['voice']>
   resetVoiceIdentity(): Promise<AshyBootstrapSnapshot['voice']>
   upsertSemanticFact(input: UpsertFactInput): Promise<SemanticFact>
@@ -1098,6 +1372,7 @@ export interface AshyHostBridge {
   updateMilestone?(input: UpdateMilestoneInput): Promise<AutobiographicalMilestone>
   updateInitiativePolicy?(input: UpdateInitiativePolicyInput): Promise<InitiativePolicy>
   evaluateAttentionInitiative?(input?: EvaluateInitiativeInput): Promise<ProactiveInitiativeRecord>
+  updateStagePreferences?(input: UpdateStagePreferencesInput): Promise<PersistedStagePreferences>
   onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
 
@@ -1123,6 +1398,7 @@ export const DEFAULT_PROVIDER_CONFIGS: Record<
     label: string
     baseUrl: string
     modelId: string
+    reasoningEffort: ReasoningEffort
     requiresApiKey: boolean
   }
 > = {
@@ -1130,32 +1406,218 @@ export const DEFAULT_PROVIDER_CONFIGS: Record<
     label: 'OpenRouter',
     baseUrl: 'https://openrouter.ai/api/v1',
     modelId: 'anthropic/claude-3.7-sonnet',
+    reasoningEffort: 'none',
     requiresApiKey: true,
   },
   anthropic: {
     label: 'Anthropic',
     baseUrl: 'https://api.anthropic.com/v1',
     modelId: 'claude-3-7-sonnet-latest',
+    reasoningEffort: 'none',
     requiresApiKey: true,
   },
   openai: {
     label: 'OpenAI',
     baseUrl: 'https://api.openai.com/v1',
     modelId: 'gpt-4o-mini',
+    reasoningEffort: 'none',
     requiresApiKey: true,
   },
   'nvidia-nim': {
     label: 'NVIDIA NIM',
     baseUrl: 'https://integrate.api.nvidia.com/v1',
     modelId: 'meta/llama-3.3-70b-instruct',
+    reasoningEffort: 'none',
     requiresApiKey: true,
   },
   ollama: {
     label: 'Ollama (Local)',
     baseUrl: 'http://127.0.0.1:11434/v1',
     modelId: 'qwen2.5:14b',
+    reasoningEffort: 'none',
     requiresApiKey: false,
   },
+}
+
+export const FALLBACK_PROVIDER_MODELS: Record<LlmProviderId, ProviderModelCatalogItem[]> = {
+  openrouter: [
+    {
+      id: 'qwen/qwen3.8-flash',
+      name: 'Qwen 3.8 Flash',
+      providerId: 'openrouter',
+      contextLength: 131072,
+      supportsTools: true,
+      supportsReasoning: true,
+    },
+    {
+      id: 'anthropic/claude-3.7-sonnet',
+      name: 'Claude 3.7 Sonnet',
+      providerId: 'openrouter',
+      contextLength: 200000,
+      supportsTools: true,
+      supportsReasoning: true,
+    },
+    {
+      id: 'deepseek/deepseek-chat-v3-0324',
+      name: 'DeepSeek Chat V3 (0324)',
+      providerId: 'openrouter',
+      contextLength: 128000,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
+    {
+      id: 'google/gemini-2.5-flash',
+      name: 'Gemini 2.5 Flash',
+      providerId: 'openrouter',
+      contextLength: 1048576,
+      supportsTools: true,
+      supportsReasoning: true,
+    },
+    {
+      id: 'openai/gpt-4.1',
+      name: 'GPT-4.1',
+      providerId: 'openrouter',
+      contextLength: 1047576,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
+    {
+      id: 'meta/llama-3.3-70b-instruct',
+      name: 'Llama 3.3 70B Instruct',
+      providerId: 'openrouter',
+      contextLength: 131072,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
+  ],
+  anthropic: [
+    {
+      id: 'claude-3-7-sonnet-latest',
+      name: 'Claude 3.7 Sonnet (Latest)',
+      providerId: 'anthropic',
+      contextLength: 200000,
+      supportsTools: true,
+      supportsReasoning: true,
+    },
+    {
+      id: 'claude-3-5-sonnet-latest',
+      name: 'Claude 3.5 Sonnet (Latest)',
+      providerId: 'anthropic',
+      contextLength: 200000,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
+    {
+      id: 'claude-3-5-haiku-latest',
+      name: 'Claude 3.5 Haiku (Latest)',
+      providerId: 'anthropic',
+      contextLength: 200000,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
+  ],
+  openai: [
+    {
+      id: 'gpt-4.1',
+      name: 'GPT-4.1',
+      providerId: 'openai',
+      contextLength: 1047576,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
+    {
+      id: 'gpt-4.1-mini',
+      name: 'GPT-4.1 Mini',
+      providerId: 'openai',
+      contextLength: 1047576,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
+    {
+      id: 'gpt-4o',
+      name: 'GPT-4o',
+      providerId: 'openai',
+      contextLength: 128000,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
+    {
+      id: 'gpt-4o-mini',
+      name: 'GPT-4o Mini',
+      providerId: 'openai',
+      contextLength: 128000,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
+    {
+      id: 'o3-mini',
+      name: 'o3-mini',
+      providerId: 'openai',
+      contextLength: 200000,
+      supportsTools: true,
+      supportsReasoning: true,
+    },
+  ],
+  'nvidia-nim': [
+    {
+      id: 'meta/llama-3.3-70b-instruct',
+      name: 'Llama 3.3 70B Instruct',
+      providerId: 'nvidia-nim',
+      contextLength: 128000,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
+    {
+      id: 'deepseek-ai/deepseek-r1',
+      name: 'DeepSeek R1',
+      providerId: 'nvidia-nim',
+      contextLength: 128000,
+      supportsTools: false,
+      supportsReasoning: true,
+    },
+    {
+      id: 'qwen/qwen2.5-coder-32b-instruct',
+      name: 'Qwen 2.5 Coder 32B Instruct',
+      providerId: 'nvidia-nim',
+      contextLength: 32768,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
+  ],
+  ollama: [
+    {
+      id: 'qwen2.5:14b',
+      name: 'qwen2.5:14b',
+      providerId: 'ollama',
+      contextLength: 32768,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
+    {
+      id: 'qwen3:8b',
+      name: 'qwen3:8b',
+      providerId: 'ollama',
+      contextLength: 32768,
+      supportsTools: true,
+      supportsReasoning: true,
+    },
+    {
+      id: 'llama3.2:latest',
+      name: 'llama3.2:latest',
+      providerId: 'ollama',
+      contextLength: 128000,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
+    {
+      id: 'deepseek-r1:8b',
+      name: 'deepseek-r1:8b',
+      providerId: 'ollama',
+      contextLength: 65536,
+      supportsTools: false,
+      supportsReasoning: true,
+    },
+  ],
 }
 
 export const DEFAULT_ASHY_VOICE_MD = `# Ashy — Voz & Identidade Viva (Cozy Night Studio)

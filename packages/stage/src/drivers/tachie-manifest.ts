@@ -8,6 +8,7 @@ import {
 } from '@ashy/shared'
 import type { ComputedStageFrameState } from '../components/AshyStageCanvas'
 import { VOWEL_KEYS, type VowelKey } from './lip-sync-driver'
+import { inspectLive2DModelJson, type Live2DModelControls } from './live2d-inspector'
 
 export type TachieAccessoryFx =
   | 'none'
@@ -284,6 +285,139 @@ export const DEFAULT_ASHY_LIVE2D_MODEL3_JSON = Object.freeze({
     { Id: 'HitAreaBody', Name: 'Body' },
   ],
 })
+
+export const BUILTIN_LIVE2D_MODEL3_MANIFESTS: Readonly<
+  Record<'hiyori' | 'haru' | 'mao', Record<string, unknown>>
+> = Object.freeze({
+  hiyori: Object.freeze({
+    Version: 3,
+    FileReferences: {
+      Moc: 'Hiyori.moc3',
+      Textures: ['Hiyori.2048/texture_00.png', 'Hiyori.2048/texture_01.png'],
+      Physics: 'Hiyori.physics3.json',
+      Pose: 'Hiyori.pose3.json',
+      UserData: 'Hiyori.userdata3.json',
+      DisplayInfo: 'Hiyori.cdi3.json',
+      Motions: {
+        Idle: [
+          { File: 'motions/Hiyori_m01.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          { File: 'motions/Hiyori_m02.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          { File: 'motions/Hiyori_m03.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          { File: 'motions/Hiyori_m05.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          { File: 'motions/Hiyori_m06.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          { File: 'motions/Hiyori_m07.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          { File: 'motions/Hiyori_m08.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          { File: 'motions/Hiyori_m09.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          { File: 'motions/Hiyori_m10.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+        ],
+        TapBody: [
+          { File: 'motions/Hiyori_m04.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+        ],
+      },
+    },
+    Groups: [
+      { Target: 'Parameter', Name: 'LipSync', Ids: ['ParamMouthOpenY'] },
+      { Target: 'Parameter', Name: 'EyeBlink', Ids: ['ParamEyeLOpen', 'ParamEyeROpen'] },
+    ],
+    HitAreas: [{ Id: 'HitArea', Name: 'Body' }],
+  }),
+  haru: Object.freeze({
+    Version: 3,
+    FileReferences: {
+      Moc: 'Haru.moc3',
+      Textures: ['Haru.2048/texture_00.png', 'Haru.2048/texture_01.png'],
+      Physics: 'Haru.physics3.json',
+      Pose: 'Haru.pose3.json',
+      DisplayInfo: 'Haru.cdi3.json',
+      Expressions: [
+        { Name: 'F01', File: 'expressions/F01.exp3.json' },
+        { Name: 'F02', File: 'expressions/F02.exp3.json' },
+        { Name: 'F03', File: 'expressions/F03.exp3.json' },
+        { Name: 'F04', File: 'expressions/F04.exp3.json' },
+        { Name: 'F05', File: 'expressions/F05.exp3.json' },
+        { Name: 'F06', File: 'expressions/F06.exp3.json' },
+        { Name: 'F07', File: 'expressions/F07.exp3.json' },
+        { Name: 'F08', File: 'expressions/F08.exp3.json' },
+      ],
+      Motions: {
+        Idle: [
+          { File: 'motions/haru_g_idle.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          { File: 'motions/haru_g_m15.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+        ],
+        TapBody: [
+          { File: 'motions/haru_g_m26.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          { File: 'motions/haru_g_m06.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          { File: 'motions/haru_g_m20.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+          { File: 'motions/haru_g_m09.motion3.json', FadeInTime: 0.5, FadeOutTime: 0.5 },
+        ],
+      },
+      UserData: 'Haru.userdata3.json',
+    },
+    Groups: [
+      { Target: 'Parameter', Name: 'EyeBlink', Ids: ['ParamEyeLOpen', 'ParamEyeROpen'] },
+      { Target: 'Parameter', Name: 'LipSync', Ids: ['ParamMouthOpenY'] },
+    ],
+    HitAreas: [
+      { Id: 'HitArea', Name: 'Head' },
+      { Id: 'HitArea2', Name: 'Body' },
+    ],
+  }),
+  mao: Object.freeze({
+    Version: 3,
+    FileReferences: {
+      Moc: 'Mao.moc3',
+      Textures: ['Mao.2048/texture_00.png'],
+      Physics: 'Mao.physics3.json',
+      Pose: 'Mao.pose3.json',
+      DisplayInfo: 'Mao.cdi3.json',
+      Expressions: [
+        { Name: 'exp_01', File: 'expressions/exp_01.exp3.json' },
+        { Name: 'exp_02', File: 'expressions/exp_02.exp3.json' },
+        { Name: 'exp_03', File: 'expressions/exp_03.exp3.json' },
+        { Name: 'exp_04', File: 'expressions/exp_04.exp3.json' },
+        { Name: 'exp_05', File: 'expressions/exp_05.exp3.json' },
+        { Name: 'exp_06', File: 'expressions/exp_06.exp3.json' },
+        { Name: 'exp_07', File: 'expressions/exp_07.exp3.json' },
+        { Name: 'exp_08', File: 'expressions/exp_08.exp3.json' },
+      ],
+      Motions: {
+        Idle: [
+          { File: 'motions/mtn_01.motion3.json' },
+          { File: 'motions/sample_01.motion3.json' },
+        ],
+        TapBody: [
+          { File: 'motions/mtn_02.motion3.json' },
+          { File: 'motions/mtn_03.motion3.json' },
+          { File: 'motions/mtn_04.motion3.json' },
+          { File: 'motions/special_01.motion3.json' },
+          { File: 'motions/special_02.motion3.json' },
+          { File: 'motions/special_03.motion3.json' },
+        ],
+      },
+    },
+    Groups: [
+      { Target: 'Parameter', Name: 'LipSync', Ids: ['ParamA'] },
+      { Target: 'Parameter', Name: 'EyeBlink', Ids: ['ParamEyeLOpen', 'ParamEyeROpen'] },
+    ],
+    HitAreas: [
+      { Id: 'HitAreaHead', Name: 'Head' },
+      { Id: 'HitAreaBody', Name: 'Body' },
+    ],
+  }),
+})
+
+export function getBuiltinLive2DModelControls(
+  presetId: 'hiyori' | 'haru' | 'mao' | string,
+): Live2DModelControls {
+  const normalized = typeof presetId === 'string' ? presetId.trim().toLowerCase() : ''
+  const manifest = Object.prototype.hasOwnProperty.call(
+    BUILTIN_LIVE2D_MODEL3_MANIFESTS,
+    normalized,
+  )
+    ? BUILTIN_LIVE2D_MODEL3_MANIFESTS[normalized as 'hiyori' | 'haru' | 'mao']
+    : DEFAULT_ASHY_LIVE2D_MODEL3_JSON
+  return inspectLive2DModelJson(manifest)
+}
 
 export function buildTachieLayerSvgMap(): Record<string, string> {
   return {

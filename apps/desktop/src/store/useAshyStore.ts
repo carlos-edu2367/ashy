@@ -2,6 +2,7 @@ import {
   ActionGatekeeper,
   PrivacyController,
   ProgressiveMcpRegistry,
+  canonicalizeSafePath,
   computeUnifiedDiffPreview,
   createAuthorizedVisionSensor,
   type ActionAuditLogEntry,
@@ -58,7 +59,10 @@ import {
   DEFAULT_MEMORY_GOVERNANCE_POLICY,
   DEFAULT_PROVIDER_CONFIGS,
   DEFAULT_VOICE_RUNTIME_SETTINGS,
+  FALLBACK_PROVIDER_MODELS,
   LLM_PROVIDER_IDS,
+  isSafeLive2DModelUrl,
+  type AgencySnapshot,
   type AgencyToolSummary,
   type ApprovableMemoryKind,
   type AshyBootstrapSnapshot,
@@ -80,6 +84,8 @@ import {
   type EvaluateInitiativeInput,
   type ExternalMcpServerConfig,
   type InitiativePolicy,
+  type ListProviderModelsInput,
+  type ListProviderModelsResult,
   type Live2DBuiltinModelId,
   type LlmProviderId,
   type MemoryGovernanceCategory,
@@ -91,6 +97,7 @@ import {
   type ProactiveInitiativeRecord,
   type ProspectiveIntent,
   type ProviderHealthResult,
+  type ProviderModelCatalogItem,
   type PublicProviderConfig,
   type RelationalMotif,
   type RelationshipStage,
@@ -104,6 +111,7 @@ import {
   type TestProviderInput,
   type TtfaTelemetryRecord,
   type TtsProviderId,
+  type UpdateAgencyConsentInput,
   type UpdateInitiativePolicyInput,
   type UpdateMilestoneInput,
   type UserHabit,
@@ -115,6 +123,7 @@ import {
   analyzePcmFrameToVowels,
   createStageSpeechSynchronizer,
   formatLive2DControlPrompt,
+  getBuiltinLive2DModelControls,
   inspectLive2DModelJson,
   resolveTachieActiveLayers,
   synthesizeFormantVowelPcm,
@@ -131,12 +140,11 @@ import {
 } from '@ashy/voice'
 import { create } from 'zustand'
 import { getAshyHostBridge } from '../services/ashy-host-client'
-import { DEMO_MEMORY_CARDS } from '../test/fixtures/demo-seed'
 
 export type DesktopViewMode = 'hub' | 'stage'
 export type HubTabId = 'studio' | 'story' | 'memories' | 'personality' | 'agency'
 export type MemoryFilterCategory = 'todas' | 'momentos' | 'sobre_voce' | 'referencias' | 'planos'
-export type SettingsSubTab = 'geral' | 'voz' | 'modelos' | 'privacidade'
+export type SettingsSubTab = 'todas' | 'geral' | 'voz' | 'modelos' | 'privacidade'
 
 export interface FeaturedMemoryCard {
   id: string
@@ -152,43 +160,7 @@ export interface FeaturedMemoryCard {
   episodeId?: string
 }
 
-export type SupportedModelId =
-  | 'claude-3-7-sonnet'
-  | 'gpt-4.1'
-  | 'deepseek-v3'
-  | 'llama-3.3-70b-local'
-
-export const SUPPORTED_MODELS: ReadonlyArray<{
-  id: SupportedModelId
-  label: string
-  provider: string
-  badge: string
-}> = [
-  {
-    id: 'claude-3-7-sonnet',
-    label: 'Claude 3.7 Sonnet',
-    provider: 'Anthropic',
-    badge: 'Cloud Flagship',
-  },
-  {
-    id: 'gpt-4.1',
-    label: 'GPT-4.1',
-    provider: 'OpenAI',
-    badge: 'Fast Reasoning',
-  },
-  {
-    id: 'deepseek-v3',
-    label: 'DeepSeek V3',
-    provider: 'OpenRouter',
-    badge: 'Open-Weights MoE',
-  },
-  {
-    id: 'llama-3.3-70b-local',
-    label: 'Llama 3.3 70B (Local)',
-    provider: 'Ollama Local',
-    badge: '100% Offline',
-  },
-]
+export type SupportedModelId = string
 
 export interface ChatJokeCallbackCard {
   title: string
@@ -214,8 +186,12 @@ export interface ChatTurnMessage {
 export interface RoomTrophy {
   id: string
   title: string
+  name: string
   subtitle: string
+  description: string
   milestoneId: string
+  unlockedByMilestoneId: string
+  iconName: string
   unlocked: boolean
 }
 
@@ -242,6 +218,9 @@ export interface AshyDesktopState {
   activeSessionId: string
   sessions: ChatSessionRecord[]
   providers: AshyBootstrapSnapshot['providers']
+  providerModelCatalog: Partial<Record<LlmProviderId, ProviderModelCatalogItem[]>>
+  providerModelCatalogSource: Partial<Record<LlmProviderId, 'remote' | 'fallback'>>
+  isLoadingProviderModels: boolean
   voiceIdentity: AshyBootstrapSnapshot['voice']
   runtimeDiagnostics: AshyBootstrapSnapshot['runtimeDiagnostics']
   isStreamingTurn: boolean
@@ -321,6 +300,7 @@ export interface AshyDesktopState {
   computerActionsPolicy: ComputerActionsPolicy
   quietHoursRange: string
   preferencesSavedToast: boolean
+  preferencesSavedAt: number | null
   privacyState: PrivacyState
   mcpSearchQuery: string
   mcpSearchResults: McpToolCompactSummary[]
@@ -345,6 +325,7 @@ export interface AshyDesktopState {
   }>
   setActiveProvider: (providerId: LlmProviderId) => Promise<AshyBootstrapSnapshot['providers']>
   testProviderConnection: (input: TestProviderInput) => Promise<ProviderHealthResult>
+  listProviderModels: (input: ListProviderModelsInput) => Promise<ListProviderModelsResult>
   saveVoiceIdentity: (content: string) => Promise<AshyBootstrapSnapshot['voice']>
   resetVoiceIdentity: () => Promise<AshyBootstrapSnapshot['voice']>
   createSession: (title?: string) => Promise<ChatSessionRecord>
@@ -432,17 +413,29 @@ export interface AshyDesktopState {
   setComputerActionsEnabled: (enabled: boolean) => void
   setComputerActionsPolicy: (policy: ComputerActionsPolicy) => void
   toggleDontAskMode: (enabled?: boolean) => void
+  setDontAskMode: (enabled: boolean) => void
   setToolRiskTierOverride: (toolName: string, riskTier: ActionRiskTier) => void
+  setToolRiskTier: (toolName: string, riskTier: ActionRiskTier) => void
   addAllowedPath: (rawPath: string) => void
   removeAllowedPath: (rawPath: string) => void
   addAllowedWindowTitle: (title: string) => void
   removeAllowedWindowTitle: (title: string) => void
   revokeSessionPermissions: (toolName?: string) => void
-  captureAuthorizedScreen: (input?: {
-    windowTitle?: string
-    frameFixtureId?: string
-  }) => Promise<VisionObservationResult>
+  revokeSessionApproval: (toolName: string) => void
+  revokeAllSessionApprovals: () => void
+  captureAuthorizedScreen: (
+    input?:
+      | {
+          windowTitle?: string
+          frameFixtureId?: string
+          forceRefresh?: boolean
+        }
+      | string,
+    frameFixtureId?: string,
+  ) => Promise<VisionObservationResult>
   registerExternalMcpServer: (config: ExternalMcpServerConfig) => void
+  connectExternalMcpServer: (config: ExternalMcpServerConfig) => void
+  removeExternalMcpServer: (serverId: string) => void
   setQuietHoursRange: (range: string) => void
   saveUserPreferences: () => void
   setMicMode: (mode: MicMode | 'push-to-talk') => void
@@ -455,6 +448,7 @@ export interface AshyDesktopState {
   setEyesMode: (mode: EyesMode) => void
   setDndMode: (enabled: boolean) => void
   activateFullPrivacyShield: () => void
+  activatePrivacyShield: () => void
   searchMcpTools: (query: string) => McpToolCompactSummary[]
   triggerMcpTool: (
     toolName: string,
@@ -607,7 +601,12 @@ function createAgencyRuntime() {
         },
       },
       handler: (args) => ({
-        observedWindow: String(args.windowTitle ?? 'Ashy Studio Window'),
+        observedWindow: String(
+          args.windowTitle ??
+            (typeof document !== 'undefined' && document.title
+              ? document.title
+              : 'Ashy Studio Window'),
+        ),
         timestamp: Date.now(),
       }),
     },
@@ -623,10 +622,17 @@ function createAgencyRuntime() {
         },
         required: ['path'],
       },
-      handler: (args) => ({
-        path: String(args.path),
-        preview: 'export const PACKAGE_NAME = "@ashy/desktop"',
-      }),
+      handler: async (args) => {
+        const bridge = getAshyHostBridge()
+        if (typeof bridge.callMcpTool === 'function') {
+          const res = await bridge.callMcpTool({ toolName: 'read_workspace_file', args })
+          if (res.status === 'executed') {
+            return res.output
+          }
+          throw new Error(res.reason || `read_workspace_file blocked (${res.status})`)
+        }
+        throw new Error(`Host bridge required to read workspace file: ${String(args.path ?? '')}`)
+      },
     },
     {
       toolName: 'write_project_note',
@@ -642,11 +648,24 @@ function createAgencyRuntime() {
         },
         required: ['title'],
       },
-      handler: (args) => ({
-        saved: true,
-        title: String(args.title ?? 'Untitled Note'),
-        path: String(args.path ?? '/workspace/ashy/notes/nota-arquitetura.md'),
-      }),
+      handler: async (args) => {
+        const bridge = getAshyHostBridge()
+        if (typeof bridge.callMcpTool === 'function') {
+          try {
+            const res = await bridge.callMcpTool({ toolName: 'write_project_note', args })
+            if (res.status === 'executed') {
+              return res.output
+            }
+          } catch {
+            // Fall through when offline
+          }
+        }
+        return {
+          saved: true,
+          title: String(args.title ?? 'Untitled Note'),
+          path: String(args.path ?? '/workspace/ashy/notes/nota-arquitetura.md'),
+        }
+      },
     },
     {
       toolName: 'run_cleanup_command',
@@ -660,10 +679,17 @@ function createAgencyRuntime() {
         },
         required: ['command'],
       },
-      handler: (args) => ({
-        executedCommand: String(args.command ?? ''),
-        exitCode: 0,
-      }),
+      handler: async (args) => {
+        const bridge = getAshyHostBridge()
+        if (typeof bridge.callMcpTool === 'function') {
+          const res = await bridge.callMcpTool({ toolName: 'run_cleanup_command', args })
+          if (res.status === 'executed') {
+            return res.output
+          }
+          throw new Error(res.reason || `run_cleanup_command blocked (${res.status})`)
+        }
+        throw new Error(`Host bridge required to run cleanup command: ${String(args.command ?? '')}`)
+      },
     },
   ])
 
@@ -687,6 +713,7 @@ function createInitialPublicProviders(): AshyBootstrapSnapshot['providers'] {
       label: def.label,
       baseUrl: def.baseUrl,
       modelId: def.modelId,
+      reasoningEffort: 'none',
       requiresApiKey: def.requiresApiKey,
       hasApiKey: false,
       maskedApiKey: null,
@@ -707,29 +734,84 @@ function createInitialPublicProviders(): AshyBootstrapSnapshot['providers'] {
 
 function buildRoomTrophies(milestones: readonly AutobiographicalMilestone[]): RoomTrophy[] {
   const milestoneIds = new Set(milestones.map((m) => m.id))
-  return [
+  const roomTrophyIds = new Set(
+    milestones.map((m) => m.roomTrophyId).filter((id): id is string => Boolean(id)),
+  )
+  const baseCatalog: RoomTrophy[] = [
     {
       id: 'trophy-first-boot-mug',
       title: 'First Boot Mug',
+      name: 'First Boot Mug',
       subtitle: 'Unlocked by First Boot & Late-Night Architecture Session',
+      description: 'Unlocked by First Boot & Late-Night Architecture Session',
       milestoneId: 'milestone-first-meeting',
-      unlocked: milestoneIds.has('milestone-first-meeting'),
+      unlockedByMilestoneId: 'milestone-first-meeting',
+      iconName: 'Award',
+      unlocked:
+        milestoneIds.has('milestone-first-meeting') ||
+        roomTrophyIds.has('trophy-first-boot-mug'),
     },
     {
       id: 'trophy-padre-npm-relic',
       title: 'Padre no NPM Relic',
+      name: 'Padre no NPM Relic',
       subtitle: "Unlocked by Born Inside Joke: 'Chamar um padre no npm'",
+      description: "Unlocked by Born Inside Joke: 'Chamar um padre no npm'",
       milestoneId: 'milestone-inside-joke-padre',
-      unlocked: milestoneIds.has('milestone-inside-joke-padre'),
+      unlockedByMilestoneId: 'milestone-inside-joke-padre',
+      iconName: 'Sparkles',
+      unlocked:
+        milestoneIds.has('milestone-inside-joke-padre') ||
+        roomTrophyIds.has('trophy-padre-npm-relic'),
     },
     {
       id: 'trophy-prod-shield',
       title: '03:14 AM Production Shield',
+      name: '03:14 AM Production Shield',
       subtitle: 'Unlocked by Saved Production Database at 03:14 AM',
+      description: 'Unlocked by Saved Production Database at 03:14 AM',
       milestoneId: 'milestone-flashbulb-deploy',
-      unlocked: milestoneIds.has('milestone-flashbulb-deploy'),
+      unlockedByMilestoneId: 'milestone-flashbulb-deploy',
+      iconName: 'ShieldAlert',
+      unlocked:
+        milestoneIds.has('milestone-flashbulb-deploy') ||
+        roomTrophyIds.has('trophy-prod-shield'),
     },
   ]
+
+  const seenMilestoneIds = new Set(baseCatalog.map((t) => t.milestoneId))
+  const seenTrophyIds = new Set(baseCatalog.map((t) => t.id))
+  const dynamicTrophies: RoomTrophy[] = []
+
+  for (const ms of milestones) {
+    if (seenMilestoneIds.has(ms.id)) continue
+    if (ms.roomTrophyId && seenTrophyIds.has(ms.roomTrophyId)) continue
+    const trophyId = ms.roomTrophyId?.trim() || `trophy-${ms.id}`
+    if (seenTrophyIds.has(trophyId)) continue
+    seenMilestoneIds.add(ms.id)
+    seenTrophyIds.add(trophyId)
+
+    const iconName =
+      ms.category === 'inside_joke_born'
+        ? 'Sparkles'
+        : ms.category === 'flashbulb_moment'
+          ? 'ShieldAlert'
+          : 'Award'
+
+    dynamicTrophies.push({
+      id: trophyId,
+      title: ms.title,
+      name: ms.title,
+      subtitle: ms.narrative,
+      description: ms.narrative,
+      milestoneId: ms.id,
+      unlockedByMilestoneId: ms.id,
+      iconName,
+      unlocked: true,
+    })
+  }
+
+  return [...baseCatalog, ...dynamicTrophies]
 }
 
 function parseAssistantRawOutput(rawReply: string): {
@@ -843,56 +925,81 @@ function mapChatRecordsToTurnMessages(
   return result
 }
 
+function resolveMemoryFilterCategory(
+  tags: readonly string[],
+): Exclude<MemoryFilterCategory, 'todas'> {
+  if (
+    tags.includes('category:planos') ||
+    tags.includes('planos') ||
+    tags.includes('plan') ||
+    tags.includes('goal') ||
+    tags.includes('intent')
+  ) {
+    return 'planos'
+  }
+  if (
+    tags.includes('category:sobre_voce') ||
+    tags.includes('sobre_voce') ||
+    tags.includes('identity') ||
+    tags.includes('preference') ||
+    tags.includes('work_style')
+  ) {
+    return 'sobre_voce'
+  }
+  if (
+    tags.includes('category:referencias') ||
+    tags.includes('referencias') ||
+    tags.includes('inside_joke') ||
+    tags.includes('reference')
+  ) {
+    return 'referencias'
+  }
+  return 'momentos'
+}
+
+function resolveMemoryCategoryImage(
+  category: Exclude<MemoryFilterCategory, 'todas'>,
+): string {
+  if (category === 'sobre_voce') return '/assets/mem-work-style.jpg'
+  if (category === 'referencias') return '/assets/mem-ghost-backend.jpg'
+  if (category === 'planos') return '/assets/mem-prototype-plan.jpg'
+  return '/assets/mem-first-chat.jpg'
+}
+
 function mapEpisodesToMemoryCards(
   episodes: readonly EpisodicMemory[],
-  existingCards: readonly FeaturedMemoryCard[],
 ): FeaturedMemoryCard[] {
-  const approvedEpisodes = episodes.filter((ep) => ep.approvalStatus !== 'pending_review')
-  const hasDemoSeed =
-    DEMO_MEMORY_CARDS.length > 0 &&
-    approvedEpisodes.some((ep) => ep.id === DEMO_MEMORY_CARDS[0]?.id)
+  const approvedEpisodes = episodes.filter(
+    (ep) => ep.approvalStatus !== 'pending_review' && isReflectablePermanentEpisode(ep),
+  )
 
-  const baseCards: FeaturedMemoryCard[] = hasDemoSeed
-    ? DEMO_MEMORY_CARDS.map((card) => {
-        const edited = existingCards.find((c) => c.id === card.id)
-        return edited ? { ...edited } : { ...card }
-      })
-    : []
+  return approvedEpisodes.map((ep) => {
+    const filterCategory = resolveMemoryFilterCategory(ep.tags)
+    const image = resolveMemoryCategoryImage(filterCategory)
+    const badge = ep.isFlashbulb
+      ? 'Flashbulb'
+      : filterCategory === 'planos'
+        ? 'Plano'
+        : undefined
+    const featured = Boolean(ep.isFlashbulb || ep.surprise >= 0.75)
+    const dateLabel = formatLocalTimeHHMM(ep.createdAt)
+    const originLabel =
+      filterCategory === 'planos' ? `Plano de ${dateLabel}` : `Conversa de ${dateLabel}`
 
-  const seenEpisodeIds = new Set<string>()
-  const seenCardIds = new Set<string>()
-  for (const card of baseCards) {
-    seenCardIds.add(card.id)
-    if (card.episodeId) seenEpisodeIds.add(card.episodeId)
-  }
-
-  const dynamicCards: FeaturedMemoryCard[] = []
-  for (const ep of approvedEpisodes) {
-    if (seenCardIds.has(ep.id) || seenEpisodeIds.has(ep.id)) continue
-    const existing = existingCards.find((c) => c.id === ep.id)
-    if (existing) {
-      dynamicCards.push(existing)
-      continue
-    }
-    const categoryTag = ep.tags.find(
-      (t): t is Exclude<MemoryFilterCategory, 'todas'> =>
-        t === 'momentos' || t === 'sobre_voce' || t === 'referencias' || t === 'planos',
-    )
-    dynamicCards.push({
+    return {
       id: ep.id,
       title: ep.title,
       summary: ep.summary,
       fullStory: ep.content,
-      dateLabel: formatLocalTimeHHMM(ep.createdAt),
-      originLabel: 'Conversa registrada',
-      filterCategory: categoryTag ?? 'momentos',
-      image: '/assets/mem-first-chat.jpg',
-      featured: ep.isFlashbulb,
+      dateLabel,
+      originLabel,
+      filterCategory,
+      ...(badge ? { badge } : {}),
+      image,
+      featured,
       episodeId: ep.id,
-    })
-  }
-
-  return [...dynamicCards, ...baseCards]
+    }
+  })
 }
 
 let agency = createAgencyRuntime()
@@ -910,6 +1017,90 @@ let subscribedBridge: AshyHostBridge | null = null
 let unsubscribeHostEvents: (() => void) | null = null
 let lastPromptMinuteLabel = formatLocalTimeHHMM(Date.now())
 let evalRunSeq = 0
+let inFlightCatalogCount = 0
+let hasExplicitConsentMutation = false
+let agencyRpcChain: Promise<unknown> = Promise.resolve()
+const providerCatalogSeq = new Map<LlmProviderId, number>()
+
+function isFactoryDefaultConsent(agencySnap: AgencySnapshot): boolean {
+  const c = agencySnap.consent
+  return (
+    c.eyesMode === 'off' &&
+    c.micMode === 'muted' &&
+    c.dndMode === false &&
+    c.approvalPolicy === 'ask' &&
+    Object.keys(c.toolRiskOverrides).length === 0 &&
+    c.externalMcpServers.length === 0 &&
+    agencySnap.auditLog.length === 0 &&
+    agencySnap.pendingActions.length === 0
+  )
+}
+
+function buildAgencyStatePatch(
+  agencySnap: AgencySnapshot,
+  options?: { preserveOverlayInitialSensors?: boolean; currentPrivacy?: PrivacyState },
+): Partial<AshyDesktopState> {
+  const keepOverlaySensors =
+    Boolean(options?.preserveOverlayInitialSensors) &&
+    !hasExplicitConsentMutation &&
+    isFactoryDefaultConsent(agencySnap) &&
+    options?.currentPrivacy !== undefined
+
+  const resolvedMicMode: MicMode = keepOverlaySensors
+    ? options!.currentPrivacy!.micMode
+    : agencySnap.consent.micMode === 'ptt'
+      ? 'ptt'
+      : agencySnap.consent.micMode
+  const resolvedEyesMode: EyesMode = keepOverlaySensors
+    ? options!.currentPrivacy!.eyesMode
+    : agencySnap.consent.eyesMode
+
+  agency.privacyController.setMicMode(resolvedMicMode)
+  voiceRuntime.setMicMode(resolvedMicMode)
+  agency.privacyController.setEyesMode(resolvedEyesMode)
+  agency.privacyController.setDndMode(agencySnap.consent.dndMode)
+  agency.privacyController.setAllowedWindowTitles([...agencySnap.consent.allowedWindowTitles])
+  agency.privacyController.setAllowedPaths([...agencySnap.consent.allowedPaths])
+  agency.gatekeeper.setToolRiskOverrides({ ...agencySnap.consent.toolRiskOverrides })
+  for (const [toolName, riskTier] of Object.entries(agencySnap.consent.toolRiskOverrides)) {
+    agency.mcpRegistry.setToolRiskTier(toolName, riskTier)
+  }
+  void agency.gatekeeper.setApprovalPolicy(agencySnap.consent.approvalPolicy, {
+    autoApprovePending: false,
+  })
+
+  return {
+    privacyState: {
+      micMode: resolvedMicMode,
+      eyesMode: resolvedEyesMode,
+      dndMode: agencySnap.consent.dndMode,
+      allowedWindowTitles: [...agencySnap.consent.allowedWindowTitles],
+      allowedPaths: [...agencySnap.consent.allowedPaths],
+    },
+    computerActionsPolicy: agencySnap.consent.approvalPolicy,
+    computerActionsEnabled: agencySnap.consent.approvalPolicy !== 'off',
+    agencyTools: [...agencySnap.tools],
+    toolRiskOverrides: { ...agencySnap.consent.toolRiskOverrides },
+    sessionApprovedTools: [...agencySnap.sessionApprovedTools],
+    visionTelemetry: {
+      ...agencySnap.vision,
+      eyesMode: resolvedEyesMode,
+    },
+    externalMcpServers: [...agencySnap.consent.externalMcpServers],
+    pendingActions: [...agencySnap.pendingActions],
+    auditLog: agencySnap.auditLog.map((entry) => ({
+      ...entry,
+      actionId: entry.actionId ?? undefined,
+      reason: entry.reason ?? undefined,
+      blastRadiusWarning: entry.blastRadiusWarning ?? undefined,
+      targetPath: entry.targetPath ?? undefined,
+      commandPreview: entry.commandPreview ?? undefined,
+      diffPreview: entry.diffPreview ?? undefined,
+    })),
+    exposedMetaToolsCount: agencySnap.exposedMetaToolsCount,
+    registeredMcpToolsCount: agencySnap.registeredMcpToolsCount,
+  }
+}
 
 const completedTurnEvents = new Map<string, AshyHostStreamEvent>()
 const pendingTurnResolvers = new Map<string, () => void>()
@@ -970,7 +1161,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         .find((m) => m.role === 'user')?.content ??
       'Olá Ashy.'
 
-    const modelId = params?.modelId ?? current?.activeModelId ?? 'claude-3-7-sonnet'
+    const modelId = params?.modelId ?? current?.activeModelId ?? 'anthropic/claude-3.7-sonnet'
     const seriousness = evaluateSeriousnessGate(userMessage)
     const baseMood = params?.mood ?? current?.mood ?? ASHY_BASELINE_MOOD
     const effectiveMood: MoodVector = seriousness.isSeriousOrDelicate
@@ -1088,6 +1279,65 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
   }
 
   function handleHostStreamEvent(event: AshyHostStreamEvent): void {
+    if (event.type === 'stage:updated') {
+      const prefs = event.stagePreferences
+      const nextControls = prefs.live2dModelControls ?? get().live2dModelControls
+      const nextPrompt = compilePromptFromState({
+        live2dModelControls: nextControls,
+      })
+      set({
+        stageMode: prefs.stageMode,
+        live2dPresetId: prefs.live2dPresetId,
+        live2dModelUrl: prefs.live2dModelUrl,
+        loadedLive2DModelName: prefs.loadedLive2DModelName,
+        ambientLuminance: prefs.ambientLuminance,
+        showDesktopAvatar: prefs.showDesktopAvatar,
+        isStageHidden: prefs.isStageHidden,
+        ...(prefs.live2dModelControls ? { live2dModelControls: prefs.live2dModelControls } : {}),
+        lastPrompt: nextPrompt,
+      })
+      return
+    }
+
+    if (event.type === 'shortcut:triggered') {
+      if (event.action === 'toggleHideStage') {
+        // Authoritative isStageHidden state is already broadcast via stage:updated by the Host kernel
+        return
+      }
+      const bridge = getAshyHostBridge()
+      if (typeof bridge.getAgencySnapshot === 'function') {
+        void bridge
+          .getAgencySnapshot()
+          .then((snap) => {
+            if (!snap?.consent) return
+            set(buildAgencyStatePatch(snap))
+          })
+          .catch(() => {
+            // Ignore when offline in unit test
+          })
+        return
+      }
+      if (event.action === 'toggleMic') {
+        const nextMic: MicMode =
+          get().privacyState.micMode === 'muted' ? 'continuous' : 'muted'
+        agency.privacyController.setMicMode(nextMic)
+        voiceRuntime.setMicMode(nextMic)
+        set({ privacyState: agency.privacyController.getState() })
+      } else if (event.action === 'toggleEyes') {
+        const cur = get().privacyState.eyesMode
+        const nextEyes = cur === 'window' ? 'screen' : cur === 'screen' ? 'off' : 'window'
+        agency.privacyController.setEyesMode(nextEyes)
+        set({
+          privacyState: agency.privacyController.getState(),
+          visionTelemetry: agency.visionSensor.getTelemetry(),
+        })
+      } else if (event.action === 'toggleDnd') {
+        agency.privacyController.setDndMode(!get().privacyState.dndMode)
+        set({ privacyState: agency.privacyController.getState() })
+      }
+      return
+    }
+
     const assistantMsgId = `msg-assistant-${event.turnId}`
 
     if (event.type === 'turn:started') {
@@ -1341,15 +1591,35 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       pendingTurnSeriousness.delete(event.turnId)
       streamedDeltaTurnIds.delete(event.turnId)
       const wasBargeIn = bargeInTurnIds.delete(event.turnId)
-      set((state) => ({
-        isStreamingTurn: false,
-        activeTurnId: null,
-        isSpeaking: false,
-        presenceStatus: wasBargeIn ? 'Listening' : 'Idle',
-        stageEmotion: wasBargeIn ? 'surprised' : state.stageEmotion,
-        bubbleText: state.bubbleText,
-        simulatedVowels: { A: 0, E: 0, I: 0, O: 0, U: 0 },
-      }))
+      set((state) => {
+        const isCurrentTurn =
+          state.activeTurnId === event.turnId || state.activeTurnId === null
+        const partial = event.partialText.trim()
+        const nextMessages = state.chatMessages
+          .map((m) =>
+            m.id === assistantMsgId && m.content.trim().length === 0 && partial.length > 0
+              ? { ...m, content: partial }
+              : m,
+          )
+          .filter((m) => !(m.id === assistantMsgId && m.content.trim().length === 0))
+
+        return {
+          isStreamingTurn: isCurrentTurn ? false : state.isStreamingTurn,
+          activeTurnId: isCurrentTurn ? null : state.activeTurnId,
+          isSpeaking: isCurrentTurn ? false : state.isSpeaking,
+          presenceStatus: isCurrentTurn
+            ? wasBargeIn
+              ? 'Listening'
+              : 'Idle'
+            : state.presenceStatus,
+          stageEmotion: wasBargeIn ? 'surprised' : state.stageEmotion,
+          bubbleText: state.bubbleText,
+          simulatedVowels: isCurrentTurn
+            ? { A: 0, E: 0, I: 0, O: 0, U: 0 }
+            : state.simulatedVowels,
+          chatMessages: nextMessages,
+        }
+      })
       completedTurnEvents.set(event.turnId, event)
       const resolver = pendingTurnResolvers.get(event.turnId)
       if (resolver) {
@@ -1361,21 +1631,27 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
     if (event.type === 'turn:error') {
       pendingTurnSeriousness.delete(event.turnId)
-      set((state) => ({
-        isStreamingTurn: false,
-        activeTurnId: null,
-        isSpeaking: false,
-        presenceStatus: 'Idle',
-        simulatedVowels: { A: 0, E: 0, I: 0, O: 0, U: 0 },
-        lastTurnError: {
-          code: event.code,
-          message: event.message,
-          recoverable: event.recoverable,
-        },
-        chatMessages: state.chatMessages.filter(
-          (m) => !(m.id === assistantMsgId && m.content.trim().length === 0),
-        ),
-      }))
+      set((state) => {
+        const isCurrentTurn =
+          state.activeTurnId === event.turnId || state.activeTurnId === null
+        return {
+          isStreamingTurn: isCurrentTurn ? false : state.isStreamingTurn,
+          activeTurnId: isCurrentTurn ? null : state.activeTurnId,
+          isSpeaking: isCurrentTurn ? false : state.isSpeaking,
+          presenceStatus: isCurrentTurn ? 'Idle' : state.presenceStatus,
+          simulatedVowels: isCurrentTurn
+            ? { A: 0, E: 0, I: 0, O: 0, U: 0 }
+            : state.simulatedVowels,
+          lastTurnError: {
+            code: event.code,
+            message: event.message,
+            recoverable: event.recoverable,
+          },
+          chatMessages: state.chatMessages.filter(
+            (m) => !(m.id === assistantMsgId && m.content.trim().length === 0),
+          ),
+        }
+      })
       completedTurnEvents.set(event.turnId, event)
       const resolver = pendingTurnResolvers.get(event.turnId)
       if (resolver) {
@@ -1398,7 +1674,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
   const initialWindowMode = resolveInitialWindowMode()
   const initialPrompt = composeAshyTurnPrompt({
     userMessage: 'Olá Ashy.',
-    modelId: 'claude-3-7-sonnet',
+    modelId: 'anthropic/claude-3.7-sonnet',
     timeOfDayLabel: lastPromptMinuteLabel,
     stage: 'stranger',
     voiceIdentityMarkdown: DEFAULT_ASHY_VOICE_MD,
@@ -1410,7 +1686,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
   return {
     viewMode: initialWindowMode.viewMode,
     activeTab: 'studio',
-    activeModelId: 'claude-3-7-sonnet',
+    activeModelId: 'anthropic/claude-3.7-sonnet',
 
     isBootstrapped: false,
     needsOnboarding: true,
@@ -1425,6 +1701,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     activeSessionId: 'session-initial',
     sessions: [],
     providers: createInitialPublicProviders(),
+    providerModelCatalog: { ...FALLBACK_PROVIDER_MODELS },
+    providerModelCatalogSource: {},
+    isLoadingProviderModels: false,
     voiceIdentity: {
       content: DEFAULT_ASHY_VOICE_MD,
       diagnostics: {
@@ -1513,12 +1792,13 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     lastVoiceFixtureResult: null,
     isPushToTalkHeld: false,
 
-    settingsSubTab: 'privacidade',
+    settingsSubTab: 'todas',
     showDesktopAvatar: true,
     computerActionsEnabled: true,
     computerActionsPolicy: 'ask',
     quietHoursRange: '22:00 — 08:00',
     preferencesSavedToast: false,
+    preferencesSavedAt: null,
     privacyState: agency.privacyController.getState(),
     mcpSearchQuery: '',
     mcpSearchResults: agency.mcpRegistry.search_mcp_tools({ query: '', limit: 10 }),
@@ -1550,10 +1830,16 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         snapshot.messages,
         snapshot.memories.jokes,
       )
-      const mappedCards = mapEpisodesToMemoryCards(
-        snapshot.memories.episodes,
-        current.memoryCards,
+      const inFlightOptimistic = current.chatMessages.filter(
+        (m) =>
+          m.id.startsWith('msg-user-optimistic-') &&
+          !mappedMessages.some((mm) => mm.role === 'user' && mm.content === m.content),
       )
+      const finalMappedMessages =
+        inFlightOptimistic.length > 0
+          ? [...mappedMessages, ...inFlightOptimistic]
+          : mappedMessages
+      const mappedCards = mapEpisodesToMemoryCards(snapshot.memories.episodes)
       const nextSelectedMemoryId =
         mappedCards.some((c) => c.id === current.selectedMemoryId) && current.selectedMemoryId
           ? current.selectedMemoryId
@@ -1586,8 +1872,19 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
             episodes: snapshot.memories.episodes,
           }))
 
+      const activeProviderCfg = snapshot.providers.configs[snapshot.providers.activeProviderId]
+      const nextActiveModelId = activeProviderCfg?.modelId || current.activeModelId
+
+      const persistedStagePrefs =
+        snapshot.stagePreferences && snapshot.stagePreferences.updatedAt > 0
+          ? snapshot.stagePreferences
+          : null
+
+      const nextLive2dControls =
+        persistedStagePrefs?.live2dModelControls ?? current.live2dModelControls
+
       const nextPrompt = compilePromptFromState({
-        modelId: current.activeModelId,
+        modelId: nextActiveModelId,
         stage: snapshot.relationship.stage,
         voiceIdentityMarkdown: snapshot.voice.content,
         userName: snapshot.userProfile.userName,
@@ -1601,11 +1898,13 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         prospectiveIntents,
         chatMessages: mappedMessages,
         interruptionControlNote: current.lastTurnInterruptionNote ?? undefined,
+        live2dModelControls: nextLive2dControls,
       })
 
       set({
         isBootstrapped: true,
         needsOnboarding: snapshot.needsOnboarding,
+        activeModelId: nextActiveModelId,
         userProfile: snapshot.userProfile,
         relationshipStage: snapshot.relationship.stage,
         familiarityScore: snapshot.relationship.familiarityScore,
@@ -1620,10 +1919,29 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         mood: snapshot.affect.mood,
         traits: snapshot.affect.traits,
         stageEmotion: snapshot.affect.dominantEmotion,
+        ...(persistedStagePrefs
+          ? {
+              stageMode: persistedStagePrefs.stageMode,
+              live2dPresetId: persistedStagePrefs.live2dPresetId,
+              live2dModelUrl: persistedStagePrefs.live2dModelUrl,
+              loadedLive2DModelName: persistedStagePrefs.loadedLive2DModelName,
+              ambientLuminance: persistedStagePrefs.ambientLuminance,
+              showDesktopAvatar: persistedStagePrefs.showDesktopAvatar,
+              isStageHidden: persistedStagePrefs.isStageHidden,
+              ...(persistedStagePrefs.live2dModelControls
+                ? { live2dModelControls: persistedStagePrefs.live2dModelControls }
+                : {}),
+            }
+          : {}),
         milestones: snapshot.relationship.milestones,
         crossEpisodeLinks,
         dreamJournalEntries,
         initiativePolicy,
+        ...(snapshot.memories?.initiativePolicy
+          ? {
+              quietHoursRange: `${snapshot.memories.initiativePolicy.quietHoursStart} - ${snapshot.memories.initiativePolicy.quietHoursEnd}`,
+            }
+          : {}),
         initiativeLog,
         roomEnvironment,
         episodicMemories: snapshot.memories.episodes,
@@ -1636,11 +1954,37 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         prospectiveIntents,
         personalityEvolutionLog,
         memoryGovernancePolicy,
-        chatMessages: mappedMessages,
+        chatMessages: finalMappedMessages,
         lastPrompt: nextPrompt,
         roomTrophies: buildRoomTrophies(snapshot.relationship.milestones),
         lastEvalReport: snapshot.lastEvalReport ?? current.lastEvalReport,
+        ...(snapshot.agency
+          ? buildAgencyStatePatch(snapshot.agency, {
+              preserveOverlayInitialSensors: current.isTransparentOverlayWindow,
+              currentPrivacy: current.privacyState,
+            })
+          : {}),
       })
+
+      if (
+        snapshot.agency &&
+        current.isTransparentOverlayWindow &&
+        !hasExplicitConsentMutation &&
+        isFactoryDefaultConsent(snapshot.agency)
+      ) {
+        const nextTask = agencyRpcChain
+          .catch(() => undefined)
+          .then(async () => {
+            await getAshyHostBridge().updateAgencyConsent?.({
+              micMode: current.privacyState.micMode,
+              eyesMode: current.privacyState.eyesMode,
+            })
+          })
+          .catch(() => {
+            // Ignore when offline
+          })
+        agencyRpcChain = nextTask
+      }
     },
 
     async completeOnboarding(input) {
@@ -1653,14 +1997,33 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     async saveProviderConfig(input) {
       const bridge = ensureHostSubscription()
       const result = await bridge.saveProviderConfig(input)
-      set({ providers: result.providers })
+      const nextActiveModelId =
+        result.providers.configs[result.providers.activeProviderId]?.modelId ||
+        get().activeModelId
+      set((state) => ({
+        providers: result.providers,
+        activeModelId: nextActiveModelId,
+        lastPrompt: compilePromptFromState({
+          modelId: nextActiveModelId,
+          voiceIdentityMarkdown: state.voiceIdentity.content,
+        }),
+      }))
       return result
     },
 
     async setActiveProvider(providerId) {
       const bridge = ensureHostSubscription()
       const providers = await bridge.setActiveProvider(providerId)
-      set({ providers })
+      const nextActiveModelId =
+        providers.configs[providers.activeProviderId]?.modelId || get().activeModelId
+      set((state) => ({
+        providers,
+        activeModelId: nextActiveModelId,
+        lastPrompt: compilePromptFromState({
+          modelId: nextActiveModelId,
+          voiceIdentityMarkdown: state.voiceIdentity.content,
+        }),
+      }))
       return providers
     },
 
@@ -1674,6 +2037,69 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         // Ignore snapshot refresh failure during probe
       }
       return result
+    },
+
+    async listProviderModels(input) {
+      const bridge = ensureHostSubscription()
+      const nextSeq = (providerCatalogSeq.get(input.providerId) ?? 0) + 1
+      providerCatalogSeq.set(input.providerId, nextSeq)
+      inFlightCatalogCount += 1
+      set({ isLoadingProviderModels: true })
+      try {
+        const result: ListProviderModelsResult =
+          typeof bridge.listProviderModels === 'function'
+            ? await bridge.listProviderModels(input)
+            : {
+                providerId: input.providerId,
+                models: FALLBACK_PROVIDER_MODELS[input.providerId] ?? [],
+                source: 'fallback',
+                fetchedAt: Date.now(),
+                error: null,
+              }
+        inFlightCatalogCount = Math.max(0, inFlightCatalogCount - 1)
+        if (providerCatalogSeq.get(input.providerId) === nextSeq) {
+          set((state) => ({
+            isLoadingProviderModels: inFlightCatalogCount > 0,
+            providerModelCatalog: {
+              ...state.providerModelCatalog,
+              [input.providerId]: result.models,
+            },
+            providerModelCatalogSource: {
+              ...state.providerModelCatalogSource,
+              [input.providerId]: result.source,
+            },
+          }))
+        } else {
+          set({ isLoadingProviderModels: inFlightCatalogCount > 0 })
+        }
+        return result
+      } catch (err) {
+        inFlightCatalogCount = Math.max(0, inFlightCatalogCount - 1)
+        const fallbackModels = FALLBACK_PROVIDER_MODELS[input.providerId] ?? []
+        const fallbackResult: ListProviderModelsResult = {
+          providerId: input.providerId,
+          models: fallbackModels,
+          source: 'fallback',
+          fetchedAt: Date.now(),
+          error: err instanceof Error ? err.message : String(err),
+        }
+        if (providerCatalogSeq.get(input.providerId) === nextSeq) {
+          set((state) => ({
+            isLoadingProviderModels: inFlightCatalogCount > 0,
+            providerModelCatalog: {
+              ...state.providerModelCatalog,
+              [input.providerId]: fallbackModels,
+            },
+            providerModelCatalogSource: {
+              ...state.providerModelCatalogSource,
+              [input.providerId]: 'fallback',
+            },
+          }))
+        } else {
+          set({ isLoadingProviderModels: inFlightCatalogCount > 0 })
+        }
+        return fallbackResult
+      }
     },
 
     async saveVoiceIdentity(content) {
@@ -1778,6 +2204,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
     setStageMode(mode) {
       set({ stageMode: mode })
+      void getAshyHostBridge()
+        .updateStagePreferences?.({ stageMode: mode })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     setStageEmotion(emotion, intensity = 0.85) {
@@ -1798,6 +2229,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     setAmbientLuminance(luminance) {
       const clamped = Math.min(1, Math.max(0, Number.isFinite(luminance) ? luminance : 0.35))
       set({ ambientLuminance: clamped })
+      void getAshyHostBridge()
+        .updateStagePreferences?.({ ambientLuminance: clamped })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     toggleSimulatedSpeech(speaking) {
@@ -1853,6 +2289,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           }
         }
       ).ashyHost?.setOverlayVisible?.({ visible: !nextHidden })
+      void getAshyHostBridge()
+        .updateStagePreferences?.({ isStageHidden: nextHidden })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     toggleStageHidden() {
@@ -1870,25 +2311,72 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         BUILTIN_LIVE2D_MODEL_PRESETS.find((p) => p.id === presetId) ??
         BUILTIN_LIVE2D_MODEL_PRESETS[0]
       if (!preset) return
+      const loadedName = preset.modelJsonUrl.split('/').pop() ?? `${preset.id}.model3.json`
+      const controls = preset.manifestJson
+        ? inspectLive2DModelJson(preset.manifestJson)
+        : get().live2dModelControls
+      const nextPrompt = compilePromptFromState({
+        live2dModelControls: controls,
+      })
       set({
         live2dPresetId: preset.id,
         live2dModelUrl: preset.modelJsonUrl,
-        loadedLive2DModelName: preset.modelJsonUrl.split('/').pop() ?? `${preset.id}.model3.json`,
+        loadedLive2DModelName: loadedName,
+        live2dModelControls: controls,
         stageMode: 'live2d',
+        lastPrompt: nextPrompt,
       })
+      void getAshyHostBridge()
+        .updateStagePreferences?.({
+          stageMode: 'live2d',
+          live2dPresetId: preset.id,
+          live2dModelUrl: preset.modelJsonUrl,
+          loadedLive2DModelName: loadedName,
+          live2dModelControls: controls,
+        })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
     },
 
     importLive2DModelJson(rawJson, modelName = 'custom-imported.model3.json') {
       const trimmedInput = typeof rawJson === 'string' ? rawJson.trim() : ''
       if (trimmedInput.endsWith('.model3.json') && !trimmedInput.startsWith('{')) {
+        if (!isSafeLive2DModelUrl(trimmedInput)) {
+          throw new Error('Invalid or unsafe Live2D model URL.')
+        }
         const cleanName =
           trimmedInput.split('/').pop()?.trim() || modelName.trim() || 'custom-imported.model3.json'
+        const matchedPreset = BUILTIN_LIVE2D_MODEL_PRESETS.find(
+          (p) => p.modelJsonUrl === trimmedInput,
+        )
+        const nextControls = matchedPreset
+          ? getBuiltinLive2DModelControls(matchedPreset.id)
+          : get().live2dModelControls
+        const nextPresetId = matchedPreset ? matchedPreset.id : get().live2dPresetId
+        const nextPrompt = compilePromptFromState({
+          live2dModelControls: nextControls,
+        })
         set({
+          live2dPresetId: nextPresetId,
           live2dModelUrl: trimmedInput,
           loadedLive2DModelName: cleanName,
+          live2dModelControls: nextControls,
           stageMode: 'live2d',
+          lastPrompt: nextPrompt,
         })
-        return get().live2dModelControls
+        void getAshyHostBridge()
+          .updateStagePreferences?.({
+            stageMode: 'live2d',
+            live2dPresetId: nextPresetId,
+            live2dModelUrl: trimmedInput,
+            loadedLive2DModelName: cleanName,
+            live2dModelControls: nextControls,
+          })
+          .catch(() => {
+            // Ignore when offline in unit test
+          })
+        return nextControls
       }
 
       let parsed: unknown = rawJson
@@ -1913,6 +2401,15 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         stageMode: 'live2d',
         lastPrompt: nextPrompt,
       }))
+      void getAshyHostBridge()
+        .updateStagePreferences?.({
+          stageMode: 'live2d',
+          loadedLive2DModelName: cleanName,
+          live2dModelControls: controls,
+        })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
       return controls
     },
 
@@ -2018,34 +2515,55 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         interruptionControlNote: interruptionNote,
       })
 
+      const optimisticNow = Date.now()
+      const optimisticUserId = `msg-user-optimistic-${optimisticNow}-${Math.random().toString(36).slice(2, 8)}`
+      const optimisticUserTurn: ChatTurnMessage = {
+        id: optimisticUserId,
+        role: 'user',
+        content: trimmed,
+        timeLabel: formatLocalTimeHHMM(optimisticNow),
+        timestamp: optimisticNow,
+      }
+
       if (seriousness.isSeriousOrDelicate) {
         const seriousMood: MoodVector = {
           valence: -0.1,
           arousal: 0.35,
           playfulness: Math.min(0.12, seriousness.maxPlayfulnessAllowed),
         }
-        set({
+        set((state) => ({
           lastPrompt: compiledPrompt,
           stageEmotion: 'concerned',
           mood: seriousMood,
-        })
+          chatMessages: [...state.chatMessages, optimisticUserTurn],
+        }))
       } else {
-        set({
+        set((state) => ({
           lastPrompt: compiledPrompt,
-        })
+          chatMessages: [...state.chatMessages, optimisticUserTurn],
+        }))
       }
 
-      const { turnId, userMessage: savedUserMsg } = await bridge.sendTurn({
-        sessionId: get().activeSessionId,
-        text: trimmed,
-        ...(interruptionNote ? { interruptionControlNote: interruptionNote } : {}),
-      })
+      let turnId: string
+      let savedUserMsg: ChatMessageRecord
+      try {
+        const res = await bridge.sendTurn({
+          sessionId: get().activeSessionId,
+          text: trimmed,
+          ...(interruptionNote ? { interruptionControlNote: interruptionNote } : {}),
+        })
+        turnId = res.turnId
+        savedUserMsg = res.userMessage
+      } catch (err) {
+        set((state) => ({
+          chatMessages: state.chatMessages.filter((m) => m.id !== optimisticUserId),
+        }))
+        throw err
+      }
 
       pendingTurnSeriousness.set(turnId, seriousness.isSeriousOrDelicate)
 
       set((state) => {
-        const hasUserMsg = state.chatMessages.some((m) => m.id === savedUserMsg.id)
-        if (hasUserMsg) return {}
         const userTurn: ChatTurnMessage = {
           id: savedUserMsg.id,
           role: 'user',
@@ -2053,8 +2571,25 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           timeLabel: formatLocalTimeHHMM(savedUserMsg.createdAt),
           timestamp: savedUserMsg.createdAt,
         }
+        const assistantMsgId = `msg-assistant-${turnId}`
+        const filtered = state.chatMessages.filter(
+          (m) => m.id !== optimisticUserId && m.id !== savedUserMsg.id,
+        )
+        const assistantIdx = filtered.findIndex((m) => m.id === assistantMsgId)
+        if (assistantIdx !== -1) {
+          const next = [...filtered]
+          next.splice(assistantIdx, 0, userTurn)
+          return { chatMessages: next }
+        }
+        const optIdx = state.chatMessages.findIndex((m) => m.id === optimisticUserId)
+        if (optIdx !== -1) {
+          const next = state.chatMessages
+            .map((m, idx) => (idx === optIdx ? userTurn : m))
+            .filter((m, idx) => idx === optIdx || m.id !== savedUserMsg.id)
+          return { chatMessages: next }
+        }
         return {
-          chatMessages: [...state.chatMessages, userTurn],
+          chatMessages: [...filtered, userTurn],
         }
       })
 
@@ -2116,6 +2651,10 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       const cleanSummary = input.summary.trim() || 'Momento registrado manualmente.'
       const cleanStory = input.fullStory?.trim() || cleanSummary
       const cat = input.filterCategory ?? 'momentos'
+      const categoryTag = `category:${cat}`
+      const tags = input.tags?.length
+        ? Array.from(new Set([...input.tags, categoryTag]))
+        : [categoryTag, cat]
 
       const episode: EpisodicMemory = {
         id: newId,
@@ -2128,7 +2667,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         difficulty: 3.5,
         surprise: 0.8,
         isFlashbulb: false,
-        tags: input.tags?.length ? input.tags : [cat],
+        tags,
       }
 
       const card: FeaturedMemoryCard = {
@@ -2137,9 +2676,10 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         summary: cleanSummary,
         fullStory: cleanStory,
         dateLabel: 'Hoje',
-        originLabel: 'Criada agora',
+        originLabel: cat === 'planos' ? 'Plano de Hoje' : 'Criada agora',
         filterCategory: cat,
-        image: '/assets/mem-first-chat.jpg',
+        ...(cat === 'planos' ? { badge: 'Plano' } : {}),
+        image: resolveMemoryCategoryImage(cat),
         featured: false,
         episodeId: newId,
       }
@@ -2496,7 +3036,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
       set({
         initiativePolicy: nextPolicy,
-        quietHoursRange: `${nextPolicy.quietHoursStart} — ${nextPolicy.quietHoursEnd}`,
+        quietHoursRange: `${nextPolicy.quietHoursStart} - ${nextPolicy.quietHoursEnd}`,
       })
 
       const persisted = await getAshyHostBridge()
@@ -2506,7 +3046,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       if (persisted) {
         set({
           initiativePolicy: persisted,
-          quietHoursRange: `${persisted.quietHoursStart} — ${persisted.quietHoursEnd}`,
+          quietHoursRange: `${persisted.quietHoursStart} - ${persisted.quietHoursEnd}`,
         })
         return persisted
       }
@@ -2612,6 +3152,21 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           initiativeLog: state.initiativeLog.map((r) =>
             r.id === localRecord.id ? hostRecord : r,
           ),
+          ...(hostRecord.decision === 'spoken' && hostRecord.replyText
+            ? {
+                bubbleText: hostRecord.replyText,
+                chatMessages: state.chatMessages.map((msg) =>
+                  msg.id === `msg-proactive-${localRecord.id}`
+                    ? {
+                        ...msg,
+                        id: `msg-proactive-${hostRecord.id}`,
+                        content: hostRecord.replyText!,
+                        rawContent: hostRecord.replyText!,
+                      }
+                    : msg,
+                ),
+              }
+            : {}),
         }))
         return hostRecord
       }
@@ -2868,6 +3423,26 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
             })
         }
 
+        void getAshyHostBridge()
+          .runDreamReflection({
+            sessionId: state.activeSessionId,
+            force: true,
+            maxEvolutions: 0,
+          })
+          .then((res) => {
+            if (
+              res?.snapshot &&
+              !get().personalityEvolutionLog.some(
+                (r) => typeof r.revertedAt === 'number' && r.revertedAt >= nowMs,
+              )
+            ) {
+              get().applyBootstrapSnapshot(res.snapshot)
+            }
+          })
+          .catch(() => {
+            // Ignore when offline in unit test
+          })
+
         return record
       }
 
@@ -2885,7 +3460,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           maxEvolutions: 1,
         })
         .then((res) => {
-          if (res?.snapshot && res.result.appliedEvolutions.length > 0) {
+          if (res?.snapshot) {
             get().applyBootstrapSnapshot(res.snapshot)
           }
         })
@@ -2954,39 +3529,61 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
 
     setShowDesktopAvatar(show) {
-      set({ showDesktopAvatar: show })
-    },
-
-    setComputerActionsEnabled(enabled) {
-      set({ computerActionsEnabled: enabled })
-    },
-
-    setComputerActionsPolicy(policy) {
-      set({
-        computerActionsPolicy: policy,
-        computerActionsEnabled: policy !== 'off',
-      })
-      void agency.gatekeeper
-        .setApprovalPolicy(policy, { autoApprovePending: policy === 'auto_accept' })
-        .then(() => {
-          set({
-            computerActionsPolicy: policy,
-            computerActionsEnabled: policy !== 'off',
-            pendingActions: agency.gatekeeper.getPendingActions(),
-            auditLog: [...agency.gatekeeper.getAuditLog()],
-            sessionApprovedTools: agency.gatekeeper.getSessionApprovedTools(),
-          })
-        })
-      set({
-        pendingActions: agency.gatekeeper.getPendingActions(),
-        auditLog: [...agency.gatekeeper.getAuditLog()],
-        sessionApprovedTools: agency.gatekeeper.getSessionApprovedTools(),
-      })
+      const nextShow = Boolean(show)
+      set({ showDesktopAvatar: nextShow })
+      void (
+        globalThis as unknown as {
+          ashyHost?: {
+            setOverlayVisible?: (input: { visible: boolean }) => unknown
+          }
+        }
+      ).ashyHost?.setOverlayVisible?.({ visible: nextShow && !get().isStageHidden })
       void getAshyHostBridge()
-        .updateAgencyConsent?.({ approvalPolicy: policy })
+        .updateStagePreferences?.({ showDesktopAvatar: nextShow })
         .catch(() => {
           // Ignore when offline in unit test
         })
+    },
+
+    setComputerActionsEnabled(enabled) {
+      const nextPolicy: ComputerActionsPolicy = enabled
+        ? get().computerActionsPolicy === 'off'
+          ? 'ask'
+          : get().computerActionsPolicy
+        : 'off'
+      get().setComputerActionsPolicy(nextPolicy)
+    },
+
+    setComputerActionsPolicy(policy) {
+      set((state) => ({
+        computerActionsPolicy: policy,
+        computerActionsEnabled: policy !== 'off',
+        ...(policy === 'auto_accept' ? { pendingActions: [] } : {}),
+      }))
+      void agency.gatekeeper
+        .setApprovalPolicy(policy, { autoApprovePending: policy === 'auto_accept' })
+        .then(() => {
+          set((state) => ({
+            computerActionsPolicy: policy,
+            computerActionsEnabled: policy !== 'off',
+            ...(policy === 'auto_accept' ? { pendingActions: [] } : {}),
+          }))
+        })
+
+      const nextTask = agencyRpcChain
+        .catch(() => undefined)
+        .then(async () => {
+          const hostSnap = await getAshyHostBridge().updateAgencyConsent?.({
+            approvalPolicy: policy,
+          })
+          if (hostSnap?.consent) {
+            set(buildAgencyStatePatch(hostSnap))
+          }
+        })
+        .catch(() => {
+          // Ignore when offline in unit test
+        })
+      agencyRpcChain = nextTask
     },
 
     toggleDontAskMode(enabled) {
@@ -2995,81 +3592,157 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       get().setComputerActionsPolicy(shouldEnable ? 'auto_accept' : 'ask')
     },
 
+    setDontAskMode(enabled) {
+      get().toggleDontAskMode(enabled)
+    },
+
     setToolRiskTierOverride(toolName, riskTier) {
       agency.mcpRegistry.setToolRiskTier(toolName, riskTier)
-      const overrides = agency.gatekeeper.getToolRiskOverrides()
-      set({
-        agencyTools: agency.mcpRegistry.listAllTools(),
+      const overrides: Record<string, ActionRiskTier> = {
+        ...get().toolRiskOverrides,
+        [toolName]: riskTier,
+      }
+      agency.gatekeeper.setToolRiskOverrides(overrides)
+      set((state) => ({
+        agencyTools: state.agencyTools.map((t) =>
+          t.toolName === toolName ? { ...t, effectiveRiskTier: riskTier } : t,
+        ),
         toolRiskOverrides: overrides,
         mcpSearchResults: agency.mcpRegistry.search_mcp_tools({
           query: get().mcpSearchQuery,
           limit: 10,
         }),
-      })
-      void getAshyHostBridge()
-        .updateAgencyConsent?.({ toolRiskOverrides: overrides })
+      }))
+      const nextTask = agencyRpcChain
+        .catch(() => undefined)
+        .then(async () => {
+          const hostSnap = await getAshyHostBridge().updateAgencyConsent?.({
+            toolRiskOverrides: overrides,
+          })
+          if (hostSnap?.consent) {
+            set(buildAgencyStatePatch(hostSnap))
+          }
+        })
         .catch(() => {
           // Ignore when offline in unit test
         })
+      agencyRpcChain = nextTask
+    },
+
+    setToolRiskTier(toolName, riskTier) {
+      get().setToolRiskTierOverride(toolName, riskTier)
     },
 
     addAllowedPath(rawPath) {
+      if (typeof rawPath !== 'string') return
       const trimmed = rawPath.replace(/[\x00-\x1f\x7f]/g, '').trim()
-      if (!trimmed || trimmed.includes('..')) return
-      const nextPaths = Array.from(new Set([...agency.privacyController.allowedPaths, trimmed]))
+      if (!trimmed || trimmed.includes('..') || !canonicalizeSafePath(trimmed)) return
+      const nextPaths = Array.from(new Set([...get().privacyState.allowedPaths, trimmed]))
       agency.privacyController.setAllowedPaths(nextPaths)
-      set({ privacyState: agency.privacyController.getState() })
-      void getAshyHostBridge()
-        .updateAgencyConsent?.({ allowedPaths: [...agency.privacyController.allowedPaths] })
+      set((state) => ({
+        privacyState: {
+          ...state.privacyState,
+          allowedPaths: nextPaths,
+        },
+      }))
+      const nextTask = agencyRpcChain
+        .catch(() => undefined)
+        .then(async () => {
+          const hostSnap = await getAshyHostBridge().updateAgencyConsent?.({
+            allowedPaths: nextPaths,
+          })
+          if (hostSnap?.consent) {
+            set(buildAgencyStatePatch(hostSnap))
+          }
+        })
         .catch(() => {
           // Ignore when offline in unit test
         })
+      agencyRpcChain = nextTask
     },
 
     removeAllowedPath(rawPath) {
       const trimmed = rawPath.trim().replace(/\\/g, '/').replace(/\/+$/, '')
-      const nextPaths = agency.privacyController.allowedPaths.filter(
+      const nextPaths = get().privacyState.allowedPaths.filter(
         (p) => p.trim().replace(/\\/g, '/').replace(/\/+$/, '') !== trimmed,
       )
       if (nextPaths.length === 0) return
       agency.privacyController.setAllowedPaths(nextPaths)
-      set({ privacyState: agency.privacyController.getState() })
-      void getAshyHostBridge()
-        .updateAgencyConsent?.({ allowedPaths: [...agency.privacyController.allowedPaths] })
+      set((state) => ({
+        privacyState: {
+          ...state.privacyState,
+          allowedPaths: nextPaths,
+        },
+      }))
+      const nextTask = agencyRpcChain
+        .catch(() => undefined)
+        .then(async () => {
+          const hostSnap = await getAshyHostBridge().updateAgencyConsent?.({
+            allowedPaths: nextPaths,
+          })
+          if (hostSnap?.consent) {
+            set(buildAgencyStatePatch(hostSnap))
+          }
+        })
         .catch(() => {
           // Ignore when offline in unit test
         })
+      agencyRpcChain = nextTask
     },
 
     addAllowedWindowTitle(title) {
       const trimmed = title.replace(/[\x00-\x1f\x7f]/g, '').trim()
       if (!trimmed) return
       const nextTitles = Array.from(
-        new Set([...agency.privacyController.allowedWindowTitles, trimmed]),
+        new Set([...get().privacyState.allowedWindowTitles, trimmed]),
       )
       agency.privacyController.setAllowedWindowTitles(nextTitles)
-      set({ privacyState: agency.privacyController.getState() })
-      void getAshyHostBridge()
-        .updateAgencyConsent?.({
-          allowedWindowTitles: [...agency.privacyController.allowedWindowTitles],
+      set((state) => ({
+        privacyState: {
+          ...state.privacyState,
+          allowedWindowTitles: nextTitles,
+        },
+      }))
+      const nextTask = agencyRpcChain
+        .catch(() => undefined)
+        .then(async () => {
+          const hostSnap = await getAshyHostBridge().updateAgencyConsent?.({
+            allowedWindowTitles: nextTitles,
+          })
+          if (hostSnap?.consent) {
+            set(buildAgencyStatePatch(hostSnap))
+          }
         })
         .catch(() => {
           // Ignore when offline in unit test
         })
+      agencyRpcChain = nextTask
     },
 
     removeAllowedWindowTitle(title) {
       const trimmed = title.trim()
-      const nextTitles = agency.privacyController.allowedWindowTitles.filter((t) => t !== trimmed)
+      const nextTitles = get().privacyState.allowedWindowTitles.filter((t) => t !== trimmed)
       agency.privacyController.setAllowedWindowTitles(nextTitles)
-      set({ privacyState: agency.privacyController.getState() })
-      void getAshyHostBridge()
-        .updateAgencyConsent?.({
-          allowedWindowTitles: [...agency.privacyController.allowedWindowTitles],
+      set((state) => ({
+        privacyState: {
+          ...state.privacyState,
+          allowedWindowTitles: nextTitles,
+        },
+      }))
+      const nextTask = agencyRpcChain
+        .catch(() => undefined)
+        .then(async () => {
+          const hostSnap = await getAshyHostBridge().updateAgencyConsent?.({
+            allowedWindowTitles: nextTitles,
+          })
+          if (hostSnap?.consent) {
+            set(buildAgencyStatePatch(hostSnap))
+          }
         })
         .catch(() => {
           // Ignore when offline in unit test
         })
+      agencyRpcChain = nextTask
     },
 
     revokeSessionPermissions(toolName) {
@@ -3078,35 +3751,99 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       } else {
         agency.gatekeeper.revokeAllSessionApprovals()
       }
-      set({
-        sessionApprovedTools: agency.gatekeeper.getSessionApprovedTools(),
-        auditLog: [...agency.gatekeeper.getAuditLog()],
-      })
-      void getAshyHostBridge()
-        .revokeSessionPermissions?.(toolName ? { toolName } : undefined)
+      const revokedEntry: ActionAuditLogEntry = {
+        id: `audit-revoke-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        timestamp: Date.now(),
+        toolName: toolName?.trim() || '*',
+        serverName: 'consent-center',
+        riskTier: 'staged-confirm',
+        decision: 'revoked',
+        argsPreview: '{}',
+        reason: toolName
+          ? `Session approval revoked for ${toolName}`
+          : 'All session approvals revoked by user',
+      }
+      set((state) => ({
+        sessionApprovedTools: toolName
+          ? state.sessionApprovedTools.filter((t) => t !== toolName)
+          : [],
+        auditLog: [revokedEntry, ...state.auditLog],
+      }))
+      const nextTask = agencyRpcChain
+        .catch(() => undefined)
+        .then(async () => {
+          const hostSnap = await getAshyHostBridge().revokeSessionPermissions?.(
+            toolName ? { toolName } : undefined,
+          )
+          if (hostSnap?.consent) {
+            set(buildAgencyStatePatch(hostSnap))
+          }
+        })
         .catch(() => {
           // Ignore when offline in unit test
         })
+      agencyRpcChain = nextTask
     },
 
-    async captureAuthorizedScreen(input) {
+    revokeSessionApproval(toolName) {
+      get().revokeSessionPermissions(toolName)
+    },
+
+    revokeAllSessionApprovals() {
+      get().revokeSessionPermissions()
+    },
+
+    async captureAuthorizedScreen(inputOrWindowTitle, frameFixtureIdArg) {
+      const input =
+        typeof inputOrWindowTitle === 'string'
+          ? {
+              windowTitle: inputOrWindowTitle,
+              ...(frameFixtureIdArg ? { frameFixtureId: frameFixtureIdArg } : {}),
+            }
+          : inputOrWindowTitle
+
+      await agencyRpcChain.catch(() => undefined)
+
+      const bridge = getAshyHostBridge()
+      if (typeof bridge.captureAuthorizedScreen === 'function') {
+        try {
+          const hostRes = await bridge.captureAuthorizedScreen(input)
+          if (hostRes?.observation) {
+            const obs = hostRes.observation
+            const patch = hostRes.snapshot ? buildAgencyStatePatch(hostRes.snapshot) : {}
+            const screenCtx =
+              obs.observed && obs.summary
+                ? `${obs.windowTitle ?? 'Desktop'} — ${obs.summary}`
+                : undefined
+            set((state) => ({
+              ...patch,
+              lastPrompt: screenCtx
+                ? compilePromptFromState({ screenContext: screenCtx })
+                : state.lastPrompt,
+            }))
+            return obs
+          }
+        } catch {
+          // Fall back to local sensor when offline in unit test
+        }
+      }
+
       agency.setPendingCaptureOptions(input)
       const observation = await agency.visionSensor.observeScreen({
         windowTitle: input?.windowTitle,
       })
       const telemetry = agency.visionSensor.getTelemetry()
+      const screenCtx =
+        observation.observed && observation.summary
+          ? `${observation.windowTitle ?? 'Desktop'} — ${observation.summary}`
+          : undefined
       set((state) => ({
         visionTelemetry: telemetry,
         auditLog: [...agency.gatekeeper.getAuditLog()],
-        lastPrompt: observation.summary
-          ? compilePromptFromState({ screenContext: observation.summary })
+        lastPrompt: screenCtx
+          ? compilePromptFromState({ screenContext: screenCtx })
           : state.lastPrompt,
       }))
-      void getAshyHostBridge()
-        .captureAuthorizedScreen?.(input)
-        .catch(() => {
-          // Ignore when offline in unit test
-        })
       return observation
     },
 
@@ -3123,31 +3860,93 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         registeredMcpToolsCount: agency.mcpRegistry.getRegisteredToolsCount(),
         agencyTools: agency.mcpRegistry.listAllTools(),
       }))
-      void getAshyHostBridge()
-        .registerExternalMcpServer?.(config)
+      const nextTask = agencyRpcChain
+        .catch(() => undefined)
+        .then(async () => {
+          const hostSnap = await getAshyHostBridge().registerExternalMcpServer?.(config)
+          if (hostSnap?.consent) {
+            set(buildAgencyStatePatch(hostSnap))
+          }
+        })
         .catch(() => {
           // Ignore when offline in unit test
         })
+      agencyRpcChain = nextTask
+    },
+
+    connectExternalMcpServer(config) {
+      get().registerExternalMcpServer(config)
+    },
+
+    removeExternalMcpServer(serverId) {
+      set((state) => ({
+        externalMcpServers: state.externalMcpServers.filter((s) => s.id !== serverId),
+      }))
     },
 
     setQuietHoursRange(range) {
-      set({ quietHoursRange: range })
+      if (typeof range !== 'string') return
+      const match = range
+        .trim()
+        .match(/^((?:[01]\d|2[0-3]):[0-5]\d)\s*[-–—]\s*((?:[01]\d|2[0-3]):[0-5]\d)$/)
+      if (!match) return
+      const normalizedRange = `${match[1]!} - ${match[2]!}`
+      set({ quietHoursRange: normalizedRange })
+      void get().updateInitiativePolicy({
+        quietHoursStart: match[1]!,
+        quietHoursEnd: match[2]!,
+      })
     },
 
     saveUserPreferences() {
-      set({ preferencesSavedToast: true })
+      const savedAt = Date.now()
+      try {
+        if (typeof window !== 'undefined' && window.localStorage) {
+          window.localStorage.setItem(
+            'ashy.userPreferences.v1',
+            JSON.stringify({
+              quietHoursRange: get().quietHoursRange,
+              showDesktopAvatar: get().showDesktopAvatar,
+              computerActionsEnabled: get().computerActionsEnabled,
+              computerActionsPolicy: get().computerActionsPolicy,
+              savedAt,
+            }),
+          )
+        }
+      } catch {
+        // Ignore storage write errors in restricted environments
+      }
+      set({
+        preferencesSavedToast: true,
+        preferencesSavedAt: savedAt,
+      })
     },
 
     setMicMode(mode) {
+      hasExplicitConsentMutation = true
       const agencyMode: MicMode = mode === 'push-to-talk' ? 'ptt' : mode
       agency.privacyController.setMicMode(agencyMode)
       voiceRuntime.setMicMode(mode)
-      set({ privacyState: agency.privacyController.getState() })
-      void getAshyHostBridge()
-        .updateAgencyConsent?.({ micMode: agencyMode })
+      set((state) => ({
+        privacyState: {
+          ...state.privacyState,
+          micMode: agencyMode,
+        },
+      }))
+      const nextTask = agencyRpcChain
+        .catch(() => undefined)
+        .then(async () => {
+          const hostSnap = await getAshyHostBridge().updateAgencyConsent?.({
+            micMode: agencyMode,
+          })
+          if (hostSnap?.consent) {
+            set(buildAgencyStatePatch(hostSnap))
+          }
+        })
         .catch(() => {
           // Ignore when offline in unit test
         })
+      agencyRpcChain = nextTask
     },
 
     setActiveSttProvider(providerId) {
@@ -3210,43 +4009,90 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
 
     setEyesMode(mode) {
+      hasExplicitConsentMutation = true
       agency.privacyController.setEyesMode(mode)
-      set({
-        privacyState: agency.privacyController.getState(),
-        visionTelemetry: agency.visionSensor.getTelemetry(),
-      })
-      void getAshyHostBridge()
-        .updateAgencyConsent?.({ eyesMode: mode })
+      set((state) => ({
+        privacyState: {
+          ...state.privacyState,
+          eyesMode: mode,
+        },
+        visionTelemetry: {
+          ...state.visionTelemetry,
+          eyesMode: mode,
+        },
+      }))
+      const nextTask = agencyRpcChain
+        .catch(() => undefined)
+        .then(async () => {
+          const hostSnap = await getAshyHostBridge().updateAgencyConsent?.({
+            eyesMode: mode,
+          })
+          if (hostSnap?.consent) {
+            set(buildAgencyStatePatch(hostSnap))
+          }
+        })
         .catch(() => {
           // Ignore when offline in unit test
         })
+      agencyRpcChain = nextTask
     },
 
     setDndMode(enabled) {
+      hasExplicitConsentMutation = true
       agency.privacyController.setDndMode(enabled)
-      set({ privacyState: agency.privacyController.getState() })
-      void getAshyHostBridge()
-        .updateAgencyConsent?.({ dndMode: enabled })
+      set((state) => ({
+        privacyState: {
+          ...state.privacyState,
+          dndMode: enabled,
+        },
+      }))
+      const nextTask = agencyRpcChain
+        .catch(() => undefined)
+        .then(async () => {
+          const hostSnap = await getAshyHostBridge().updateAgencyConsent?.({
+            dndMode: enabled,
+          })
+          if (hostSnap?.consent) {
+            set(buildAgencyStatePatch(hostSnap))
+          }
+        })
         .catch(() => {
           // Ignore when offline in unit test
         })
+      agencyRpcChain = nextTask
     },
 
     activateFullPrivacyShield() {
+      hasExplicitConsentMutation = true
       const next = agency.privacyController.activatePrivacyShield()
-      set({
+      voiceRuntime.setMicMode('muted')
+      set((state) => ({
         privacyState: next,
-        visionTelemetry: agency.visionSensor.getTelemetry(),
-      })
-      void getAshyHostBridge()
-        .updateAgencyConsent?.({
+        visionTelemetry: {
+          ...state.visionTelemetry,
           eyesMode: 'off',
-          micMode: 'muted',
-          dndMode: true,
+        },
+      }))
+      const nextTask = agencyRpcChain
+        .catch(() => undefined)
+        .then(async () => {
+          const hostSnap = await getAshyHostBridge().updateAgencyConsent?.({
+            eyesMode: 'off',
+            micMode: 'muted',
+            dndMode: true,
+          })
+          if (hostSnap?.consent) {
+            set(buildAgencyStatePatch(hostSnap))
+          }
         })
         .catch(() => {
           // Ignore when offline in unit test
         })
+      agencyRpcChain = nextTask
+    },
+
+    activatePrivacyShield() {
+      get().activateFullPrivacyShield()
     },
 
     searchMcpTools(query) {
@@ -3288,6 +4134,41 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         }
       }
 
+      await agencyRpcChain.catch(() => undefined)
+
+      const bridge = getAshyHostBridge()
+      if (typeof bridge.callMcpTool === 'function') {
+        try {
+          const hostRes = await bridge.callMcpTool({ toolName, args: safeArgs })
+          if (hostRes && typeof hostRes.status === 'string') {
+            let summary = `Tool "${toolName}" -> ${hostRes.status}`
+            if (hostRes.pendingCard?.blastRadiusWarning) {
+              summary += ` (${hostRes.pendingCard.blastRadiusWarning})`
+            } else if (hostRes.reason) {
+              summary += ` (${hostRes.reason})`
+            }
+            if (hostRes.snapshot) {
+              set({
+                ...buildAgencyStatePatch(hostRes.snapshot),
+                lastMcpResultSummary: summary,
+              })
+            } else {
+              set({ lastMcpResultSummary: summary })
+            }
+            return {
+              status: hostRes.status,
+              ...(hostRes.output !== undefined ? { output: hostRes.output } : {}),
+              ...(hostRes.pendingCard
+                ? { pendingCard: hostRes.pendingCard as PendingActionCard }
+                : {}),
+              ...(hostRes.reason ? { reason: hostRes.reason } : {}),
+            }
+          }
+        } catch {
+          // Fall back to local registry when offline in unit test
+        }
+      }
+
       const res = await agency.mcpRegistry.call_mcp_tool({ toolName, args: safeArgs })
       let summary = `Tool "${toolName}" -> ${res.status}`
       if (res.pendingCard?.blastRadiusWarning) {
@@ -3302,15 +4183,37 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         auditLog: [...agency.gatekeeper.getAuditLog()],
         lastMcpResultSummary: summary,
       })
-      void getAshyHostBridge()
-        .callMcpTool?.({ toolName, args: safeArgs })
-        .catch(() => {
-          // Ignore when offline in unit test
-        })
       return res
     },
 
     async approvePendingAction(actionId, scope) {
+      await agencyRpcChain.catch(() => undefined)
+
+      if (get().computerActionsPolicy === 'off') {
+        throw new Error(
+          `Cannot approve action ${actionId}: computer actions are disabled by policy (off)`,
+        )
+      }
+
+      const bridge = getAshyHostBridge()
+      if (typeof bridge.approvePendingAction === 'function') {
+        try {
+          const hostRes = await bridge.approvePendingAction({ actionId, scope })
+          if (hostRes?.snapshot) {
+            set({
+              ...buildAgencyStatePatch(hostRes.snapshot),
+              lastMcpResultSummary: `Approved action ${actionId} (scope=${scope})`,
+            })
+            return
+          }
+        } catch (err) {
+          if (err instanceof Error && /disabled by policy/i.test(err.message)) {
+            throw err
+          }
+          // Fall back to local gatekeeper when offline
+        }
+      }
+
       await agency.gatekeeper.approveAction(actionId, scope)
       set({
         pendingActions: agency.gatekeeper.getPendingActions(),
@@ -3318,26 +4221,71 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         auditLog: [...agency.gatekeeper.getAuditLog()],
         lastMcpResultSummary: `Approved action ${actionId} (scope=${scope})`,
       })
-      void getAshyHostBridge()
-        .approvePendingAction?.({ actionId, scope })
-        .catch(() => {
-          // Ignore when offline in unit test
-        })
     },
 
     denyPendingAction(actionId, reason = 'Denied by user in Consent Center') {
-      const res = agency.gatekeeper.denyAction(actionId, reason)
-      set({
-        pendingActions: agency.gatekeeper.getPendingActions(),
-        sessionApprovedTools: agency.gatekeeper.getSessionApprovedTools(),
-        auditLog: [...agency.gatekeeper.getAuditLog()],
-        lastMcpResultSummary: res.feedback,
+      let localFeedback = `Action ${actionId} denied: ${reason}`
+      let deniedLocally = false
+      try {
+        const res = agency.gatekeeper.denyAction(actionId, reason)
+        localFeedback = res.feedback
+        deniedLocally = true
+      } catch {
+        // Action may only exist on Host
+      }
+      set((state) => {
+        const existingCard = state.pendingActions.find((a) => a.id === actionId)
+        const nextAuditLog = deniedLocally
+          ? [...agency.gatekeeper.getAuditLog()]
+          : existingCard
+            ? [
+                {
+                  id: `audit-deny-${actionId}`,
+                  timestamp: Date.now(),
+                  toolName: existingCard.toolName,
+                  serverName: existingCard.serverName,
+                  riskTier: existingCard.riskTier,
+                  decision: 'denied' as const,
+                  argsPreview: existingCard.argsPreview,
+                  actionId: existingCard.id,
+                  reason,
+                  ...(existingCard.blastRadiusWarning
+                    ? { blastRadiusWarning: existingCard.blastRadiusWarning }
+                    : {}),
+                  ...(existingCard.targetPath ? { targetPath: existingCard.targetPath } : {}),
+                  ...(existingCard.commandPreview
+                    ? { commandPreview: existingCard.commandPreview }
+                    : {}),
+                  ...(existingCard.diffPreview ? { diffPreview: existingCard.diffPreview } : {}),
+                },
+                ...state.auditLog,
+              ]
+            : state.auditLog
+
+        return {
+          pendingActions: state.pendingActions.filter((a) => a.id !== actionId),
+          auditLog: nextAuditLog,
+          lastMcpResultSummary: localFeedback,
+        }
       })
-      void getAshyHostBridge()
-        .denyPendingAction?.({ actionId, reason })
+      const nextTask = agencyRpcChain
+        .catch(() => undefined)
+        .then(async () => {
+          const hostRes = await getAshyHostBridge().denyPendingAction?.({
+            actionId,
+            reason,
+          })
+          if (hostRes?.snapshot) {
+            set({
+              ...buildAgencyStatePatch(hostRes.snapshot),
+              lastMcpResultSummary: hostRes.feedback,
+            })
+          }
+        })
         .catch(() => {
           // Ignore when offline in unit test
         })
+      agencyRpcChain = nextTask
     },
 
     resetStoreForTesting() {
@@ -3348,6 +4296,10 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       firstDeltaEnqueuedAtMs = null
       firstChunkRecordedForTurn = false
       evalRunSeq += 1
+      inFlightCatalogCount = 0
+      hasExplicitConsentMutation = false
+      agencyRpcChain = Promise.resolve()
+      providerCatalogSeq.clear()
       completedTurnEvents.clear()
       pendingTurnResolvers.clear()
       pendingTurnSeriousness.clear()
@@ -3366,7 +4318,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       const resetWindowMode = resolveInitialWindowMode()
       const freshPrompt = composeAshyTurnPrompt({
         userMessage: 'Olá Ashy.',
-        modelId: 'claude-3-7-sonnet',
+        modelId: 'anthropic/claude-3.7-sonnet',
         timeOfDayLabel: lastPromptMinuteLabel,
         stage: 'stranger',
         voiceIdentityMarkdown: DEFAULT_ASHY_VOICE_MD,
@@ -3378,7 +4330,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       set({
         viewMode: resetWindowMode.viewMode,
         activeTab: 'studio',
-        activeModelId: 'claude-3-7-sonnet',
+        activeModelId: 'anthropic/claude-3.7-sonnet',
         isBootstrapped: false,
         needsOnboarding: true,
         userProfile: {
@@ -3392,6 +4344,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         activeSessionId: 'session-initial',
         sessions: [],
         providers: createInitialPublicProviders(),
+        providerModelCatalog: { ...FALLBACK_PROVIDER_MODELS },
+        providerModelCatalogSource: {},
+        isLoadingProviderModels: false,
         voiceIdentity: {
           content: DEFAULT_ASHY_VOICE_MD,
           diagnostics: {
@@ -3476,12 +4431,13 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         voiceCancelledShortCount: 0,
         lastVoiceFixtureResult: null,
         isPushToTalkHeld: false,
-        settingsSubTab: 'privacidade',
+        settingsSubTab: 'todas',
         showDesktopAvatar: true,
         computerActionsEnabled: true,
         computerActionsPolicy: 'ask',
         quietHoursRange: '22:00 — 08:00',
         preferencesSavedToast: false,
+        preferencesSavedAt: null,
         privacyState: agency.privacyController.getState(),
         mcpSearchQuery: '',
         mcpSearchResults: agency.mcpRegistry.search_mcp_tools({ query: '', limit: 10 }),

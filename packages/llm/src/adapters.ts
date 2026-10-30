@@ -4,6 +4,7 @@ import type {
   LanguageModel,
   LanguageModelEvent,
   LanguageModelRequest,
+  ReasoningEffort,
   TokenUsage,
   ToolDefinition,
 } from './stream-text'
@@ -12,6 +13,7 @@ export interface OpenAICompatibleModelConfig {
   baseUrl?: string
   apiKey?: string
   model: string
+  reasoningEffort?: ReasoningEffort
   fetchImpl?: typeof fetch
   headers?: Record<string, string>
 }
@@ -21,6 +23,7 @@ export interface AnthropicMessagesModelConfig {
   apiKey?: string
   model: string
   maxTokens?: number
+  reasoningEffort?: ReasoningEffort
   anthropicVersion?: string
   fetchImpl?: typeof fetch
   headers?: Record<string, string>
@@ -52,17 +55,44 @@ export type ScriptedStep =
       stepIndex: number,
     ) => ScriptedStepConfig | Promise<ScriptedStepConfig>)
 
+function applyPipeMetadata(
+  pipeItems: readonly unknown[],
+  target: Record<string, unknown>,
+): Record<string, unknown> {
+  for (let i = 1; i < pipeItems.length; i++) {
+    const item = pipeItems[i] as Record<string, unknown> | undefined
+    if (!item || typeof item !== 'object') continue
+    const actionType = item.type as string | undefined
+    if (actionType === 'description' && typeof item.description === 'string') {
+      target.description = item.description
+    } else if (actionType === 'min_length' && typeof item.requirement === 'number') {
+      target.minLength = item.requirement
+    } else if (actionType === 'max_length' && typeof item.requirement === 'number') {
+      target.maxLength = item.requirement
+    } else if (actionType === 'min_value' && typeof item.requirement === 'number') {
+      target.minimum = item.requirement
+    } else if (actionType === 'max_value' && typeof item.requirement === 'number') {
+      target.maximum = item.requirement
+    }
+  }
+  return target
+}
+
 /**
- * Lightweight Valibot schema introspector to produce JSON Schema for tool declarations.
+ * Valibot schema introspector to produce JSON Schema for tool declarations.
  */
 export function valibotSchemaToJsonSchema(schema: AnyValibotSchema): Record<string, unknown> {
   const raw = schema as unknown as Record<string, unknown>
   const schemaType = raw.type as string | undefined
+  const pipeItems = Array.isArray(raw.pipe) ? (raw.pipe as readonly unknown[]) : undefined
 
   if (schemaType === 'optional' || schemaType === 'nullable' || schemaType === 'nullish') {
     const wrapped = raw.wrapped as AnyValibotSchema | undefined
-    return wrapped ? valibotSchemaToJsonSchema(wrapped) : { type: 'string' }
+    const base = wrapped ? valibotSchemaToJsonSchema(wrapped) : { type: 'string' }
+    return pipeItems ? applyPipeMetadata(pipeItems, base) : base
   }
+
+  let result: Record<string, unknown> = { type: 'object' }
 
   if (schemaType === 'object' && typeof raw.entries === 'object' && raw.entries !== null) {
     const entries = raw.entries as Record<string, AnyValibotSchema>
@@ -77,28 +107,53 @@ export function valibotSchemaToJsonSchema(schema: AnyValibotSchema): Record<stri
       properties[key] = valibotSchemaToJsonSchema(entrySchema)
     }
 
-    return {
+    result = {
       type: 'object',
       properties,
       required,
       additionalProperties: false,
     }
-  }
-
-  if (schemaType === 'string') return { type: 'string' }
-  if (schemaType === 'number') return { type: 'number' }
-  if (schemaType === 'boolean') return { type: 'boolean' }
-  if (schemaType === 'picklist' && Array.isArray(raw.options)) {
-    return { type: 'string', enum: raw.options }
-  }
-  if (schemaType === 'array' && raw.item) {
-    return {
+  } else if (schemaType === 'literal') {
+    const literalValue = raw.literal
+    const litType = typeof literalValue
+    if (litType === 'string' || litType === 'number' || litType === 'boolean') {
+      result = { type: litType, const: literalValue }
+    } else {
+      result = { const: literalValue }
+    }
+  } else if (schemaType === 'union' && Array.isArray(raw.options)) {
+    result = {
+      anyOf: (raw.options as AnyValibotSchema[]).map((opt) => valibotSchemaToJsonSchema(opt)),
+    }
+  } else if (schemaType === 'record' && raw.value) {
+    result = {
+      type: 'object',
+      additionalProperties: valibotSchemaToJsonSchema(raw.value as AnyValibotSchema),
+    }
+  } else if (schemaType === 'tuple' && Array.isArray(raw.items)) {
+    const tupleItems = (raw.items as AnyValibotSchema[]).map((it) => valibotSchemaToJsonSchema(it))
+    result = {
+      type: 'array',
+      items: tupleItems,
+      minItems: tupleItems.length,
+      maxItems: tupleItems.length,
+    }
+  } else if (schemaType === 'string') {
+    result = { type: 'string' }
+  } else if (schemaType === 'number') {
+    result = { type: 'number' }
+  } else if (schemaType === 'boolean') {
+    result = { type: 'boolean' }
+  } else if (schemaType === 'picklist' && Array.isArray(raw.options)) {
+    result = { type: 'string', enum: raw.options }
+  } else if (schemaType === 'array' && raw.item) {
+    result = {
       type: 'array',
       items: valibotSchemaToJsonSchema(raw.item as AnyValibotSchema),
     }
   }
 
-  return { type: 'object' }
+  return pipeItems ? applyPipeMetadata(pipeItems, result) : result
 }
 
 function serializeOpenAIMessages(messages: ChatMessage[], system?: string): unknown[] {
@@ -153,6 +208,66 @@ function serializeOpenAITools(
   }))
 }
 
+const REASONING_PAYLOAD_KEYS = [
+  'reasoning',
+  'reasoning_effort',
+  'think',
+  'chat_template_kwargs',
+] as const
+
+function applyOpenAIReasoningPayload(
+  bodyPayload: Record<string, unknown>,
+  baseUrl: string,
+  modelId: string,
+  effort: ReasoningEffort | undefined,
+): boolean {
+  if (!effort) return false
+  const lowerUrl = baseUrl.toLowerCase()
+  const lowerModel = modelId.toLowerCase()
+
+  if (lowerUrl.includes('openrouter.ai')) {
+    if (effort === 'none') {
+      bodyPayload.reasoning = { enabled: false, effort: 'none' }
+    } else {
+      bodyPayload.reasoning = { enabled: true, effort }
+    }
+    return true
+  }
+
+  const isOllamaOrLocal =
+    lowerUrl.includes(':11434') ||
+    lowerUrl.includes('ollama') ||
+    lowerUrl.includes('127.0.0.1') ||
+    lowerUrl.includes('localhost')
+  const isHybridThinkingModel =
+    lowerModel.includes('qwen3') ||
+    lowerModel.includes('deepseek-r1') ||
+    lowerModel.includes('qwq')
+
+  if (isOllamaOrLocal || isHybridThinkingModel) {
+    if (effort === 'none') {
+      bodyPayload.think = false
+      bodyPayload.chat_template_kwargs = { enable_thinking: false }
+    } else {
+      bodyPayload.reasoning_effort = effort === 'minimal' ? 'low' : effort
+    }
+    return true
+  }
+
+  const isOpenAIReasoningModel = /^(o1|o3|o4|gpt-5)/i.test(lowerModel)
+  if (isOpenAIReasoningModel) {
+    bodyPayload.reasoning_effort = effort === 'none' ? 'minimal' : effort
+    return true
+  }
+
+  if (effort !== 'none') {
+    bodyPayload.reasoning_effort = effort === 'minimal' ? 'low' : effort
+    return true
+  }
+
+  return false
+}
+
 /**
  * Creates an OpenAI-compatible SSE streaming model adapter (OpenRouter, OpenAI, NVIDIA NIM, Ollama, vLLM).
  */
@@ -187,12 +302,35 @@ export function createOpenAICompatibleModel(
       bodyPayload.max_tokens = request.maxTokens
     }
 
-    const response = await fetchFn(`${baseUrl}/chat/completions`, {
+    const effectiveEffort = request.reasoningEffort ?? config.reasoningEffort
+    const hasReasoningParams = applyOpenAIReasoningPayload(
+      bodyPayload,
+      baseUrl,
+      config.model,
+      effectiveEffort,
+    )
+
+    let response = await fetchFn(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers,
       body: JSON.stringify(bodyPayload),
       signal: request.signal,
     })
+
+    // Adversarial resilience: if an OpenAI-compatible endpoint rejects reasoning/thinking fields with HTTP 400, retry cleanly without them
+    if (response.status === 400 && hasReasoningParams && !request.signal?.aborted) {
+      await response.body?.cancel().catch(() => undefined)
+      const fallbackPayload: Record<string, unknown> = { ...bodyPayload }
+      for (const key of REASONING_PAYLOAD_KEYS) {
+        delete fallbackPayload[key]
+      }
+      response = await fetchFn(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(fallbackPayload),
+        signal: request.signal,
+      })
+    }
 
     if (!response.ok || !response.body) {
       const errorText = await response.text().catch(() => response.statusText)
@@ -374,6 +512,19 @@ export function createOpenAICompatibleModel(
   return modelFn
 }
 
+function safeParseJsonObject(argsText: string): Record<string, unknown> {
+  if (!argsText || argsText.trim().length === 0) return {}
+  try {
+    const parsed = JSON.parse(argsText) as unknown
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>
+    }
+    return {}
+  } catch {
+    return {}
+  }
+}
+
 /**
  * Creates an Anthropic Messages API SSE streaming model adapter.
  */
@@ -415,20 +566,55 @@ export function createAnthropicMessagesModel(
         })
         continue
       }
+      if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
+        const blocks: Array<Record<string, unknown>> = []
+        if (m.content && m.content.length > 0) {
+          blocks.push({ type: 'text', text: m.content })
+        }
+        for (const tc of m.toolCalls) {
+          blocks.push({
+            type: 'tool_use',
+            id: tc.toolCallId,
+            name: tc.toolName,
+            input: safeParseJsonObject(tc.argsText),
+          })
+        }
+        anthropicMessages.push({
+          role: 'assistant',
+          content: blocks,
+        })
+        continue
+      }
       anthropicMessages.push({
         role: m.role === 'assistant' ? 'assistant' : 'user',
         content: m.content,
       })
     }
 
+    const effectiveEffort = request.reasoningEffort ?? config.reasoningEffort
+    const thinkingEnabled =
+      effectiveEffort === 'low' || effectiveEffort === 'medium' || effectiveEffort === 'high'
+    const baseMaxTokens = request.maxTokens ?? config.maxTokens ?? 4096
+
     const bodyPayload: Record<string, unknown> = {
       model: config.model,
-      max_tokens: request.maxTokens ?? config.maxTokens ?? 4096,
+      max_tokens: baseMaxTokens,
       messages: anthropicMessages,
       stream: true,
     }
     if (systemParts.length > 0) {
       bodyPayload.system = systemParts.join('\n\n')
+    }
+    if (thinkingEnabled) {
+      const budgetTokens =
+        effectiveEffort === 'low' ? 1024 : effectiveEffort === 'medium' ? 4096 : 8192
+      bodyPayload.max_tokens = Math.max(baseMaxTokens, budgetTokens + 1024)
+      bodyPayload.thinking = {
+        type: 'enabled',
+        budget_tokens: budgetTokens,
+      }
+    } else if (request.temperature !== undefined) {
+      bodyPayload.temperature = request.temperature
     }
     if (request.tools && request.tools.length > 0) {
       bodyPayload.tools = request.tools.map((t) => ({
@@ -438,12 +624,31 @@ export function createAnthropicMessagesModel(
       }))
     }
 
-    const response = await fetchFn(`${baseUrl}/messages`, {
+    let response = await fetchFn(`${baseUrl}/messages`, {
       method: 'POST',
       headers,
       body: JSON.stringify(bodyPayload),
       signal: request.signal,
     })
+
+    // Adversarial resilience: if the selected Anthropic model does not support extended thinking (HTTP 400), retry without thinking
+    if (response.status === 400 && thinkingEnabled && !request.signal?.aborted) {
+      await response.body?.cancel().catch(() => undefined)
+      const fallbackPayload: Record<string, unknown> = {
+        ...bodyPayload,
+        max_tokens: baseMaxTokens,
+      }
+      delete fallbackPayload.thinking
+      if (request.temperature !== undefined) {
+        fallbackPayload.temperature = request.temperature
+      }
+      response = await fetchFn(`${baseUrl}/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(fallbackPayload),
+        signal: request.signal,
+      })
+    }
 
     if (!response.ok || !response.body) {
       const errorText = await response.text().catch(() => response.statusText)
@@ -459,6 +664,18 @@ export function createAnthropicMessagesModel(
       { id: string; name: string; argsText: string }
     >()
     let finishReason = 'stop'
+    let promptTokens = 0
+    let completionTokens = 0
+    let hasUsage = false
+
+    function buildAnthropicUsage(): TokenUsage | undefined {
+      if (!hasUsage) return undefined
+      return {
+        promptTokens,
+        completionTokens,
+        totalTokens: promptTokens + completionTokens,
+      }
+    }
 
     function processLine(
       line: string,
@@ -483,7 +700,14 @@ export function createAnthropicMessagesModel(
       const eventType = payload.type as string | undefined
       const index = typeof payload.index === 'number' ? payload.index : 0
 
-      if (eventType === 'content_block_start') {
+      if (eventType === 'message_start') {
+        const messageObj = payload.message as Record<string, unknown> | undefined
+        const usageObj = messageObj?.usage as Record<string, unknown> | undefined
+        if (typeof usageObj?.input_tokens === 'number') {
+          promptTokens = usageObj.input_tokens
+          hasUsage = true
+        }
+      } else if (eventType === 'content_block_start') {
         const block = payload.content_block as Record<string, unknown> | undefined
         if (block?.type === 'tool_use') {
           activeToolBlocks.set(index, {
@@ -525,6 +749,11 @@ export function createAnthropicMessagesModel(
         if (typeof delta?.stop_reason === 'string') {
           finishReason = delta.stop_reason
         }
+        const usageObj = payload.usage as Record<string, unknown> | undefined
+        if (typeof usageObj?.output_tokens === 'number') {
+          completionTokens = usageObj.output_tokens
+          hasUsage = true
+        }
       } else if (eventType === 'message_stop') {
         return true
       }
@@ -541,7 +770,11 @@ export function createAnthropicMessagesModel(
               const line = lineBuffer.slice(0, nl)
               lineBuffer = lineBuffer.slice(nl + 1)
               if (processLine(line, controller)) {
-                controller.enqueue({ type: 'finish', finishReason })
+                controller.enqueue({
+                  type: 'finish',
+                  finishReason,
+                  usage: buildAnthropicUsage(),
+                })
                 controller.close()
                 await byteReader.cancel().catch(() => undefined)
                 return
@@ -558,7 +791,11 @@ export function createAnthropicMessagesModel(
                 }
                 lineBuffer = ''
               }
-              controller.enqueue({ type: 'finish', finishReason })
+              controller.enqueue({
+                type: 'finish',
+                finishReason,
+                usage: buildAnthropicUsage(),
+              })
               controller.close()
               return
             }

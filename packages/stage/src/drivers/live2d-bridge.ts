@@ -1,10 +1,12 @@
-import type {
-  AshyEmotion,
-  AshyEyeLayerState,
-  AshyMotionPreset,
-  AshyVisemeKey,
-  PngTuberSpriteStateKey,
+import {
+  ASHY_MOTION_PRESETS,
+  type AshyEmotion,
+  type AshyEyeLayerState,
+  type AshyMotionPreset,
+  type AshyVisemeKey,
+  type PngTuberSpriteStateKey,
 } from '@ashy/shared'
+import type { Live2DModelControls } from './live2d-inspector'
 import type { Live2DParameterMap } from './tachie-compositor'
 
 export type TachieEyeState = AshyEyeLayerState | 'happy_arc'
@@ -19,6 +21,11 @@ export type StageMotionPreset = AshyMotionPreset
 export interface CubismCoreModelLike {
   setParameterValueById?: (id: string, value: number, weight?: number) => void
   addParameterValueById?: (id: string, value: number, weight?: number) => void
+}
+
+export interface CubismExpressiveModelLike {
+  expression?: (id?: string | number) => Promise<unknown> | unknown
+  motion?: (group: string, index?: number, priority?: number) => Promise<unknown> | unknown
 }
 
 export function hasWebGLSupport(): boolean {
@@ -82,6 +89,43 @@ export function applyLive2DParametersToCoreModel(
   coreModel.setParameterValueById('ParamMouthForm', params.ParamMouthForm, 1)
   coreModel.setParameterValueById('ParamCheek', params.ParamCheek ?? 0, 1)
   coreModel.setParameterValueById('ParamBreath', params.ParamBreath, 1)
+}
+
+function expSmooth(current: number, target: number, dtSeconds: number, tauSeconds: number): number {
+  const safeCur = Number.isFinite(current) ? current : 0
+  const safeTgt = Number.isFinite(target) ? target : safeCur
+  const safeDt = Number.isFinite(dtSeconds) ? Math.max(0, Math.min(0.1, dtSeconds)) : 1 / 60
+  if (tauSeconds <= 0 || safeDt <= 0) {
+    return safeTgt
+  }
+  const alpha = 1 - Math.exp(-safeDt / tauSeconds)
+  return safeCur + (safeTgt - safeCur) * alpha
+}
+
+/**
+ * Frame-rate-independent temporal smoother for Live2D parameters.
+ * Eliminates step discontinuities on head/body angles and gaze while keeping blinks and lip-sync crisp.
+ */
+export function smoothLive2DParameterMap(
+  current: Live2DParameterMap,
+  target: Live2DParameterMap,
+  dtSeconds: number,
+): Live2DParameterMap {
+  return {
+    ParamAngleX: Number(expSmooth(current.ParamAngleX, target.ParamAngleX, dtSeconds, 0.14).toFixed(3)),
+    ParamAngleY: Number(expSmooth(current.ParamAngleY, target.ParamAngleY, dtSeconds, 0.14).toFixed(3)),
+    ParamAngleZ: Number(expSmooth(current.ParamAngleZ, target.ParamAngleZ, dtSeconds, 0.16).toFixed(3)),
+    ParamEyeLOpen: Number(expSmooth(current.ParamEyeLOpen, target.ParamEyeLOpen, dtSeconds, 0.022).toFixed(3)),
+    ParamEyeROpen: Number(expSmooth(current.ParamEyeROpen, target.ParamEyeROpen, dtSeconds, 0.022).toFixed(3)),
+    ParamEyeBallX: Number(expSmooth(current.ParamEyeBallX, target.ParamEyeBallX, dtSeconds, 0.065).toFixed(3)),
+    ParamEyeBallY: Number(expSmooth(current.ParamEyeBallY, target.ParamEyeBallY, dtSeconds, 0.065).toFixed(3)),
+    ParamBrowLY: Number(expSmooth(current.ParamBrowLY, target.ParamBrowLY, dtSeconds, 0.09).toFixed(3)),
+    ParamBrowRY: Number(expSmooth(current.ParamBrowRY, target.ParamBrowRY, dtSeconds, 0.09).toFixed(3)),
+    ParamMouthOpenY: Number(expSmooth(current.ParamMouthOpenY, target.ParamMouthOpenY, dtSeconds, 0.028).toFixed(3)),
+    ParamMouthForm: Number(expSmooth(current.ParamMouthForm, target.ParamMouthForm, dtSeconds, 0.08).toFixed(3)),
+    ParamCheek: Number(expSmooth(current.ParamCheek, target.ParamCheek, dtSeconds, 0.12).toFixed(3)),
+    ParamBreath: Number(expSmooth(current.ParamBreath, target.ParamBreath, dtSeconds, 0.12).toFixed(3)),
+  }
 }
 
 export function resolvePngTuberSpriteState(input: {
@@ -215,4 +259,115 @@ export function resolveEmotionToLive2DExpressionIndex(
   ]
   const fallbackPos = Math.max(0, emotionOrder.indexOf(emotion))
   return fallbackPos % expressions.length
+}
+
+export function resolveLive2DExpressionAndMotion(options: {
+  emotion: EmotionState | string
+  motionPreset?: StageMotionPreset | string
+  controls?: Live2DModelControls
+}): {
+  appliedExpression: string | number | null
+  appliedMotionGroup: string | null
+  appliedMotionIndex: number
+} {
+  let appliedExpression: string | number | null = null
+  if (options.controls?.expressions?.length) {
+    const idx = resolveEmotionToLive2DExpressionIndex(
+      options.emotion as EmotionState,
+      options.controls.expressions,
+    )
+    if (idx >= 0) {
+      appliedExpression = options.controls.expressions[idx] ?? null
+    }
+  } else {
+    const trimmed = String(options.emotion ?? '').trim()
+    if (trimmed.length > 0) {
+      appliedExpression = trimmed
+    }
+  }
+
+  const presetRaw = String(options.motionPreset ?? 'idle').trim() || 'idle'
+  const presetLower = presetRaw.toLowerCase()
+  const presetIdx = Math.max(0, ASHY_MOTION_PRESETS.indexOf(presetLower as AshyMotionPreset))
+
+  let appliedMotionGroup: string | null = null
+  let appliedMotionIndex = 0
+
+  if (options.controls?.motionGroups?.length) {
+    const groups = options.controls.motionGroups
+    let matchedGroup = groups.find((g) => g.name.toLowerCase() === presetLower)
+    if (!matchedGroup) {
+      if (presetLower !== 'idle') {
+        matchedGroup =
+          groups.find((g) => g.name.toLowerCase() === 'tapbody') ?? groups[0]
+      } else {
+        matchedGroup =
+          groups.find((g) => g.name.toLowerCase() === 'idle') ?? groups[0]
+      }
+    }
+    if (matchedGroup) {
+      appliedMotionGroup = matchedGroup.name
+      appliedMotionIndex = matchedGroup.count > 0 ? presetIdx % matchedGroup.count : 0
+    }
+  } else {
+    appliedMotionGroup = presetLower === 'idle' ? 'Idle' : 'TapBody'
+    appliedMotionIndex = 0
+  }
+
+  return {
+    appliedExpression,
+    appliedMotionGroup,
+    appliedMotionIndex,
+  }
+}
+
+export function applyLive2DExpressionAndMotion(
+  model: CubismExpressiveModelLike | null | undefined,
+  options: {
+    emotion: EmotionState | string
+    motionPreset?: StageMotionPreset | string
+    controls?: Live2DModelControls
+  },
+): {
+  appliedExpression: string | number | null
+  appliedMotionGroup: string | null
+  appliedMotionIndex: number
+} {
+  if (!model) {
+    return {
+      appliedExpression: null,
+      appliedMotionGroup: null,
+      appliedMotionIndex: 0,
+    }
+  }
+
+  const resolved = resolveLive2DExpressionAndMotion(options)
+  let appliedExpression: string | number | null = null
+  let appliedMotionGroup: string | null = null
+  let appliedMotionIndex = 0
+
+  if (typeof model.expression === 'function' && resolved.appliedExpression !== null) {
+    appliedExpression = resolved.appliedExpression
+    try {
+      void Promise.resolve(model.expression(appliedExpression)).catch(() => {})
+    } catch {
+      // Ignore synchronous Cubism expression throws
+    }
+  }
+
+  if (typeof model.motion === 'function' && resolved.appliedMotionGroup !== null) {
+    appliedMotionGroup = resolved.appliedMotionGroup
+    appliedMotionIndex = resolved.appliedMotionIndex
+    try {
+      void Promise.resolve(model.motion(appliedMotionGroup, appliedMotionIndex)).catch(() => {})
+    } catch {
+      // Ignore synchronous Cubism motion throws
+    }
+  }
+
+  return {
+    appliedExpression,
+    appliedMotionGroup,
+    appliedMotionIndex,
+  }
 }
