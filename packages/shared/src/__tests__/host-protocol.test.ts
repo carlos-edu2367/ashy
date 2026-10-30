@@ -67,6 +67,26 @@ import {
   ExternalMcpServerConfigSchema,
   DEFAULT_PERSISTED_AGENCY_CONSENT_STATE,
   UpdateAgencyConsentInputSchema,
+  INITIATIVE_TRIGGER_KINDS,
+  InitiativeTriggerKindSchema,
+  INITIATIVE_DECISIONS,
+  InitiativeDecisionSchema,
+  QuietHoursHHMMSchema,
+  InitiativePolicySchema,
+  DEFAULT_INITIATIVE_POLICY,
+  UpdateInitiativePolicyInputSchema,
+  EvaluateInitiativeInputSchema,
+  ProactiveInitiativeRecordSchema,
+  DreamJournalEntrySchema,
+  UpdateMilestoneInputSchema,
+  ROOM_TIME_OF_DAY_PERIODS,
+  RoomTimeOfDayPeriodSchema,
+  ROOM_LIGHTING_PRESETS,
+  RoomLightingPresetSchema,
+  ROOM_TROPHY_ICON_KEYS,
+  RoomTrophyIconKeySchema,
+  RoomTrophyItemSchema,
+  RoomEnvironmentStateSchema,
 } from '../index'
 
 describe('@ashy/shared host-protocol', () => {
@@ -330,6 +350,8 @@ describe('@ashy/shared host-protocol', () => {
       seriousnessFalseNegativeCountMax: 0,
       bondSafeguardComplianceRateMin: 1.0,
       traitDriftCorridorComplianceRateMin: 1.0,
+      initiativeGroundingRateMin: 1.0,
+      unopportuneInitiativeCountMax: 0,
     })
 
     const inputRes = v.safeParse(RunCoreExperimentInputSchema, {
@@ -626,6 +648,8 @@ describe('@ashy/shared host-protocol', () => {
       expect(metricDefaultsRes.output.seriousnessFalseNegativeCount).toBe(0)
       expect(metricDefaultsRes.output.bondSafeguardComplianceRate).toBe(1.0)
       expect(metricDefaultsRes.output.traitDriftCorridorComplianceRate).toBe(1.0)
+      expect(metricDefaultsRes.output.initiativeGroundingRate).toBe(1.0)
+      expect(metricDefaultsRes.output.unopportuneInitiativeCount).toBe(0)
     }
 
     expect(
@@ -1015,5 +1039,382 @@ describe('Phase 7 Desktop, Vision & MCP Shared Contracts', () => {
     expect(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.toolRiskOverrides).toEqual({})
     expect(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.externalMcpServers).toEqual([])
     expect(Object.isFrozen(DEFAULT_PERSISTED_AGENCY_CONSENT_STATE)).toBe(true)
+  })
+})
+
+describe('Phase 8 Contextual Initiative & Own World Shared Contracts', () => {
+  it('accepts optional id on CrossEpisodeLinkSchema while preserving backwards compatibility', () => {
+    const withId = v.safeParse(CrossEpisodeLinkSchema, {
+      id: '  link-ep-1-ep-2-debug  ',
+      fromEpisodeId: 'ep-1',
+      toEpisodeId: 'ep-2',
+      sharedTheme: 'late_night_debug',
+      similarity: 0.88,
+    })
+    expect(withId.success).toBe(true)
+    if (withId.success) {
+      expect(withId.output.id).toBe('link-ep-1-ep-2-debug')
+    }
+
+    const withoutId = v.safeParse(CrossEpisodeLinkSchema, {
+      fromEpisodeId: 'ep-1',
+      toEpisodeId: 'ep-2',
+      sharedTheme: 'late_night_debug',
+      similarity: 0.88,
+    })
+    expect(withoutId.success).toBe(true)
+    if (withoutId.success) {
+      expect(withoutId.output.id).toBeUndefined()
+    }
+
+    expect(
+      v.safeParse(CrossEpisodeLinkSchema, {
+        id: '   ',
+        fromEpisodeId: 'ep-1',
+        toEpisodeId: 'ep-2',
+        sharedTheme: 'late_night_debug',
+        similarity: 0.88,
+      }).success,
+    ).toBe(false)
+  })
+
+  it('validates InitiativePolicySchema defaults, QuietHoursHHMMSchema, UpdateInitiativePolicyInputSchema, and EvaluateInitiativeInputSchema', () => {
+    expect(INITIATIVE_TRIGGER_KINDS).toEqual([
+      'prospective_intent',
+      'milestone_followup',
+      'recurring_theme',
+      'none',
+    ])
+    for (const kind of INITIATIVE_TRIGGER_KINDS) {
+      expect(v.safeParse(InitiativeTriggerKindSchema, kind).success).toBe(true)
+    }
+    expect(v.safeParse(InitiativeTriggerKindSchema, 'random_ping').success).toBe(false)
+
+    expect(INITIATIVE_DECISIONS).toEqual([
+      'spoken',
+      'selective_silence',
+      'suppressed_disabled',
+      'suppressed_dnd',
+      'suppressed_quiet_hours',
+      'suppressed_cooldown',
+      'suppressed_daily_limit',
+      'suppressed_habit_focus',
+      'suppressed_no_anchor',
+    ])
+    for (const decision of INITIATIVE_DECISIONS) {
+      expect(v.safeParse(InitiativeDecisionSchema, decision).success).toBe(true)
+    }
+    expect(v.safeParse(InitiativeDecisionSchema, 'forced_interrupt').success).toBe(false)
+
+    expect(v.safeParse(QuietHoursHHMMSchema, '23:00').success).toBe(true)
+    expect(v.safeParse(QuietHoursHHMMSchema, '  08:00  ').success).toBe(true)
+    expect(v.safeParse(QuietHoursHHMMSchema, '00:00').success).toBe(true)
+    expect(v.safeParse(QuietHoursHHMMSchema, '23:59').success).toBe(true)
+    expect(v.safeParse(QuietHoursHHMMSchema, '25:99').success).toBe(false)
+    expect(v.safeParse(QuietHoursHHMMSchema, '24:00').success).toBe(false)
+    expect(v.safeParse(QuietHoursHHMMSchema, '8:00').success).toBe(false)
+    expect(v.safeParse(QuietHoursHHMMSchema, '23:00\x00').success).toBe(false)
+    expect(v.safeParse(QuietHoursHHMMSchema, '23:00\ninjected').success).toBe(false)
+
+    expect(DEFAULT_INITIATIVE_POLICY).toEqual({
+      enabled: true,
+      cooldownMinutes: 120,
+      maxDailyInitiatives: 3,
+      quietHoursStart: '23:00',
+      quietHoursEnd: '08:00',
+      respectDnd: true,
+      modulateByHabits: true,
+    })
+    expect(Object.isFrozen(DEFAULT_INITIATIVE_POLICY)).toBe(true)
+
+    const parsedDefaults = v.parse(InitiativePolicySchema, {})
+    expect(parsedDefaults).toEqual(DEFAULT_INITIATIVE_POLICY)
+
+    expect(
+      v.safeParse(InitiativePolicySchema, {
+        quietHoursStart: '25:99',
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(InitiativePolicySchema, {
+        cooldownMinutes: 0,
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(InitiativePolicySchema, {
+        cooldownMinutes: -10,
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(InitiativePolicySchema, {
+        cooldownMinutes: 1441,
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(InitiativePolicySchema, {
+        maxDailyInitiatives: -1,
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(InitiativePolicySchema, {
+        maxDailyInitiatives: 21,
+      }).success,
+    ).toBe(false)
+
+    const validPolicyUpdate = v.safeParse(UpdateInitiativePolicyInputSchema, {
+      enabled: false,
+      cooldownMinutes: 60,
+      maxDailyInitiatives: 2,
+      quietHoursStart: '22:30',
+      quietHoursEnd: '07:30',
+      respectDnd: true,
+      modulateByHabits: false,
+    })
+    expect(validPolicyUpdate.success).toBe(true)
+    expect(v.safeParse(UpdateInitiativePolicyInputSchema, {}).success).toBe(true)
+    expect(
+      v.safeParse(UpdateInitiativePolicyInputSchema, {
+        quietHoursEnd: '25:99',
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(UpdateInitiativePolicyInputSchema, {
+        cooldownMinutes: -5,
+      }).success,
+    ).toBe(false)
+
+    const validEvalInput = v.safeParse(EvaluateInitiativeInputSchema, {
+      nowMs: 1761740000000,
+      localTimeHHMM: '14:30',
+      idleMinutes: 25,
+      activeAppTitle: '  VS Code — ashy  ',
+      recentUserMessage: 'Terminando o deploy',
+      simulatedReplyText: 'E aí, o deploy subiu sem explodir?',
+      forceDnd: false,
+    })
+    expect(validEvalInput.success).toBe(true)
+    if (validEvalInput.success) {
+      expect(validEvalInput.output.activeAppTitle).toBe('VS Code — ashy')
+    }
+    expect(v.safeParse(EvaluateInitiativeInputSchema, {}).success).toBe(true)
+    expect(
+      v.safeParse(EvaluateInitiativeInputSchema, {
+        localTimeHHMM: '25:99',
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(EvaluateInitiativeInputSchema, {
+        idleMinutes: -1,
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(EvaluateInitiativeInputSchema, {
+        activeAppTitle: 'VS Code\x00null',
+      }).success,
+    ).toBe(false)
+  })
+
+  it('validates ProactiveInitiativeRecordSchema, DreamJournalEntrySchema, UpdateMilestoneInputSchema, and Room schemas', () => {
+    const validRecord = v.safeParse(ProactiveInitiativeRecordSchema, {
+      id: 'init-1',
+      triggerKind: 'prospective_intent',
+      sourceId: 'intent-deploy',
+      sourceTitle: 'Deploy da API',
+      noticePrompt: 'Perguntar sobre o deploy da API',
+      replyText: 'E aí, o deploy da API sobreviveu?',
+      decision: 'spoken',
+      reason: 'Anchor prospective_intent ready and outside quiet hours',
+      createdAt: 1761740000000,
+    })
+    expect(validRecord.success).toBe(true)
+
+    const validSuppressed = v.safeParse(ProactiveInitiativeRecordSchema, {
+      id: 'init-2',
+      triggerKind: 'none',
+      sourceId: null,
+      sourceTitle: '',
+      noticePrompt: '',
+      replyText: null,
+      decision: 'suppressed_dnd',
+      reason: 'DND active',
+      createdAt: 1761740000000,
+    })
+    expect(validSuppressed.success).toBe(true)
+
+    expect(
+      v.safeParse(ProactiveInitiativeRecordSchema, {
+        id: '   ',
+        triggerKind: 'none',
+        sourceId: null,
+        sourceTitle: '',
+        noticePrompt: '',
+        replyText: null,
+        decision: 'suppressed_dnd',
+        reason: 'DND',
+        createdAt: 1761740000000,
+      }).success,
+    ).toBe(false)
+
+    const validJournal = v.safeParse(DreamJournalEntrySchema, {
+      id: 'dream-entry-1',
+      createdAt: 1761740000000,
+      summary: 'Reflexão noturna conectando sessões de debug.',
+      sourceEpisodeIds: ['ep-1', 'ep-2'],
+      crossLinksCount: 1,
+      traitEvolutionsCount: 1,
+    })
+    expect(validJournal.success).toBe(true)
+
+    expect(
+      v.safeParse(DreamJournalEntrySchema, {
+        id: 'dream-entry-1',
+        createdAt: 1761740000000,
+        summary: '   ',
+        sourceEpisodeIds: ['ep-1'],
+        crossLinksCount: 0,
+        traitEvolutionsCount: 0,
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(DreamJournalEntrySchema, {
+        id: 'dream-entry-1',
+        createdAt: 1761740000000,
+        summary: 'Valid summary',
+        sourceEpisodeIds: [''],
+        crossLinksCount: 0,
+        traitEvolutionsCount: 0,
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(DreamJournalEntrySchema, {
+        id: 'dream-entry-1',
+        createdAt: 1761740000000,
+        summary: 'Valid summary',
+        sourceEpisodeIds: ['ep-1'],
+        crossLinksCount: -1,
+        traitEvolutionsCount: 0,
+      }).success,
+    ).toBe(false)
+
+    const validMilestoneUpdate = v.safeParse(UpdateMilestoneInputSchema, {
+      id: 'ms-1',
+      title: '  Primeiro deploy sem fantasma  ',
+      narrative: '  Subimos a versão sem cair nada.  ',
+      category: 'project_shipped',
+      roomTrophyId: 'trophy-prod-shield',
+    })
+    expect(validMilestoneUpdate.success).toBe(true)
+    if (validMilestoneUpdate.success) {
+      expect(validMilestoneUpdate.output.title).toBe('Primeiro deploy sem fantasma')
+      expect(validMilestoneUpdate.output.narrative).toBe('Subimos a versão sem cair nada.')
+    }
+
+    expect(
+      v.safeParse(UpdateMilestoneInputSchema, {
+        id: 'ms-1',
+        roomTrophyId: null,
+      }).success,
+    ).toBe(true)
+
+    expect(
+      v.safeParse(UpdateMilestoneInputSchema, {
+        id: 'ms-1\nnewline',
+        title: 'Valid',
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(UpdateMilestoneInputSchema, {
+        id: 'ms-1\x00null',
+        title: 'Valid',
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(UpdateMilestoneInputSchema, {
+        id: 'ms-1',
+        title: 'Bad\x00Title',
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(UpdateMilestoneInputSchema, {
+        id: 'ms-1',
+        title: 'x'.repeat(161),
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(UpdateMilestoneInputSchema, {
+        id: 'ms-1',
+        narrative: 'Bad\x00Narrative',
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(UpdateMilestoneInputSchema, {
+        id: 'ms-1',
+        narrative: 'x'.repeat(2001),
+      }).success,
+    ).toBe(false)
+
+    expect(ROOM_TIME_OF_DAY_PERIODS).toEqual([
+      'morning',
+      'afternoon',
+      'evening',
+      'late_night',
+    ])
+    for (const p of ROOM_TIME_OF_DAY_PERIODS) {
+      expect(v.safeParse(RoomTimeOfDayPeriodSchema, p).success).toBe(true)
+    }
+
+    expect(ROOM_LIGHTING_PRESETS).toEqual([
+      'warm_sunrise',
+      'golden_studio',
+      'cozy_neon',
+      'midnight_lofi',
+    ])
+    for (const preset of ROOM_LIGHTING_PRESETS) {
+      expect(v.safeParse(RoomLightingPresetSchema, preset).success).toBe(true)
+    }
+
+    expect(ROOM_TROPHY_ICON_KEYS).toEqual([
+      'mug',
+      'sparkles',
+      'rocket',
+      'moon',
+      'heart',
+      'flame',
+      'shield',
+      'duck',
+    ])
+    for (const icon of ROOM_TROPHY_ICON_KEYS) {
+      expect(v.safeParse(RoomTrophyIconKeySchema, icon).success).toBe(true)
+    }
+
+    const validTrophy = {
+      id: 'trophy-first-boot-mug',
+      name: 'Caneca do Primeiro Boot',
+      description: 'Desbloqueada no primeiro encontro no estúdio.',
+      category: 'first_meeting' as const,
+      milestoneId: 'ms-first-boot',
+      episodeId: 'ep-1',
+      unlockedAt: 1761740000000,
+      unlocked: true,
+      iconKey: 'mug' as const,
+    }
+    expect(v.safeParse(RoomTrophyItemSchema, validTrophy).success).toBe(true)
+
+    const validRoom = v.safeParse(RoomEnvironmentStateSchema, {
+      period: 'late_night',
+      ambientLabel: 'Madrugada Lo-Fi no Estúdio',
+      lightingPreset: 'midnight_lofi',
+      unlockedTrophies: [validTrophy],
+    })
+    expect(validRoom.success).toBe(true)
+
+    expect(
+      v.safeParse(RoomEnvironmentStateSchema, {
+        period: 'invalid_period',
+        ambientLabel: 'Label',
+        lightingPreset: 'midnight_lofi',
+        unlockedTrophies: [],
+      }).success,
+    ).toBe(false)
   })
 })

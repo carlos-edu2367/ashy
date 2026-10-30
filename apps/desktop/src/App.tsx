@@ -180,6 +180,10 @@ export function App(): React.ReactElement {
   const [msTitle, setMsTitle] = useState('')
   const [msNarrative, setMsNarrative] = useState('')
   const [msCategory, setMsCategory] = useState<MilestoneCategory>('project_shipped')
+  const [editingMilestoneId, setEditingMilestoneId] = useState<string | null>(null)
+  const [editMsTitle, setEditMsTitle] = useState('')
+  const [editMsNarrative, setEditMsNarrative] = useState('')
+  const [editMsCategory, setEditMsCategory] = useState<MilestoneCategory>('project_shipped')
 
   // Semantic Fact form state
   const [factCategory, setFactCategory] = useState<SemanticFactCategory>('preference')
@@ -2209,42 +2213,211 @@ export function App(): React.ReactElement {
 
             <div className="ashy-settings-grid">
               <div className="ashy-settings-column">
-                {state.milestones.map((ms) => (
-                  <article
-                    key={ms.id}
-                    data-testid={`milestone-card-${ms.id}`}
-                    className="ashy-settings-card"
-                    style={{ gap: '10px' }}
-                  >
-                    <div
-                      style={{
-                        display: 'flex',
-                        justifyContent: 'space-between',
-                        alignItems: 'center',
-                        gap: '8px',
-                      }}
+                {/* Search & Category Filter Bar */}
+                <section
+                  className="ashy-settings-card"
+                  style={{ padding: '12px 14px', gap: '10px' }}
+                >
+                  <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                    <input
+                      type="text"
+                      className="ashy-input"
+                      data-testid="story-search-input"
+                      style={{ flex: 1, minWidth: '180px' }}
+                      placeholder="Buscar em Nossa História (título, narrativa ou categoria)..."
+                      value={state.storySearchQuery}
+                      onChange={(e) => state.setStorySearchQuery(e.target.value)}
+                    />
+                    <select
+                      aria-label="Filtrar capítulos por categoria"
+                      data-testid="story-category-filter"
+                      className="ashy-select"
+                      style={{ width: '190px' }}
+                      value={state.storyCategoryFilter}
+                      onChange={(e) =>
+                        state.setStoryCategoryFilter(
+                          e.target.value as 'todas' | MilestoneCategory,
+                        )
+                      }
                     >
-                      <h3 className="ashy-setting-title" style={{ fontSize: '16px', margin: 0 }}>
-                        {ms.title}
-                      </h3>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                        <span className="ashy-badge violet">{ms.category}</span>
-                        <button
-                          type="button"
-                          className="ashy-danger-outline-btn"
-                          style={{ padding: '4px 8px', fontSize: '11px' }}
-                          data-testid={`btn-delete-milestone-${ms.id}`}
-                          onClick={() => void state.deleteMemoryItem('milestone', ms.id)}
+                      <option value="todas">Todas as categorias</option>
+                      {MILESTONE_CATEGORIES.map((c) => (
+                        <option key={c} value={c}>
+                          {c}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </section>
+
+                {state.milestones
+                  .filter((ms) => {
+                    const matchesCategory =
+                      state.storyCategoryFilter === 'todas' ||
+                      ms.category === state.storyCategoryFilter
+                    const q = state.storySearchQuery.trim().toLowerCase()
+                    const matchesQuery =
+                      !q ||
+                      ms.title.toLowerCase().includes(q) ||
+                      ms.narrative.toLowerCase().includes(q) ||
+                      ms.category.toLowerCase().includes(q)
+                    return matchesCategory && matchesQuery
+                  })
+                  .map((ms) => {
+                    const isEditingThis = editingMilestoneId === ms.id
+                    return (
+                      <article
+                        key={ms.id}
+                        data-testid={`milestone-card-${ms.id}`}
+                        className="ashy-settings-card"
+                        style={{ gap: '10px' }}
+                      >
+                        <div
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            gap: '8px',
+                            flexWrap: 'wrap',
+                          }}
                         >
-                          Excluir
-                        </button>
-                      </div>
-                    </div>
-                    <p className="ashy-setting-desc" style={{ lineHeight: 1.55 }}>
-                      {ms.narrative}
-                    </p>
-                  </article>
-                ))}
+                          <h3
+                            className="ashy-setting-title"
+                            style={{ fontSize: '16px', margin: 0 }}
+                          >
+                            {ms.title}
+                          </h3>
+                          <div
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '6px',
+                              flexWrap: 'wrap',
+                            }}
+                          >
+                            <span
+                              className="ashy-badge peach"
+                              data-testid={`milestone-origin-${ms.id}`}
+                            >
+                              {ms.episodeId
+                                ? `Episódio: ${ms.episodeId}`
+                                : 'Capítulo manual'}
+                            </span>
+                            <span className="ashy-badge violet">{ms.category}</span>
+                            <button
+                              type="button"
+                              className="ashy-outline-btn"
+                              style={{ padding: '4px 8px', fontSize: '11px' }}
+                              data-testid={`btn-edit-milestone-${ms.id}`}
+                              onClick={() => {
+                                if (isEditingThis) {
+                                  setEditingMilestoneId(null)
+                                } else {
+                                  setEditingMilestoneId(ms.id)
+                                  setEditMsTitle(ms.title)
+                                  setEditMsNarrative(ms.narrative)
+                                  setEditMsCategory(ms.category)
+                                }
+                              }}
+                            >
+                              Editar
+                            </button>
+                            <button
+                              type="button"
+                              className="ashy-danger-outline-btn"
+                              style={{ padding: '4px 8px', fontSize: '11px' }}
+                              data-testid={`btn-delete-milestone-${ms.id}`}
+                              onClick={() => {
+                                if (editingMilestoneId === ms.id) {
+                                  setEditingMilestoneId(null)
+                                }
+                                void state.deleteMemoryItem('milestone', ms.id)
+                              }}
+                            >
+                              Excluir
+                            </button>
+                          </div>
+                        </div>
+
+                        {isEditingThis ? (
+                          <div
+                            style={{
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: '8px',
+                            }}
+                          >
+                            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                              <input
+                                type="text"
+                                className="ashy-input"
+                                data-testid={`input-edit-milestone-title-${ms.id}`}
+                                style={{ flex: 1, minWidth: '170px' }}
+                                value={editMsTitle}
+                                onChange={(e) => setEditMsTitle(e.target.value)}
+                              />
+                              <select
+                                className="ashy-select"
+                                data-testid={`select-edit-milestone-category-${ms.id}`}
+                                style={{ width: '185px' }}
+                                value={editMsCategory}
+                                onChange={(e) =>
+                                  setEditMsCategory(e.target.value as MilestoneCategory)
+                                }
+                              >
+                                {MILESTONE_CATEGORIES.map((c) => (
+                                  <option key={c} value={c}>
+                                    {c}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                            <textarea
+                              className="ashy-input"
+                              data-testid={`input-edit-milestone-narrative-${ms.id}`}
+                              rows={3}
+                              value={editMsNarrative}
+                              onChange={(e) => setEditMsNarrative(e.target.value)}
+                            />
+                            <div style={{ display: 'flex', gap: '8px' }}>
+                              <button
+                                type="button"
+                                className="ashy-peach-btn"
+                                style={{ padding: '5px 12px', fontSize: '12px' }}
+                                data-testid={`btn-save-milestone-${ms.id}`}
+                                onClick={() => {
+                                  if (!editMsTitle.trim() || !editMsNarrative.trim()) {
+                                    return
+                                  }
+                                  void state.updateMilestone({
+                                    id: ms.id,
+                                    title: editMsTitle.trim(),
+                                    narrative: editMsNarrative.trim(),
+                                    category: editMsCategory,
+                                  })
+                                  setEditingMilestoneId(null)
+                                }}
+                              >
+                                Salvar capítulo
+                              </button>
+                              <button
+                                type="button"
+                                className="ashy-outline-btn"
+                                style={{ padding: '5px 12px', fontSize: '12px' }}
+                                onClick={() => setEditingMilestoneId(null)}
+                              >
+                                Cancelar
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="ashy-setting-desc" style={{ lineHeight: 1.55 }}>
+                            {ms.narrative}
+                          </p>
+                        )}
+                      </article>
+                    )
+                  })}
 
                 {/* Add New Milestone Card */}
                 <section className="ashy-settings-card">
@@ -2302,6 +2475,470 @@ export function App(): React.ReactElement {
               </div>
 
               <aside className="ashy-settings-column">
+                {/* Section 1: Quarto da Ashy (Ashy's Room) */}
+                <section
+                  className="ashy-preview-card"
+                  data-testid="panel-ashy-room"
+                  style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: '8px',
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <h2 className="ashy-serif-panel" style={{ margin: 0 }}>
+                      Quarto da Ashy (Ashy&apos;s Room)
+                    </h2>
+                    <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                      <span
+                        className="ashy-badge peach"
+                        data-testid="room-time-period-badge"
+                      >
+                        {state.roomEnvironment.period} · {state.roomEnvironment.ambientLabel}
+                      </span>
+                      <span
+                        className="ashy-badge violet"
+                        data-testid="room-lighting-badge"
+                      >
+                        {state.roomEnvironment.lightingPreset}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <label
+                      htmlFor="select-room-time-override"
+                      style={{ fontSize: '12px', color: 'var(--text-secondary)' }}
+                    >
+                      Horário do estúdio:
+                    </label>
+                    <select
+                      id="select-room-time-override"
+                      data-testid="select-room-time-override"
+                      className="ashy-select"
+                      style={{ flex: 1 }}
+                      value={state.roomTimeOverrideHHMM ?? 'auto'}
+                      onChange={(e) =>
+                        state.setRoomTimeOverride(
+                          e.target.value === 'auto' ? null : e.target.value,
+                        )
+                      }
+                    >
+                      <option value="auto">Automático (Relógio local)</option>
+                      <option value="08:30">08:30 — Manhã (warm_sunrise)</option>
+                      <option value="15:00">15:00 — Tarde (golden_studio)</option>
+                      <option value="20:00">20:00 — Noite (cozy_neon)</option>
+                      <option value="02:00">02:00 — Madrugada (midnight_lofi)</option>
+                    </select>
+                  </div>
+
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                      Lembranças e troféus desbloqueados ({state.roomEnvironment.unlockedTrophies.length}):
+                    </div>
+                    {state.roomEnvironment.unlockedTrophies.map((trophy) => (
+                      <div
+                        key={trophy.id}
+                        data-testid={`ashy-room-trophy-${trophy.id}`}
+                        style={{
+                          padding: '9px 12px',
+                          borderRadius: '10px',
+                          background: '#181523',
+                          border: '1px solid var(--border-subtle)',
+                          fontSize: '12px',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '4px',
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            gap: '6px',
+                          }}
+                        >
+                          <strong>{trophy.name}</strong>
+                          <span className="ashy-badge emerald">
+                            Marco: {trophy.milestoneId}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: '11.5px', color: 'var(--text-secondary)' }}>
+                          {trophy.description}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+
+                {/* Section 2: Diário de Reflexão (Dream & Reflection Journal) */}
+                <section
+                  className="ashy-preview-card"
+                  data-testid="panel-dream-journal"
+                  style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: '8px',
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <h2 className="ashy-serif-panel" style={{ margin: 0 }}>
+                      Diário de Reflexão (Dream &amp; Reflection Journal)
+                    </h2>
+                    <button
+                      type="button"
+                      className="ashy-peach-btn"
+                      style={{ padding: '6px 12px', fontSize: '12px' }}
+                      data-testid="btn-story-run-dream"
+                      onClick={() => {
+                        state.runDreamConsolidation()
+                      }}
+                    >
+                      <Sparkles size={14} />
+                      <span>Refletir agora</span>
+                    </button>
+                  </div>
+
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    {state.dreamJournalEntries.map((entry) => (
+                      <div
+                        key={entry.id}
+                        data-testid={`dream-journal-entry-${entry.id}`}
+                        style={{
+                          padding: '9px 12px',
+                          borderRadius: '10px',
+                          background: '#181523',
+                          border: '1px solid var(--border-subtle)',
+                          fontSize: '12px',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '4px',
+                        }}
+                      >
+                        <div>{entry.summary}</div>
+                        <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                          Episódios: {entry.sourceEpisodeIds.join(', ')}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {state.crossEpisodeLinks.length > 0 && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                      <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                        Conexões entre episódios ({state.crossEpisodeLinks.length}):
+                      </div>
+                      {state.crossEpisodeLinks.map((link) => {
+                        const linkKey =
+                          link.id ?? `${link.fromEpisodeId}-${link.toEpisodeId}`
+                        return (
+                          <div
+                            key={linkKey}
+                            data-testid={`dream-link-${linkKey}`}
+                            style={{
+                              padding: '7px 10px',
+                              borderRadius: '8px',
+                              background: '#221e2e',
+                              fontSize: '11.5px',
+                            }}
+                          >
+                            <strong>{link.sharedTheme}</strong> ({link.fromEpisodeId} ↔{' '}
+                            {link.toEpisodeId})
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+                </section>
+
+                {/* Section 3: Iniciativa Contextual & Limites (§15) */}
+                <section
+                  className="ashy-preview-card"
+                  data-testid="panel-initiative-limits"
+                  style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: '8px',
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <h2 className="ashy-serif-panel" style={{ margin: 0 }}>
+                      Iniciativa Contextual &amp; Limites
+                    </h2>
+                    <span
+                      data-testid="initiative-mode-badge"
+                      className={`ashy-badge ${
+                        state.initiativePolicy.enabled ? 'emerald' : 'amber'
+                      }`}
+                    >
+                      {state.initiativePolicy.enabled
+                        ? 'Iniciativa contextual ativa'
+                        : 'Nunca iniciar sozinha'}
+                    </span>
+                  </div>
+
+                  <div className="ashy-setting-box" style={{ justifyContent: 'space-between' }}>
+                    <div>
+                      <div className="ashy-setting-title" style={{ fontSize: '12.5px' }}>
+                        Permitir iniciativa espontânea da Ashy
+                      </div>
+                      <p className="ashy-setting-desc" style={{ fontSize: '11.5px', margin: 0 }}>
+                        Desative para o modo &ldquo;Nunca iniciar sozinha&rdquo;.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={state.initiativePolicy.enabled}
+                      data-testid="toggle-initiative-enabled"
+                      className={`ashy-switch ${
+                        state.initiativePolicy.enabled ? 'checked' : ''
+                      }`}
+                      onClick={() => void state.toggleInitiativeEnabled()}
+                    />
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    <div style={{ flex: 1, minWidth: '130px' }}>
+                      <label
+                        htmlFor="select-initiative-cooldown"
+                        style={{
+                          display: 'block',
+                          fontSize: '11.5px',
+                          color: 'var(--text-secondary)',
+                          marginBottom: '4px',
+                        }}
+                      >
+                        Cooldown (min):
+                      </label>
+                      <select
+                        id="select-initiative-cooldown"
+                        data-testid="select-initiative-cooldown"
+                        className="ashy-select"
+                        value={String(state.initiativePolicy.cooldownMinutes)}
+                        onChange={(e) =>
+                          void state.updateInitiativePolicy({
+                            cooldownMinutes: Number(e.target.value),
+                          })
+                        }
+                      >
+                        <option value="15">15 min</option>
+                        <option value="60">60 min</option>
+                        <option value="120">120 min</option>
+                        <option value="240">240 min</option>
+                      </select>
+                    </div>
+
+                    <div style={{ flex: 1, minWidth: '130px' }}>
+                      <label
+                        htmlFor="select-initiative-max-daily"
+                        style={{
+                          display: 'block',
+                          fontSize: '11.5px',
+                          color: 'var(--text-secondary)',
+                          marginBottom: '4px',
+                        }}
+                      >
+                        Limite diário:
+                      </label>
+                      <select
+                        id="select-initiative-max-daily"
+                        data-testid="select-initiative-max-daily"
+                        className="ashy-select"
+                        value={String(state.initiativePolicy.maxDailyInitiatives)}
+                        onChange={(e) =>
+                          void state.updateInitiativePolicy({
+                            maxDailyInitiatives: Number(e.target.value),
+                          })
+                        }
+                      >
+                        <option value="1">1 / dia</option>
+                        <option value="3">3 / dia</option>
+                        <option value="5">5 / dia</option>
+                        <option value="10">10 / dia</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    <div style={{ flex: 1, minWidth: '120px' }}>
+                      <label
+                        htmlFor="input-quiet-hours-start"
+                        style={{
+                          display: 'block',
+                          fontSize: '11.5px',
+                          color: 'var(--text-secondary)',
+                          marginBottom: '4px',
+                        }}
+                      >
+                        Silêncio início:
+                      </label>
+                      <input
+                        id="input-quiet-hours-start"
+                        type="text"
+                        data-testid="input-quiet-hours-start"
+                        className="ashy-input"
+                        value={state.initiativePolicy.quietHoursStart}
+                        onChange={(e) =>
+                          void state.updateInitiativePolicy({
+                            quietHoursStart: e.target.value,
+                          })
+                        }
+                      />
+                    </div>
+                    <div style={{ flex: 1, minWidth: '120px' }}>
+                      <label
+                        htmlFor="input-quiet-hours-end"
+                        style={{
+                          display: 'block',
+                          fontSize: '11.5px',
+                          color: 'var(--text-secondary)',
+                          marginBottom: '4px',
+                        }}
+                      >
+                        Silêncio fim:
+                      </label>
+                      <input
+                        id="input-quiet-hours-end"
+                        type="text"
+                        data-testid="input-quiet-hours-end"
+                        className="ashy-input"
+                        value={state.initiativePolicy.quietHoursEnd}
+                        onChange={(e) =>
+                          void state.updateInitiativePolicy({
+                            quietHoursEnd: e.target.value,
+                          })
+                        }
+                      />
+                    </div>
+                  </div>
+
+                  <div className="ashy-setting-box" style={{ justifyContent: 'space-between' }}>
+                    <div>
+                      <div className="ashy-setting-title" style={{ fontSize: '12.5px' }}>
+                        Modular horários pelos hábitos observados
+                      </div>
+                      <p className="ashy-setting-desc" style={{ fontSize: '11.5px', margin: 0 }}>
+                        Respeita foco profundo e adapta madrugada quando há hábito confirmado.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={state.initiativePolicy.modulateByHabits}
+                      data-testid="toggle-initiative-habits"
+                      className={`ashy-switch ${
+                        state.initiativePolicy.modulateByHabits ? 'checked' : ''
+                      }`}
+                      onClick={() =>
+                        void state.updateInitiativePolicy({
+                          modulateByHabits: !state.initiativePolicy.modulateByHabits,
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      className="ashy-peach-btn"
+                      style={{ padding: '5px 10px', fontSize: '11.5px' }}
+                      data-testid="btn-evaluate-initiative-now"
+                      onClick={() =>
+                        void state.evaluateAttentionInitiative({ localTimeHHMM: '14:00' })
+                      }
+                    >
+                      Avaliar Iniciativa (14:00)
+                    </button>
+                    <button
+                      type="button"
+                      className="ashy-outline-btn"
+                      style={{ padding: '5px 10px', fontSize: '11.5px' }}
+                      data-testid="btn-evaluate-initiative-silence"
+                      onClick={() =>
+                        void state.evaluateAttentionInitiative({
+                          localTimeHHMM: '14:00',
+                          simulatedReplyText: '[SILENCE]',
+                        })
+                      }
+                    >
+                      Simular [SILENCE]
+                    </button>
+                    <button
+                      type="button"
+                      className="ashy-outline-btn"
+                      style={{ padding: '5px 10px', fontSize: '11.5px' }}
+                      data-testid="btn-evaluate-initiative-quiet-hours"
+                      onClick={() =>
+                        void state.evaluateAttentionInitiative({ localTimeHHMM: '02:30' })
+                      }
+                    >
+                      Testar Madrugada (02:30)
+                    </button>
+                  </div>
+
+                  <div
+                    data-testid="initiative-audit-log"
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '6px',
+                      maxHeight: '190px',
+                      overflowY: 'auto',
+                    }}
+                  >
+                    {state.initiativeLog.map((item) => (
+                      <div
+                        key={item.id}
+                        style={{
+                          padding: '8px 10px',
+                          borderRadius: '8px',
+                          background: '#181523',
+                          border: '1px solid var(--border-subtle)',
+                          fontSize: '11.5px',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '3px',
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            gap: '6px',
+                          }}
+                        >
+                          <strong>{item.decision}</strong>
+                          <span className="ashy-badge violet">
+                            {item.triggerKind}
+                            {item.sourceId ? ` (${item.sourceId})` : ''}
+                          </span>
+                        </div>
+                        <div style={{ color: 'var(--text-secondary)' }}>{item.reason}</div>
+                        {item.replyText && (
+                          <div style={{ color: 'var(--accent-peach)' }}>
+                            &ldquo;{item.replyText}&rdquo;
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </section>
+
                 <section className="ashy-preview-card">
                   <h2 className="ashy-serif-panel">O que aprendi sobre você</h2>
                   <p className="ashy-subtitle" style={{ marginTop: '-8px' }}>

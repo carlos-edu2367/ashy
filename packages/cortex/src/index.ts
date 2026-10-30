@@ -21,4 +21,6 @@ export {
 } from './dream/dream-worker'
 export * from './prompt/default-golden-exemplars'
 export * from './prompt/soul-composer'
+export * from './initiative/attention-loop'
+export * from './world/ashy-room'
 export * from './ashy-cortex'

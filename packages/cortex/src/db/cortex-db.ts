@@ -7,18 +7,24 @@ import {
   AUDIT_DECISIONS,
   AutobiographicalMilestoneSchema,
   COMPUTER_ACTIONS_POLICIES,
+  DEFAULT_INITIATIVE_POLICY,
   DEFAULT_MEMORY_GOVERNANCE_POLICY,
   DEFAULT_PERSISTED_AGENCY_CONSENT_STATE,
+  DreamJournalEntrySchema,
   EYES_MODES,
   EpisodicMemorySchema,
+  InitiativePolicySchema,
   MEMORY_GOVERNANCE_CATEGORIES,
   MIC_MODES,
   MoodVectorSchema,
   PersonalityEvolutionRecordSchema,
   PersonalityTraitsSchema,
+  ProactiveInitiativeRecordSchema,
   ProspectiveIntentSchema,
   RelationalMotifSchema,
   SemanticFactSchema,
+  UpdateInitiativePolicyInputSchema,
+  UpdateMilestoneInputSchema,
   UserHabitSchema,
   type ActionRiskTier,
   type ApprovableMemoryKind,
@@ -28,8 +34,10 @@ import {
   type ChatMessageRecord,
   type ChatSessionRecord,
   type ComputerActionsPolicy,
+  type DreamJournalEntry,
   type EpisodicMemory,
   type ExternalMcpServerConfig,
+  type InitiativePolicy,
   type LlmProviderId,
   type MemoryApprovalStatus,
   type MemoryGovernanceCategory,
@@ -38,6 +46,7 @@ import {
   type PersistedAgencyConsentState,
   type PersonalityEvolutionRecord,
   type PersonalityTraits,
+  type ProactiveInitiativeRecord,
   type ProspectiveIntent,
   type ProspectiveIntentStatus,
   type RelationalMotif,
@@ -46,6 +55,8 @@ import {
   type SharedActionAuditLogEntry,
   type SharedEyesMode,
   type SharedMicMode,
+  type UpdateInitiativePolicyInput,
+  type UpdateMilestoneInput,
   type UserHabit,
 } from '@ashy/shared'
 import * as v from 'valibot'
@@ -313,6 +324,9 @@ export class MemoryStorageAdapter {
   readonly chatSessions = new Map<string, ChatSessionRecord>()
   readonly chatMessages: ChatMessageRecord[] = []
   readonly actionAuditLog: SharedActionAuditLogEntry[] = []
+  readonly proactiveInitiativeLog: ProactiveInitiativeRecord[] = []
+  readonly dreamJournal = new Map<string, DreamJournalEntry>()
+  initiativePolicy: InitiativePolicy = { ...DEFAULT_INITIATIVE_POLICY }
   agencyConsentState: PersistedAgencyConsentState = structuredClone(
     DEFAULT_PERSISTED_AGENCY_CONSENT_STATE as PersistedAgencyConsentState,
   )
@@ -343,6 +357,11 @@ export class MemoryStorageAdapter {
     this.migrations.set(4, {
       version: 4,
       name: 'v4_phase7_agency_audit_and_consent',
+      appliedAt: now,
+    })
+    this.migrations.set(5, {
+      version: 5,
+      name: 'v5_phase8_initiative_and_reflection_journal',
       appliedAt: now,
     })
     for (const ex of DEFAULT_GOLDEN_STYLE_EXEMPLARS) {
@@ -606,6 +625,45 @@ export class CortexDatabase {
         external_mcp_servers_json TEXT NOT NULL DEFAULT '[]',
         updated_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS initiative_policy_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        enabled INTEGER NOT NULL DEFAULT 1,
+        cooldown_minutes INTEGER NOT NULL DEFAULT 120,
+        max_daily_initiatives INTEGER NOT NULL DEFAULT 3,
+        quiet_hours_start TEXT NOT NULL DEFAULT '23:00',
+        quiet_hours_end TEXT NOT NULL DEFAULT '08:00',
+        respect_dnd INTEGER NOT NULL DEFAULT 1,
+        modulate_by_habits INTEGER NOT NULL DEFAULT 1,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS proactive_initiative_log (
+        id TEXT PRIMARY KEY,
+        trigger_kind TEXT NOT NULL,
+        source_id TEXT,
+        source_title TEXT NOT NULL,
+        notice_prompt TEXT NOT NULL,
+        reply_text TEXT,
+        decision TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_proactive_initiative_log_created
+        ON proactive_initiative_log(created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS dream_reflection_journal (
+        id TEXT PRIMARY KEY,
+        summary TEXT NOT NULL,
+        source_episode_ids_json TEXT NOT NULL,
+        cross_links_count INTEGER NOT NULL DEFAULT 0,
+        trait_evolutions_count INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_dream_reflection_journal_created
+        ON dream_reflection_journal(created_at DESC);
     `)
 
     // Idempotent column upgrades for pre-existing v1/v2 database files
@@ -629,6 +687,7 @@ export class CortexDatabase {
     insertMigration.run(2, 'v2_phase1_chat_and_exemplars', now)
     insertMigration.run(3, 'v3_phase2_self_writing_memory', now)
     insertMigration.run(4, 'v4_phase7_agency_audit_and_consent', now)
+    insertMigration.run(5, 'v5_phase8_initiative_and_reflection_journal', now)
 
     // Seed default Golden Style Exemplars if empty
     const countRow = this.sqlite
@@ -689,6 +748,9 @@ export class CortexDatabase {
         'memory_governance_settings',
         'action_audit_log',
         'agency_consent_state',
+        'initiative_policy_state',
+        'proactive_initiative_log',
+        'dream_reflection_journal',
       ]
     }
     const rows = this.sqlite
@@ -836,6 +898,25 @@ export class CortexDatabase {
           ...milestone,
           episodeId: undefined,
         })
+      }
+    }
+
+    for (const entry of this.listDreamJournalEntries(1000)) {
+      if (entry.sourceEpisodeIds.includes(id)) {
+        const remaining = entry.sourceEpisodeIds.filter((epId) => epId !== id)
+        if (remaining.length === 0) {
+          this.memory.dreamJournal.delete(entry.id)
+          if (this.sqlite) {
+            this.sqlite
+              .prepare('DELETE FROM dream_reflection_journal WHERE id = ?')
+              .run(entry.id)
+          }
+        } else {
+          this.insertDreamJournalEntry({
+            ...entry,
+            sourceEpisodeIds: remaining,
+          })
+        }
       }
     }
 
@@ -1194,6 +1275,55 @@ export class CortexDatabase {
     }
     this.sqlite.prepare('DELETE FROM autobiographical_milestones WHERE id = ?').run(id)
     return true
+  }
+
+  public updateMilestone(input: UpdateMilestoneInput): AutobiographicalMilestone {
+    const validated = v.parse(UpdateMilestoneInputSchema, input)
+    const existing = this.listMilestones().find((m) => m.id === validated.id)
+    if (!existing) {
+      throw new Error(`AutobiographicalMilestone not found: ${validated.id}`)
+    }
+
+    const sanitizeMilestoneField = (raw: string): string =>
+      raw
+        .replace(/\0/g, '')
+        .replace(/<\|[\s\S]*?\|>/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+
+    let nextTitle = existing.title
+    if (validated.title !== undefined) {
+      const cleanedTitle = sanitizeMilestoneField(validated.title)
+      if (!cleanedTitle) {
+        throw new Error('Milestone title cannot be empty after sanitization')
+      }
+      nextTitle = cleanedTitle
+    }
+
+    let nextNarrative = existing.narrative
+    if (validated.narrative !== undefined) {
+      const cleanedNarrative = sanitizeMilestoneField(validated.narrative)
+      if (!cleanedNarrative) {
+        throw new Error('Milestone narrative cannot be empty after sanitization')
+      }
+      nextNarrative = cleanedNarrative
+    }
+
+    const nextCategory = validated.category ?? existing.category
+    const nextRoomTrophyId =
+      validated.roomTrophyId === null
+        ? undefined
+        : validated.roomTrophyId !== undefined
+          ? sanitizeMilestoneField(validated.roomTrophyId) || undefined
+          : existing.roomTrophyId
+
+    return this.upsertMilestone({
+      ...existing,
+      title: nextTitle,
+      narrative: nextNarrative,
+      category: nextCategory,
+      roomTrophyId: nextRoomTrophyId,
+    })
   }
 
   public listMilestones(): AutobiographicalMilestone[] {
@@ -2397,6 +2527,229 @@ export class CortexDatabase {
       externalMcpServers,
       updatedAt: Number(row.updated_at ?? 0),
     }
+  }
+
+  // 12. Phase 8 — Initiative Policy, Proactive Initiative Log & Dream Reflection Journal (Migration v5)
+  public getInitiativePolicy(): InitiativePolicy {
+    if (!this.sqlite) {
+      return { ...this.memory.initiativePolicy }
+    }
+    const row = this.sqlite
+      .prepare('SELECT * FROM initiative_policy_state WHERE id = 1')
+      .get()
+    if (!row) {
+      return { ...DEFAULT_INITIATIVE_POLICY }
+    }
+    const parsed = v.parse(InitiativePolicySchema, {
+      enabled: Number(row.enabled ?? 1) === 1,
+      cooldownMinutes: Number(row.cooldown_minutes ?? DEFAULT_INITIATIVE_POLICY.cooldownMinutes),
+      maxDailyInitiatives: Number(
+        row.max_daily_initiatives ?? DEFAULT_INITIATIVE_POLICY.maxDailyInitiatives,
+      ),
+      quietHoursStart: String(
+        row.quiet_hours_start ?? DEFAULT_INITIATIVE_POLICY.quietHoursStart,
+      ),
+      quietHoursEnd: String(row.quiet_hours_end ?? DEFAULT_INITIATIVE_POLICY.quietHoursEnd),
+      respectDnd: Number(row.respect_dnd ?? 1) === 1,
+      modulateByHabits: Number(row.modulate_by_habits ?? 1) === 1,
+    })
+    this.memory.initiativePolicy = { ...parsed }
+    return { ...parsed }
+  }
+
+  public saveInitiativePolicy(input: UpdateInitiativePolicyInput): InitiativePolicy {
+    const patch = v.parse(UpdateInitiativePolicyInputSchema, input)
+    const current = this.getInitiativePolicy()
+    const next = v.parse(InitiativePolicySchema, {
+      ...current,
+      ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+      ...(patch.cooldownMinutes !== undefined
+        ? { cooldownMinutes: patch.cooldownMinutes }
+        : {}),
+      ...(patch.maxDailyInitiatives !== undefined
+        ? { maxDailyInitiatives: patch.maxDailyInitiatives }
+        : {}),
+      ...(patch.quietHoursStart !== undefined
+        ? { quietHoursStart: patch.quietHoursStart }
+        : {}),
+      ...(patch.quietHoursEnd !== undefined ? { quietHoursEnd: patch.quietHoursEnd } : {}),
+      ...(patch.respectDnd !== undefined ? { respectDnd: patch.respectDnd } : {}),
+      ...(patch.modulateByHabits !== undefined
+        ? { modulateByHabits: patch.modulateByHabits }
+        : {}),
+    })
+
+    this.memory.initiativePolicy = { ...next }
+
+    if (this.sqlite) {
+      this.sqlite
+        .prepare(
+          `INSERT OR REPLACE INTO initiative_policy_state (
+            id, enabled, cooldown_minutes, max_daily_initiatives,
+            quiet_hours_start, quiet_hours_end, respect_dnd, modulate_by_habits, updated_at
+          ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          next.enabled ? 1 : 0,
+          next.cooldownMinutes,
+          next.maxDailyInitiatives,
+          next.quietHoursStart,
+          next.quietHoursEnd,
+          next.respectDnd ? 1 : 0,
+          next.modulateByHabits ? 1 : 0,
+          Date.now(),
+        )
+    }
+
+    return { ...next }
+  }
+
+  public insertProactiveInitiativeLog(
+    record: ProactiveInitiativeRecord,
+  ): ProactiveInitiativeRecord {
+    const parsed = v.parse(ProactiveInitiativeRecordSchema, record)
+    const existingIdx = this.memory.proactiveInitiativeLog.findIndex(
+      (r) => r.id === parsed.id,
+    )
+    if (existingIdx >= 0) {
+      this.memory.proactiveInitiativeLog[existingIdx] = parsed
+    } else {
+      this.memory.proactiveInitiativeLog.push(parsed)
+    }
+
+    if (this.sqlite) {
+      this.sqlite
+        .prepare(
+          `INSERT OR REPLACE INTO proactive_initiative_log (
+            id, trigger_kind, source_id, source_title,
+            notice_prompt, reply_text, decision, reason, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          parsed.id,
+          parsed.triggerKind,
+          parsed.sourceId ?? null,
+          parsed.sourceTitle,
+          parsed.noticePrompt,
+          parsed.replyText ?? null,
+          parsed.decision,
+          parsed.reason,
+          parsed.createdAt,
+        )
+    }
+
+    return { ...parsed }
+  }
+
+  public listProactiveInitiativeLog(limit = 50): ProactiveInitiativeRecord[] {
+    if (!Number.isFinite(limit) || limit <= 0) {
+      return []
+    }
+    const safeLimit = Math.floor(limit)
+
+    if (!this.sqlite) {
+      return this.memory.proactiveInitiativeLog
+        .map((item, idx) => ({ item, idx }))
+        .sort((a, b) => b.item.createdAt - a.item.createdAt || b.idx - a.idx)
+        .slice(0, safeLimit)
+        .map(({ item }) => ({ ...item }))
+    }
+
+    const rows = this.sqlite
+      .prepare(
+        `SELECT rowid AS _rowid, * FROM proactive_initiative_log
+         ORDER BY created_at DESC, _rowid DESC
+         LIMIT ?`,
+      )
+      .all(safeLimit)
+
+    return rows.map((row) =>
+      v.parse(ProactiveInitiativeRecordSchema, {
+        id: String(row.id),
+        triggerKind: String(row.trigger_kind),
+        sourceId:
+          row.source_id === null || row.source_id === undefined
+            ? null
+            : String(row.source_id),
+        sourceTitle: String(row.source_title ?? ''),
+        noticePrompt: String(row.notice_prompt ?? ''),
+        replyText:
+          row.reply_text === null || row.reply_text === undefined
+            ? null
+            : String(row.reply_text),
+        decision: String(row.decision),
+        reason: String(row.reason),
+        createdAt: Number(row.created_at),
+      }),
+    )
+  }
+
+  public insertDreamJournalEntry(entry: DreamJournalEntry): DreamJournalEntry {
+    const parsed = v.parse(DreamJournalEntrySchema, {
+      ...entry,
+      summary: entry.summary.replace(/\0/g, '').trim(),
+      sourceEpisodeIds: Array.from(new Set(entry.sourceEpisodeIds)),
+    })
+    this.memory.dreamJournal.set(parsed.id, parsed)
+
+    if (this.sqlite) {
+      this.sqlite
+        .prepare(
+          `INSERT OR REPLACE INTO dream_reflection_journal (
+            id, summary, source_episode_ids_json,
+            cross_links_count, trait_evolutions_count, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          parsed.id,
+          parsed.summary,
+          JSON.stringify(parsed.sourceEpisodeIds),
+          parsed.crossLinksCount,
+          parsed.traitEvolutionsCount,
+          parsed.createdAt,
+        )
+    }
+
+    return {
+      ...parsed,
+      sourceEpisodeIds: [...parsed.sourceEpisodeIds],
+    }
+  }
+
+  public listDreamJournalEntries(limit = 50): DreamJournalEntry[] {
+    if (!Number.isFinite(limit) || limit <= 0) {
+      return []
+    }
+    const safeLimit = Math.floor(limit)
+
+    if (!this.sqlite) {
+      return Array.from(this.memory.dreamJournal.values())
+        .sort((a, b) => b.createdAt - a.createdAt)
+        .slice(0, safeLimit)
+        .map((entry) => ({
+          ...entry,
+          sourceEpisodeIds: [...entry.sourceEpisodeIds],
+        }))
+    }
+
+    const rows = this.sqlite
+      .prepare(
+        `SELECT rowid AS _rowid, * FROM dream_reflection_journal
+         ORDER BY created_at DESC, _rowid DESC
+         LIMIT ?`,
+      )
+      .all(safeLimit)
+
+    return rows.map((row) =>
+      v.parse(DreamJournalEntrySchema, {
+        id: String(row.id),
+        summary: String(row.summary),
+        sourceEpisodeIds: safeParseJson<string[]>(row.source_episode_ids_json, []),
+        crossLinksCount: Number(row.cross_links_count ?? 0),
+        traitEvolutionsCount: Number(row.trait_evolutions_count ?? 0),
+        createdAt: Number(row.created_at),
+      }),
+    )
   }
 
   public close(): void {

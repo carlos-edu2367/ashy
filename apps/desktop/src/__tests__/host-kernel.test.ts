@@ -777,4 +777,91 @@ describe('AshyHostKernel & TurnOrchestrator', () => {
 
     await kernel.stop()
   })
+
+  it('populates Phase 8 memories snapshot fields, updates milestones & initiative policy (rejecting invalid 25:99), evaluates attention initiative with DND/spoken message append, and preserves M4 eval metrics', async () => {
+    const dir = makeTempDir()
+    const kernel = await createAshyHostKernel({ userDataDir: dir })
+
+    try {
+      await kernel.seedDemoFixtures()
+      const snap0 = await kernel.getBootstrapSnapshot()
+
+      // 1. Verify Phase 8 snapshot fields in memories
+      expect(Array.isArray(snap0.memories.crossEpisodeLinks)).toBe(true)
+      expect(Array.isArray(snap0.memories.dreamJournalEntries)).toBe(true)
+      expect(snap0.memories.initiativePolicy).toBeDefined()
+      expect(snap0.memories.initiativePolicy?.enabled).toBe(true)
+      expect(snap0.memories.initiativePolicy?.quietHoursStart).toBe('23:00')
+      expect(Array.isArray(snap0.memories.initiativeLog)).toBe(true)
+      expect(snap0.memories.roomEnvironment).toBeDefined()
+      expect(snap0.memories.roomEnvironment?.unlockedTrophies.length).toBeGreaterThan(0)
+
+      // 2. updateMilestone updates title/narrative/category and rejects invalid input
+      const targetMilestone = snap0.relationship.milestones[0]!
+      const updatedMilestone = await kernel.updateMilestone!({
+        id: targetMilestone.id,
+        title: 'Primeiro Encontro Revisado',
+        narrative: 'Narrativa editada com carinho na Fase 8.',
+        category: 'project_shipped',
+      })
+      expect(updatedMilestone.title).toBe('Primeiro Encontro Revisado')
+      expect(updatedMilestone.narrative).toBe('Narrativa editada com carinho na Fase 8.')
+      expect(updatedMilestone.category).toBe('project_shipped')
+
+      await expect(
+        kernel.updateMilestone!({
+          id: '',
+          title: 'Inválido',
+        }),
+      ).rejects.toThrow(/Invalid RPC argument/i)
+
+      // 3. updateInitiativePolicy persists valid policy and rejects invalid HH:MM ('25:99')
+      const updatedPolicy = await kernel.updateInitiativePolicy!({
+        cooldownMinutes: 45,
+        maxDailyInitiatives: 4,
+        quietHoursStart: '22:30',
+        quietHoursEnd: '07:30',
+      })
+      expect(updatedPolicy.cooldownMinutes).toBe(45)
+      expect(updatedPolicy.maxDailyInitiatives).toBe(4)
+      expect(updatedPolicy.quietHoursStart).toBe('22:30')
+      expect(updatedPolicy.quietHoursEnd).toBe('07:30')
+
+      await expect(
+        kernel.updateInitiativePolicy!({
+          quietHoursStart: '25:99',
+        }),
+      ).rejects.toThrow(/Invalid RPC argument/i)
+
+      // 4. evaluateAttentionInitiative respects agency DND mode and appends spoken message to active session when triggered
+      await kernel.updateAgencyConsent!({ dndMode: true })
+      const dndSuppressed = await kernel.evaluateAttentionInitiative!({
+        nowMs: Date.now() + 86_400_000,
+        localTimeHHMM: '14:00',
+      })
+      expect(dndSuppressed.decision).toBe('suppressed_dnd')
+
+      await kernel.updateAgencyConsent!({ dndMode: false })
+      const messagesBefore = (await kernel.getBootstrapSnapshot()).messages.length
+
+      const spokenRecord = await kernel.evaluateAttentionInitiative!({
+        nowMs: Date.now() + 2 * 86_400_000,
+        localTimeHHMM: '15:00',
+      })
+      expect(spokenRecord.decision).toBe('spoken')
+      expect(spokenRecord.replyText).toBeTruthy()
+
+      const snapAfterSpoken = await kernel.getBootstrapSnapshot()
+      expect(snapAfterSpoken.messages.length).toBe(messagesBefore + 1)
+      expect(snapAfterSpoken.messages.at(-1)?.content).toBe(spokenRecord.replyText)
+      expect(snapAfterSpoken.memories.initiativeLog?.[0]?.id).toBe(spokenRecord.id)
+
+      // 5. runCoreExperimentEval preserves initiativeGroundingRate and unopportuneInitiativeCount
+      const evalReport = await kernel.runCoreExperimentEval({ seed: 0 })
+      expect(evalReport.metrics.initiativeGroundingRate).toBe(1.0)
+      expect(evalReport.metrics.unopportuneInitiativeCount).toBe(0)
+    } finally {
+      await kernel.stop()
+    }
+  })
 })

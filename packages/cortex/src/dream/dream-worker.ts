@@ -325,9 +325,11 @@ export function detectCrossEpisodeLinks(
         const similarity = Number(
           Math.min(1, Math.max(sim, sharedTag ? 0.65 : sim)).toFixed(4),
         )
-        const sharedTheme = sharedTag ?? inferSharedThemeFromTexts(texts[i]!, texts[j]!)
+        const rawTheme = sharedTag ?? inferSharedThemeFromTexts(texts[i]!, texts[j]!)
+        const sharedTheme = rawTheme.replace(/[\r\n\0]+/g, '').trim() || 'shared_studio_context'
         links.push(
           v.parse(CrossEpisodeLinkSchema, {
+            id: `link-${epA.id}-${epB.id}-${sharedTheme}`,
             fromEpisodeId: epA.id,
             toEpisodeId: epB.id,
             sharedTheme,

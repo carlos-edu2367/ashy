@@ -863,4 +863,91 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
     cleanupIpc()
     await kernel.stop()
   })
+
+  it('dispatches Phase 8 RPC methods (updateMilestone, updateInitiativePolicy, evaluateAttentionInitiative) over HTTP POST /__ashy_host/rpc and Preload IPC bridges', async () => {
+    const dir = makeTempDir()
+    const kernel = await createAshyHostKernel({ userDataDir: dir })
+    await kernel.seedDemoFixtures()
+
+    const middleware = createAshyHostHttpMiddleware(async () => kernel)
+    const server = http.createServer((req, res) => {
+      middleware(req, res, () => {
+        res.statusCode = 404
+        res.end('Not Found')
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    const address = server.address()
+    const port = typeof address === 'object' && address ? address.port : 0
+    const baseUrl = `http://127.0.0.1:${port}`
+
+    const httpBridge = createHttpSseHostBridge({
+      baseUrl,
+      fetchImpl: fetch,
+    })
+
+    try {
+      const snap0 = await httpBridge.getBootstrapSnapshot()
+      expect(snap0.memories.initiativePolicy).toBeDefined()
+      expect(snap0.memories.roomEnvironment).toBeDefined()
+
+      const targetMilestone = snap0.relationship.milestones[0]!
+      const updatedMs = await httpBridge.updateMilestone!({
+        id: targetMilestone.id,
+        title: 'Marco HTTP RPC Fase 8',
+        narrative: 'Atualizado via POST /__ashy_host/rpc',
+      })
+      expect(updatedMs.title).toBe('Marco HTTP RPC Fase 8')
+
+      const updatedPolicy = await httpBridge.updateInitiativePolicy!({
+        cooldownMinutes: 90,
+        maxDailyInitiatives: 2,
+        quietHoursStart: '23:30',
+        quietHoursEnd: '07:00',
+      })
+      expect(updatedPolicy.cooldownMinutes).toBe(90)
+      expect(updatedPolicy.quietHoursStart).toBe('23:30')
+
+      // Invalid quietHours must be rejected with 400 Invalid RPC argument
+      const badPolicyRes = await fetch(`${baseUrl}/__ashy_host/rpc`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          method: 'updateInitiativePolicy',
+          payload: { quietHoursStart: '25:99' },
+        }),
+      })
+      expect(badPolicyRes.status).toBe(400)
+      const badPolicyJson = (await badPolicyRes.json()) as { ok: boolean; error?: string }
+      expect(badPolicyJson.ok).toBe(false)
+      expect(badPolicyJson.error).toMatch(/Invalid RPC argument/i)
+
+      // Evaluate attention initiative over HTTP bridge
+      const evalRec = await httpBridge.evaluateAttentionInitiative!({
+        nowMs: Date.now() + 3 * 86_400_000,
+        localTimeHHMM: '16:00',
+      })
+      expect(evalRec.decision).toBe('spoken')
+      expect(evalRec.replyText).toBeTruthy()
+
+      // Also verify preload bridge wiring and null-payload dispatchHostRpc
+      const fakeIpcRenderer = {
+        invoke: vi.fn(async (_channel: string, req: { method: string; payload?: unknown }) =>
+          dispatchHostRpc(kernel, req.method, req.payload),
+        ),
+        on: vi.fn(),
+        removeListener: vi.fn(),
+      }
+      const preloadBridge = createPreloadHostBridge(createAshyPreloadApi(fakeIpcRenderer))
+      const evalDefault = await preloadBridge.evaluateAttentionInitiative!()
+      expect(evalDefault.id).toBeTruthy()
+
+      await expect(
+        dispatchHostRpc(kernel, 'updateMilestone', { id: '' }),
+      ).rejects.toThrow(/Invalid RPC argument/i)
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+      await kernel.stop()
+    }
+  })
 })

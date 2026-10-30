@@ -10,6 +10,7 @@ import type {
   CompleteOnboardingInput,
   DeletableMemoryKind,
   EpisodicMemory,
+  EvaluateInitiativeInput,
   ExternalMcpServerConfig,
   LlmProviderId,
   MemoryGovernanceCategory,
@@ -22,6 +23,8 @@ import type {
   SendTurnInput,
   TestProviderInput,
   UpdateAgencyConsentInput,
+  UpdateInitiativePolicyInput,
+  UpdateMilestoneInput,
   UpsertFactInput,
 } from '@ashy/shared'
 import type { AshyHostKernel, AshyHostKernelOptions } from './kernel'
@@ -90,6 +93,9 @@ const ALLOWED_RPC_METHODS = new Set<string>([
   'revokeSessionPermissions',
   'captureAuthorizedScreen',
   'registerExternalMcpServer',
+  'updateMilestone',
+  'updateInitiativePolicy',
+  'evaluateAttentionInitiative',
 ])
 
 export class DisallowedRpcMethodError extends Error {
@@ -562,6 +568,45 @@ export async function dispatchHostRpc(
       }
       const obj = assertObjectPayload<ExternalMcpServerConfig>(payload, method)
       return kernel.registerExternalMcpServer(obj)
+    }
+
+    case 'updateMilestone': {
+      if (!kernel.updateMilestone) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<UpdateMilestoneInput>(payload, method)
+      assertSafeIdentifier(obj.id, 'updateMilestone.id', 160)
+      return kernel.updateMilestone(obj)
+    }
+
+    case 'updateInitiativePolicy': {
+      if (!kernel.updateInitiativePolicy) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<UpdateInitiativePolicyInput>(payload, method)
+      const hhmmRegex = /^(?:[01]\d|2[0-3]):[0-5]\d$/
+      if (
+        (obj.quietHoursStart !== undefined &&
+          (typeof obj.quietHoursStart !== 'string' ||
+            !hhmmRegex.test(obj.quietHoursStart.trim()))) ||
+        (obj.quietHoursEnd !== undefined &&
+          (typeof obj.quietHoursEnd !== 'string' ||
+            !hhmmRegex.test(obj.quietHoursEnd.trim())))
+      ) {
+        throw new Error('Invalid RPC argument: quietHours must match HH:MM')
+      }
+      return kernel.updateInitiativePolicy(obj)
+    }
+
+    case 'evaluateAttentionInitiative': {
+      if (!kernel.evaluateAttentionInitiative) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      if (payload === undefined || payload === null) {
+        return kernel.evaluateAttentionInitiative()
+      }
+      const obj = assertObjectPayload<EvaluateInitiativeInput>(payload, method)
+      return kernel.evaluateAttentionInitiative(obj)
     }
 
     default:

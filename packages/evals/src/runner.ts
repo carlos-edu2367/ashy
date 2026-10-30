@@ -14,6 +14,7 @@ import {
   evaluateAntiSlopAndFormatHygiene,
   evaluateBondSafeguardCompliance,
   evaluateCallbackAndCooldownCompliance,
+  evaluateContextualInitiativeSuite,
   evaluateSeriousnessGateCompliance,
   evaluateStepMemoryRecallAndPrecision,
   evaluateVoiceConsistencyRubric,
@@ -111,6 +112,12 @@ export function evaluateSummaryGates(
     G13_trait_drift_corridor_compliance:
       (summary.traitDriftCorridorComplianceRate ?? 1) >=
       M2_GATE_THRESHOLDS.traitDriftCorridorComplianceRateMin,
+    G14_contextual_initiative_grounding:
+      (summary.initiativeGroundingRate ?? 1) >=
+      M2_GATE_THRESHOLDS.initiativeGroundingRateMin,
+    G15_zero_unopportune_initiatives:
+      (summary.unopportuneInitiativeCount ?? 0) <=
+      M2_GATE_THRESHOLDS.unopportuneInitiativeCountMax,
   }
 }
 
@@ -563,6 +570,17 @@ export async function runCoreExperimentM2(
       Math.abs(voiceScoreModelA - voiceScoreModelB),
     )
 
+    const finalStepNowMs =
+      scenario.steps[scenario.steps.length - 1]?.timestampMs ?? Date.now()
+    const initiativeAudit = evaluateContextualInitiativeSuite(cortex, {
+      nowMs: finalStepNowMs,
+    })
+    const initiativeGroundingRate = clampUnit(
+      initiativeAudit.initiativeGroundingRate,
+    )
+    const unopportuneInitiativeCount =
+      initiativeAudit.unopportuneInitiativeCount
+
     const metrics: CoreExperimentMetricSummary = {
       memoryRecallRate,
       memoryPrecisionRate,
@@ -578,6 +596,8 @@ export async function runCoreExperimentM2(
       seriousnessFalseNegativeCount,
       bondSafeguardComplianceRate,
       traitDriftCorridorComplianceRate,
+      initiativeGroundingRate,
+      unopportuneInitiativeCount,
     }
 
     const failedGates: string[] = []
@@ -657,6 +677,22 @@ export async function runCoreExperimentM2(
     ) {
       failedGates.push(
         `G13: traitDriftCorridorComplianceRate (${traitDriftCorridorComplianceRate}) < ${M2_GATE_THRESHOLDS.traitDriftCorridorComplianceRateMin}`,
+      )
+    }
+    if (
+      initiativeGroundingRate <
+      M2_GATE_THRESHOLDS.initiativeGroundingRateMin
+    ) {
+      failedGates.push(
+        `G14: initiativeGroundingRate (${initiativeGroundingRate}) < ${M2_GATE_THRESHOLDS.initiativeGroundingRateMin}`,
+      )
+    }
+    if (
+      unopportuneInitiativeCount >
+      M2_GATE_THRESHOLDS.unopportuneInitiativeCountMax
+    ) {
+      failedGates.push(
+        `G15: unopportuneInitiativeCount (${unopportuneInitiativeCount}) > ${M2_GATE_THRESHOLDS.unopportuneInitiativeCountMax}`,
       )
     }
 

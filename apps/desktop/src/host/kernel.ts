@@ -6,7 +6,10 @@ import { createAshyCortex, type AshyCortex } from '@ashy/cortex'
 import { runCoreExperimentM2 } from '@ashy/evals'
 import {
   CompleteOnboardingInputSchema,
+  EvaluateInitiativeInputSchema,
   RunCoreExperimentInputSchema,
+  UpdateInitiativePolicyInputSchema,
+  UpdateMilestoneInputSchema,
   type AgencySnapshot,
   type ApprovalScope,
   type ApprovableMemoryKind,
@@ -22,12 +25,15 @@ import {
   type DeletableMemoryKind,
   type DreamReflectionCycleResult,
   type EpisodicMemory,
+  type EvaluateInitiativeInput,
   type ExternalMcpServerConfig,
+  type InitiativePolicy,
   type LlmProviderId,
   type MemoryGovernanceCategory,
   type MemoryGovernancePolicy,
   type PersonalityEvolutionRecord,
   type PersonalityTraits,
+  type ProactiveInitiativeRecord,
   type ProspectiveIntent,
   type ProviderHealthResult,
   type PublicProviderConfig,
@@ -40,6 +46,8 @@ import {
   type SharedPendingActionCard,
   type TestProviderInput,
   type UpdateAgencyConsentInput,
+  type UpdateInitiativePolicyInput,
+  type UpdateMilestoneInput,
   type UpsertFactInput,
   type VisionObservationResult,
 } from '@ashy/shared'
@@ -286,6 +294,11 @@ export async function createAshyHostKernel(
         intents,
         evolutionLog,
         governancePolicy,
+        crossEpisodeLinks: cortex.getCrossEpisodeLinks(),
+        dreamJournalEntries: cortex.listDreamJournalEntries(50),
+        initiativePolicy: cortex.getInitiativePolicy(),
+        initiativeLog: cortex.listProactiveInitiativeLog(50),
+        roomEnvironment: cortex.getRoomEnvironment(),
       },
       voice: voiceStore.read(),
       providers: providerVault.getPublicState(),
@@ -696,6 +709,10 @@ export async function createAshyHostKernel(
               report.metrics.bondSafeguardComplianceRate ?? 1.0,
             traitDriftCorridorComplianceRate:
               report.metrics.traitDriftCorridorComplianceRate ?? 1.0,
+            initiativeGroundingRate:
+              report.metrics.initiativeGroundingRate ?? 1.0,
+            unopportuneInitiativeCount:
+              report.metrics.unopportuneInitiativeCount ?? 0,
           },
         }
         lastEvalReport = normalizedReport
@@ -802,6 +819,73 @@ export async function createAshyHostKernel(
 
     async registerExternalMcpServer(input: ExternalMcpServerConfig): Promise<AgencySnapshot> {
       return agencyRuntimeInstance.registerExternalMcpServer(input)
+    },
+
+    async updateMilestone(
+      input: UpdateMilestoneInput,
+    ): Promise<AutobiographicalMilestone> {
+      let parsed: UpdateMilestoneInput
+      try {
+        parsed = v.parse(UpdateMilestoneInputSchema, input)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        throw new Error(`Invalid RPC argument: ${message}`)
+      }
+      return cortexInstance.updateMilestone(parsed)
+    },
+
+    async updateInitiativePolicy(
+      input: UpdateInitiativePolicyInput,
+    ): Promise<InitiativePolicy> {
+      let parsed: UpdateInitiativePolicyInput
+      try {
+        parsed = v.parse(UpdateInitiativePolicyInputSchema, input)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        throw new Error(`Invalid RPC argument: ${message}`)
+      }
+      return cortexInstance.saveInitiativePolicy(parsed)
+    },
+
+    async evaluateAttentionInitiative(
+      input?: EvaluateInitiativeInput,
+    ): Promise<ProactiveInitiativeRecord> {
+      let parsed: EvaluateInitiativeInput
+      try {
+        parsed = v.parse(EvaluateInitiativeInputSchema, input ?? {})
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        throw new Error(`Invalid RPC argument: ${message}`)
+      }
+      const dndMode = parsed.forceDnd ?? agencyRuntimeInstance.privacyController.dndMode
+      const record = cortexInstance.evaluateAttentionInitiative({
+        ...parsed,
+        forceDnd: dndMode,
+      })
+      if (record.decision === 'spoken' && record.replyText) {
+        let sessions = cortexInstance.listChatSessions()
+        if (sessions.length === 0) {
+          const initialSession = cortexInstance.createChatSession({
+            id: 'session-initial',
+            title: 'Primeiro Encontro',
+          })
+          sessions = [initialSession]
+        }
+        const targetSession =
+          sessions.find((s) => s.id === activeSessionId) ?? sessions[0]!
+        activeSessionId = targetSession.id
+        cortexInstance.appendChatMessage({
+          id: `msg-proactive-${record.id}`,
+          sessionId: targetSession.id,
+          role: 'assistant',
+          content: record.replyText,
+          rawContent: record.replyText,
+          emotion: 'happy',
+          markersJson: '[]',
+          createdAt: record.createdAt,
+        })
+      }
+      return record
     },
 
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {

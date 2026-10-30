@@ -21,9 +21,14 @@ import {
 import {
   applyEmotionSignalToMood,
   composeAshyTurnPrompt,
+  deriveAshyRoomEnvironment,
+  detectCrossEpisodeLinks,
+  evaluateAttentionLoop,
   evaluateSeriousnessGate,
   formatLocalTimeHHMM,
   inspectMotifCooldownStatus,
+  isReflectablePermanentEpisode,
+  isWithinQuietHours,
   proposeGroundedTraitEvolutions,
   rankEpisodicMemories,
   recordMotifInvocation,
@@ -49,6 +54,7 @@ import {
   ASHY_TRAIT_CORRIDORS,
   BUILTIN_LIVE2D_MODEL_PRESETS,
   DEFAULT_ASHY_VOICE_MD,
+  DEFAULT_INITIATIVE_POLICY,
   DEFAULT_MEMORY_GOVERNANCE_POLICY,
   DEFAULT_PROVIDER_CONFIGS,
   DEFAULT_VOICE_RUNTIME_SETTINGS,
@@ -67,9 +73,13 @@ import {
   type ChatSessionRecord,
   type CompleteOnboardingInput,
   type CoreExperimentEvalReport,
+  type CrossEpisodeLink,
   type DeletableMemoryKind,
+  type DreamJournalEntry,
   type EpisodicMemory,
+  type EvaluateInitiativeInput,
   type ExternalMcpServerConfig,
+  type InitiativePolicy,
   type Live2DBuiltinModelId,
   type LlmProviderId,
   type MemoryGovernanceCategory,
@@ -78,11 +88,14 @@ import {
   type MoodVector,
   type PersonalityEvolutionRecord,
   type PersonalityTraits,
+  type ProactiveInitiativeRecord,
   type ProspectiveIntent,
   type ProviderHealthResult,
   type PublicProviderConfig,
   type RelationalMotif,
   type RelationshipStage,
+  type RoomEnvironmentState,
+  type RoomTimeOfDayPeriod,
   type RunCoreExperimentInput,
   type SaveProviderConfigInput,
   type SemanticFact,
@@ -91,6 +104,8 @@ import {
   type TestProviderInput,
   type TtfaTelemetryRecord,
   type TtsProviderId,
+  type UpdateInitiativePolicyInput,
+  type UpdateMilestoneInput,
   type UserHabit,
   type VoiceFixtureId,
   type VoiceRuntimeSettings,
@@ -259,6 +274,14 @@ export interface AshyDesktopState {
   mood: MoodVector
   traits: PersonalityTraits
   milestones: AutobiographicalMilestone[]
+  storySearchQuery: string
+  storyCategoryFilter: 'todas' | MilestoneCategory
+  crossEpisodeLinks: CrossEpisodeLink[]
+  dreamJournalEntries: DreamJournalEntry[]
+  initiativePolicy: InitiativePolicy
+  initiativeLog: ProactiveInitiativeRecord[]
+  roomEnvironment: RoomEnvironmentState
+  roomTimeOverrideHHMM: string | null
   episodicMemories: EpisodicMemory[]
   rankedMemories: RankedEpisodicMemory[]
   memoryCards: FeaturedMemoryCard[]
@@ -361,6 +384,7 @@ export interface AshyDesktopState {
     summary: string
     fullStory?: string
     filterCategory?: Exclude<MemoryFilterCategory, 'todas'>
+    tags?: string[]
   }) => FeaturedMemoryCard
   updateMemoryStory: (id: string, newTitle: string, newStory: string) => void
   deleteMemoryCard: (id: string) => void
@@ -376,6 +400,15 @@ export interface AshyDesktopState {
     narrative: string
     category: MilestoneCategory
   }) => AutobiographicalMilestone
+  setStorySearchQuery: (query: string) => void
+  setStoryCategoryFilter: (category: 'todas' | MilestoneCategory) => void
+  updateMilestone: (input: UpdateMilestoneInput) => Promise<AutobiographicalMilestone | null>
+  setRoomTimeOverride: (localTimeHHMM: string | null) => void
+  updateInitiativePolicy: (input: UpdateInitiativePolicyInput) => Promise<InitiativePolicy>
+  toggleInitiativeEnabled: (enabled?: boolean) => Promise<InitiativePolicy>
+  evaluateAttentionInitiative: (
+    input?: EvaluateInitiativeInput,
+  ) => Promise<ProactiveInitiativeRecord>
   searchMemories: (query: string) => RankedEpisodicMemory[]
   reviewEpisodicMemoryById: (id: string, rating: FsrsReviewRating) => void
   invokeMotifManually: (motifId: string) => void
@@ -1438,6 +1471,14 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     mood: { ...ASHY_BASELINE_MOOD },
     traits: { ...ASHY_DEFAULT_TRAITS },
     milestones: [],
+    storySearchQuery: '',
+    storyCategoryFilter: 'todas',
+    crossEpisodeLinks: [],
+    dreamJournalEntries: [],
+    initiativePolicy: { ...DEFAULT_INITIATIVE_POLICY },
+    initiativeLog: [],
+    roomEnvironment: deriveAshyRoomEnvironment({ milestones: [], episodes: [] }),
+    roomTimeOverrideHHMM: null,
     episodicMemories: [],
     rankedMemories: [],
     memoryCards: [],
@@ -1524,6 +1565,26 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         snapshot.memories.evolutionLog ?? current.personalityEvolutionLog
       const memoryGovernancePolicy =
         snapshot.memories.governancePolicy ?? current.memoryGovernancePolicy
+      const crossEpisodeLinks =
+        snapshot.memories.crossEpisodeLinks ??
+        detectCrossEpisodeLinks(snapshot.memories.episodes)
+      const dreamJournalEntries =
+        snapshot.memories.dreamJournalEntries ?? current.dreamJournalEntries
+      const initiativePolicy = snapshot.memories.initiativePolicy
+        ? { ...snapshot.memories.initiativePolicy }
+        : current.initiativePolicy
+      const initiativeLog = snapshot.memories.initiativeLog ?? current.initiativeLog
+      const roomEnvironment = current.roomTimeOverrideHHMM
+        ? deriveAshyRoomEnvironment({
+            milestones: snapshot.relationship.milestones,
+            episodes: snapshot.memories.episodes,
+            localTimeHHMM: current.roomTimeOverrideHHMM,
+          })
+        : (snapshot.memories.roomEnvironment ??
+          deriveAshyRoomEnvironment({
+            milestones: snapshot.relationship.milestones,
+            episodes: snapshot.memories.episodes,
+          }))
 
       const nextPrompt = compilePromptFromState({
         modelId: current.activeModelId,
@@ -1560,6 +1621,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         traits: snapshot.affect.traits,
         stageEmotion: snapshot.affect.dominantEmotion,
         milestones: snapshot.relationship.milestones,
+        crossEpisodeLinks,
+        dreamJournalEntries,
+        initiativePolicy,
+        initiativeLog,
+        roomEnvironment,
         episodicMemories: snapshot.memories.episodes,
         rankedMemories: ranked,
         memoryCards: mappedCards,
@@ -2062,7 +2128,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         difficulty: 3.5,
         surprise: 0.8,
         isFlashbulb: false,
-        tags: [cat],
+        tags: input.tags?.length ? input.tags : [cat],
       }
 
       const card: FeaturedMemoryCard = {
@@ -2081,6 +2147,12 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       const nextEpisodes = [episode, ...get().episodicMemories]
       set({
         episodicMemories: nextEpisodes,
+        crossEpisodeLinks: detectCrossEpisodeLinks(nextEpisodes),
+        roomEnvironment: deriveAshyRoomEnvironment({
+          milestones: get().milestones,
+          episodes: nextEpisodes,
+          localTimeHHMM: get().roomTimeOverrideHHMM ?? undefined,
+        }),
         rankedMemories: rankEpisodesInMemory(nextEpisodes, get().memorySearchQuery, nowMs),
         memoryCards: [card, ...get().memoryCards],
         selectedMemoryId: card.id,
@@ -2134,6 +2206,12 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       set({
         memoryCards: cards,
         episodicMemories: nextEpisodes,
+        crossEpisodeLinks: detectCrossEpisodeLinks(nextEpisodes),
+        roomEnvironment: deriveAshyRoomEnvironment({
+          milestones: get().milestones,
+          episodes: nextEpisodes,
+          localTimeHHMM: get().roomTimeOverrideHHMM ?? undefined,
+        }),
         rankedMemories: rankEpisodesInMemory(nextEpisodes, get().memorySearchQuery, nowMs),
       })
     },
@@ -2174,8 +2252,16 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         const nextMilestones = current.milestones.map((m) =>
           m.episodeId === id ? { ...m, episodeId: undefined } : m,
         )
+        const nextDreamJournalEntries = current.dreamJournalEntries
+          .map((entry) => ({
+            ...entry,
+            sourceEpisodeIds: entry.sourceEpisodeIds.filter((epId) => epId !== id),
+          }))
+          .filter((entry) => entry.sourceEpisodeIds.length > 0)
         set({
           episodicMemories: nextEpisodes,
+          crossEpisodeLinks: detectCrossEpisodeLinks(nextEpisodes),
+          dreamJournalEntries: nextDreamJournalEntries,
           rankedMemories: nextRanked,
           memoryCards: remainingCards,
           selectedMemoryId: nextSelected,
@@ -2184,6 +2270,12 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           userHabits: nextHabits,
           prospectiveIntents: nextIntents,
           milestones: nextMilestones,
+          roomTrophies: buildRoomTrophies(nextMilestones),
+          roomEnvironment: deriveAshyRoomEnvironment({
+            milestones: nextMilestones,
+            episodes: nextEpisodes,
+            localTimeHHMM: current.roomTimeOverrideHHMM ?? undefined,
+          }),
           lastPrompt: compilePromptFromState({
             rankedMemories: nextRanked,
             semanticFacts: nextFacts,
@@ -2229,6 +2321,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         set({
           milestones: nextMilestones,
           roomTrophies: buildRoomTrophies(nextMilestones),
+          roomEnvironment: deriveAshyRoomEnvironment({
+            milestones: nextMilestones,
+            episodes: current.episodicMemories,
+            localTimeHHMM: current.roomTimeOverrideHHMM ?? undefined,
+          }),
         })
       }
 
@@ -2282,6 +2379,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       set({
         milestones: nextMilestones,
         roomTrophies: buildRoomTrophies(nextMilestones),
+        roomEnvironment: deriveAshyRoomEnvironment({
+          milestones: nextMilestones,
+          episodes: get().episodicMemories,
+          localTimeHHMM: get().roomTimeOverrideHHMM ?? undefined,
+        }),
       })
       void getAshyHostBridge()
         .upsertMilestone(created)
@@ -2289,6 +2391,232 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           // Ignore when offline in unit test
         })
       return created
+    },
+
+    setStorySearchQuery(query) {
+      set({ storySearchQuery: query })
+    },
+
+    setStoryCategoryFilter(category) {
+      set({ storyCategoryFilter: category })
+    },
+
+    async updateMilestone(input) {
+      const cleanId = input.id?.trim() ?? ''
+      if (!cleanId) return null
+      if (input.title !== undefined && !input.title.trim()) return null
+      if (input.narrative !== undefined && !input.narrative.trim()) return null
+
+      const current = get()
+      const existing = current.milestones.find((m) => m.id === cleanId)
+      if (!existing) return null
+
+      const updated: AutobiographicalMilestone = {
+        ...existing,
+        title: input.title !== undefined ? input.title.trim() : existing.title,
+        narrative: input.narrative !== undefined ? input.narrative.trim() : existing.narrative,
+        category: input.category !== undefined ? input.category : existing.category,
+        ...(input.roomTrophyId !== undefined
+          ? input.roomTrophyId === null
+            ? { roomTrophyId: undefined }
+            : { roomTrophyId: input.roomTrophyId.trim() }
+          : {}),
+      }
+
+      const nextMilestones = current.milestones.map((m) => (m.id === cleanId ? updated : m))
+      set({
+        milestones: nextMilestones,
+        roomTrophies: buildRoomTrophies(nextMilestones),
+        roomEnvironment: deriveAshyRoomEnvironment({
+          milestones: nextMilestones,
+          episodes: current.episodicMemories,
+          localTimeHHMM: current.roomTimeOverrideHHMM ?? undefined,
+        }),
+      })
+
+      await getAshyHostBridge()
+        .updateMilestone?.({
+          id: cleanId,
+          title: updated.title,
+          narrative: updated.narrative,
+          category: updated.category,
+          ...(input.roomTrophyId !== undefined ? { roomTrophyId: input.roomTrophyId } : {}),
+        })
+        .catch(() => undefined)
+
+      return updated
+    },
+
+    setRoomTimeOverride(localTimeHHMM) {
+      const cleanTime =
+        localTimeHHMM && localTimeHHMM.trim() && localTimeHHMM !== 'auto'
+          ? localTimeHHMM.trim()
+          : null
+      const roomEnvironment = deriveAshyRoomEnvironment({
+        milestones: get().milestones,
+        episodes: get().episodicMemories,
+        localTimeHHMM: cleanTime ?? undefined,
+      })
+      set({
+        roomTimeOverrideHHMM: cleanTime,
+        roomEnvironment,
+      })
+    },
+
+    async updateInitiativePolicy(input) {
+      const current = get()
+      const validHHMM = (val?: string) =>
+        typeof val === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(val.trim())
+          ? val.trim()
+          : null
+
+      const nextPolicy: InitiativePolicy = {
+        enabled:
+          input.enabled !== undefined ? Boolean(input.enabled) : current.initiativePolicy.enabled,
+        cooldownMinutes:
+          input.cooldownMinutes !== undefined && Number.isFinite(input.cooldownMinutes)
+            ? Math.max(1, Math.min(1440, Math.round(input.cooldownMinutes)))
+            : current.initiativePolicy.cooldownMinutes,
+        maxDailyInitiatives:
+          input.maxDailyInitiatives !== undefined && Number.isFinite(input.maxDailyInitiatives)
+            ? Math.max(0, Math.min(20, Math.round(input.maxDailyInitiatives)))
+            : current.initiativePolicy.maxDailyInitiatives,
+        quietHoursStart:
+          validHHMM(input.quietHoursStart) ?? current.initiativePolicy.quietHoursStart,
+        quietHoursEnd: validHHMM(input.quietHoursEnd) ?? current.initiativePolicy.quietHoursEnd,
+        respectDnd:
+          input.respectDnd !== undefined
+            ? Boolean(input.respectDnd)
+            : current.initiativePolicy.respectDnd,
+        modulateByHabits:
+          input.modulateByHabits !== undefined
+            ? Boolean(input.modulateByHabits)
+            : current.initiativePolicy.modulateByHabits,
+      }
+
+      set({
+        initiativePolicy: nextPolicy,
+        quietHoursRange: `${nextPolicy.quietHoursStart} — ${nextPolicy.quietHoursEnd}`,
+      })
+
+      const persisted = await getAshyHostBridge()
+        .updateInitiativePolicy?.(nextPolicy)
+        .catch(() => undefined)
+
+      if (persisted) {
+        set({
+          initiativePolicy: persisted,
+          quietHoursRange: `${persisted.quietHoursStart} — ${persisted.quietHoursEnd}`,
+        })
+        return persisted
+      }
+
+      return nextPolicy
+    },
+
+    async toggleInitiativeEnabled(enabled) {
+      const nextEnabled =
+        enabled !== undefined ? Boolean(enabled) : !get().initiativePolicy.enabled
+      return get().updateInitiativePolicy({ enabled: nextEnabled })
+    },
+
+    async evaluateAttentionInitiative(input) {
+      const current = get()
+      const resolvedTimeHHMM =
+        input?.localTimeHHMM ?? current.roomTimeOverrideHHMM ?? undefined
+      const resolvedDnd = input?.forceDnd ?? current.privacyState.dndMode
+      const seriousness = input?.recentUserMessage
+        ? evaluateSeriousnessGate(input.recentUserMessage)
+        : undefined
+
+      // Validate quiet hours helper reference
+      if (resolvedTimeHHMM) {
+        void isWithinQuietHours(
+          resolvedTimeHHMM,
+          current.initiativePolicy.quietHoursStart,
+          current.initiativePolicy.quietHoursEnd,
+        )
+      }
+
+      const localRecord = evaluateAttentionLoop({
+        policy: current.initiativePolicy,
+        dndMode: resolvedDnd,
+        nowMs: input?.nowMs,
+        localTimeHHMM: resolvedTimeHHMM,
+        prospectiveIntents: current.prospectiveIntents,
+        milestones: current.milestones,
+        episodes: current.episodicMemories,
+        crossEpisodeLinks: current.crossEpisodeLinks,
+        userHabits: current.userHabits,
+        recentInitiatives: current.initiativeLog,
+        mood: current.mood,
+        seriousness,
+        idleMinutes: input?.idleMinutes,
+        activeAppTitle: input?.activeAppTitle,
+        recentUserMessage: input?.recentUserMessage,
+        simulatedReplyText: input?.simulatedReplyText,
+      })
+
+      set((state) => {
+        const nextIntents =
+          localRecord.decision === 'spoken' &&
+          localRecord.triggerKind === 'prospective_intent' &&
+          localRecord.sourceId
+            ? state.prospectiveIntents.map((intent) =>
+                intent.id === localRecord.sourceId
+                  ? { ...intent, status: 'triggered' as const }
+                  : intent,
+              )
+            : state.prospectiveIntents
+
+        const nextMessages =
+          localRecord.decision === 'spoken' && localRecord.replyText
+            ? [
+                ...state.chatMessages,
+                {
+                  id: `msg-proactive-${localRecord.id}`,
+                  role: 'assistant' as const,
+                  content: localRecord.replyText,
+                  rawContent: localRecord.replyText,
+                  emotion: 'happy' as const,
+                  modelId: state.activeModelId,
+                  timeLabel: formatLocalTimeHHMM(localRecord.createdAt),
+                  timestamp: localRecord.createdAt,
+                },
+              ]
+            : state.chatMessages
+
+        return {
+          initiativeLog: [localRecord, ...state.initiativeLog],
+          prospectiveIntents: nextIntents,
+          ...(localRecord.decision === 'spoken' && localRecord.replyText
+            ? {
+                bubbleText: localRecord.replyText,
+                stageEmotion: 'happy' as const,
+                chatMessages: nextMessages,
+              }
+            : {}),
+        }
+      })
+
+      const hostRecord = await getAshyHostBridge()
+        .evaluateAttentionInitiative?.({
+          ...input,
+          ...(resolvedTimeHHMM ? { localTimeHHMM: resolvedTimeHHMM } : {}),
+          forceDnd: resolvedDnd,
+        })
+        .catch(() => undefined)
+
+      if (hostRecord) {
+        set((state) => ({
+          initiativeLog: state.initiativeLog.map((r) =>
+            r.id === localRecord.id ? hostRecord : r,
+          ),
+        }))
+        return hostRecord
+      }
+
+      return localRecord
     },
 
     searchMemories(query) {
@@ -2441,6 +2769,8 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
     runDreamConsolidation(nowMs = Date.now()) {
       const state = get()
+      const reflectable = state.episodicMemories.filter(isReflectablePermanentEpisode)
+      const crossEpisodeLinks = detectCrossEpisodeLinks(reflectable)
       const evoRes = proposeGroundedTraitEvolutions({
         episodes: state.episodicMemories,
         existingLog: state.personalityEvolutionLog,
@@ -2448,6 +2778,45 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         nowMs,
         maxEvolutions: 1,
       })
+
+      let nextDreamJournalEntries = state.dreamJournalEntries
+      if (reflectable.length > 0) {
+        const sourceEpisodeIds = reflectable.map((ep) => ep.id)
+        const sortedSourceKey = [...sourceEpisodeIds].sort().join(',')
+        const latestEntry = state.dreamJournalEntries[0]
+        const hasSameEpisodeSetAsLatest =
+          latestEntry !== undefined &&
+          [...latestEntry.sourceEpisodeIds].sort().join(',') === sortedSourceKey &&
+          evoRes.records.length === 0
+
+        if (!hasSameEpisodeSetAsLatest || state.dreamJournalEntries.length === 0) {
+          const themesLabel =
+            crossEpisodeLinks.length > 0
+              ? crossEpisodeLinks
+                  .map((l) => l.sharedTheme)
+                  .slice(0, 3)
+                  .join(', ')
+              : ''
+          const summary =
+            evoRes.records.length > 0 && crossEpisodeLinks.length > 0
+              ? `Reflexão noturna sobre ${reflectable.length} episódio(s): ${crossEpisodeLinks.length} conexão(ões) temática(s) (${themesLabel}) e ${evoRes.records.length} evolução(ões) de traço (${evoRes.records.map((r) => r.trait).join(', ')}).`
+              : crossEpisodeLinks.length > 0
+                ? `Reflexão sobre ${reflectable.length} episódio(s) conectados pelo tema "${themesLabel}".`
+                : evoRes.records.length > 0
+                  ? `Reflexão sobre ${reflectable.length} episódio(s): ${evoRes.records.map((r) => r.explanation).join(' ')}`
+                  : `Síntese reflexiva sobre ${reflectable.length} memória(s) permanente(s) do estúdio.`
+
+          const newJournalEntry: DreamJournalEntry = {
+            id: `dream-journal-${nowMs}-${state.dreamJournalEntries.length + 1}`,
+            createdAt: nowMs,
+            summary,
+            sourceEpisodeIds,
+            crossLinksCount: crossEpisodeLinks.length,
+            traitEvolutionsCount: evoRes.records.length,
+          }
+          nextDreamJournalEntries = [newJournalEntry, ...state.dreamJournalEntries]
+        }
+      }
 
       if (evoRes.records[0]) {
         const record = evoRes.records[0]
@@ -2466,7 +2835,14 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           traits: nextTraits,
           personalityEvolutionLog: nextLog,
           milestones: nextMilestones,
+          crossEpisodeLinks,
+          dreamJournalEntries: nextDreamJournalEntries,
           roomTrophies: buildRoomTrophies(nextMilestones),
+          roomEnvironment: deriveAshyRoomEnvironment({
+            milestones: nextMilestones,
+            episodes: state.episodicMemories,
+            localTimeHHMM: state.roomTimeOverrideHHMM ?? undefined,
+          }),
           stageEmotion: 'happy',
           lastPrompt: compilePromptFromState({
             traits: nextTraits,
@@ -2493,6 +2869,13 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         }
 
         return record
+      }
+
+      if (reflectable.length > 0) {
+        set({
+          crossEpisodeLinks,
+          dreamJournalEntries: nextDreamJournalEntries,
+        })
       }
 
       void getAshyHostBridge()
@@ -3053,6 +3436,14 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         mood: { ...ASHY_BASELINE_MOOD },
         traits: { ...ASHY_DEFAULT_TRAITS },
         milestones: [],
+        storySearchQuery: '',
+        storyCategoryFilter: 'todas',
+        crossEpisodeLinks: [],
+        dreamJournalEntries: [],
+        initiativePolicy: { ...DEFAULT_INITIATIVE_POLICY },
+        initiativeLog: [],
+        roomEnvironment: deriveAshyRoomEnvironment({ milestones: [], episodes: [] }),
+        roomTimeOverrideHHMM: null,
         episodicMemories: [],
         rankedMemories: [],
         memoryCards: [],
@@ -3110,6 +3501,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 })
 
 export type AshyStoreState = AshyDesktopState
+export type { RoomTimeOfDayPeriod }
 
 export function resetAshyStore(): void {
   useAshyStore.getState().resetStoreForTesting()

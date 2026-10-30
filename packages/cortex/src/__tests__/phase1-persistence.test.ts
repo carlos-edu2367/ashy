@@ -129,7 +129,7 @@ describe('@ashy/cortex Phase 1 persistence & Migration v2', () => {
 
     const db = createCortexDatabase({ filePath: dbPath })
     expect(db.isPersistent).toBe(true)
-    expect(db.getAppliedMigrations().map((m) => m.version)).toEqual([1, 2, 3, 4])
+    expect(db.getAppliedMigrations().map((m) => m.version)).toEqual([1, 2, 3, 4, 5])
 
     const files = fs.readdirSync(dir)
     expect(files.some((f) => f.startsWith('ashy.db.corrupt.'))).toBe(true)
@@ -265,7 +265,7 @@ describe('@ashy/cortex Phase 1 persistence & Migration v2', () => {
       )
 
       const migrations = db1.getAppliedMigrations()
-      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4])
+      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5])
       expect(migrations.find((m) => m.version === 3)?.name).toBe('v3_phase2_self_writing_memory')
       expect(db1.listSqlTables()).toContain('memory_governance_settings')
 
@@ -547,7 +547,7 @@ describe('@ashy/cortex Phase 1 persistence & Migration v2', () => {
       )
 
       const migrations = db1.getAppliedMigrations()
-      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4])
+      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5])
       expect(migrations.find((m) => m.version === 4)?.name).toBe(
         'v4_phase7_agency_audit_and_consent',
       )
@@ -674,6 +674,86 @@ describe('@ashy/cortex Phase 1 persistence & Migration v2', () => {
       } else {
         db1.clearActionAuditLog()
         expect(db1.listActionAuditLog(50)).toHaveLength(0)
+        db1.close()
+      }
+    }
+  })
+
+  it('applies Migration v5 (v5_phase8_initiative_and_reflection_journal) and persists initiative policy, initiative log, and dream journal across restarts', () => {
+    const dir = makeTempDir()
+    const dbPath = path.join(dir, 'ashy-v5.db')
+
+    for (const forceMemoryFallback of [false, true]) {
+      const db1 = createCortexDatabase(
+        forceMemoryFallback ? { forceMemoryFallback: true } : { filePath: dbPath },
+      )
+
+      const migrations = db1.getAppliedMigrations()
+      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5])
+      expect(migrations.find((m) => m.version === 5)?.name).toBe(
+        'v5_phase8_initiative_and_reflection_journal',
+      )
+      expect(db1.listSqlTables()).toContain('initiative_policy_state')
+      expect(db1.listSqlTables()).toContain('proactive_initiative_log')
+      expect(db1.listSqlTables()).toContain('dream_reflection_journal')
+
+      expect(db1.getInitiativePolicy()).toEqual({
+        enabled: true,
+        cooldownMinutes: 120,
+        maxDailyInitiatives: 3,
+        quietHoursStart: '23:00',
+        quietHoursEnd: '08:00',
+        respectDnd: true,
+        modulateByHabits: true,
+      })
+
+      const savedPolicy = db1.saveInitiativePolicy({
+        enabled: false,
+        cooldownMinutes: 180,
+        maxDailyInitiatives: 2,
+        quietHoursStart: '22:30',
+        quietHoursEnd: '07:30',
+      })
+      expect(savedPolicy.enabled).toBe(false)
+      expect(savedPolicy.cooldownMinutes).toBe(180)
+      expect(savedPolicy.maxDailyInitiatives).toBe(2)
+      expect(savedPolicy.quietHoursStart).toBe('22:30')
+      expect(savedPolicy.quietHoursEnd).toBe('07:30')
+
+      db1.insertProactiveInitiativeLog({
+        id: 'init-log-1',
+        triggerKind: 'prospective_intent',
+        sourceId: 'intent-1',
+        sourceTitle: 'Revisar deploy M4',
+        noticePrompt: '[Proactive Notice]',
+        replyText: 'E aí, como foi o deploy?',
+        decision: 'spoken',
+        reason: 'Ancorada em intenção pendente.',
+        createdAt: 1730020001000,
+      })
+
+      db1.insertDreamJournalEntry({
+        id: 'dream-j-1',
+        summary: 'Reflexão sobre sessões de madrugada e testes SQLite.',
+        sourceEpisodeIds: ['ep-1', 'ep-2'],
+        crossLinksCount: 1,
+        traitEvolutionsCount: 1,
+        createdAt: 1730020002000,
+      })
+
+      if (!forceMemoryFallback) {
+        db1.close()
+        const db2 = createCortexDatabase({ filePath: dbPath })
+        expect(db2.getInitiativePolicy()).toEqual(savedPolicy)
+        expect(db2.listProactiveInitiativeLog(10)).toHaveLength(1)
+        expect(db2.listProactiveInitiativeLog(10)[0]?.id).toBe('init-log-1')
+        expect(db2.listDreamJournalEntries(10)).toHaveLength(1)
+        expect(db2.listDreamJournalEntries(10)[0]?.sourceEpisodeIds).toEqual(['ep-1', 'ep-2'])
+        db2.close()
+      } else {
+        expect(db1.getInitiativePolicy()).toEqual(savedPolicy)
+        expect(db1.listProactiveInitiativeLog(10)).toHaveLength(1)
+        expect(db1.listDreamJournalEntries(10)).toHaveLength(1)
         db1.close()
       }
     }

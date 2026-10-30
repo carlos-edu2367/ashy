@@ -1,24 +1,34 @@
-import type {
-  ApprovableMemoryKind,
-  AshyEmotion,
-  AutobiographicalMilestone,
-  ChatMessageRecord,
-  ChatSessionRecord,
-  DreamReflectionCycleResult,
-  EpisodicMemory,
-  MemoryGovernanceCategory,
-  MemoryGovernancePolicy,
-  PersonalityEvolutionRecord,
-  PersonalityTraitKey,
-  PersonalityTraits,
-  ProspectiveIntent,
-  RelationalMotif,
-  RelationshipStage,
-  SemanticFact,
-  SemanticFactCategory,
-  SeriousnessAssessment,
-  UserHabit,
+import {
+  EvaluateInitiativeInputSchema,
+  type ApprovableMemoryKind,
+  type AshyEmotion,
+  type AutobiographicalMilestone,
+  type ChatMessageRecord,
+  type ChatSessionRecord,
+  type CrossEpisodeLink,
+  type DreamJournalEntry,
+  type DreamReflectionCycleResult,
+  type EpisodicMemory,
+  type EvaluateInitiativeInput,
+  type InitiativePolicy,
+  type MemoryGovernanceCategory,
+  type MemoryGovernancePolicy,
+  type PersonalityEvolutionRecord,
+  type PersonalityTraitKey,
+  type PersonalityTraits,
+  type ProactiveInitiativeRecord,
+  type ProspectiveIntent,
+  type RelationalMotif,
+  type RelationshipStage,
+  type RoomEnvironmentState,
+  type SemanticFact,
+  type SemanticFactCategory,
+  type SeriousnessAssessment,
+  type UpdateInitiativePolicyInput,
+  type UpdateMilestoneInput,
+  type UserHabit,
 } from '@ashy/shared'
+import * as v from 'valibot'
 import {
   applyEmotionSignalToMood,
   applyExperienceTraitDelta,
@@ -62,6 +72,8 @@ import {
   type ConversationMessage,
 } from './prompt/soul-composer'
 import { recordMotifInvocation, selectEligibleMotifs } from './relational/inside-joke-engine'
+import { evaluateAttentionLoop } from './initiative/attention-loop'
+import { deriveAshyRoomEnvironment } from './world/ashy-room'
 
 const USER_NAME_DECLARATION_RE =
   /(?:meu nome é|pode me chamar de)\s+([A-Za-zÀ-ÿ0-9_ -]{2,40})/i
@@ -933,6 +945,7 @@ export class AshyCortex {
   public async runDreamReflectionCycle(params?: {
     sessionId?: string
     nowMs?: number
+    force?: boolean
     forceConsolidate?: boolean
     maxEvolutions?: number
     generateJsonFn?: (prompt: string) => Promise<string>
@@ -1008,14 +1021,149 @@ export class AshyCortex {
       this.db.saveAffectiveState({ ...affect, traits: evoRes.traits, updatedAt: safeNow })
     }
 
+    const skippedReason = evoRes.records.length === 0 ? 'already_reflected' : null
+
+    const sourceEpisodeIds = reflectable.map((ep) => ep.id)
+    const sortedSourceKey = [...sourceEpisodeIds].sort().join(',')
+    const existingJournal = this.db.listDreamJournalEntries(20)
+    const latestEntry = existingJournal[0]
+    const hasSameEpisodeSetAsLatest =
+      latestEntry !== undefined &&
+      [...latestEntry.sourceEpisodeIds].sort().join(',') === sortedSourceKey &&
+      evoRes.records.length === 0
+
+    if (
+      (skippedReason === null || params?.force === true || existingJournal.length === 0) &&
+      !hasSameEpisodeSetAsLatest
+    ) {
+      const themesLabel =
+        crossEpisodeLinks.length > 0
+          ? crossEpisodeLinks
+              .map((l) => l.sharedTheme)
+              .slice(0, 3)
+              .join(', ')
+          : ''
+      const summary =
+        evoRes.records.length > 0 && crossEpisodeLinks.length > 0
+          ? `Reflexão noturna sobre ${reflectable.length} episódio(s): ${crossEpisodeLinks.length} conexão(ões) temática(s) (${themesLabel}) e ${evoRes.records.length} evolução(ões) de traço (${evoRes.records.map((r) => r.trait).join(', ')}).`
+          : crossEpisodeLinks.length > 0
+            ? `Reflexão sobre ${reflectable.length} episódio(s) conectados pelo tema "${themesLabel}".`
+            : evoRes.records.length > 0
+              ? `Reflexão sobre ${reflectable.length} episódio(s): ${evoRes.records.map((r) => r.explanation).join(' ')}`
+              : `Síntese reflexiva sobre ${reflectable.length} memória(s) permanente(s) do estúdio.`
+
+      this.db.insertDreamJournalEntry({
+        id: `dream-journal-${safeNow}-${existingJournal.length + 1}`,
+        summary,
+        sourceEpisodeIds,
+        crossLinksCount: crossEpisodeLinks.length,
+        traitEvolutionsCount: evoRes.records.length,
+        createdAt: safeNow,
+      })
+    }
+
     return {
       ranAt: safeNow,
       consolidatedEpisodesCount,
       reviewedMemoriesCount,
       crossEpisodeLinks,
       appliedEvolutions: evoRes.records,
-      skippedReason: evoRes.records.length === 0 ? 'already_reflected' : null,
+      skippedReason,
     }
+  }
+
+  // Phase 8 — Our Story, Ashy's Room, Dream Journal & Contextual Initiative helpers
+  public updateMilestone(input: UpdateMilestoneInput): AutobiographicalMilestone {
+    return this.db.updateMilestone(input)
+  }
+
+  public getInitiativePolicy(): InitiativePolicy {
+    return this.db.getInitiativePolicy()
+  }
+
+  public saveInitiativePolicy(input: UpdateInitiativePolicyInput): InitiativePolicy {
+    return this.db.saveInitiativePolicy(input)
+  }
+
+  public listProactiveInitiativeLog(limit = 50): ProactiveInitiativeRecord[] {
+    return this.db.listProactiveInitiativeLog(limit)
+  }
+
+  public listDreamJournalEntries(limit = 50): DreamJournalEntry[] {
+    return this.db.listDreamJournalEntries(limit)
+  }
+
+  public getCrossEpisodeLinks(): CrossEpisodeLink[] {
+    return detectCrossEpisodeLinks(this.db.listEpisodicMemories(200))
+  }
+
+  public getRoomEnvironment(options?: {
+    nowMs?: number
+    localTimeHHMM?: string
+  }): RoomEnvironmentState {
+    return deriveAshyRoomEnvironment({
+      milestones: this.db.listMilestones(),
+      episodes: this.db.listEpisodicMemories(200),
+      nowMs: options?.nowMs,
+      localTimeHHMM: options?.localTimeHHMM,
+    })
+  }
+
+  public evaluateAttentionInitiative(
+    options?: EvaluateInitiativeInput,
+  ): ProactiveInitiativeRecord {
+    const parsed = options ? v.parse(EvaluateInitiativeInputSchema, options) : {}
+    const policy = this.db.getInitiativePolicy()
+    const consent = this.db.getAgencyConsentState()
+    const dndMode = parsed.forceDnd !== undefined ? parsed.forceDnd : consent.dndMode
+    const affect = this.db.getAffectiveState()
+    const seriousness = parsed.recentUserMessage
+      ? evaluateSeriousnessGate(parsed.recentUserMessage)
+      : undefined
+
+    const episodes = this.db.listEpisodicMemories(200)
+    const milestones = this.db.listMilestones()
+    const prospectiveIntents = this.db.listProspectiveIntents()
+    const userHabits = this.db.listUserHabits()
+    const recentInitiatives = this.db.listProactiveInitiativeLog(50)
+    const crossEpisodeLinks = detectCrossEpisodeLinks(episodes)
+
+    const record = evaluateAttentionLoop({
+      policy,
+      dndMode,
+      nowMs: parsed.nowMs,
+      localTimeHHMM: parsed.localTimeHHMM,
+      prospectiveIntents,
+      milestones,
+      episodes,
+      crossEpisodeLinks,
+      userHabits,
+      recentInitiatives,
+      mood: affect.mood,
+      seriousness,
+      idleMinutes: parsed.idleMinutes,
+      activeAppTitle: parsed.activeAppTitle,
+      recentUserMessage: parsed.recentUserMessage,
+      simulatedReplyText: parsed.simulatedReplyText,
+    })
+
+    const savedRecord = this.db.insertProactiveInitiativeLog(record)
+
+    if (
+      savedRecord.decision === 'spoken' &&
+      savedRecord.triggerKind === 'prospective_intent' &&
+      savedRecord.sourceId
+    ) {
+      const targetIntent = prospectiveIntents.find((i) => i.id === savedRecord.sourceId)
+      if (targetIntent && targetIntent.status !== 'triggered') {
+        this.db.upsertProspectiveIntent({
+          ...targetIntent,
+          status: 'triggered',
+        })
+      }
+    }
+
+    return savedRecord
   }
 
   public evolveTrait(params: {

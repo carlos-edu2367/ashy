@@ -1,7 +1,9 @@
 import * as v from 'valibot'
 import { AshyEmotionSchema, type AshyEmotion } from './emotions'
+import { MilestoneCategorySchema } from './memory-types'
 import type {
   DreamReflectionCycleResult,
+  CrossEpisodeLink,
   MoodVector,
   PersonalityEvolutionRecord,
   PersonalityTraits,
@@ -322,6 +324,8 @@ export const M2_GATE_THRESHOLDS = {
   seriousnessFalseNegativeCountMax: 0,
   bondSafeguardComplianceRateMin: 1.0,
   traitDriftCorridorComplianceRateMin: 1.0,
+  initiativeGroundingRateMin: 1.0,
+  unopportuneInitiativeCountMax: 0,
 } as const
 
 const UnitIntervalSchema = v.pipe(
@@ -349,11 +353,20 @@ export const CoreExperimentMetricSummarySchema = v.object({
   ),
   bondSafeguardComplianceRate: v.optional(UnitIntervalSchema, 1.0),
   traitDriftCorridorComplianceRate: v.optional(UnitIntervalSchema, 1.0),
+  initiativeGroundingRate: v.optional(UnitIntervalSchema, 1.0),
+  unopportuneInitiativeCount: v.optional(
+    v.pipe(v.number(), v.integer(), v.minValue(0)),
+    0,
+  ),
 })
 
-export type CoreExperimentMetricSummary = v.InferOutput<
-  typeof CoreExperimentMetricSummarySchema
->
+export type CoreExperimentMetricSummary = Omit<
+  v.InferOutput<typeof CoreExperimentMetricSummarySchema>,
+  'initiativeGroundingRate' | 'unopportuneInitiativeCount'
+> & {
+  initiativeGroundingRate?: number
+  unopportuneInitiativeCount?: number
+}
 
 export const CoreExperimentTurnStepResultSchema = v.object({
   stepId: v.pipe(v.string(), v.trim(), v.nonEmpty()),
@@ -390,9 +403,12 @@ export const CoreExperimentEvalReportSchema = v.object({
   steps: v.array(CoreExperimentTurnStepResultSchema),
 })
 
-export type CoreExperimentEvalReport = v.InferOutput<
-  typeof CoreExperimentEvalReportSchema
->
+export type CoreExperimentEvalReport = Omit<
+  v.InferOutput<typeof CoreExperimentEvalReportSchema>,
+  'metrics'
+> & {
+  metrics: CoreExperimentMetricSummary
+}
 
 export const RunCoreExperimentInputSchema = v.object({
   seed: v.optional(v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(999))),
@@ -578,6 +594,230 @@ export interface AgencySnapshot {
   vision: VisionTelemetryState
 }
 
+const NonEmptyStringSchema = v.pipe(v.string(), v.trim(), v.nonEmpty())
+
+const TimestampSchema = v.pipe(
+  v.number(),
+  v.finite(),
+  v.minValue(0),
+)
+
+const NonNegativeIntSchema = v.pipe(
+  v.number(),
+  v.integer(),
+  v.minValue(0),
+)
+
+export const INITIATIVE_TRIGGER_KINDS = [
+  'prospective_intent',
+  'milestone_followup',
+  'recurring_theme',
+  'none',
+] as const
+export type InitiativeTriggerKind = (typeof INITIATIVE_TRIGGER_KINDS)[number]
+export const InitiativeTriggerKindSchema = v.picklist(INITIATIVE_TRIGGER_KINDS)
+
+export const INITIATIVE_DECISIONS = [
+  'spoken',
+  'selective_silence',
+  'suppressed_disabled',
+  'suppressed_dnd',
+  'suppressed_quiet_hours',
+  'suppressed_cooldown',
+  'suppressed_daily_limit',
+  'suppressed_habit_focus',
+  'suppressed_no_anchor',
+] as const
+export type InitiativeDecision = (typeof INITIATIVE_DECISIONS)[number]
+export const InitiativeDecisionSchema = v.picklist(INITIATIVE_DECISIONS)
+
+export const QuietHoursHHMMSchema = v.pipe(
+  v.string(),
+  v.trim(),
+  v.regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/),
+)
+
+export const InitiativePolicySchema = v.object({
+  enabled: v.optional(v.boolean(), true),
+  cooldownMinutes: v.optional(
+    v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(1440)),
+    120,
+  ),
+  maxDailyInitiatives: v.optional(
+    v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(20)),
+    3,
+  ),
+  quietHoursStart: v.optional(QuietHoursHHMMSchema, '23:00'),
+  quietHoursEnd: v.optional(QuietHoursHHMMSchema, '08:00'),
+  respectDnd: v.optional(v.boolean(), true),
+  modulateByHabits: v.optional(v.boolean(), true),
+})
+export type InitiativePolicy = v.InferOutput<typeof InitiativePolicySchema>
+
+export const DEFAULT_INITIATIVE_POLICY: Readonly<InitiativePolicy> = Object.freeze({
+  enabled: true,
+  cooldownMinutes: 120,
+  maxDailyInitiatives: 3,
+  quietHoursStart: '23:00',
+  quietHoursEnd: '08:00',
+  respectDnd: true,
+  modulateByHabits: true,
+})
+
+export const UpdateInitiativePolicyInputSchema = v.object({
+  enabled: v.optional(v.boolean()),
+  cooldownMinutes: v.optional(
+    v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(1440)),
+  ),
+  maxDailyInitiatives: v.optional(
+    v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(20)),
+  ),
+  quietHoursStart: v.optional(QuietHoursHHMMSchema),
+  quietHoursEnd: v.optional(QuietHoursHHMMSchema),
+  respectDnd: v.optional(v.boolean()),
+  modulateByHabits: v.optional(v.boolean()),
+})
+export type UpdateInitiativePolicyInput = v.InferOutput<
+  typeof UpdateInitiativePolicyInputSchema
+>
+
+export const EvaluateInitiativeInputSchema = v.object({
+  nowMs: v.optional(TimestampSchema),
+  localTimeHHMM: v.optional(QuietHoursHHMMSchema),
+  idleMinutes: v.optional(v.pipe(v.number(), v.finite(), v.minValue(0))),
+  activeAppTitle: v.optional(
+    v.pipe(v.string(), v.trim(), v.maxLength(256), v.regex(/^[^\x00]*$/)),
+  ),
+  recentUserMessage: v.optional(
+    v.pipe(v.string(), v.trim(), v.maxLength(4000), v.regex(/^[^\x00]*$/)),
+  ),
+  simulatedReplyText: v.optional(
+    v.pipe(v.string(), v.trim(), v.maxLength(4000), v.regex(/^[^\x00]*$/)),
+  ),
+  forceDnd: v.optional(v.boolean()),
+})
+export type EvaluateInitiativeInput = v.InferOutput<
+  typeof EvaluateInitiativeInputSchema
+>
+
+export const ProactiveInitiativeRecordSchema = v.object({
+  id: NonEmptyStringSchema,
+  triggerKind: InitiativeTriggerKindSchema,
+  sourceId: v.nullable(NonEmptyStringSchema),
+  sourceTitle: v.string(),
+  noticePrompt: v.string(),
+  replyText: v.nullable(v.string()),
+  decision: InitiativeDecisionSchema,
+  reason: NonEmptyStringSchema,
+  createdAt: TimestampSchema,
+})
+export type ProactiveInitiativeRecord = v.InferOutput<
+  typeof ProactiveInitiativeRecordSchema
+>
+
+export const DreamJournalEntrySchema = v.object({
+  id: NonEmptyStringSchema,
+  createdAt: TimestampSchema,
+  summary: NonEmptyStringSchema,
+  sourceEpisodeIds: v.pipe(v.array(NonEmptyStringSchema), v.minLength(1)),
+  crossLinksCount: NonNegativeIntSchema,
+  traitEvolutionsCount: NonNegativeIntSchema,
+})
+export type DreamJournalEntry = v.InferOutput<typeof DreamJournalEntrySchema>
+
+export const UpdateMilestoneInputSchema = v.object({
+  id: v.pipe(
+    v.string(),
+    v.trim(),
+    v.nonEmpty(),
+    v.maxLength(160),
+    v.regex(/^[^\x00\r\n]+$/),
+  ),
+  title: v.optional(
+    v.pipe(
+      v.string(),
+      v.trim(),
+      v.nonEmpty(),
+      v.maxLength(160),
+      v.regex(/^[^\x00\r\n]+$/),
+    ),
+  ),
+  narrative: v.optional(
+    v.pipe(
+      v.string(),
+      v.trim(),
+      v.nonEmpty(),
+      v.maxLength(2000),
+      v.regex(/^[^\x00]+$/),
+    ),
+  ),
+  category: v.optional(MilestoneCategorySchema),
+  roomTrophyId: v.optional(
+    v.nullable(
+      v.pipe(
+        v.string(),
+        v.trim(),
+        v.nonEmpty(),
+        v.maxLength(160),
+        v.regex(/^[^\x00\r\n]+$/),
+      ),
+    ),
+  ),
+})
+export type UpdateMilestoneInput = v.InferOutput<typeof UpdateMilestoneInputSchema>
+
+export const ROOM_TIME_OF_DAY_PERIODS = [
+  'morning',
+  'afternoon',
+  'evening',
+  'late_night',
+] as const
+export type RoomTimeOfDayPeriod = (typeof ROOM_TIME_OF_DAY_PERIODS)[number]
+export const RoomTimeOfDayPeriodSchema = v.picklist(ROOM_TIME_OF_DAY_PERIODS)
+
+export const ROOM_LIGHTING_PRESETS = [
+  'warm_sunrise',
+  'golden_studio',
+  'cozy_neon',
+  'midnight_lofi',
+] as const
+export type RoomLightingPreset = (typeof ROOM_LIGHTING_PRESETS)[number]
+export const RoomLightingPresetSchema = v.picklist(ROOM_LIGHTING_PRESETS)
+
+export const ROOM_TROPHY_ICON_KEYS = [
+  'mug',
+  'sparkles',
+  'rocket',
+  'moon',
+  'heart',
+  'flame',
+  'shield',
+  'duck',
+] as const
+export type RoomTrophyIconKey = (typeof ROOM_TROPHY_ICON_KEYS)[number]
+export const RoomTrophyIconKeySchema = v.picklist(ROOM_TROPHY_ICON_KEYS)
+
+export const RoomTrophyItemSchema = v.object({
+  id: NonEmptyStringSchema,
+  name: NonEmptyStringSchema,
+  description: NonEmptyStringSchema,
+  category: MilestoneCategorySchema,
+  milestoneId: NonEmptyStringSchema,
+  episodeId: v.optional(NonEmptyStringSchema),
+  unlockedAt: TimestampSchema,
+  unlocked: v.boolean(),
+  iconKey: RoomTrophyIconKeySchema,
+})
+export type RoomTrophyItem = v.InferOutput<typeof RoomTrophyItemSchema>
+
+export const RoomEnvironmentStateSchema = v.object({
+  period: RoomTimeOfDayPeriodSchema,
+  ambientLabel: NonEmptyStringSchema,
+  lightingPreset: RoomLightingPresetSchema,
+  unlockedTrophies: v.array(RoomTrophyItemSchema),
+})
+export type RoomEnvironmentState = v.InferOutput<typeof RoomEnvironmentStateSchema>
+
 export interface AshyBootstrapSnapshot {
   needsOnboarding: boolean
   userProfile: {
@@ -607,6 +847,11 @@ export interface AshyBootstrapSnapshot {
     intents?: ProspectiveIntent[]
     evolutionLog?: PersonalityEvolutionRecord[]
     governancePolicy?: MemoryGovernancePolicy
+    crossEpisodeLinks?: CrossEpisodeLink[]
+    dreamJournalEntries?: DreamJournalEntry[]
+    initiativePolicy?: InitiativePolicy
+    initiativeLog?: ProactiveInitiativeRecord[]
+    roomEnvironment?: RoomEnvironmentState
   }
   voice: {
     content: string
@@ -850,6 +1095,9 @@ export interface AshyHostBridge {
     snapshot: AgencySnapshot
   }>
   registerExternalMcpServer?(input: ExternalMcpServerConfig): Promise<AgencySnapshot>
+  updateMilestone?(input: UpdateMilestoneInput): Promise<AutobiographicalMilestone>
+  updateInitiativePolicy?(input: UpdateInitiativePolicyInput): Promise<InitiativePolicy>
+  evaluateAttentionInitiative?(input?: EvaluateInitiativeInput): Promise<ProactiveInitiativeRecord>
   onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
 

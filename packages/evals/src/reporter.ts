@@ -27,6 +27,10 @@ export function buildM2ReportPayload(
       report.metrics.bondSafeguardComplianceRate ?? 1.0,
     traitDriftCorridorComplianceRate:
       report.metrics.traitDriftCorridorComplianceRate ?? 1.0,
+    initiativeGroundingRate:
+      report.metrics.initiativeGroundingRate ?? 1.0,
+    unopportuneInitiativeCount:
+      report.metrics.unopportuneInitiativeCount ?? 0,
     seedInvariancePassed: multiSeedSummary
       ? multiSeedSummary.allPassed
       : report.passedAllGates,
@@ -38,6 +42,8 @@ export function buildM2ReportPayload(
       seriousnessFalseNegativeCount: summary.seriousnessFalseNegativeCount,
       bondSafeguardComplianceRate: summary.bondSafeguardComplianceRate,
       traitDriftCorridorComplianceRate: summary.traitDriftCorridorComplianceRate,
+      initiativeGroundingRate: summary.initiativeGroundingRate,
+      unopportuneInitiativeCount: summary.unopportuneInitiativeCount,
     },
     summary,
     gates: evaluateSummaryGates(summary),
@@ -92,13 +98,25 @@ export function formatCoreExperimentMarkdownReport(
   const sfnCount = m.seriousnessFalseNegativeCount ?? 0
   const bondRate = m.bondSafeguardComplianceRate ?? 1.0
   const corridorRate = m.traitDriftCorridorComplianceRate ?? 1.0
+  const initGroundingRate = m.initiativeGroundingRate ?? 1.0
+  const unopportuneCount = m.unopportuneInitiativeCount ?? 0
   const g11Pass = sfnCount <= M2_GATE_THRESHOLDS.seriousnessFalseNegativeCountMax
   const g12Pass = bondRate >= M2_GATE_THRESHOLDS.bondSafeguardComplianceRateMin
   const g13Pass =
     corridorRate >= M2_GATE_THRESHOLDS.traitDriftCorridorComplianceRateMin
+  const g14Pass =
+    initGroundingRate >= M2_GATE_THRESHOLDS.initiativeGroundingRateMin
+  const g15Pass =
+    unopportuneCount <= M2_GATE_THRESHOLDS.unopportuneInitiativeCountMax
 
   const overallPass =
-    report.passedAllGates && g10Pass && g11Pass && g12Pass && g13Pass
+    report.passedAllGates &&
+    g10Pass &&
+    g11Pass &&
+    g12Pass &&
+    g13Pass &&
+    g14Pass &&
+    g15Pass
 
   const lines: string[] = [
     '# Ashy — Phase 3 Core Experiment (Milestone M2) Evaluation Report',
@@ -111,7 +129,7 @@ export function formatCoreExperimentMarkdownReport(
     `- **Model B (Days 11–21):** \`${report.modelBId}\``,
     `- **Overall Status:** **${overallPass ? 'PASS (ALL GATES GREEN)' : 'FAIL'}**`,
     '',
-    '## 1. Milestone M2 Gate Summary Table (`G1`–`G13`)',
+    '## 1. Milestone M2 Gate Summary Table (`G1`–`G15`)',
     '',
     '| Gate | Metric | Threshold | Observed | Status |',
     '| :--- | :--- | :--- | :--- | :--- |',
@@ -128,6 +146,8 @@ export function formatCoreExperimentMarkdownReport(
     `| **G11** | \`seriousnessFalseNegativeCount\` | \`=== ${M2_GATE_THRESHOLDS.seriousnessFalseNegativeCountMax}\` | \`${sfnCount}\` | ${g11Pass ? 'PASS' : 'FAIL'} |`,
     `| **G12** | \`bondSafeguardComplianceRate\` | \`=== ${M2_GATE_THRESHOLDS.bondSafeguardComplianceRateMin.toFixed(2)}\` | \`${formatDec(bondRate)}\` (${formatPct(bondRate)}) | ${g12Pass ? 'PASS' : 'FAIL'} |`,
     `| **G13** | \`traitDriftCorridorComplianceRate\` | \`=== ${M2_GATE_THRESHOLDS.traitDriftCorridorComplianceRateMin.toFixed(2)}\` | \`${formatDec(corridorRate)}\` (${formatPct(corridorRate)}) | ${g13Pass ? 'PASS' : 'FAIL'} |`,
+    `| **G14** | \`initiativeGroundingRate\` | \`=== ${M2_GATE_THRESHOLDS.initiativeGroundingRateMin.toFixed(2)}\` | \`${formatDec(initGroundingRate)}\` (${formatPct(initGroundingRate)}) | ${g14Pass ? 'PASS' : 'FAIL'} |`,
+    `| **G15** | \`unopportuneInitiativeCount\` | \`=== ${M2_GATE_THRESHOLDS.unopportuneInitiativeCountMax}\` | \`${unopportuneCount}\` | ${g15Pass ? 'PASS' : 'FAIL'} |`,
     '',
   ]
 

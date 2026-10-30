@@ -194,6 +194,7 @@ export const UserAffectReactionSchema = v.object({
 export type UserAffectReaction = v.InferOutput<typeof UserAffectReactionSchema>
 
 export const CrossEpisodeLinkSchema = v.object({
+  id: v.optional(NonEmptyStringSchema),
   fromEpisodeId: NonEmptyStringSchema,
   toEpisodeId: NonEmptyStringSchema,
   sharedTheme: NonEmptyStringSchema,

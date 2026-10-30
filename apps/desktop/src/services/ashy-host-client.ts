@@ -14,12 +14,15 @@ import type {
   DeletableMemoryKind,
   DreamReflectionCycleResult,
   EpisodicMemory,
+  EvaluateInitiativeInput,
   ExternalMcpServerConfig,
+  InitiativePolicy,
   LlmProviderId,
   MemoryGovernanceCategory,
   MemoryGovernancePolicy,
   PersonalityEvolutionRecord,
   PersonalityTraits,
+  ProactiveInitiativeRecord,
   ProspectiveIntent,
   ProviderHealthResult,
   PublicProviderConfig,
@@ -31,6 +34,8 @@ import type {
   SharedPendingActionCard,
   TestProviderInput,
   UpdateAgencyConsentInput,
+  UpdateInitiativePolicyInput,
+  UpdateMilestoneInput,
   UpsertFactInput,
   VisionObservationResult,
 } from '@ashy/shared'
@@ -249,6 +254,17 @@ export function createPreloadHostBridge(
     },
     registerExternalMcpServer(input: ExternalMcpServerConfig): Promise<AgencySnapshot> {
       return invoke<AgencySnapshot>('registerExternalMcpServer', input)
+    },
+    updateMilestone(input: UpdateMilestoneInput): Promise<AutobiographicalMilestone> {
+      return invoke<AutobiographicalMilestone>('updateMilestone', input)
+    },
+    updateInitiativePolicy(input: UpdateInitiativePolicyInput): Promise<InitiativePolicy> {
+      return invoke<InitiativePolicy>('updateInitiativePolicy', input)
+    },
+    evaluateAttentionInitiative(
+      input?: EvaluateInitiativeInput,
+    ): Promise<ProactiveInitiativeRecord> {
+      return invoke<ProactiveInitiativeRecord>('evaluateAttentionInitiative', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       return preloadApi.onEvent(listener)
@@ -521,6 +537,17 @@ export function createHttpSseHostBridge(
     },
     registerExternalMcpServer(input: ExternalMcpServerConfig): Promise<AgencySnapshot> {
       return rpc<AgencySnapshot>('registerExternalMcpServer', input)
+    },
+    updateMilestone(input: UpdateMilestoneInput): Promise<AutobiographicalMilestone> {
+      return rpc<AutobiographicalMilestone>('updateMilestone', input)
+    },
+    updateInitiativePolicy(input: UpdateInitiativePolicyInput): Promise<InitiativePolicy> {
+      return rpc<InitiativePolicy>('updateInitiativePolicy', input)
+    },
+    evaluateAttentionInitiative(
+      input?: EvaluateInitiativeInput,
+    ): Promise<ProactiveInitiativeRecord> {
+      return rpc<ProactiveInitiativeRecord>('evaluateAttentionInitiative', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       listeners.add(listener)
