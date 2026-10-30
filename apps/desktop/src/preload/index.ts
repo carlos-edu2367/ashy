@@ -1,10 +1,7 @@
-import type { AshyHostStreamEvent } from '@ashy/shared'
+import type { AshyHostStreamEvent, StageOverlayRuntimeState } from '@ashy/shared'
 
 export interface IpcRendererLike {
-  invoke(
-    channel: string,
-    request: { method: string; payload?: unknown },
-  ): Promise<unknown>
+  invoke(channel: string, request?: unknown): Promise<unknown>
   on(
     channel: string,
     listener: (event: unknown, payload: AshyHostStreamEvent) => void,
@@ -27,6 +24,12 @@ export interface AshyPreloadApi {
     maxEvolutions?: number
   }): Promise<unknown>
   revertTraitEvolution?(input: { recordId: string }): Promise<unknown>
+  setOverlayIgnoreMouse?(input: {
+    ignore: boolean
+    forward?: boolean
+  }): Promise<StageOverlayRuntimeState>
+  setOverlayVisible?(input: { visible: boolean }): Promise<StageOverlayRuntimeState>
+  getOverlayState?(): Promise<StageOverlayRuntimeState>
   onEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
 
@@ -52,6 +55,24 @@ export function createAshyPreloadApi(
         method: 'revertTraitEvolution',
         payload: input,
       })
+    },
+    setOverlayIgnoreMouse(input: {
+      ignore: boolean
+      forward?: boolean
+    }): Promise<StageOverlayRuntimeState> {
+      return ipcRenderer.invoke(
+        'ashy:setOverlayIgnoreMouse',
+        input,
+      ) as Promise<StageOverlayRuntimeState>
+    },
+    setOverlayVisible(input: { visible: boolean }): Promise<StageOverlayRuntimeState> {
+      return ipcRenderer.invoke(
+        'ashy:setOverlayVisible',
+        input,
+      ) as Promise<StageOverlayRuntimeState>
+    },
+    getOverlayState(): Promise<StageOverlayRuntimeState> {
+      return ipcRenderer.invoke('ashy:getOverlayState') as Promise<StageOverlayRuntimeState>
     },
     onEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       const wrapped = (_event: unknown, payload: AshyHostStreamEvent) => {

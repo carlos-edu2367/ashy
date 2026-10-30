@@ -44,6 +44,7 @@ export interface ComposeTurnPromptInput {
   prospectiveIntents?: readonly ProspectiveIntent[]
   screenContext?: string
   interruptionControlNote?: string
+  stageControlsPromptBlock?: string
   conversationHistory?: readonly ConversationMessage[]
 }
 
@@ -73,6 +74,11 @@ export function sanitizePromptLine(raw: string | undefined | null): string {
     .replace(/<\|[\s\S]*?\|>/g, '')
     .replace(/\s+/g, ' ')
     .trim()
+}
+
+export function sanitizeStageControlsBlock(raw?: string): string {
+  if (typeof raw !== 'string') return ''
+  return raw.replace(/\0/g, '').trim().slice(0, 2000)
 }
 
 const INTENT_STOPWORDS = new Set([
@@ -400,6 +406,11 @@ export function buildVolatileTurnContext(input: ComposeTurnPromptInput): string 
         '- Diretriz de Interrupção: O usuário interrompeu sua fala anterior no meio. Reaja com naturalidade imediata ao que ele acabou de dizer, sabendo exatamente o que ele ouviu ("heard") e o que ficou por dizer ("unheard"), sem repetir o trecho já ouvido como robô.',
       ].join('\n'),
     )
+  }
+
+  const cleanStageControls = sanitizeStageControlsBlock(input.stageControlsPromptBlock)
+  if (cleanStageControls.length > 0) {
+    sections.push(['[STAGE AVATAR CAPABILITIES]', cleanStageControls].join('\n'))
   }
 
   const approvedHabits = (input.userHabits ?? []).filter(

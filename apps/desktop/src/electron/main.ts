@@ -1,4 +1,8 @@
 import {
+  DEFAULT_STAGE_OVERLAY_RUNTIME_STATE,
+  type StageOverlayRuntimeState,
+} from '@ashy/shared'
+import {
   buildAvatarSilhouetteMask,
   shouldIgnoreMouseEvent,
   type UiIslandRect,
@@ -31,6 +35,13 @@ export interface AshyElectronBrowserWindowConfig {
 export interface AshyElectronOverlayController {
   browserWindowOptions: AshyElectronBrowserWindowConfig
   silhouetteMask: Uint8Array
+  getState: () => StageOverlayRuntimeState
+  setIgnoreMouseEvents: (
+    ignore: boolean,
+    forward?: boolean,
+  ) => { changed: boolean; state: StageOverlayRuntimeState }
+  setOverlayVisible: (visible: boolean) => StageOverlayRuntimeState
+  updateSilhouetteMask: (nextMask: Uint8Array) => void
   evaluateMouseClickThrough: (params: {
     clientX: number
     clientY: number
@@ -51,13 +62,18 @@ export function createAshyElectronOverlayConfig(
   const borderThresholdPx = options.borderThresholdPx ?? 10
   const defaultIslands = options.uiIslandRects ?? []
 
-  const silhouetteMask = buildAvatarSilhouetteMask({
+  let currentMask = buildAvatarSilhouetteMask({
     centerX: 0.5,
     centerY: 0.58,
     scale: 1,
   })
 
-  return {
+  let runtimeState: StageOverlayRuntimeState = {
+    ...DEFAULT_STAGE_OVERLAY_RUNTIME_STATE,
+    shortcuts: { ...DEFAULT_STAGE_OVERLAY_RUNTIME_STATE.shortcuts },
+  }
+
+  const controller: AshyElectronOverlayController = {
     browserWindowOptions: {
       width,
       height,
@@ -74,18 +90,58 @@ export function createAshyElectronOverlayConfig(
         backgroundThrottling: false,
       },
     },
-    silhouetteMask,
+    silhouetteMask: currentMask,
+    getState() {
+      return {
+        ...runtimeState,
+        shortcuts: { ...runtimeState.shortcuts },
+      }
+    },
+    setIgnoreMouseEvents(ignore: boolean, _forward = true) {
+      const nextIgnore = Boolean(ignore)
+      if (nextIgnore === runtimeState.ignoringMouseEvents) {
+        return {
+          changed: false,
+          state: controller.getState(),
+        }
+      }
+      runtimeState = {
+        ...runtimeState,
+        ignoringMouseEvents: nextIgnore,
+      }
+      return {
+        changed: true,
+        state: controller.getState(),
+      }
+    },
+    setOverlayVisible(visible: boolean) {
+      const nextVisible = Boolean(visible)
+      runtimeState = {
+        ...runtimeState,
+        isOverlayVisible: nextVisible,
+        ignoringMouseEvents: nextVisible ? runtimeState.ignoringMouseEvents : false,
+      }
+      return controller.getState()
+    },
+    updateSilhouetteMask(nextMask: Uint8Array) {
+      if (nextMask instanceof Uint8Array && nextMask.length === 128 * 72) {
+        currentMask = nextMask
+        controller.silhouetteMask = nextMask
+      }
+    },
     evaluateMouseClickThrough(params) {
       return shouldIgnoreMouseEvent({
         clientX: params.clientX,
         clientY: params.clientY,
         viewportWidth: width,
         viewportHeight: height,
-        silhouetteMask,
+        silhouetteMask: currentMask,
         isOverUiIsland: params.isOverUiIsland ?? false,
         uiIslandRects: params.uiIslandRects ?? defaultIslands,
         borderThresholdPx,
       })
     },
   }
+
+  return controller
 }

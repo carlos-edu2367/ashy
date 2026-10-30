@@ -641,4 +641,127 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
     cleanupIpc2()
     await kernel2.stop()
   })
+
+  it('wires Stage Overlay IPC (setOverlayIgnoreMouse deduplication, setOverlayVisible, getOverlayState) and globalShortcut registration + unregisterAll on shutdown', async () => {
+    const dir = makeTempDir()
+    const handlers = new Map<string, (event: unknown, req?: unknown) => Promise<unknown> | unknown>()
+
+    const fakeIpcMain = {
+      handle: vi.fn((channel: string, handler: (event: unknown, req?: unknown) => Promise<unknown> | unknown) => {
+        handlers.set(channel, handler)
+      }),
+      removeHandler: vi.fn((channel: string) => {
+        handlers.delete(channel)
+      }),
+    }
+
+    const createdWindows: Array<{
+      options: Record<string, unknown>
+      webContents: { isDestroyed: () => boolean; send: ReturnType<typeof vi.fn> }
+      loadURL: ReturnType<typeof vi.fn>
+      setIgnoreMouseEvents: ReturnType<typeof vi.fn>
+      show: ReturnType<typeof vi.fn>
+      hide: ReturnType<typeof vi.fn>
+    }> = []
+
+    class FakeBrowserWindow {
+      options: Record<string, unknown>
+      webContents = {
+        isDestroyed: () => false,
+        send: vi.fn(),
+      }
+      loadURL = vi.fn(async () => undefined)
+      setIgnoreMouseEvents = vi.fn()
+      show = vi.fn()
+      hide = vi.fn()
+
+      constructor(options: Record<string, unknown>) {
+        this.options = options
+        createdWindows.push(this)
+      }
+    }
+
+    const registeredShortcuts = new Map<string, () => void>()
+    const fakeGlobalShortcut = {
+      register: vi.fn((accelerator: string, callback: () => void) => {
+        registeredShortcuts.set(accelerator, callback)
+        return true
+      }),
+      unregisterAll: vi.fn(() => {
+        registeredShortcuts.clear()
+      }),
+    }
+
+    const fakeApp = {
+      getPath: vi.fn(() => dir),
+      on: vi.fn(),
+    }
+
+    const booted = await bootAshyElectronMain({
+      app: fakeApp,
+      BrowserWindow: FakeBrowserWindow as unknown as never,
+      ipcMain: fakeIpcMain,
+      globalShortcut: fakeGlobalShortcut,
+      rendererUrl: 'http://localhost:5173',
+    })
+
+    const overlayWin = createdWindows[1]!
+    expect(fakeGlobalShortcut.register).toHaveBeenCalledTimes(4)
+    expect(Array.from(registeredShortcuts.keys())).toEqual(
+      expect.arrayContaining([
+        'CommandOrControl+Shift+M',
+        'CommandOrControl+Shift+E',
+        'CommandOrControl+Shift+D',
+        'CommandOrControl+Shift+H',
+      ]),
+    )
+
+    const preloadApi = createAshyPreloadApi({
+      invoke: async (channel: string, req?: unknown) => {
+        const handler = handlers.get(channel)
+        if (!handler) throw new Error(`Missing handler: ${channel}`)
+        return handler({}, req)
+      },
+      on: vi.fn(),
+      removeListener: vi.fn(),
+    })
+
+    // 1. Deduplicated setOverlayIgnoreMouse
+    const state1 = await preloadApi.setOverlayIgnoreMouse!({ ignore: true, forward: true })
+    expect(state1.ignoringMouseEvents).toBe(true)
+    expect(overlayWin.setIgnoreMouseEvents).toHaveBeenCalledTimes(1)
+    expect(overlayWin.setIgnoreMouseEvents).toHaveBeenCalledWith(true, { forward: true })
+
+    // Repeated call with ignore: true must be deduplicated
+    const state2 = await preloadApi.setOverlayIgnoreMouse!({ ignore: true, forward: true })
+    expect(state2.ignoringMouseEvents).toBe(true)
+    expect(overlayWin.setIgnoreMouseEvents).toHaveBeenCalledTimes(1)
+
+    // Transition back to ignore: false
+    const state3 = await preloadApi.setOverlayIgnoreMouse!({ ignore: false })
+    expect(state3.ignoringMouseEvents).toBe(false)
+    expect(overlayWin.setIgnoreMouseEvents).toHaveBeenCalledTimes(2)
+    expect(overlayWin.setIgnoreMouseEvents).toHaveBeenLastCalledWith(false, { forward: true })
+
+    // 2. setOverlayVisible hides and shows overlayWindow
+    const hiddenState = await preloadApi.setOverlayVisible!({ visible: false })
+    expect(hiddenState.isOverlayVisible).toBe(false)
+    expect(overlayWin.hide).toHaveBeenCalledTimes(1)
+
+    const shownState = await preloadApi.setOverlayVisible!({ visible: true })
+    expect(shownState.isOverlayVisible).toBe(true)
+    expect(overlayWin.show).toHaveBeenCalledTimes(1)
+
+    // 3. getOverlayState returns current runtime state
+    const current = await preloadApi.getOverlayState!()
+    expect(current.isOverlayVisible).toBe(true)
+    expect(current.ignoringMouseEvents).toBe(false)
+
+    // 4. Shutdown unregisters all global shortcuts and IPC handlers
+    await booted.shutdown()
+    expect(fakeGlobalShortcut.unregisterAll).toHaveBeenCalledTimes(1)
+    expect(fakeIpcMain.removeHandler).toHaveBeenCalledWith('ashy:setOverlayIgnoreMouse')
+    expect(fakeIpcMain.removeHandler).toHaveBeenCalledWith('ashy:setOverlayVisible')
+    expect(fakeIpcMain.removeHandler).toHaveBeenCalledWith('ashy:getOverlayState')
+  })
 })

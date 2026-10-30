@@ -3,6 +3,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  DEFAULT_ASHY_LIVE2D_MODEL3_JSON,
+  formatLive2DControlPrompt,
+  inspectLive2DModelJson,
+} from '@ashy/stage'
+import {
   ASHY_BASELINE_MOOD,
   ASHY_DEFAULT_TRAITS,
   ASHY_TRAIT_CORRIDORS,
@@ -1473,6 +1478,45 @@ describe('@ashy/cortex — Phase 3 Biological & Relational Memory, 4-Layer Affec
       expect(adversarialComposed.volatileTurnContext).not.toContain('<|ACT')
       expect(adversarialComposed.volatileTurnContext).not.toContain('\n[SYSTEM OVERRIDE]')
       expect(adversarialComposed.userTurnContent).not.toContain('<|ACT')
+
+      cortex.close()
+    })
+
+    it('injects [STAGE AVATAR CAPABILITIES] into volatileTurnContext with <|ACT preserved while keeping staticSystemPrompt 100% deterministic (B5)', () => {
+      const cortex = createAshyCortex({ dbPath: ':memory:' })
+      const now = Date.UTC(2026, 9, 29, 21, 0, 0)
+      const controls = inspectLive2DModelJson(DEFAULT_ASHY_LIVE2D_MODEL3_JSON)
+      const block = formatLive2DControlPrompt(controls)
+
+      const withoutStage = composeAshyTurnPrompt({
+        userMessage: 'Mostra uma expressão provocadora!',
+        nowMs: now,
+      })
+
+      const withStage = composeAshyTurnPrompt({
+        userMessage: 'Mostra uma expressão provocadora!',
+        nowMs: now,
+        stageControlsPromptBlock: `${block}\0`,
+      })
+
+      expect(withStage.staticSystemPrompt).toBe(withoutStage.staticSystemPrompt)
+      expect(withStage.volatileTurnContext).toContain('[STAGE AVATAR CAPABILITIES]')
+      expect(withStage.volatileTurnContext).toContain('<|ACT')
+      expect(withStage.volatileTurnContext).toContain('Available Motion Groups:')
+      expect(withStage.volatileTurnContext).not.toContain('\0')
+
+      const compiledWithoutStage = cortex.compileTurnPrompt({
+        userMessage: 'Mostra uma expressão provocadora!',
+        nowMs: now,
+      })
+      const compiled = cortex.compileTurnPrompt({
+        userMessage: 'Mostra uma expressão provocadora!',
+        nowMs: now,
+        stageControlsPromptBlock: block,
+      })
+      expect(compiled.staticSystemPrompt).toBe(compiledWithoutStage.staticSystemPrompt)
+      expect(compiled.volatileTurnContext).toContain('[STAGE AVATAR CAPABILITIES]')
+      expect(compiled.volatileTurnContext).toContain('<|ACT')
 
       cortex.close()
     })

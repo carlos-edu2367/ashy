@@ -1,5 +1,12 @@
 import path from 'node:path'
-import type { AshyHostBridge, AshyHostStreamEvent } from '@ashy/shared'
+import * as v from 'valibot'
+import {
+  DEFAULT_STAGE_SHORTCUTS,
+  SetStageOverlayIgnoreMouseInputSchema,
+  SetStageOverlayVisibleInputSchema,
+  type AshyHostBridge,
+  type AshyHostStreamEvent,
+} from '@ashy/shared'
 import {
   createAshyElectronOverlayConfig,
   type AshyElectronOverlayController,
@@ -18,7 +25,8 @@ export interface ElectronIpcMainLike {
     channel: string,
     listener: (
       event: unknown,
-      request: { method: string; payload?: unknown },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      request?: any,
     ) => Promise<unknown> | unknown,
   ): void
   removeHandler(channel: string): void
@@ -28,6 +36,10 @@ export interface ElectronBrowserWindowInstanceLike {
   webContents: ElectronWebContentsLike
   loadURL(url: string): Promise<void>
   loadFile?(filePath: string): Promise<void>
+  setIgnoreMouseEvents?(ignore: boolean, options?: { forward?: boolean }): void
+  show?(): void
+  hide?(): void
+  isVisible?(): boolean
 }
 
 export interface ElectronBrowserWindowConstructorLike {
@@ -45,11 +57,17 @@ export interface ElectronSafeStorageLike {
   decryptString(encrypted: Buffer): string
 }
 
+export interface ElectronGlobalShortcutLike {
+  register(accelerator: string, callback: () => void): boolean
+  unregisterAll(): void
+}
+
 export interface BootAshyElectronMainDeps {
   app: ElectronAppLike
   BrowserWindow: ElectronBrowserWindowConstructorLike
   ipcMain: ElectronIpcMainLike
   safeStorage?: ElectronSafeStorageLike
+  globalShortcut?: ElectronGlobalShortcutLike
   kernel?: AshyHostKernel
   preloadPath?: string
   rendererUrl?: string
@@ -64,11 +82,23 @@ export interface BootedAshyElectronRuntime {
   shutdown(): Promise<void>
 }
 
+export interface RegisterAshyElectronIpcOverlayOptions {
+  overlayController?: AshyElectronOverlayController
+  overlayWindow?: ElectronBrowserWindowInstanceLike | null
+  getOverlayWindow?: () => ElectronBrowserWindowInstanceLike | null | undefined
+}
+
 export function registerAshyElectronIpc(
   ipcMain: ElectronIpcMainLike,
   kernel: AshyHostBridge,
   getWebContents: () => ReadonlyArray<ElectronWebContentsLike>,
+  overlayOptions?: RegisterAshyElectronIpcOverlayOptions,
 ): () => void {
+  const overlayController =
+    overlayOptions?.overlayController ?? createAshyElectronOverlayConfig()
+  const resolveOverlayWindow = () =>
+    overlayOptions?.getOverlayWindow?.() ?? overlayOptions?.overlayWindow ?? null
+
   ipcMain.handle('ashy:rpc', async (_event, request) => {
     if (
       !request ||
@@ -86,6 +116,35 @@ export function registerAshyElectronIpc(
 
   ipcMain.handle('ashy:revertTraitEvolution', async (_event, payload) => {
     return dispatchHostRpc(kernel, 'revertTraitEvolution', payload)
+  })
+
+  ipcMain.handle('ashy:setOverlayIgnoreMouse', async (_event, payload) => {
+    const parsed = v.parse(SetStageOverlayIgnoreMouseInputSchema, payload)
+    const forward = parsed.forward ?? true
+    const { changed, state } = overlayController.setIgnoreMouseEvents(
+      parsed.ignore,
+      forward,
+    )
+    if (changed) {
+      resolveOverlayWindow()?.setIgnoreMouseEvents?.(parsed.ignore, { forward })
+    }
+    return state
+  })
+
+  ipcMain.handle('ashy:setOverlayVisible', async (_event, payload) => {
+    const parsed = v.parse(SetStageOverlayVisibleInputSchema, payload)
+    const state = overlayController.setOverlayVisible(parsed.visible)
+    const overlayWin = resolveOverlayWindow()
+    if (parsed.visible) {
+      overlayWin?.show?.()
+    } else {
+      overlayWin?.hide?.()
+    }
+    return state
+  })
+
+  ipcMain.handle('ashy:getOverlayState', async () => {
+    return overlayController.getState()
   })
 
   const unsubscribe = kernel.onHostEvent((event) => {
@@ -110,6 +169,9 @@ export function registerAshyElectronIpc(
     ipcMain.removeHandler('ashy:rpc')
     ipcMain.removeHandler('ashy:runDreamReflection')
     ipcMain.removeHandler('ashy:revertTraitEvolution')
+    ipcMain.removeHandler('ashy:setOverlayIgnoreMouse')
+    ipcMain.removeHandler('ashy:setOverlayVisible')
+    ipcMain.removeHandler('ashy:getOverlayState')
   }
 }
 
@@ -131,10 +193,18 @@ export async function bootAshyElectronMain(
   await kernel.start()
 
   const activeWindows: ElectronBrowserWindowInstanceLike[] = []
+  const overlayController = createAshyElectronOverlayConfig()
+  let overlayWindowRef: ElectronBrowserWindowInstanceLike | null = null
 
   // airi invariant: register all ipcMain.handle channels strictly BEFORE window.loadURL / loadFile
-  const cleanupIpc = registerAshyElectronIpc(deps.ipcMain, kernel, () =>
-    activeWindows.map((win) => win.webContents),
+  const cleanupIpc = registerAshyElectronIpc(
+    deps.ipcMain,
+    kernel,
+    () => activeWindows.map((win) => win.webContents),
+    {
+      overlayController,
+      getOverlayWindow: () => overlayWindowRef,
+    },
   )
 
   const preloadPath =
@@ -158,7 +228,6 @@ export async function bootAshyElectronMain(
     },
   })
 
-  const overlayController = createAshyElectronOverlayConfig()
   const overlayWindow = new deps.BrowserWindow({
     ...overlayController.browserWindowOptions,
     webPreferences: {
@@ -166,11 +235,33 @@ export async function bootAshyElectronMain(
       preload: preloadPath,
     },
   })
+  overlayWindowRef = overlayWindow
 
   activeWindows.push(hubWindow, overlayWindow)
 
   await hubWindow.loadURL(baseRendererUrl)
   await overlayWindow.loadURL(overlayUrl)
+
+  if (deps.globalShortcut) {
+    deps.globalShortcut.register(DEFAULT_STAGE_SHORTCUTS.electronGlobalMic, () => {
+      // Global shortcut for mic toggle
+    })
+    deps.globalShortcut.register(DEFAULT_STAGE_SHORTCUTS.electronGlobalEyes, () => {
+      // Global shortcut for eyes toggle
+    })
+    deps.globalShortcut.register(DEFAULT_STAGE_SHORTCUTS.electronGlobalDnd, () => {
+      // Global shortcut for DND toggle
+    })
+    deps.globalShortcut.register(DEFAULT_STAGE_SHORTCUTS.electronGlobalHideStage, () => {
+      const nextVisible = !overlayController.getState().isOverlayVisible
+      overlayController.setOverlayVisible(nextVisible)
+      if (nextVisible) {
+        overlayWindow.show?.()
+      } else {
+        overlayWindow.hide?.()
+      }
+    })
+  }
 
   let isShuttingDown = false
   const processRef = deps.processRef ?? process
@@ -179,6 +270,7 @@ export async function bootAshyElectronMain(
     if (isShuttingDown) return
     isShuttingDown = true
     processRef.removeListener('SIGINT', onSigInt)
+    deps.globalShortcut?.unregisterAll()
     cleanupIpc()
     await kernel.stop()
   }
