@@ -21,7 +21,12 @@ export interface Live2DWebGLStageProps {
 interface Live2DInternalModelLike {
   width?: number
   height?: number
+  originalWidth?: number
+  originalHeight?: number
   coreModel?: CubismCoreModelLike
+  focusController?: {
+    focus: (x: number, y: number, instant?: boolean) => void
+  }
   on: (event: string, fn: () => void) => void
   off: (event: string, fn: () => void) => void
 }
@@ -91,19 +96,25 @@ export function Live2DWebGLStage({
 
         cleanupModel = model
 
-        const fitScale =
-          Math.min(
-            width / (model.internalModel.width || 1200),
-            height / (model.internalModel.height || 1600),
-          ) * 1.65
-        model.anchor.set(0.5, 0.32)
+        const isMao = /\/mao\//i.test(modelUrl) || /mao\.model3\.json/i.test(modelUrl)
+        const modelHeight = model.internalModel.originalHeight || model.internalModel.height || 4200
+        const fitScale = (height / modelHeight) * (isMao ? 2.15 : 1.78)
+        model.anchor.set(0.5, isMao ? 0.31 : 0.17)
         model.scale.set(fitScale)
-        model.position.set(width * 0.5, height * 0.42)
+        model.position.set(width * 0.5, height * (isMao ? 0.56 : 0.45))
 
         const updateHandler = () => {
+          const currentParams = latestParamsRef.current
+          if (model.internalModel.focusController?.focus) {
+            model.internalModel.focusController.focus(
+              currentParams.ParamEyeBallX,
+              -currentParams.ParamEyeBallY,
+              true,
+            )
+          }
           applyLive2DParametersToCoreModel(
             (model.internalModel as { coreModel?: CubismCoreModelLike }).coreModel,
-            latestParamsRef.current,
+            currentParams,
           )
         }
         cleanupUpdateHandler = updateHandler
@@ -160,6 +171,7 @@ export function Live2DWebGLStage({
       }}
     >
       <canvas
+        key={`${modelUrl}-${width}-${height}`}
         ref={canvasRef}
         data-testid="live2d-webgl-canvas"
         width={width}
