@@ -47,6 +47,10 @@ import {
   SetStageOverlayIgnoreMouseInputSchema,
   SetStageOverlayVisibleInputSchema,
   DEFAULT_STAGE_SHORTCUTS,
+  STAGE_AVATAR_MODES,
+  LIVE2D_BUILTIN_MODEL_IDS,
+  BUILTIN_LIVE2D_MODEL_PRESETS,
+  PNGTUBER_SPRITE_STATE_KEYS,
   DEFAULT_STAGE_OVERLAY_RUNTIME_STATE,
 } from '../index'
 
@@ -751,6 +755,27 @@ describe('@ashy/shared host-protocol', () => {
     expect(DEFAULT_STAGE_OVERLAY_RUNTIME_STATE.isOverlayVisible).toBe(true)
     expect(DEFAULT_STAGE_OVERLAY_RUNTIME_STATE.ignoringMouseEvents).toBe(false)
     expect(DEFAULT_STAGE_OVERLAY_RUNTIME_STATE.activeStageMode).toBe('tachie')
+
+    expect(STAGE_AVATAR_MODES).toEqual(['tachie', 'live2d', 'vrm'])
+    expect(LIVE2D_BUILTIN_MODEL_IDS).toEqual(['hiyori', 'haru', 'mao'])
+    expect(BUILTIN_LIVE2D_MODEL_PRESETS.map((p) => p.id)).toEqual(['hiyori', 'haru', 'mao'])
+    expect(BUILTIN_LIVE2D_MODEL_PRESETS[0]?.modelJsonUrl).toBe(
+      '/live2d/models/hiyori/Hiyori.model3.json',
+    )
+    expect(BUILTIN_LIVE2D_MODEL_PRESETS[1]?.modelJsonUrl).toBe(
+      '/live2d/models/haru/Haru.model3.json',
+    )
+    expect(BUILTIN_LIVE2D_MODEL_PRESETS[2]?.modelJsonUrl).toBe(
+      '/live2d/models/mao/Mao.model3.json',
+    )
+    expect(PNGTUBER_SPRITE_STATE_KEYS).toEqual([
+      'eyes_open_mouth_closed',
+      'eyes_open_mouth_open',
+      'eyes_open_mouth_smile',
+      'eyes_closed_mouth_closed',
+      'eyes_closed_mouth_open',
+      'concerned',
+    ])
     expect(DEFAULT_STAGE_OVERLAY_RUNTIME_STATE.loadedLive2DModelName).toBe(
       'ashy-default.model3.json',
     )

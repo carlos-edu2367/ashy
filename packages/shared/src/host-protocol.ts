@@ -80,6 +80,62 @@ export const ASHY_EYE_LAYER_STATES = ['open', 'half', 'closed', 'wink'] as const
 export type AshyEyeLayerState = (typeof ASHY_EYE_LAYER_STATES)[number]
 export const AshyEyeLayerStateSchema = v.picklist(ASHY_EYE_LAYER_STATES)
 
+export const STAGE_AVATAR_MODES = ['tachie', 'live2d', 'vrm'] as const
+export type StageAvatarMode = (typeof STAGE_AVATAR_MODES)[number]
+
+export const LIVE2D_BUILTIN_MODEL_IDS = ['hiyori', 'haru', 'mao'] as const
+export type Live2DBuiltinModelId = (typeof LIVE2D_BUILTIN_MODEL_IDS)[number]
+
+export interface Live2DModelPreset {
+  id: Live2DBuiltinModelId
+  label: string
+  description: string
+  modelJsonUrl: string
+  cubismVersion: 4
+  scale: number
+  offsetY: number
+}
+
+export const BUILTIN_LIVE2D_MODEL_PRESETS: readonly Live2DModelPreset[] = [
+  {
+    id: 'hiyori',
+    label: 'Hiyori Momose (Cubism 4)',
+    description: 'Personagem anime colegial expressiva com física completa de cabelo longo e uniforme.',
+    modelJsonUrl: '/live2d/models/hiyori/Hiyori.model3.json',
+    cubismVersion: 4,
+    scale: 0.24,
+    offsetY: 0.08,
+  },
+  {
+    id: 'haru',
+    label: 'Haru Greeter (Cubism 4)',
+    description: 'Recepcionista anime clássica da Live2D com movimentos suaves de cabeça e expressões ricas.',
+    modelJsonUrl: '/live2d/models/haru/Haru.model3.json',
+    cubismVersion: 4,
+    scale: 0.24,
+    offsetY: 0.06,
+  },
+  {
+    id: 'mao',
+    label: 'Mao Pro (Cubism 4)',
+    description: 'Bruxinha anime vibrante (usada no Open-LLM-VTuber) com chapéu, capa e efeitos mágicos.',
+    modelJsonUrl: '/live2d/models/mao/Mao.model3.json',
+    cubismVersion: 4,
+    scale: 0.2,
+    offsetY: 0.1,
+  },
+] as const
+
+export const PNGTUBER_SPRITE_STATE_KEYS = [
+  'eyes_open_mouth_closed',
+  'eyes_open_mouth_open',
+  'eyes_open_mouth_smile',
+  'eyes_closed_mouth_closed',
+  'eyes_closed_mouth_open',
+  'concerned',
+] as const
+export type PngTuberSpriteStateKey = (typeof PNGTUBER_SPRITE_STATE_KEYS)[number]
+
 export interface StageShortcutBindings {
   toggleMic: string
   toggleEyes: string

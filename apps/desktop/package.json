@@ -14,7 +14,11 @@
     "@ashy/shared": "workspace:*",
     "@ashy/stage": "workspace:*",
     "@ashy/voice": "workspace:*",
+    "@pixi/core": "^7.4.2",
+    "@pixi/display": "^7.4.2",
     "lucide-react": "^0.487.0",
+    "pixi-live2d-display-lipsyncpatch": "^0.5.0-ls-8",
+    "pixi.js": "^7.4.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "zustand": "^5.0.3"

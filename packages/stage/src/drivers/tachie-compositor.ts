@@ -27,6 +27,7 @@ export interface Live2DParameterMap {
   ParamBrowRY: number
   ParamMouthOpenY: number
   ParamMouthForm: number
+  ParamCheek: number
   ParamBreath: number
 }
 
@@ -122,6 +123,7 @@ export function computeLive2DParameterMap(
     ParamBrowRY: Number.isFinite(pose.browRY) ? pose.browRY : 0,
     ParamMouthOpenY: Number.isFinite(pose.mouthOpen) ? pose.mouthOpen : 0,
     ParamMouthForm: Number.isFinite(pose.mouthForm) ? pose.mouthForm : 0,
+    ParamCheek: Number.isFinite(pose.cheekBlush) ? pose.cheekBlush : 0,
     ParamBreath: Number.isFinite(breathValue) ? breathValue : 0,
   }
 }

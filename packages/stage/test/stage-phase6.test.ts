@@ -19,6 +19,12 @@ import {
   buildDynamicAvatarSilhouetteMask,
   computeLive2DParameterMap,
   renderTachieStageToCanvas,
+  hasWebGLSupport,
+  applyLive2DParametersToCoreModel,
+  resolvePngTuberSpriteState,
+  PNGTUBER_SPRITE_PATHS,
+  computePngTuberBounceTransform,
+  Live2DWebGLStage,
   AshyStageCanvas,
 } from '../src/index'
 
@@ -285,6 +291,200 @@ describe('@ashy/stage — Phase 6 Digital Body & Presence Suite', () => {
       expect(calls).toContain('ellipse')
       expect(calls).toContain('fill')
       expect(calls).toContain('restore')
+    })
+  })
+
+  describe('4. Phase 6.1 Live2D Cubism 4 Bridge, PNGTuber Sprite Engine & Live2DWebGLStage', () => {
+    it('writes all Cubism 4 parameters including ParamA (Red-Team B4) and ParamBodyAngleX/Y/Z in applyLive2DParametersToCoreModel', () => {
+      const written: Record<string, { value: number; weight?: number }> = {}
+      const mockCoreModel = {
+        setParameterValueById: (id: string, value: number, weight?: number) => {
+          written[id] = { value, weight }
+        },
+      }
+
+      // Safely no-ops on null/undefined coreModel
+      expect(() =>
+        applyLive2DParametersToCoreModel(null, {
+          ParamAngleX: 10,
+          ParamAngleY: -8,
+          ParamAngleZ: 4,
+          ParamEyeLOpen: 0.9,
+          ParamEyeROpen: 0.85,
+          ParamEyeBallX: 0.2,
+          ParamEyeBallY: -0.1,
+          ParamBrowLY: 0.3,
+          ParamBrowRY: 0.25,
+          ParamMouthOpenY: 0.72,
+          ParamMouthForm: 0.6,
+          ParamCheek: 0.55,
+          ParamBreath: 0.4,
+        }),
+      ).not.toThrow()
+
+      applyLive2DParametersToCoreModel(mockCoreModel, {
+        ParamAngleX: 10,
+        ParamAngleY: -8,
+        ParamAngleZ: 4,
+        ParamEyeLOpen: 0.9,
+        ParamEyeROpen: 0.85,
+        ParamEyeBallX: 0.2,
+        ParamEyeBallY: -0.1,
+        ParamBrowLY: 0.3,
+        ParamBrowRY: 0.25,
+        ParamMouthOpenY: 0.72,
+        ParamMouthForm: 0.6,
+        ParamCheek: 0.55,
+        ParamBreath: 0.4,
+      })
+
+      expect(written.ParamAngleX?.value).toBe(10)
+      expect(written.ParamAngleY?.value).toBe(-8)
+      expect(written.ParamAngleZ?.value).toBe(4)
+      expect(written.ParamBodyAngleX?.value).toBeCloseTo(3.5, 3)
+      expect(written.ParamBodyAngleY?.value).toBeCloseTo(-2.0, 3)
+      expect(written.ParamBodyAngleZ?.value).toBeCloseTo(1.4, 3)
+      expect(written.ParamEyeLOpen?.value).toBe(0.9)
+      expect(written.ParamEyeROpen?.value).toBe(0.85)
+      expect(written.ParamEyeLSmile?.value).toBe(0.6)
+      expect(written.ParamEyeRSmile?.value).toBe(0.6)
+      expect(written.ParamEyeBallX?.value).toBe(0.2)
+      expect(written.ParamEyeBallY?.value).toBe(-0.1)
+      expect(written.ParamBrowLY?.value).toBe(0.3)
+      expect(written.ParamBrowRY?.value).toBe(0.25)
+      expect(written.ParamMouthOpenY?.value).toBe(0.72)
+      // Red-Team B4: Mao.model3.json uses ParamA for lip-sync
+      expect(written.ParamA?.value).toBe(0.72)
+      expect(written.ParamMouthForm?.value).toBe(0.6)
+      expect(written.ParamCheek?.value).toBe(0.55)
+      expect(written.ParamBreath?.value).toBe(0.4)
+    })
+
+    it('resolves all 6 painted PNGTuber sprite states and Veadotube-style elastic squash-and-stretch transforms', () => {
+      expect(
+        resolvePngTuberSpriteState({
+          eyeState: 'open',
+          activeViseme: 'closed',
+          emotion: 'concerned',
+          isSpeaking: false,
+        }),
+      ).toBe('concerned')
+
+      expect(
+        resolvePngTuberSpriteState({
+          eyeState: 'closed',
+          activeViseme: 'closed',
+          emotion: 'neutral',
+          isSpeaking: false,
+        }),
+      ).toBe('eyes_closed_mouth_closed')
+
+      expect(
+        resolvePngTuberSpriteState({
+          eyeState: 'happy_arc',
+          activeViseme: 'A',
+          emotion: 'happy',
+          isSpeaking: true,
+        }),
+      ).toBe('eyes_closed_mouth_open')
+
+      expect(
+        resolvePngTuberSpriteState({
+          eyeState: 'open',
+          activeViseme: 'E',
+          emotion: 'neutral',
+          isSpeaking: true,
+        }),
+      ).toBe('eyes_open_mouth_smile')
+
+      expect(
+        resolvePngTuberSpriteState({
+          eyeState: 'open',
+          activeViseme: 'A',
+          emotion: 'neutral',
+          isSpeaking: true,
+        }),
+      ).toBe('eyes_open_mouth_open')
+
+      expect(
+        resolvePngTuberSpriteState({
+          eyeState: 'open',
+          activeViseme: 'closed',
+          emotion: 'excited',
+          isSpeaking: false,
+        }),
+      ).toBe('eyes_open_mouth_smile')
+
+      expect(
+        resolvePngTuberSpriteState({
+          eyeState: 'open',
+          activeViseme: 'closed',
+          emotion: 'neutral',
+          isSpeaking: false,
+        }),
+      ).toBe('eyes_open_mouth_closed')
+
+      expect(PNGTUBER_SPRITE_PATHS.eyes_open_mouth_closed).toBe(
+        '/assets/default-avatar/sprites/ashy-eyes-open-mouth-closed.png',
+      )
+      expect(PNGTUBER_SPRITE_PATHS.concerned).toBe(
+        '/assets/default-avatar/sprites/ashy-concerned.png',
+      )
+
+      const speakingBounce = computePngTuberBounceTransform({
+        mouthOpen: 0.85,
+        isSpeaking: true,
+        breathValue: 0.5,
+        headTx: 10,
+        headTy: -4,
+        headRotDeg: 2,
+        motionPreset: 'bounce',
+      })
+      expect(speakingBounce.scaleY).toBeGreaterThan(speakingBounce.scaleX)
+      expect(speakingBounce.translateY).toBeLessThan(0)
+      expect(speakingBounce.cssTransform).toContain('translate3d(')
+      expect(speakingBounce.cssTransform).toContain('scale(')
+
+      const silentBounce = computePngTuberBounceTransform({
+        mouthOpen: 0.85,
+        isSpeaking: false,
+        breathValue: 0,
+        headTx: 0,
+        headTy: 0,
+        headRotDeg: 0,
+        motionPreset: 'idle',
+      })
+      expect(silentBounce.scaleX).toBe(1.03)
+      expect(silentBounce.scaleY).toBe(1.03)
+      expect(silentBounce.translateY).toBe(0)
+    })
+
+    it('renders Live2DWebGLStage safely in SSR/jsdom without throwing on missing window.Live2DCubismCore (Red-Team B1)', () => {
+      expect(hasWebGLSupport()).toBe(false)
+      const html = renderToStaticMarkup(
+        React.createElement(Live2DWebGLStage, {
+          modelUrl: '/live2d/models/hiyori/Hiyori.model3.json',
+          params: {
+            ParamAngleX: 0,
+            ParamAngleY: 0,
+            ParamAngleZ: 0,
+            ParamEyeLOpen: 0.9,
+            ParamEyeROpen: 0.9,
+            ParamEyeBallX: 0,
+            ParamEyeBallY: 0,
+            ParamBrowLY: 0,
+            ParamBrowRY: 0,
+            ParamMouthOpenY: 0.5,
+            ParamMouthForm: 0.2,
+            ParamCheek: 0.1,
+            ParamBreath: 0.3,
+          },
+          width: 380,
+          height: 460,
+        }),
+      )
+      expect(html).toContain('data-testid="live2d-webgl-stage"')
+      expect(html).toContain('data-live2d-model-url="/live2d/models/hiyori/Hiyori.model3.json"')
     })
   })
 })
