@@ -10,6 +10,9 @@ import {
   buildTachieLayerSvgMap,
   computeStageFrameState,
   inspectLive2DModelJson,
+  synthesizeFormantVowelPcm,
+  analyzePcmFrameToVowels,
+  createStageSpeechSynchronizer,
 } from '../src/index'
 
 describe('@ashy/stage — Phase 6 Digital Body & Presence Suite', () => {
@@ -104,6 +107,70 @@ describe('@ashy/stage — Phase 6 Digital Body & Presence Suite', () => {
         expect(Number.isFinite(impNan.scale)).toBe(true)
       }
       expect(ASHY_VISEME_KEYS).toContain(speakingLayers.activeViseme)
+    })
+  })
+
+  describe('2. Acoustic Lip-Sync Analyzer (Formants/ZCR/RMS) & <|ACT|> Audio Timeline Sync', () => {
+    it('extracts distinct dominant vowels (A, E, I, O, U) and sibilant S from raw PCM formant waveforms', () => {
+      const sampleRate = 16000
+      for (const targetVowel of ['A', 'E', 'I', 'O', 'U'] as const) {
+        const pcm = synthesizeFormantVowelPcm(targetVowel, 60, sampleRate)
+        const analyzed = analyzePcmFrameToVowels(pcm, sampleRate)
+        expect(analyzed.rawVolume).toBeGreaterThan(0.15)
+        expect(analyzed.dominantVowel).toBe(targetVowel)
+        expect(analyzed.rawVowels[targetVowel]).toBeGreaterThan(0.45)
+      }
+
+      // High-ZCR sibilant noise ('S') maps strongly to rawVowels.S and feeds I in WinnerRunnerUpVowelDriver
+      const sibilantPcm = synthesizeFormantVowelPcm('S', 60, sampleRate)
+      const sibilantFrame = analyzePcmFrameToVowels(sibilantPcm, sampleRate)
+      expect(sibilantFrame.rawVowels.S).toBeGreaterThan(0.5)
+      expect(sibilantFrame.zeroCrossingRate).toBeGreaterThan(0.25)
+
+      // Silence / NaN / Infinity safety
+      const silentFrame = analyzePcmFrameToVowels(new Float32Array(320), sampleRate)
+      expect(silentFrame.rawVolume).toBe(0)
+      expect(silentFrame.dominantVowel).toBeNull()
+
+      const poisoned = new Float32Array([Number.NaN, Number.POSITIVE_INFINITY, -999, 0])
+      const safePoison = analyzePcmFrameToVowels(poisoned, sampleRate)
+      expect(Number.isFinite(safePoison.rawVolume)).toBe(true)
+      expect(Number.isFinite(safePoison.rawVowels.A)).toBe(true)
+    })
+
+    it('synchronizes multi-<|ACT|> keyframes and acoustic vowel frames along the TTS audio playback clock', () => {
+      const sampleRate = 16000
+      const segA = synthesizeFormantVowelPcm('A', 200, sampleRate)
+      const segO = synthesizeFormantVowelPcm('O', 200, sampleRate)
+      const combined = new Float32Array(segA.length + segO.length)
+      combined.set(segA, 0)
+      combined.set(segO, segA.length)
+
+      const sync = createStageSpeechSynchronizer({
+        samples: combined,
+        sampleRate,
+        actKeyframes: [
+          { atMs: 0, emotion: 'smug', intensity: 0.8, motion: 'tease' },
+          { atMs: 200, emotion: 'excited', intensity: 0.95, motion: 'bounce' },
+        ],
+      })
+
+      const at50ms = sync.sampleAt(50)
+      expect(at50ms.isSpeaking).toBe(true)
+      expect(at50ms.emotion).toBe('smug')
+      expect(at50ms.motion).toBe('tease')
+      expect(at50ms.acoustic.dominantVowel).toBe('A')
+      expect(at50ms.driverFrame.winner).toBe('A')
+
+      const at260ms = sync.sampleAt(260)
+      expect(at260ms.isSpeaking).toBe(true)
+      expect(at260ms.emotion).toBe('excited')
+      expect(at260ms.motion).toBe('bounce')
+      expect(at260ms.acoustic.dominantVowel).toBe('O')
+      expect(at260ms.driverFrame.winner).toBe('O')
+
+      const afterEnd = sync.sampleAt(500)
+      expect(afterEnd.isSpeaking).toBe(false)
     })
   })
 })
