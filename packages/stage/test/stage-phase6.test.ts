@@ -1,5 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import React from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import { ASHY_EMOTIONS, ASHY_MOTION_PRESETS, ASHY_VISEME_KEYS } from '@ashy/shared'
 import {
@@ -13,6 +15,11 @@ import {
   synthesizeFormantVowelPcm,
   analyzePcmFrameToVowels,
   createStageSpeechSynchronizer,
+  extractCanvasSilhouetteMask128x72,
+  buildDynamicAvatarSilhouetteMask,
+  computeLive2DParameterMap,
+  renderTachieStageToCanvas,
+  AshyStageCanvas,
 } from '../src/index'
 
 describe('@ashy/stage — Phase 6 Digital Body & Presence Suite', () => {
@@ -171,6 +178,113 @@ describe('@ashy/stage — Phase 6 Digital Body & Presence Suite', () => {
 
       const afterEnd = sync.sampleAt(500)
       expect(afterEnd.isSpeaking).toBe(false)
+    })
+  })
+
+  describe('3. Multi-Layer Tachie/Live2D Compositor, 4 Hz Dynamic Silhouette & Deduplicated Click-Through', () => {
+    it('extracts a 128x72 silhouette mask from RGBA image data or dynamic head/torso pose offsets', () => {
+      const rgbaWidth = 256
+      const rgbaHeight = 144
+      const rgba = new Uint8ClampedArray(rgbaWidth * rgbaHeight * 4)
+      // Paint opaque pixel block in the top-left quadrant (col 10..20, row 10..20)
+      for (let r = 10; r < 20; r++) {
+        for (let c = 10; c < 20; c++) {
+          const idx = (r * rgbaWidth + c) * 4
+          rgba[idx] = 240
+          rgba[idx + 1] = 160
+          rgba[idx + 2] = 180
+          rgba[idx + 3] = 255
+        }
+      }
+
+      const mask = extractCanvasSilhouetteMask128x72(rgba, rgbaWidth, rgbaHeight)
+      expect(mask.length).toBe(128 * 72)
+      expect(mask[7 * 128 + 7]).toBe(255)
+      expect(mask[60 * 128 + 110]).toBe(0)
+
+      // Empty/invalid dimensions guard
+      const emptyMask = extractCanvasSilhouetteMask128x72(new Uint8Array(0), 0, 0)
+      expect(emptyMask.length).toBe(128 * 72)
+
+      // Dynamic pose mask shifts with headTx / headTy
+      const shiftedMask = buildDynamicAvatarSilhouetteMask({
+        headTx: 38,
+        headTy: -20,
+        viewportWidth: 380,
+        viewportHeight: 460,
+      })
+      expect(shiftedMask.length).toBe(128 * 72)
+
+      // Live2D parameter map computation
+      const frame = computeStageFrameState({
+        emotion: 'chaotic',
+        emotionIntensity: 0.9,
+        isSpeaking: true,
+        vowels: { A: 0.8, E: 0, I: 0, O: 0, U: 0 },
+      })
+      const live2dParams = computeLive2DParameterMap(frame)
+      expect(live2dParams.ParamMouthOpenY).toBeGreaterThan(0.5)
+      expect(Number.isFinite(live2dParams.ParamEyeLOpen)).toBe(true)
+      expect(Number.isFinite(live2dParams.ParamAngleX)).toBe(true)
+    })
+
+    it('renders visible Tachie layers, active viseme/eye/motion attributes, and Live2D parameter HUD in AshyStageCanvas', () => {
+      const tachieHtml = renderToStaticMarkup(
+        React.createElement(AshyStageCanvas, {
+          emotion: 'smug',
+          emotionIntensity: 0.9,
+          isSpeaking: true,
+          rawVowels: { A: 0.85, E: 0.2, I: 0, O: 0, U: 0 },
+          rawVolume: 0.85,
+          motionPreset: 'tease',
+          mode: 'tachie',
+        }),
+      )
+      expect(tachieHtml).toContain('data-testid="ashy-stage-render-canvas"')
+      expect(tachieHtml).toContain('data-testid="ashy-tachie-svg"')
+      expect(tachieHtml).toContain('data-active-viseme="A"')
+      expect(tachieHtml).toContain('data-motion-preset="tease"')
+      // Must NOT have opacity:0.01 on the Tachie SVG in Phase 6
+      expect(tachieHtml).not.toContain('opacity:0.01')
+
+      const live2dHtml = renderToStaticMarkup(
+        React.createElement(AshyStageCanvas, {
+          emotion: 'chaotic',
+          mode: 'live2d',
+          isSpeaking: false,
+          transparentBackground: true,
+        }),
+      )
+      expect(live2dHtml).toContain('data-testid="live2d-parameter-hud"')
+      expect(live2dHtml).toContain('ParamMouthOpenY')
+      expect(typeof renderTachieStageToCanvas).toBe('function')
+
+      // Verify renderTachieStageToCanvas draws layers cleanly and survives partial mocks
+      const calls: string[] = []
+      const mockCtx = {
+        clearRect: () => calls.push('clearRect'),
+        save: () => calls.push('save'),
+        scale: () => calls.push('scale'),
+        beginPath: () => calls.push('beginPath'),
+        ellipse: () => calls.push('ellipse'),
+        arc: () => calls.push('arc'),
+        fill: () => calls.push('fill'),
+        restore: () => calls.push('restore'),
+        fillStyle: '',
+      } as unknown as CanvasRenderingContext2D
+
+      const testFrame = computeStageFrameState({
+        emotion: 'tease',
+        emotionIntensity: 0.9,
+        isSpeaking: true,
+        vowels: { A: 0.7, E: 0, I: 0, O: 0, U: 0 },
+      })
+      const testLayers = resolveTachieActiveLayers(testFrame, 'tease')
+      renderTachieStageToCanvas(mockCtx, testFrame, testLayers, 380, 460)
+      expect(calls).toContain('clearRect')
+      expect(calls).toContain('ellipse')
+      expect(calls).toContain('fill')
+      expect(calls).toContain('restore')
     })
   })
 })

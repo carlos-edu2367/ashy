@@ -1,5 +1,5 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react'
-import { ASHY_EMOTIONS, type AshyEmotion } from '@ashy/shared'
+import { ASHY_EMOTIONS, type AshyEmotion, type AshyMotionPreset } from '@ashy/shared'
 import {
   type FacialExpressionPose,
   type VowelKey,
@@ -21,6 +21,21 @@ import {
   shouldIgnoreMouseEvent,
   type UiIslandRect,
 } from '../drivers/hit-test-cpu'
+import {
+  inspectLive2DModelJson,
+  type Live2DModelControls,
+} from '../drivers/live2d-inspector'
+import {
+  DEFAULT_ASHY_LIVE2D_MODEL3_JSON,
+  computeMotionImpulseOffset,
+  resolveTachieActiveLayers,
+} from '../drivers/tachie-manifest'
+import {
+  buildDynamicAvatarSilhouetteMask,
+  computeLive2DParameterMap,
+  extractCanvasSilhouetteMask128x72,
+  renderTachieStageToCanvas,
+} from '../drivers/tachie-compositor'
 
 export const EMOTION_FACIAL_PRESETS: Readonly<Record<AshyEmotion, Readonly<FacialExpressionPose>>> =
   Object.freeze({
@@ -381,6 +396,9 @@ export interface AshyStageCanvasProps {
   bubbleText?: string
   statusLabel?: AshyPresenceStatus | string
   mode?: 'tachie' | 'live2d'
+  motionPreset?: AshyMotionPreset
+  transparentBackground?: boolean
+  live2dControls?: Live2DModelControls
   width?: number
   height?: number
   fullBleed?: boolean
@@ -400,6 +418,9 @@ export function AshyStageCanvas({
   bubbleText,
   statusLabel = 'Idle',
   mode = 'tachie',
+  motionPreset,
+  transparentBackground = false,
+  live2dControls,
   width = 380,
   height = 460,
   fullBleed = false,
@@ -408,6 +429,7 @@ export function AshyStageCanvas({
   onIgnoreMouseChange,
 }: AshyStageCanvasProps): React.ReactElement {
   const gradientId = useId()
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const vowelDriverRef = useRef(createWinnerRunnerUpVowelDriver())
   const visemeBlenderRef = useRef(createDynamicVisemeBlender())
   const blinkDriverRef = useRef(createAutoBlinkDriver())
@@ -415,11 +437,10 @@ export function AshyStageCanvas({
   const squintDriverRef = useRef(createRetinalLightSquint({ initialLuminance: ambientLuminance }))
   const headSpringRef = useRef(createSubsteppedSpring2D({ x: 0, y: 0 }))
   const bubbleSpringRef = useRef(createSubsteppedSpring2D({ x: 0, y: 0 }))
-
-  const silhouetteMask = useMemo(
-    () => buildAvatarSilhouetteMask({ centerX: 0.5, centerY: 0.58, scale: 1 }),
-    [],
+  const silhouetteMaskRef = useRef<Uint8Array>(
+    buildAvatarSilhouetteMask({ centerX: 0.5, centerY: 0.58, scale: 1 }),
   )
+  const lastIgnoreMouseRef = useRef<boolean | null>(null)
 
   const initialSynchronizedFrame = useMemo(() => {
     const vFrame = vowelDriverRef.current.step({
@@ -492,11 +513,13 @@ export function AshyStageCanvas({
       const saccadeState = saccadeDriverRef.current.step(dtSeconds, gazeTarget)
       const squintState = squintDriverRef.current.step(ambientLuminance, dtSeconds)
       const breathValue = sampleBreathCycle(elapsedSec / 3.8)
+      const activeMotion = motionPreset ?? 'idle'
+      const motionImp = computeMotionImpulseOffset(activeMotion, elapsedSec)
 
       const springState = headSpringRef.current.step(
         {
-          x: saccadeState.headFocus.x * 18,
-          y: saccadeState.headFocus.y * 12 - breathValue * 5,
+          x: saccadeState.headFocus.x * 18 + motionImp.x,
+          y: saccadeState.headFocus.y * 12 - breathValue * 5 + motionImp.y,
         },
         dtSeconds,
       )
@@ -532,7 +555,98 @@ export function AshyStageCanvas({
     return () => {
       window.cancelAnimationFrame(rafId)
     }
-  }, [emotion, emotionIntensity, isSpeaking, rawVowels, rawVolume, ambientLuminance, gazeTarget])
+  }, [
+    emotion,
+    emotionIntensity,
+    isSpeaking,
+    rawVowels,
+    rawVolume,
+    ambientLuminance,
+    gazeTarget,
+    motionPreset,
+  ])
+
+  const resolvedLayers = useMemo(
+    () => resolveTachieActiveLayers(frame, motionPreset),
+    [frame, motionPreset],
+  )
+  const motionImpulse = useMemo(
+    () => computeMotionImpulseOffset(resolvedLayers.motionPreset, 0.12),
+    [resolvedLayers.motionPreset],
+  )
+  const live2dParams = useMemo(() => computeLive2DParameterMap(frame), [frame])
+  const effectiveLive2dControls = useMemo(
+    () => live2dControls ?? inspectLive2DModelJson(DEFAULT_ASHY_LIVE2D_MODEL3_JSON),
+    [live2dControls],
+  )
+
+  const { pose, eyeFocus, headFocus, breathValue, springOffset } = frame
+  const mouthRx = Math.max(6, 16 + pose.mouthForm * 8 + pose.mouthSmile * 6)
+  const mouthRy = Math.max(1.8, 2 + pose.mouthOpen * 16)
+  const eyeRyL = Math.max(1.5, pose.eyeOpenL * 14)
+  const eyeRyR = Math.max(1.5, pose.eyeOpenR * 14)
+  const pupilOffsetX = eyeFocus.x * 6
+  const pupilOffsetY = eyeFocus.y * 4
+  const headTx = springOffset.x + headFocus.x * 10 + motionImpulse.x
+  const headTy = springOffset.y + headFocus.y * 8 - breathValue * 4 + motionImpulse.y
+
+  // Render onto <canvas> when 2D context is available (Red-Team M4 jsdom guard)
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    if (typeof navigator !== 'undefined' && /jsdom/i.test(navigator.userAgent)) {
+      return
+    }
+    try {
+      const ctx = canvas.getContext('2d')
+      if (ctx) {
+        renderTachieStageToCanvas(ctx, frame, resolvedLayers, width, height)
+      }
+    } catch {
+      // Ignore canvas context errors in headless environments
+    }
+  }, [frame, resolvedLayers, width, height])
+
+  // Refresh 128x72 silhouette mask at 4 Hz (250ms)
+  useEffect(() => {
+    const refreshSilhouette = () => {
+      const canvas = canvasRef.current
+      if (
+        canvas &&
+        (typeof navigator === 'undefined' || !/jsdom/i.test(navigator.userAgent))
+      ) {
+        try {
+          const ctx = canvas.getContext('2d')
+          if (ctx && typeof ctx.getImageData === 'function') {
+            const imgData = ctx.getImageData(0, 0, canvas.width || width, canvas.height || height)
+            if (imgData && imgData.data && imgData.data.length > 0) {
+              silhouetteMaskRef.current = extractCanvasSilhouetteMask128x72(
+                imgData.data,
+                canvas.width || width,
+                canvas.height || height,
+              )
+              return
+            }
+          }
+        } catch {
+          // Fallback to dynamic pose mask
+        }
+      }
+      silhouetteMaskRef.current = buildDynamicAvatarSilhouetteMask({
+        headTx,
+        headTy,
+        viewportWidth: width,
+        viewportHeight: height,
+        scale: motionImpulse.scale,
+      })
+    }
+
+    refreshSilhouette()
+    const timer = setInterval(refreshSilhouette, 250)
+    return () => {
+      clearInterval(timer)
+    }
+  }, [headTx, headTy, width, height, motionImpulse.scale])
 
   const handleMouseMove = (event: React.MouseEvent<HTMLDivElement>) => {
     if (!onIgnoreMouseChange) return
@@ -547,22 +661,17 @@ export function AshyStageCanvas({
       clientY,
       viewportWidth: rect.width || width,
       viewportHeight: rect.height || height,
-      silhouetteMask,
+      silhouetteMask: silhouetteMaskRef.current,
       isOverUiIsland,
       uiIslandRects,
     })
-    onIgnoreMouseChange(ignore)
-  }
 
-  const { pose, eyeFocus, headFocus, breathValue, springOffset } = frame
-  const mouthRx = Math.max(6, 16 + pose.mouthForm * 8 + pose.mouthSmile * 6)
-  const mouthRy = Math.max(1.8, 2 + pose.mouthOpen * 16)
-  const eyeRyL = Math.max(1.5, pose.eyeOpenL * 14)
-  const eyeRyR = Math.max(1.5, pose.eyeOpenR * 14)
-  const pupilOffsetX = eyeFocus.x * 6
-  const pupilOffsetY = eyeFocus.y * 4
-  const headTx = springOffset.x + headFocus.x * 10
-  const headTy = springOffset.y + headFocus.y * 8 - breathValue * 4
+    // Red-Team B6 deduplication: only notify when ignore state transitions
+    if (ignore !== lastIgnoreMouseRef.current) {
+      lastIgnoreMouseRef.current = ignore
+      onIgnoreMouseChange(ignore)
+    }
+  }
 
   const portraitSrc =
     emotion === 'concerned' || emotion === 'sad'
@@ -575,6 +684,11 @@ export function AshyStageCanvas({
       data-emotion={emotion}
       data-mode={mode}
       data-speaking={String(isSpeaking)}
+      data-active-viseme={resolvedLayers.activeViseme}
+      data-eye-state={resolvedLayers.eyeState}
+      data-motion-preset={resolvedLayers.motionPreset}
+      data-brow-preset={resolvedLayers.browPreset}
+      data-accessory-fx={resolvedLayers.accessoryFx}
       onMouseMove={handleMouseMove}
       style={{
         position: 'relative',
@@ -582,7 +696,7 @@ export function AshyStageCanvas({
         height: fullBleed ? '100%' : `${height}px`,
         overflow: 'hidden',
         userSelect: 'none',
-        background: '#14121d',
+        background: transparentBackground ? 'transparent' : '#14121d',
       }}
     >
       {/* Primary Cozy Night Studio High-Res Portrait Layer with Spring Breathing & Parallax */}
@@ -597,6 +711,7 @@ export function AshyStageCanvas({
           height: '100%',
           objectFit: 'cover',
           objectPosition: 'center 22%',
+          opacity: transparentBackground ? 0.85 : 1,
           transform: `translate3d(${(headTx * 0.4).toFixed(2)}px, ${(headTy * 0.4 - breathValue * 3).toFixed(2)}px, 0) scale(1.03)`,
           transition: 'transform 0.12s linear, filter 0.35s ease',
           filter: isSpeaking
@@ -607,15 +722,33 @@ export function AshyStageCanvas({
       />
 
       {/* Warm Ambient Vignette & Speaking Halo */}
-      <div
+      {!transparentBackground && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            pointerEvents: 'none',
+            background: isSpeaking
+              ? 'radial-gradient(circle at 50% 42%, rgba(244, 166, 136, 0.10) 0%, rgba(17, 15, 24, 0.32) 68%, rgba(14, 12, 20, 0.72) 100%)'
+              : 'radial-gradient(circle at 50% 42%, rgba(244, 166, 136, 0.03) 0%, rgba(17, 15, 24, 0.28) 65%, rgba(14, 12, 20, 0.68) 100%)',
+            transition: 'background 0.35s ease',
+          }}
+        />
+      )}
+
+      {/* Real HTML5 2D Compositor Canvas */}
+      <canvas
+        ref={canvasRef}
+        data-testid="ashy-stage-render-canvas"
+        width={width}
+        height={height}
         style={{
           position: 'absolute',
           inset: 0,
+          width: '100%',
+          height: '100%',
           pointerEvents: 'none',
-          background: isSpeaking
-            ? 'radial-gradient(circle at 50% 42%, rgba(244, 166, 136, 0.10) 0%, rgba(17, 15, 24, 0.32) 68%, rgba(14, 12, 20, 0.72) 100%)'
-            : 'radial-gradient(circle at 50% 42%, rgba(244, 166, 136, 0.03) 0%, rgba(17, 15, 24, 0.28) 65%, rgba(14, 12, 20, 0.68) 100%)',
-          transition: 'background 0.35s ease',
+          opacity: 0.94,
         }}
       />
 
@@ -628,8 +761,44 @@ export function AshyStageCanvas({
         />
       )}
 
+      {mode === 'live2d' && (
+        <div
+          data-testid="live2d-parameter-hud"
+          style={{
+            position: 'absolute',
+            bottom: '8px',
+            left: '8px',
+            padding: '6px 10px',
+            borderRadius: '10px',
+            background: 'rgba(15, 23, 42, 0.85)',
+            border: '1px solid rgba(192, 132, 252, 0.4)',
+            color: '#e2e8f0',
+            fontFamily: 'monospace',
+            fontSize: '10px',
+            lineHeight: 1.35,
+            pointerEvents: 'none',
+            zIndex: 9,
+          }}
+        >
+          <div>
+            Live2D Cubism v{effectiveLive2dControls.version} · Expr:{' '}
+            {effectiveLive2dControls.expressions.length}
+          </div>
+          <div>
+            ParamMouthOpenY: {live2dParams.ParamMouthOpenY.toFixed(2)} · ParamEyeLOpen:{' '}
+            {live2dParams.ParamEyeLOpen.toFixed(2)} · ParamAngleX:{' '}
+            {live2dParams.ParamAngleX.toFixed(1)}
+          </div>
+        </div>
+      )}
+
       <svg
         data-testid="ashy-tachie-svg"
+        data-active-viseme={resolvedLayers.activeViseme}
+        data-eye-state={resolvedLayers.eyeState}
+        data-motion-preset={resolvedLayers.motionPreset}
+        data-brow-preset={resolvedLayers.browPreset}
+        data-accessory-fx={resolvedLayers.accessoryFx}
         viewBox="0 0 380 460"
         width={width}
         height={height}
@@ -639,7 +808,7 @@ export function AshyStageCanvas({
           display: 'block',
           width: '100%',
           height: '100%',
-          opacity: mode === 'live2d' ? 0.92 : 0.01,
+          opacity: mode === 'live2d' ? 0.96 : 0.92,
           pointerEvents: 'none',
         }}
       >
