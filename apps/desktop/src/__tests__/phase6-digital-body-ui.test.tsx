@@ -411,4 +411,59 @@ describe('Phase 6 Digital Body & Presence — Stage Overlay Click-Through, Acous
     })
     expect(useAshyStore.getState().activeMotion).toBe('idle')
   })
+
+  it('5. switches between AnimePngTuberStage and Live2D Cubism 4 presets (Hiyori, Haru, Mao) via live2d-preset-select and preserves live2dModelUrl on JSON import (Red-Team B3 & M3)', async () => {
+    const dir = makeTempDir()
+    const kernel = await createAshyHostKernel({ userDataDir: dir })
+    activeKernels.push(kernel)
+    await kernel.completeOnboarding({ userName: 'Carlos' })
+
+    setAshyHostBridgeForTesting(kernel)
+    resetAshyStore()
+    await useAshyStore.getState().bootstrapFromHost()
+
+    expect(useAshyStore.getState().live2dPresetId).toBe('hiyori')
+    expect(useAshyStore.getState().live2dModelUrl).toBe('/live2d/models/hiyori/Hiyori.model3.json')
+
+    await act(async () => {
+      root!.render(<App />)
+    })
+
+    // In default tachie mode, renders ashy-pngtuber-stage with zero geometric SVG ellipses
+    expect(getByTestId('ashy-pngtuber-stage')).toBeTruthy()
+    expect(container?.querySelector('[data-testid="ashy-tachie-svg"]')).toBeNull()
+
+    await act(async () => {
+      clickElement(getByTestId('tab-personality'))
+    })
+
+    const presetSelect = getByTestId<HTMLSelectElement>('live2d-preset-select')
+    expect(presetSelect.value).toBe('hiyori')
+
+    // Switch to Mao Pro (Cubism 4) via selector
+    await act(async () => {
+      setNativeInputValue(presetSelect, 'mao')
+    })
+
+    expect(useAshyStore.getState().stageMode).toBe('live2d')
+    expect(useAshyStore.getState().live2dPresetId).toBe('mao')
+    expect(useAshyStore.getState().live2dModelUrl).toBe('/live2d/models/mao/Mao.model3.json')
+    expect(getByTestId('live2d-webgl-stage').getAttribute('data-live2d-model-url')).toBe(
+      '/live2d/models/mao/Mao.model3.json',
+    )
+
+    // Red-Team M3: importing raw JSON text updates live2dModelControls while keeping live2dModelUrl intact
+    await act(async () => {
+      useAshyStore.getState().importLive2DModelJson(
+        JSON.stringify({
+          Version: 3,
+          FileReferences: {
+            Expressions: [{ Name: 'exp_01', File: 'expressions/exp_01.exp3.json' }],
+            Motions: { Idle: [{ File: 'motions/mtn_01.motion3.json' }] },
+          },
+        }),
+      )
+    })
+    expect(useAshyStore.getState().live2dModelUrl).toBe('/live2d/models/mao/Mao.model3.json')
+  })
 })

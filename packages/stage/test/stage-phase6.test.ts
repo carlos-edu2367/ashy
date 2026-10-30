@@ -234,7 +234,7 @@ describe('@ashy/stage — Phase 6 Digital Body & Presence Suite', () => {
       expect(Number.isFinite(live2dParams.ParamAngleX)).toBe(true)
     })
 
-    it('renders visible Tachie layers, active viseme/eye/motion attributes, and Live2D parameter HUD in AshyStageCanvas', () => {
+    it('renders AnimePngTuberStage in tachie mode and Live2DWebGLStage in live2d mode with zero geometric SVG ellipses (Red-Team B3)', () => {
       const tachieHtml = renderToStaticMarkup(
         React.createElement(AshyStageCanvas, {
           emotion: 'smug',
@@ -247,36 +247,56 @@ describe('@ashy/stage — Phase 6 Digital Body & Presence Suite', () => {
         }),
       )
       expect(tachieHtml).toContain('data-testid="ashy-stage-render-canvas"')
-      expect(tachieHtml).toContain('data-testid="ashy-tachie-svg"')
+      expect(tachieHtml).toContain('data-testid="ashy-pngtuber-stage"')
+      expect(tachieHtml).toContain('data-pngtuber-sprite="eyes_open_mouth_open"')
       expect(tachieHtml).toContain('data-active-viseme="A"')
+      expect(tachieHtml).toContain('data-eye-state="half"')
       expect(tachieHtml).toContain('data-motion-preset="tease"')
-      // Must NOT have opacity:0.01 on the Tachie SVG in Phase 6
-      expect(tachieHtml).not.toContain('opacity:0.01')
+      // Must NOT contain any geometric SVG face/mouth/eyes primitives
+      expect(tachieHtml).not.toContain('ashy-tachie-svg')
+      expect(tachieHtml).not.toContain('#fde8e8')
+      expect(tachieHtml).not.toContain('ashy-mouth')
+      expect(tachieHtml).not.toContain('ashy-eye-left')
+      expect(tachieHtml).not.toContain('ashy-eye-right')
 
       const live2dHtml = renderToStaticMarkup(
         React.createElement(AshyStageCanvas, {
           emotion: 'chaotic',
           mode: 'live2d',
+          live2dModelUrl: '/live2d/models/mao/Mao.model3.json',
           isSpeaking: false,
-          transparentBackground: true,
+          transparentBackground: false,
         }),
       )
+      expect(live2dHtml).toContain('data-testid="live2d-webgl-stage"')
+      expect(live2dHtml).toContain('data-live2d-model-url="/live2d/models/mao/Mao.model3.json"')
       expect(live2dHtml).toContain('data-testid="live2d-parameter-hud"')
       expect(live2dHtml).toContain('ParamMouthOpenY')
+      expect(live2dHtml).not.toContain('ashy-tachie-svg')
+      expect(live2dHtml).not.toContain('ashy-pngtuber-stage')
       expect(typeof renderTachieStageToCanvas).toBe('function')
 
-      // Verify renderTachieStageToCanvas draws layers cleanly and survives partial mocks
+      // Verify renderTachieStageToCanvas draws ONLY the invisible anatomical silhouette mask (zero eyes/pupils/mouth)
       const calls: string[] = []
+      const fillStyles: string[] = []
       const mockCtx = {
         clearRect: () => calls.push('clearRect'),
         save: () => calls.push('save'),
         scale: () => calls.push('scale'),
         beginPath: () => calls.push('beginPath'),
+        moveTo: () => calls.push('moveTo'),
+        bezierCurveTo: () => calls.push('bezierCurveTo'),
+        closePath: () => calls.push('closePath'),
         ellipse: () => calls.push('ellipse'),
         arc: () => calls.push('arc'),
         fill: () => calls.push('fill'),
         restore: () => calls.push('restore'),
-        fillStyle: '',
+        set fillStyle(val: string) {
+          fillStyles.push(val)
+        },
+        get fillStyle() {
+          return fillStyles[fillStyles.length - 1] ?? ''
+        },
       } as unknown as CanvasRenderingContext2D
 
       const testFrame = computeStageFrameState({
@@ -291,6 +311,9 @@ describe('@ashy/stage — Phase 6 Digital Body & Presence Suite', () => {
       expect(calls).toContain('ellipse')
       expect(calls).toContain('fill')
       expect(calls).toContain('restore')
+      expect(calls).not.toContain('arc')
+      expect(fillStyles).not.toContain('#fde8e8')
+      expect(fillStyles).not.toContain('#be185d')
     })
   })
 

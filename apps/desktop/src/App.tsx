@@ -3,6 +3,7 @@ import {
   ASHY_EMOTIONS,
   ASHY_MOTION_PRESETS,
   ASHY_TRAIT_CORRIDORS,
+  BUILTIN_LIVE2D_MODEL_PRESETS,
   M2_GATE_THRESHOLDS,
   MILESTONE_CATEGORIES,
   SEMANTIC_FACT_CATEGORIES,
@@ -11,6 +12,7 @@ import {
   type ApprovableMemoryKind,
   type AshyEmotion,
   type AshyMotionPreset,
+  type Live2DBuiltinModelId,
   type MemoryGovernanceCategory,
   type MilestoneCategory,
   type SemanticFactCategory,
@@ -338,6 +340,7 @@ export function App(): React.ReactElement {
                 mode={state.stageMode}
                 motionPreset={state.activeMotion}
                 live2dControls={state.live2dModelControls}
+                live2dModelUrl={state.live2dModelUrl}
                 transparentBackground={state.isTransparentOverlayWindow}
                 onIgnoreMouseChange={(ignore) => state.setStageIgnoreMouseEvents(ignore)}
                 width={380}
@@ -720,6 +723,7 @@ export function App(): React.ReactElement {
                   mode={state.stageMode}
                   motionPreset={state.activeMotion}
                   live2dControls={state.live2dModelControls}
+                  live2dModelUrl={state.live2dModelUrl}
                   transparentBackground={state.isTransparentOverlayWindow}
                   onIgnoreMouseChange={(ignore) => state.setStageIgnoreMouseEvents(ignore)}
                   width={860}
@@ -2681,6 +2685,7 @@ export function App(): React.ReactElement {
                       mode={state.stageMode}
                       motionPreset={state.activeMotion}
                       live2dControls={state.live2dModelControls}
+                      live2dModelUrl={state.live2dModelUrl}
                       transparentBackground={state.isTransparentOverlayWindow}
                       onIgnoreMouseChange={(ignore) => state.setStageIgnoreMouseEvents(ignore)}
                       width={310}
@@ -2815,6 +2820,35 @@ export function App(): React.ReactElement {
                       >
                         Malha Live2D
                       </button>
+                    </div>
+
+                    <div>
+                      <label
+                        htmlFor="live2d-preset-select"
+                        style={{
+                          display: 'block',
+                          fontSize: '12px',
+                          color: 'var(--text-secondary)',
+                          marginBottom: '4px',
+                        }}
+                      >
+                        Personagem Live2D (Cubism 4 WebGL):
+                      </label>
+                      <select
+                        id="live2d-preset-select"
+                        data-testid="live2d-preset-select"
+                        className="ashy-select"
+                        value={state.live2dPresetId}
+                        onChange={(e) =>
+                          state.selectLive2dPreset(e.target.value as Live2DBuiltinModelId)
+                        }
+                      >
+                        {BUILTIN_LIVE2D_MODEL_PRESETS.map((preset) => (
+                          <option key={preset.id} value={preset.id}>
+                            {preset.label}
+                          </option>
+                        ))}
+                      </select>
                     </div>
                   </div>
                 </section>

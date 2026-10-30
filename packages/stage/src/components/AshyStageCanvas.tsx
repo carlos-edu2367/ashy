@@ -1,5 +1,10 @@
-import React, { useEffect, useId, useMemo, useRef, useState } from 'react'
-import { ASHY_EMOTIONS, type AshyEmotion, type AshyMotionPreset } from '@ashy/shared'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  ASHY_EMOTIONS,
+  type AshyEmotion,
+  type AshyMotionPreset,
+  type StageAvatarMode,
+} from '@ashy/shared'
 import {
   type FacialExpressionPose,
   type VowelKey,
@@ -36,6 +41,12 @@ import {
   extractCanvasSilhouetteMask128x72,
   renderTachieStageToCanvas,
 } from '../drivers/tachie-compositor'
+import {
+  PNGTUBER_SPRITE_PATHS,
+  computePngTuberBounceTransform,
+  resolvePngTuberSpriteState,
+} from '../drivers/live2d-bridge'
+import { Live2DWebGLStage } from './Live2DWebGLStage'
 
 export const EMOTION_FACIAL_PRESETS: Readonly<Record<AshyEmotion, Readonly<FacialExpressionPose>>> =
   Object.freeze({
@@ -395,10 +406,11 @@ export interface AshyStageCanvasProps {
   gazeTarget?: Point2D | null
   bubbleText?: string
   statusLabel?: AshyPresenceStatus | string
-  mode?: 'tachie' | 'live2d'
+  mode?: StageAvatarMode
   motionPreset?: AshyMotionPreset
   transparentBackground?: boolean
   live2dControls?: Live2DModelControls
+  live2dModelUrl?: string
   width?: number
   height?: number
   fullBleed?: boolean
@@ -421,6 +433,7 @@ export function AshyStageCanvas({
   motionPreset,
   transparentBackground = false,
   live2dControls,
+  live2dModelUrl = '/live2d/models/hiyori/Hiyori.model3.json',
   width = 380,
   height = 460,
   fullBleed = false,
@@ -428,7 +441,6 @@ export function AshyStageCanvas({
   uiIslandRects,
   onIgnoreMouseChange,
 }: AshyStageCanvasProps): React.ReactElement {
-  const gradientId = useId()
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const vowelDriverRef = useRef(createWinnerRunnerUpVowelDriver())
   const visemeBlenderRef = useRef(createDynamicVisemeBlender())
@@ -580,15 +592,26 @@ export function AshyStageCanvas({
     [live2dControls],
   )
 
-  const { pose, eyeFocus, headFocus, breathValue, springOffset } = frame
-  const mouthRx = Math.max(6, 16 + pose.mouthForm * 8 + pose.mouthSmile * 6)
-  const mouthRy = Math.max(1.8, 2 + pose.mouthOpen * 16)
-  const eyeRyL = Math.max(1.5, pose.eyeOpenL * 14)
-  const eyeRyR = Math.max(1.5, pose.eyeOpenR * 14)
-  const pupilOffsetX = eyeFocus.x * 6
-  const pupilOffsetY = eyeFocus.y * 4
+  const { pose, headFocus, breathValue, springOffset } = frame
   const headTx = springOffset.x + headFocus.x * 10 + motionImpulse.x
   const headTy = springOffset.y + headFocus.y * 8 - breathValue * 4 + motionImpulse.y
+  const headRotDeg = headFocus.x * 3.5 + motionImpulse.rotationDeg
+
+  const spriteState = resolvePngTuberSpriteState({
+    eyeState: resolvedLayers.eyeState,
+    activeViseme: resolvedLayers.activeViseme,
+    emotion,
+    isSpeaking,
+  })
+  const bounceTransform = computePngTuberBounceTransform({
+    mouthOpen: pose.mouthOpen,
+    isSpeaking,
+    breathValue,
+    headTx,
+    headTy,
+    headRotDeg,
+    motionPreset: resolvedLayers.motionPreset,
+  })
 
   // Render onto <canvas> when 2D context is available (Red-Team M4 jsdom guard)
   useEffect(() => {
@@ -673,11 +696,6 @@ export function AshyStageCanvas({
     }
   }
 
-  const portraitSrc =
-    emotion === 'concerned' || emotion === 'sad'
-      ? '/assets/ashy-concerned.jpg'
-      : '/assets/ashy-hero.jpg'
-
   return (
     <div
       data-testid="ashy-stage-canvas"
@@ -699,44 +717,113 @@ export function AshyStageCanvas({
         background: transparentBackground ? 'transparent' : '#14121d',
       }}
     >
-      {/* Primary Cozy Night Studio High-Res Portrait Layer with Spring Breathing & Parallax */}
-      <img
-        src={portraitSrc}
-        alt={`Ashy (${emotion})`}
-        data-testid="ashy-stage-portrait"
-        style={{
-          position: 'absolute',
-          inset: 0,
-          width: '100%',
-          height: '100%',
-          objectFit: 'cover',
-          objectPosition: 'center 22%',
-          opacity: transparentBackground ? 0.85 : 1,
-          transform: `translate3d(${(headTx * 0.4).toFixed(2)}px, ${(headTy * 0.4 - breathValue * 3).toFixed(2)}px, 0) scale(1.03)`,
-          transition: 'transform 0.12s linear, filter 0.35s ease',
-          filter: isSpeaking
-            ? 'brightness(1.05) saturate(1.04)'
-            : `brightness(${(0.92 + ambientLuminance * 0.18).toFixed(2)})`,
-          pointerEvents: 'none',
-        }}
-      />
-
-      {/* Warm Ambient Vignette & Speaking Halo */}
-      {!transparentBackground && (
+      {mode === 'live2d' ? (
+        <>
+          {!transparentBackground && (
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                pointerEvents: 'none',
+                background:
+                  'radial-gradient(circle at 50% 38%, rgba(49, 46, 129, 0.42), rgba(15, 13, 22, 0.96))',
+              }}
+            />
+          )}
+          <Live2DWebGLStage
+            modelUrl={live2dModelUrl}
+            params={live2dParams}
+            emotion={emotion}
+            motionPreset={resolvedLayers.motionPreset}
+            width={width}
+            height={height}
+          />
+          <div
+            data-testid="live2d-parameter-hud"
+            style={{
+              position: 'absolute',
+              bottom: '8px',
+              left: '8px',
+              padding: '6px 10px',
+              borderRadius: '10px',
+              background: 'rgba(15, 23, 42, 0.85)',
+              border: '1px solid rgba(192, 132, 252, 0.4)',
+              color: '#e2e8f0',
+              fontFamily: 'monospace',
+              fontSize: '10px',
+              lineHeight: 1.35,
+              pointerEvents: 'none',
+              zIndex: 9,
+            }}
+          >
+            <div>
+              Live2D Cubism v{effectiveLive2dControls.version} · Expr:{' '}
+              {effectiveLive2dControls.expressions.length}
+            </div>
+            <div>
+              ParamMouthOpenY: {live2dParams.ParamMouthOpenY.toFixed(2)} · ParamEyeLOpen:{' '}
+              {live2dParams.ParamEyeLOpen.toFixed(2)} · ParamAngleX:{' '}
+              {live2dParams.ParamAngleX.toFixed(1)}
+            </div>
+          </div>
+        </>
+      ) : (
         <div
+          data-testid="ashy-pngtuber-stage"
+          data-pngtuber-sprite={spriteState}
+          data-active-viseme={resolvedLayers.activeViseme}
+          data-eye-state={resolvedLayers.eyeState}
+          data-motion-preset={resolvedLayers.motionPreset}
+          data-brow-preset={resolvedLayers.browPreset}
+          data-accessory-fx={resolvedLayers.accessoryFx}
           style={{
             position: 'absolute',
             inset: 0,
+            width: '100%',
+            height: '100%',
             pointerEvents: 'none',
-            background: isSpeaking
-              ? 'radial-gradient(circle at 50% 42%, rgba(244, 166, 136, 0.10) 0%, rgba(17, 15, 24, 0.32) 68%, rgba(14, 12, 20, 0.72) 100%)'
-              : 'radial-gradient(circle at 50% 42%, rgba(244, 166, 136, 0.03) 0%, rgba(17, 15, 24, 0.28) 65%, rgba(14, 12, 20, 0.68) 100%)',
-            transition: 'background 0.35s ease',
           }}
-        />
+        >
+          <img
+            src={PNGTUBER_SPRITE_PATHS[spriteState]}
+            alt={`Ashy (${emotion})`}
+            data-testid="ashy-stage-portrait"
+            style={{
+              position: 'absolute',
+              inset: 0,
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+              objectPosition: 'center 22%',
+              opacity: transparentBackground ? 0.92 : 1,
+              transform: bounceTransform.cssTransform,
+              transformOrigin: '50% 82%',
+              transition: 'transform 0.08s ease-out, filter 0.25s ease',
+              filter: isSpeaking
+                ? 'brightness(1.06) saturate(1.05) drop-shadow(0 0 18px rgba(244, 166, 136, 0.28))'
+                : `brightness(${(0.92 + ambientLuminance * 0.18).toFixed(2)})`,
+              pointerEvents: 'none',
+            }}
+          />
+
+          {/* Warm Ambient Vignette & Speaking Rim-Light Glow */}
+          {!transparentBackground && (
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                pointerEvents: 'none',
+                background: isSpeaking
+                  ? 'radial-gradient(circle at 50% 42%, rgba(244, 166, 136, 0.12) 0%, rgba(17, 15, 24, 0.30) 68%, rgba(14, 12, 20, 0.72) 100%)'
+                  : 'radial-gradient(circle at 50% 42%, rgba(244, 166, 136, 0.03) 0%, rgba(17, 15, 24, 0.28) 65%, rgba(14, 12, 20, 0.68) 100%)',
+                transition: 'background 0.35s ease',
+              }}
+            />
+          )}
+        </div>
       )}
 
-      {/* Real HTML5 2D Compositor Canvas (full internal pixel alpha for 4 Hz 128x72 silhouette readback; subtle visual blend in tachie mode so Cozy Night Studio portrait stays crisp) */}
+      {/* Invisible HTML5 2D Silhouette Buffer (opacity: 0 in all modes — Red-Team B3) */}
       <canvas
         ref={canvasRef}
         data-testid="ashy-stage-render-canvas"
@@ -748,7 +835,7 @@ export function AshyStageCanvas({
           width: '100%',
           height: '100%',
           pointerEvents: 'none',
-          opacity: mode === 'live2d' ? 0.35 : 0.02,
+          opacity: 0,
         }}
       />
 
@@ -760,224 +847,6 @@ export function AshyStageCanvas({
           springOffset={bubbleOffset}
         />
       )}
-
-      {mode === 'live2d' && (
-        <div
-          data-testid="live2d-parameter-hud"
-          style={{
-            position: 'absolute',
-            bottom: '8px',
-            left: '8px',
-            padding: '6px 10px',
-            borderRadius: '10px',
-            background: 'rgba(15, 23, 42, 0.85)',
-            border: '1px solid rgba(192, 132, 252, 0.4)',
-            color: '#e2e8f0',
-            fontFamily: 'monospace',
-            fontSize: '10px',
-            lineHeight: 1.35,
-            pointerEvents: 'none',
-            zIndex: 9,
-          }}
-        >
-          <div>
-            Live2D Cubism v{effectiveLive2dControls.version} · Expr:{' '}
-            {effectiveLive2dControls.expressions.length}
-          </div>
-          <div>
-            ParamMouthOpenY: {live2dParams.ParamMouthOpenY.toFixed(2)} · ParamEyeLOpen:{' '}
-            {live2dParams.ParamEyeLOpen.toFixed(2)} · ParamAngleX:{' '}
-            {live2dParams.ParamAngleX.toFixed(1)}
-          </div>
-        </div>
-      )}
-
-      <svg
-        data-testid="ashy-tachie-svg"
-        data-active-viseme={resolvedLayers.activeViseme}
-        data-eye-state={resolvedLayers.eyeState}
-        data-motion-preset={resolvedLayers.motionPreset}
-        data-brow-preset={resolvedLayers.browPreset}
-        data-accessory-fx={resolvedLayers.accessoryFx}
-        viewBox="0 0 380 460"
-        width={width}
-        height={height}
-        style={{
-          position: 'absolute',
-          inset: 0,
-          display: 'block',
-          width: '100%',
-          height: '100%',
-          opacity: mode === 'live2d' ? 0.96 : 0.88,
-          pointerEvents: 'none',
-        }}
-      >
-        <defs>
-          <linearGradient id={`${gradientId}-hair`} x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stopColor="#312e81" />
-            <stop offset="55%" stopColor="#6d28d9" />
-            <stop offset="100%" stopColor="#db2777" />
-          </linearGradient>
-          <linearGradient id={`${gradientId}-jacket`} x1="0%" y1="0%" x2="0%" y2="100%">
-            <stop offset="0%" stopColor="#1e1b4b" />
-            <stop offset="100%" stopColor="#0f172a" />
-          </linearGradient>
-          <radialGradient id={`${gradientId}-aura`} cx="50%" cy="46%" r="48%">
-            <stop
-              offset="0%"
-              stopColor={isSpeaking ? '#f4a688' : '#c084fc'}
-              stopOpacity={isSpeaking ? '0.22' : '0.08'}
-            />
-            <stop offset="100%" stopColor="#0f172a" stopOpacity="0" />
-          </radialGradient>
-        </defs>
-
-        {/* Subtle Atmospheric & Viseme Aura in Tachie Mode */}
-        <ellipse
-          cx={190 + headTx * 0.4}
-          cy={210 + headTy * 0.4}
-          rx={145 + mouthRy * 1.6}
-          ry={175 + mouthRy * 1.8}
-          fill={`url(#${gradientId}-aura)`}
-        />
-
-        {/* Breathing Torso / Shoulders */}
-        <g
-          data-testid="ashy-layer-torso"
-          transform={`translate(0, ${(34 - breathValue * 4.5).toFixed(2)})`}
-          opacity={mode === 'live2d' ? 0.95 : 0}
-        >
-          <path
-            d="M 95 455 C 102 330, 145 295, 190 295 C 235 295, 278 330, 285 455 Z"
-            fill={`url(#${gradientId}-jacket)`}
-            stroke="#f472b6"
-            strokeWidth="2"
-          />
-          <path d="M 162 295 L 190 355 L 218 295 Z" fill="#f472b6" opacity="0.85" />
-        </g>
-
-        {/* Spring-Driven Head & Facial Expression Group */}
-        <g
-          data-testid="ashy-layer-head"
-          transform={`translate(${headTx.toFixed(2)}, ${(34 + headTy).toFixed(2)})`}
-          opacity={mode === 'live2d' ? 0.95 : 0}
-        >
-          {/* Back Hair */}
-          <ellipse
-            cx="190"
-            cy="205"
-            rx="92"
-            ry="108"
-            fill={`url(#${gradientId}-hair)`}
-          />
-
-          {/* Face Contour */}
-          <path
-            d="M 122 175 C 122 122, 258 122, 258 175 C 258 242, 224 282, 190 286 C 156 282, 122 242, 122 175 Z"
-            fill="#fde8e8"
-          />
-
-          {/* Cheek Blush */}
-          <ellipse
-            cx="144"
-            cy="226"
-            rx="16"
-            ry="8"
-            fill="#fb7185"
-            opacity={pose.cheekBlush}
-          />
-          <ellipse
-            cx="236"
-            cy="226"
-            rx="16"
-            ry="8"
-            fill="#fb7185"
-            opacity={pose.cheekBlush}
-          />
-
-          {/* Left & Right Eyebrows */}
-          <line
-            data-testid="ashy-brow-left"
-            x1="138"
-            y1={168 - pose.browLY * 12 - pose.browAngle * 8}
-            x2="172"
-            y2={168 - pose.browLY * 12 + pose.browAngle * 8}
-            stroke="#312e81"
-            strokeWidth="3.5"
-            strokeLinecap="round"
-          />
-          <line
-            data-testid="ashy-brow-right"
-            x1="208"
-            y1={168 - pose.browRY * 12 + pose.browAngle * 8}
-            x2="242"
-            y2={168 - pose.browRY * 12 - pose.browAngle * 8}
-            stroke="#312e81"
-            strokeWidth="3.5"
-            strokeLinecap="round"
-          />
-
-          {/* Left Eye */}
-          <g data-testid="ashy-eye-left">
-            <ellipse cx="155" cy="196" rx="16" ry={eyeRyL} fill="#ffffff" />
-            {pose.eyeOpenL > BLINK_THRESHOLD ? (
-              <>
-                <circle
-                  cx={155 + pupilOffsetX}
-                  cy={196 + pupilOffsetY}
-                  r={8.5 * pose.pupilScale}
-                  fill="#9333ea"
-                />
-                <circle
-                  cx={152 + pupilOffsetX * 0.6}
-                  cy={192 + pupilOffsetY * 0.6}
-                  r="3"
-                  fill="#ffffff"
-                />
-              </>
-            ) : null}
-          </g>
-
-          {/* Right Eye */}
-          <g data-testid="ashy-eye-right">
-            <ellipse cx="225" cy="196" rx="16" ry={eyeRyR} fill="#ffffff" />
-            {pose.eyeOpenR > BLINK_THRESHOLD ? (
-              <>
-                <circle
-                  cx={225 + pupilOffsetX}
-                  cy={196 + pupilOffsetY}
-                  r={8.5 * pose.pupilScale}
-                  fill="#9333ea"
-                />
-                <circle
-                  cx={222 + pupilOffsetX * 0.6}
-                  cy={192 + pupilOffsetY * 0.6}
-                  r="3"
-                  fill="#ffffff"
-                />
-              </>
-            ) : null}
-          </g>
-
-          {/* Viseme-Driven Mouth */}
-          <ellipse
-            data-testid="ashy-mouth"
-            cx="190"
-            cy={248 - pose.mouthSmile * 3}
-            rx={mouthRx}
-            ry={mouthRy}
-            fill="#be185d"
-            stroke="#831843"
-            strokeWidth="2"
-          />
-
-          {/* Front Hair Bangs */}
-          <path
-            d="M 110 175 C 125 110, 255 110, 270 175 C 248 142, 222 158, 190 145 C 158 158, 132 142, 110 175 Z"
-            fill={`url(#${gradientId}-hair)`}
-          />
-        </g>
-      </svg>
     </div>
   )
 }

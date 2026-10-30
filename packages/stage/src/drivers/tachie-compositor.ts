@@ -4,7 +4,6 @@ import {
   SILHOUETTE_MASK_WIDTH,
   buildAvatarSilhouetteMask,
 } from './hit-test-cpu'
-import { BLINK_THRESHOLD } from './procedural-life'
 import type { ResolvedTachieLayerState } from './tachie-manifest'
 
 export interface DynamicSilhouetteParams {
@@ -129,12 +128,13 @@ export function computeLive2DParameterMap(
 }
 
 /**
- * Rasterizes the layered Tachie avatar onto an HTML5 Canvas 2D context.
+ * Rasterizes only the invisible anatomical silhouette mask onto an HTML5 Canvas 2D context
+ * for O(1) 4 Hz 128x72 CPU click-through hit-testing (zero facial eyes/brows/mouth drawing — Red-Team B3).
  */
 export function renderTachieStageToCanvas(
   ctx: CanvasRenderingContext2D,
   frame: ComputedStageFrameState,
-  layers: ResolvedTachieLayerState,
+  _layers: ResolvedTachieLayerState,
   width: number,
   height: number,
 ): void {
@@ -144,85 +144,29 @@ export function renderTachieStageToCanvas(
     ctx.clearRect(0, 0, width, height)
     const scaleX = width / 380
     const scaleY = height / 460
-    const { pose, eyeFocus, headFocus, breathValue, springOffset } = frame
+    const { headFocus, breathValue, springOffset } = frame
     const headTx = springOffset.x + headFocus.x * 10
     const headTy = springOffset.y + headFocus.y * 8 - breathValue * 4
 
     ctx.save()
     ctx.scale(scaleX, scaleY)
 
-    // 1. Back hair layer
-    ctx.fillStyle = '#4c1d95'
+    // 1. Torso / shoulders anatomical silhouette mask
+    ctx.fillStyle = 'rgba(20, 18, 29, 1)'
     ctx.beginPath()
-    ctx.ellipse(190 + headTx, 239 + headTy, 92, 108, 0, 0, Math.PI * 2)
-    ctx.fill()
-
-    // 2. Torso / Jacket layer
-    ctx.fillStyle = '#1e1b4b'
-    ctx.beginPath()
-    ctx.ellipse(190, 410 - breathValue * 4.5, 92, 85, 0, Math.PI, Math.PI * 2)
-    ctx.fill()
-
-    // 3. Face base layer
-    ctx.fillStyle = '#fde8e8'
-    ctx.beginPath()
-    ctx.ellipse(190 + headTx, 235 + headTy, 68, 78, 0, 0, Math.PI * 2)
-    ctx.fill()
-
-    // 4. Blush layer
-    ctx.fillStyle = `rgba(251, 113, 133, ${Math.min(1, Math.max(0, pose.cheekBlush)).toFixed(2)})`
-    ctx.beginPath()
-    ctx.ellipse(144 + headTx, 260 + headTy, 16, 8, 0, 0, Math.PI * 2)
-    ctx.ellipse(236 + headTx, 260 + headTy, 16, 8, 0, 0, Math.PI * 2)
-    ctx.fill()
-
-    // 5. Eyes & Pupils layers
-    const eyeRyL = Math.max(1.5, pose.eyeOpenL * 14)
-    const eyeRyR = Math.max(1.5, pose.eyeOpenR * 14)
-    ctx.fillStyle = '#ffffff'
-    ctx.beginPath()
-    ctx.ellipse(155 + headTx, 230 + headTy, 16, eyeRyL, 0, 0, Math.PI * 2)
-    ctx.ellipse(225 + headTx, 230 + headTy, 16, eyeRyR, 0, 0, Math.PI * 2)
-    ctx.fill()
-
-    if (pose.eyeOpenL > BLINK_THRESHOLD || pose.eyeOpenR > BLINK_THRESHOLD) {
-      ctx.fillStyle = '#9333ea'
-      ctx.beginPath()
-      if (pose.eyeOpenL > BLINK_THRESHOLD) {
-        ctx.arc(
-          155 + headTx + eyeFocus.x * 6,
-          230 + headTy + eyeFocus.y * 4,
-          8.5 * pose.pupilScale,
-          0,
-          Math.PI * 2,
-        )
-      }
-      if (pose.eyeOpenR > BLINK_THRESHOLD && layers.eyeState !== 'wink') {
-        ctx.arc(
-          225 + headTx + eyeFocus.x * 6,
-          230 + headTy + eyeFocus.y * 4,
-          8.5 * pose.pupilScale,
-          0,
-          Math.PI * 2,
-        )
-      }
-      ctx.fill()
+    if (typeof ctx.moveTo === 'function' && typeof ctx.bezierCurveTo === 'function') {
+      ctx.moveTo(95, 455)
+      ctx.bezierCurveTo(102, 330, 145, 295, 190, 295 - breathValue * 4.5)
+      ctx.bezierCurveTo(235, 295, 278, 330, 285, 455)
+      ctx.closePath?.()
+    } else {
+      ctx.ellipse(190, 410 - breathValue * 4.5, 92, 85, 0, Math.PI, Math.PI * 2)
     }
+    ctx.fill()
 
-    // 6. Mouth viseme layer
-    const mouthRx = Math.max(6, 16 + pose.mouthForm * 8 + pose.mouthSmile * 6)
-    const mouthRy = Math.max(1.8, 2 + pose.mouthOpen * 16)
-    ctx.fillStyle = '#be185d'
+    // 2. Head / hair anatomical silhouette ellipse (zero facial features)
     ctx.beginPath()
-    ctx.ellipse(
-      190 + headTx,
-      282 + headTy - pose.mouthSmile * 3,
-      mouthRx,
-      mouthRy,
-      0,
-      0,
-      Math.PI * 2,
-    )
+    ctx.ellipse(190 + headTx, 235 + headTy, 92, 108, 0, 0, Math.PI * 2)
     ctx.fill()
 
     ctx.restore()

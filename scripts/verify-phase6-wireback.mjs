@@ -38,6 +38,8 @@ const browserSafeFiles = [
   'apps/desktop/src/App.tsx',
   'packages/stage/src/index.ts',
   'packages/stage/src/components/AshyStageCanvas.tsx',
+  'packages/stage/src/components/Live2DWebGLStage.tsx',
+  'packages/stage/src/drivers/live2d-bridge.ts',
   'packages/stage/src/drivers/tachie-manifest.ts',
   'packages/stage/src/drivers/tachie-compositor.ts',
   'packages/stage/src/drivers/acoustic-lip-sync.ts',
@@ -63,8 +65,14 @@ checkForbidden(
 
 checkForbidden(
   'packages/stage/src/components/AshyStageCanvas.tsx',
-  /opacity:\s*0\.01\b/,
-  'AshyStageCanvas.tsx must render visible Tachie layers (must not hide Tachie SVG with opacity: 0.01)',
+  /\bashy-tachie-svg\b/,
+  'AshyStageCanvas.tsx must not contain geometric SVG ellipses (ashy-tachie-svg) — Red-Team B3',
+)
+
+checkRequired(
+  'packages/stage/src/components/AshyStageCanvas.tsx',
+  [/\bLive2DWebGLStage\b/, /\bashy-pngtuber-stage\b/, /\bresolvePngTuberSpriteState\b/],
+  'AshyStageCanvas.tsx must wire Live2DWebGLStage and ashy-pngtuber-stage',
 )
 
 checkForbidden(
@@ -73,7 +81,7 @@ checkForbidden(
   'App.tsx outer .ashy-card in floating-stage-overlay must not set data-ui-island="true" (Red-Team B1)',
 )
 
-// 2. Verify Canonical Default Avatar Package on disk (assets/default-avatar/)
+// 2. Verify Canonical Default Avatar Package, Live2D Cubism 4 Models & Painted PNGTuber Sprites on disk
 const requiredAvatarAssets = [
   'assets/default-avatar/tachie-manifest.json',
   'assets/default-avatar/ashy-default.model3.json',
@@ -90,6 +98,16 @@ const requiredAvatarAssets = [
   'assets/default-avatar/layers/mouth_visemes.svg',
   'assets/default-avatar/layers/hair_front.svg',
   'assets/default-avatar/layers/accessories_fx.svg',
+  'apps/desktop/public/live2d/live2dcubismcore.min.js',
+  'apps/desktop/public/live2d/models/hiyori/Hiyori.moc3',
+  'apps/desktop/public/live2d/models/haru/Haru.moc3',
+  'apps/desktop/public/live2d/models/mao/Mao.moc3',
+  'apps/desktop/public/assets/default-avatar/sprites/ashy-eyes-open-mouth-closed.png',
+  'apps/desktop/public/assets/default-avatar/sprites/ashy-eyes-open-mouth-open.png',
+  'apps/desktop/public/assets/default-avatar/sprites/ashy-eyes-open-mouth-smile.png',
+  'apps/desktop/public/assets/default-avatar/sprites/ashy-eyes-closed-mouth-closed.png',
+  'apps/desktop/public/assets/default-avatar/sprites/ashy-eyes-closed-mouth-open.png',
+  'apps/desktop/public/assets/default-avatar/sprites/ashy-concerned.png',
 ]
 
 for (const relAsset of requiredAvatarAssets) {

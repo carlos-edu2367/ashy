@@ -40,6 +40,7 @@ import {
   ASHY_EMOTIONS,
   ASHY_MOTION_PRESETS,
   ASHY_TRAIT_CORRIDORS,
+  BUILTIN_LIVE2D_MODEL_PRESETS,
   DEFAULT_ASHY_VOICE_MD,
   DEFAULT_MEMORY_GOVERNANCE_POLICY,
   DEFAULT_PROVIDER_CONFIGS,
@@ -60,6 +61,7 @@ import {
   type CoreExperimentEvalReport,
   type DeletableMemoryKind,
   type EpisodicMemory,
+  type Live2DBuiltinModelId,
   type LlmProviderId,
   type MemoryGovernanceCategory,
   type MemoryGovernancePolicy,
@@ -239,6 +241,8 @@ export interface AshyDesktopState {
   activeViseme: AshyVisemeKey
   activeEyeState: AshyEyeLayerState
   activeMotion: AshyMotionPreset
+  live2dPresetId: Live2DBuiltinModelId
+  live2dModelUrl: string
   live2dModelControls: Live2DModelControls
   loadedLive2DModelName: string
 
@@ -324,6 +328,7 @@ export interface AshyDesktopState {
   setStageHidden: (hidden: boolean) => void
   toggleStageHidden: () => void
   triggerStageMotion: (motion: AshyMotionPreset) => void
+  selectLive2dPreset: (presetId: Live2DBuiltinModelId) => void
   importLive2DModelJson: (rawJson: string | unknown, modelName?: string) => Live2DModelControls
   runStageLipSyncActDemo: () => Promise<{
     visitedVisemes: AshyVisemeKey[]
@@ -1287,6 +1292,8 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     activeViseme: 'closed',
     activeEyeState: 'open',
     activeMotion: 'idle',
+    live2dPresetId: 'hiyori',
+    live2dModelUrl: '/live2d/models/hiyori/Hiyori.model3.json',
     live2dModelControls: {
       ...DEFAULT_LIVE2D_CONTROLS,
       expressions: [...DEFAULT_LIVE2D_CONTROLS.expressions],
@@ -1654,7 +1661,32 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       }
     },
 
+    selectLive2dPreset(presetId) {
+      const preset =
+        BUILTIN_LIVE2D_MODEL_PRESETS.find((p) => p.id === presetId) ??
+        BUILTIN_LIVE2D_MODEL_PRESETS[0]
+      if (!preset) return
+      set({
+        live2dPresetId: preset.id,
+        live2dModelUrl: preset.modelJsonUrl,
+        loadedLive2DModelName: preset.modelJsonUrl.split('/').pop() ?? `${preset.id}.model3.json`,
+        stageMode: 'live2d',
+      })
+    },
+
     importLive2DModelJson(rawJson, modelName = 'custom-imported.model3.json') {
+      const trimmedInput = typeof rawJson === 'string' ? rawJson.trim() : ''
+      if (trimmedInput.endsWith('.model3.json') && !trimmedInput.startsWith('{')) {
+        const cleanName =
+          trimmedInput.split('/').pop()?.trim() || modelName.trim() || 'custom-imported.model3.json'
+        set({
+          live2dModelUrl: trimmedInput,
+          loadedLive2DModelName: cleanName,
+          stageMode: 'live2d',
+        })
+        return get().live2dModelControls
+      }
+
       let parsed: unknown = rawJson
       if (typeof rawJson === 'string') {
         try {
@@ -1670,12 +1702,13 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       const nextPrompt = compilePromptFromState({
         live2dModelControls: controls,
       })
-      set({
+      set((state) => ({
         live2dModelControls: controls,
         loadedLive2DModelName: cleanName,
+        live2dModelUrl: state.live2dModelUrl,
         stageMode: 'live2d',
         lastPrompt: nextPrompt,
-      })
+      }))
       return controls
     },
 
@@ -2628,6 +2661,8 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         activeViseme: 'closed',
         activeEyeState: 'open',
         activeMotion: 'idle',
+        live2dPresetId: 'hiyori',
+        live2dModelUrl: '/live2d/models/hiyori/Hiyori.model3.json',
         live2dModelControls: {
           ...DEFAULT_LIVE2D_CONTROLS,
           expressions: [...DEFAULT_LIVE2D_CONTROLS.expressions],
