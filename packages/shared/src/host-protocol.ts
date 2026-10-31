@@ -277,7 +277,31 @@ export interface StageShortcutBindings {
   electronGlobalEyes: string
   electronGlobalDnd: string
   electronGlobalHideStage: string
+  electronGlobalPtt: string
+  electronGlobalPrivacyShield: string
 }
+
+export const StageShortcutBindingsSchema = v.object({
+  toggleMic: v.optional(v.pipe(v.string(), v.minLength(1)), 'Alt+M'),
+  toggleEyes: v.optional(v.pipe(v.string(), v.minLength(1)), 'Alt+E'),
+  toggleDnd: v.optional(v.pipe(v.string(), v.minLength(1)), 'Alt+D'),
+  toggleHideStage: v.optional(v.pipe(v.string(), v.minLength(1)), 'Alt+H'),
+  electronGlobalMic: v.optional(v.pipe(v.string(), v.minLength(1)), 'CommandOrControl+Shift+M'),
+  electronGlobalEyes: v.optional(v.pipe(v.string(), v.minLength(1)), 'CommandOrControl+Shift+E'),
+  electronGlobalDnd: v.optional(v.pipe(v.string(), v.minLength(1)), 'CommandOrControl+Shift+D'),
+  electronGlobalHideStage: v.optional(
+    v.pipe(v.string(), v.minLength(1)),
+    'CommandOrControl+Shift+H',
+  ),
+  electronGlobalPtt: v.optional(
+    v.pipe(v.string(), v.minLength(1)),
+    'CommandOrControl+Shift+Space',
+  ),
+  electronGlobalPrivacyShield: v.optional(
+    v.pipe(v.string(), v.minLength(1)),
+    'CommandOrControl+Shift+K',
+  ),
+})
 
 export const DEFAULT_STAGE_SHORTCUTS: Readonly<StageShortcutBindings> = Object.freeze({
   toggleMic: 'Alt+M',
@@ -288,6 +312,8 @@ export const DEFAULT_STAGE_SHORTCUTS: Readonly<StageShortcutBindings> = Object.f
   electronGlobalEyes: 'CommandOrControl+Shift+E',
   electronGlobalDnd: 'CommandOrControl+Shift+D',
   electronGlobalHideStage: 'CommandOrControl+Shift+H',
+  electronGlobalPtt: 'CommandOrControl+Shift+Space',
+  electronGlobalPrivacyShield: 'CommandOrControl+Shift+K',
 })
 
 export interface StageOverlayRuntimeState {
@@ -987,6 +1013,8 @@ export const PersistedStagePreferencesSchema = v.object({
   updatedAt: TimestampSchema,
 })
 export type PersistedStagePreferences = v.InferOutput<typeof PersistedStagePreferencesSchema>
+export const StagePreferencesSchema = PersistedStagePreferencesSchema
+export type StagePreferences = PersistedStagePreferences
 
 export const DEFAULT_PERSISTED_STAGE_PREFERENCES: Readonly<PersistedStagePreferences> =
   Object.freeze({
@@ -1236,6 +1264,140 @@ export const RoomEnvironmentStateSchema = v.object({
 })
 export type RoomEnvironmentState = v.InferOutput<typeof RoomEnvironmentStateSchema>
 
+export const FORBIDDEN_PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+export function safeJsonParseWithoutProto<T = unknown>(rawJson: string): T {
+  return JSON.parse(rawJson, (key, value) => {
+    if (FORBIDDEN_PROTO_KEYS.has(key)) {
+      throw new Error(`Forbidden key in JSON payload: ${key}`)
+    }
+    return value
+  }) as T
+}
+
+export function canonicalizeJson(value: unknown): string {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+    return JSON.stringify(value)
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new Error(`Cannot canonicalize non-finite number: ${String(value)}`)
+    }
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) {
+    const items = value.map((item) => canonicalizeJson(item === undefined ? null : item))
+    return `[${items.join(',')}]`
+  }
+  if (typeof value === 'object' && value !== null) {
+    const ownKeys = Object.getOwnPropertyNames(value)
+    for (const key of ownKeys) {
+      if (FORBIDDEN_PROTO_KEYS.has(key)) {
+        throw new Error(`Forbidden key in JSON payload: ${key}`)
+      }
+    }
+    const record = value as Record<string, unknown>
+    const sortedKeys = ownKeys
+      .filter(
+        (k) => Object.prototype.propertyIsEnumerable.call(value, k) && record[k] !== undefined,
+      )
+      .sort()
+    const pairs = sortedKeys.map((k) => `${JSON.stringify(k)}:${canonicalizeJson(record[k])}`)
+    return `{${pairs.join(',')}}`
+  }
+  return 'null'
+}
+
+export const ASHY_SOUL_ARCHIVE_MAGIC = 'ASHY_SOUL_V1' as const
+export const CURRENT_SOUL_SCHEMA_VERSION = 5 as const
+
+export const CortexSoulSnapshotSchema = v.object({
+  episodicMemories: v.array(v.any()),
+  semanticFacts: v.array(v.any()),
+  relationalMotifs: v.array(v.any()),
+  milestones: v.array(v.any()),
+  userHabits: v.array(v.any()),
+  prospectiveIntents: v.array(v.any()),
+  personalityEvolution: v.array(v.any()),
+  personalityProfile: v.optional(v.any()),
+  relationshipState: v.optional(v.any()),
+  styleExemplars: v.optional(v.array(v.any())),
+  goldenExemplars: v.optional(v.array(v.any())),
+  chatSessions: v.array(v.any()),
+  chatMessages: v.array(v.any()),
+  memoryGovernance: v.optional(v.any()),
+  actionAuditLog: v.optional(v.array(v.any())),
+  agencyConsent: v.optional(v.any()),
+  initiativePolicy: v.optional(v.any()),
+  proactiveInitiativeLog: v.optional(v.array(v.any())),
+  dreamJournalEntries: v.optional(v.array(v.any())),
+})
+export type CortexSoulSnapshot = v.InferOutput<typeof CortexSoulSnapshotSchema>
+
+export const AshySoulBundlePayloadSchema = v.object({
+  formatVersion: v.literal(1),
+  schemaVersion: v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(10)),
+  exportedAt: v.pipe(v.string(), v.minLength(1)),
+  appVersion: v.pipe(v.string(), v.minLength(1)),
+  cortex: CortexSoulSnapshotSchema,
+  voiceIdentityMarkdown: v.string(),
+  stagePreferences: v.optional(StagePreferencesSchema),
+  voicePreferences: v.optional(v.any()),
+})
+export type AshySoulBundlePayload = v.InferOutput<typeof AshySoulBundlePayloadSchema>
+
+export const AshySoulArchiveSchema = v.object({
+  magic: v.literal('ASHY_SOUL_V1'),
+  checksumSha256: v.pipe(v.string(), v.regex(/^[a-f0-9]{64}$/i)),
+  payload: AshySoulBundlePayloadSchema,
+})
+export type AshySoulArchive = v.InferOutput<typeof AshySoulArchiveSchema>
+
+export const ExportSoulInputSchema = v.optional(
+  v.object({
+    includeChatHistory: v.optional(v.boolean()),
+    includeAuditLog: v.optional(v.boolean()),
+  }),
+)
+export type ExportSoulInput = v.InferOutput<typeof ExportSoulInputSchema>
+
+export const ImportSoulInputSchema = v.object({
+  archive: v.union([v.string(), AshySoulArchiveSchema]),
+})
+export type ImportSoulInput = v.InferOutput<typeof ImportSoulInputSchema>
+
+export const EncryptionAtRestStatusSchema = v.object({
+  enabled: v.boolean(),
+  algorithm: v.literal('AES-256-GCM'),
+  keyBackend: v.picklist(['electron-safe-storage', 'node-aes-master-key'] as const),
+  updatedAt: v.nullable(v.string()),
+})
+export type EncryptionAtRestStatus = v.InferOutput<typeof EncryptionAtRestStatusSchema>
+
+export const SetEncryptionAtRestInputSchema = v.object({
+  enabled: v.boolean(),
+})
+export type SetEncryptionAtRestInput = v.InferOutput<typeof SetEncryptionAtRestInputSchema>
+
+export const AutoUpdaterStateSchema = v.object({
+  status: v.picklist([
+    'idle',
+    'checking',
+    'available',
+    'not-available',
+    'downloading',
+    'downloaded',
+    'error',
+  ] as const),
+  currentVersion: v.string(),
+  availableVersion: v.nullable(v.string()),
+  progressPercent: v.nullable(v.number()),
+  errorMessage: v.nullable(v.string()),
+  checkedAt: v.nullable(v.string()),
+  autoDownload: v.boolean(),
+})
+export type AutoUpdaterState = v.InferOutput<typeof AutoUpdaterStateSchema>
+
 export interface AshyBootstrapSnapshot {
   needsOnboarding: boolean
   userProfile: {
@@ -1291,11 +1453,47 @@ export interface AshyBootstrapSnapshot {
   agency?: AgencySnapshot
   stagePreferences?: PersistedStagePreferences
   voiceSettings?: VoiceRuntimeSettings
+  encryptionAtRest?: EncryptionAtRestStatus
+  updaterState?: AutoUpdaterState
 }
+
+export type HostBootstrapSnapshot = AshyBootstrapSnapshot
+
+export const HostBootstrapSnapshotSchema = v.object({
+  needsOnboarding: v.boolean(),
+  userProfile: v.optional(
+    v.object({
+      userName: v.nullable(v.string()),
+      userPronouns: v.nullable(v.string()),
+    }),
+  ),
+  relationship: v.optional(v.any()),
+  affect: v.optional(v.any()),
+  activeSession: v.optional(v.any()),
+  sessions: v.optional(v.array(v.any())),
+  messages: v.optional(v.array(v.any())),
+  memories: v.optional(v.any()),
+  voice: v.optional(v.any()),
+  providers: v.optional(v.any()),
+  runtimeDiagnostics: v.optional(v.any()),
+  lastEvalReport: v.optional(v.nullable(CoreExperimentEvalReportSchema)),
+  agency: v.optional(v.any()),
+  stagePreferences: v.optional(PersistedStagePreferencesSchema),
+  voiceSettings: v.optional(VoiceRuntimeSettingsSchema),
+  encryptionAtRest: v.optional(EncryptionAtRestStatusSchema),
+  updaterState: v.optional(AutoUpdaterStateSchema),
+})
+
+export const AshyBootstrapSnapshotSchema = HostBootstrapSnapshotSchema
+
+export const ONBOARDING_ARCHITECTURE_MODES = ['local-omni', 'cloud-hybrid'] as const
+export type OnboardingArchitectureMode = (typeof ONBOARDING_ARCHITECTURE_MODES)[number]
+export const OnboardingArchitectureModeSchema = v.picklist(ONBOARDING_ARCHITECTURE_MODES)
 
 export const CompleteOnboardingInputSchema = v.object({
   userName: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(80)),
   userPronouns: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(40))),
+  architectureMode: v.optional(v.picklist(['local-omni', 'cloud-hybrid'] as const)),
   providerConfig: v.optional(
     v.object({
       providerId: LlmProviderIdSchema,
@@ -1313,6 +1511,11 @@ export const CompleteOnboardingInputSchema = v.object({
       omniVoiceId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(128))),
     }),
   ),
+  voiceSettings: v.optional(SaveVoiceRuntimeSettingsInputSchema),
+  agencyConsent: v.optional(UpdateAgencyConsentInputSchema),
+  initiativePolicy: v.optional(UpdateInitiativePolicyInputSchema),
+  stagePreferences: v.optional(UpdateStagePreferencesInputSchema),
+  seedFirstGreeting: v.optional(v.boolean()),
 })
 
 export type CompleteOnboardingInput = v.InferOutput<typeof CompleteOnboardingInputSchema>
@@ -1429,9 +1632,20 @@ export const ASHY_HOST_RPC_METHODS = [
   'listVoiceProviderModels',
   'transcribeVoiceAudio',
   'synthesizeVoiceSpeech',
+  'exportSoul',
+  'importSoul',
+  'wipeAllData',
+  'setEncryptionAtRest',
+  'getEncryptionAtRestStatus',
+  'activatePrivacyShield',
+  'getUpdateState',
+  'checkForUpdates',
+  'downloadUpdate',
+  'quitAndInstallUpdate',
 ] as const
 
 export type AshyHostRpcMethod = (typeof ASHY_HOST_RPC_METHODS)[number]
+export const AshyHostRpcMethodSchema = v.picklist(ASHY_HOST_RPC_METHODS)
 
 export const TurnInputAudioSchema = v.object({
   dataBase64: v.pipe(
@@ -1622,7 +1836,18 @@ export const AshyHostStreamEventSchema = v.union([
   }),
   v.object({
     type: v.literal('shortcut:triggered'),
-    action: v.picklist(['toggleMic', 'toggleEyes', 'toggleDnd', 'toggleHideStage'] as const),
+    action: v.picklist([
+      'toggleMic',
+      'toggleEyes',
+      'toggleDnd',
+      'toggleHideStage',
+      'togglePtt',
+      'activatePrivacyShield',
+    ] as const),
+  }),
+  v.object({
+    type: v.literal('updater:status'),
+    state: AutoUpdaterStateSchema,
   }),
 ])
 
@@ -1715,7 +1940,17 @@ export type AshyHostStreamEvent =
     }
   | {
       type: 'shortcut:triggered'
-      action: 'toggleMic' | 'toggleEyes' | 'toggleDnd' | 'toggleHideStage'
+      action:
+        | 'toggleMic'
+        | 'toggleEyes'
+        | 'toggleDnd'
+        | 'toggleHideStage'
+        | 'togglePtt'
+        | 'activatePrivacyShield'
+    }
+  | {
+      type: 'updater:status'
+      state: AutoUpdaterState
     }
 
 export interface AshyHostBridge {
@@ -1841,6 +2076,16 @@ export interface AshyHostBridge {
   synthesizeVoiceSpeech?(
     input: SynthesizeVoiceSpeechInput,
   ): Promise<VoiceSynthesizeSpeechResult>
+  exportSoul?(input?: ExportSoulInput): Promise<AshySoulArchive>
+  importSoul?(input: ImportSoulInput): Promise<HostBootstrapSnapshot>
+  wipeAllData?(): Promise<HostBootstrapSnapshot>
+  setEncryptionAtRest?(input: SetEncryptionAtRestInput): Promise<HostBootstrapSnapshot>
+  getEncryptionAtRestStatus?(): Promise<EncryptionAtRestStatus>
+  activatePrivacyShield?(): Promise<HostBootstrapSnapshot>
+  getUpdateState?(): Promise<AutoUpdaterState>
+  checkForUpdates?(): Promise<AutoUpdaterState>
+  downloadUpdate?(): Promise<AutoUpdaterState>
+  quitAndInstallUpdate?(): Promise<{ ok: boolean }>
   onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
 
