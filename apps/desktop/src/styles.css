@@ -362,6 +362,17 @@ input[type='range'] {
 }
 
 /* ============================================================================
+   Mobile responsive sidebar
+   ============================================================================ */
+@media (max-width: 960px) {
+  .ashy-sidebar { min-height: auto; padding: 12px 14px; border-right: none; border-bottom: 1px solid var(--border-subtle); }
+  .ashy-sidebar-top { gap: 10px; }
+  .ashy-nav { flex-direction: row; flex-wrap: wrap; gap: 6px; }
+  .ashy-nav-item { width: auto; padding: 8px 12px; }
+  .ashy-sidebar-bottom { display: none; }
+}
+
+/* ============================================================================
    2. TYPOGRAPHY & COMMON HEADINGS
    ============================================================================ */
 
@@ -1389,7 +1400,7 @@ input[type='range'] {
    6. BUTTONS, INPUTS, SELECTS & BADGES
    ============================================================================ */
 
-.ashy-peach-btn {
+.ashy-peach-btn, .ashy-primary-btn {
   appearance: none;
   background: linear-gradient(135deg, var(--accent-peach-bright), var(--accent-peach));
   color: var(--text-on-peach);
@@ -1408,7 +1419,7 @@ input[type='range'] {
   transition: transform 0.15s ease, filter 0.15s ease, box-shadow 0.15s ease;
 }
 
-.ashy-peach-btn:hover:not(:disabled) {
+.ashy-peach-btn:hover:not(:disabled), .ashy-primary-btn:hover:not(:disabled) {
   transform: translateY(-1px);
   filter: brightness(1.04);
   box-shadow: 0 8px 24px rgba(244, 166, 136, 0.34);
