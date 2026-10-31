@@ -126,7 +126,7 @@ export function FirstMeetingWizard(): React.ReactElement {
     setArchitectureMode('local-omni')
     setSelectedProvider('ollama')
     setBaseUrl('http://127.0.0.1:11434')
-    setModelId('lfm3-omni:2b')
+    setModelId('hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M')
     setReasoningEffort('none')
     setIsOmniModel(true)
     setOmniExecutionMode('native-omni')
@@ -139,7 +139,10 @@ export function FirstMeetingWizard(): React.ReactElement {
     setArchitectureMode('cloud-hybrid')
     setIsOmniModel(false)
     setOmniExecutionMode('modular')
-    if (selectedProvider === 'ollama' && modelId === 'lfm3-omni:2b') {
+    if (
+      selectedProvider === 'ollama' &&
+      (modelId === 'hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M' || modelId === 'lfm3-omni:2b')
+    ) {
       const cloudCfg = providers.configs.openrouter
       setSelectedProvider('openrouter')
       setBaseUrl(cloudCfg?.baseUrl ?? 'https://openrouter.ai/api/v1')

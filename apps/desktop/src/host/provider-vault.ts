@@ -146,7 +146,10 @@ function createDefaultSecretsDocument(): StoredSecretsDocument {
   }
 }
 
-function parseAndValidateProviders(raw: string): StoredProvidersDocument {
+function parseAndValidateProviders(
+  raw: string,
+  allowLegacyOllamaTag = false,
+): StoredProvidersDocument {
   const parsed = JSON.parse(raw) as unknown
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new Error('providers.json root must be an object')
@@ -174,7 +177,15 @@ function parseAndValidateProviders(raw: string): StoredProvidersDocument {
     }
     const entry = item as Record<string, unknown>
     const baseUrl = typeof entry.baseUrl === 'string' ? entry.baseUrl.trim() : ''
-    const modelId = typeof entry.modelId === 'string' ? entry.modelId.trim() : ''
+    const rawModelId = typeof entry.modelId === 'string' ? entry.modelId.trim() : ''
+    const shouldHealLegacyLfm3Tag =
+      !allowLegacyOllamaTag &&
+      id === 'ollama' &&
+      rawModelId === 'lfm3-omni:2b' &&
+      entry.omniVoiceId !== 'female'
+    const modelId = shouldHealLegacyLfm3Tag
+      ? 'hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M'
+      : rawModelId
     if (baseUrl.length === 0 || modelId.length === 0) {
       throw new Error(`providers.json entry ${id} has empty baseUrl or modelId`)
     }
@@ -194,7 +205,11 @@ function parseAndValidateProviders(raw: string): StoredProvidersDocument {
         typeof entry.lastVerifiedAt === 'number' && Number.isFinite(entry.lastVerifiedAt)
           ? entry.lastVerifiedAt
           : null,
-      lastError: typeof entry.lastError === 'string' ? entry.lastError : null,
+      lastError: shouldHealLegacyLfm3Tag
+        ? null
+        : typeof entry.lastError === 'string'
+          ? entry.lastError
+          : null,
       ...(isOmniExecutionMode(entry.omniExecutionMode)
         ? { omniExecutionMode: entry.omniExecutionMode }
         : {}),
@@ -283,6 +298,7 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
   const inFlightProbes = new Map<string, Promise<ProviderHealthResult>>()
   const inFlightCatalogRequests = new Map<string, Promise<ListProviderModelsResult>>()
   const decryptedKeyCache = new Map<string, string | null>()
+  let explicitlySavedLegacyOllamaTag = false
 
   function validateHttpBaseUrl(rawUrl: string): URL {
     let parsedUrl: URL
@@ -322,7 +338,7 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
     return readWithAutoHeal({
       filePath: providersFilePath,
       defaultContent: defaultProvidersJson,
-      parseAndValidate: parseAndValidateProviders,
+      parseAndValidate: (raw) => parseAndValidateProviders(raw, explicitlySavedLegacyOllamaTag),
     })
   }
 
@@ -467,6 +483,9 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
     const secretsDoc = loadSecretsForMutation()
 
     const existing = providersDoc.providers[providerId]
+    if (providerId === 'ollama') {
+      explicitlySavedLegacyOllamaTag = modelId.trim() === 'lfm3-omni:2b'
+    }
     const updatedEntry: StoredProviderEntry = {
       ...existing,
       baseUrl,

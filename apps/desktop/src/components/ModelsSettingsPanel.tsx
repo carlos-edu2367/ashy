@@ -263,7 +263,10 @@ export function ModelsSettingsPanel(): React.ReactElement {
             onClick={() => {
               applyOmniModelPreset('lfm3-omni-2b')
               setSelectedProvider('ollama')
-              setModelId('lfm3-omni:2b')
+              setModelId(
+                useAshyStore.getState().activeModelId ||
+                  'hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M',
+              )
             }}
           >
             ⚡ LFM3-Omni-2B (Local Ollama)

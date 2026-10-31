@@ -125,7 +125,7 @@ describe('Phase 9 Task 6 — Interactive Onboarding Wizard, Soul Portability Pan
     expect(useAshyStore.getState().unifiedOmniMode).toBe(true)
     expect(useAshyStore.getState().directOmniAudio).toBe(true)
     expect(useAshyStore.getState().providers.activeProviderId).toBe('ollama')
-    expect(useAshyStore.getState().activeModelId).toBe('lfm3-omni:2b')
+    expect(useAshyStore.getState().activeModelId).toBe('hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M')
   })
 
   it('2. [BUG-ONB2] handles setQuietHoursRange("Desativado") and em-dash ranges without activating DND mode, persisting respectDnd across reloads', async () => {
@@ -207,7 +207,9 @@ describe('Phase 9 Task 6 — Interactive Onboarding Wizard, Soul Portability Pan
     expect(getByTestId<HTMLInputElement>('onboarding-base-url-input').value).toBe(
       'http://127.0.0.1:11434',
     )
-    expect(getByTestId<HTMLInputElement>('onboarding-model-id-input').value).toBe('lfm3-omni:2b')
+    expect(getByTestId<HTMLInputElement>('onboarding-model-id-input').value).toBe(
+      'hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M',
+    )
     expect(getByTestId<HTMLSelectElement>('onboarding-reasoning-effort-select').value).toBe('none')
 
     // Configure Privacy Permissions & Quiet Hours
@@ -250,7 +252,7 @@ describe('Phase 9 Task 6 — Interactive Onboarding Wizard, Soul Portability Pan
     expect(state.needsOnboarding).toBe(false)
     expect(state.userProfile.userName).toBe('Carlos')
     expect(state.providers.activeProviderId).toBe('ollama')
-    expect(state.activeModelId).toBe('lfm3-omni:2b')
+    expect(state.activeModelId).toBe('hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M')
     expect(state.providers.configs.ollama.isOmniModel).toBe(true)
     expect(state.providers.configs.ollama.omniExecutionMode).toBe('native-omni')
     expect(state.providers.configs.ollama.omniVoiceId).toBe('ashy-warm-ptbr')

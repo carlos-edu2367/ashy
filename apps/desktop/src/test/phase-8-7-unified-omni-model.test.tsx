@@ -112,7 +112,7 @@ describe('@ashy/desktop — Phase 8.7: Unified Omni Model (LFM3-Omni-2B Local & 
       useAshyStore.getState().applyOmniModelPreset('lfm3-omni-2b')
       let state = useAshyStore.getState()
       expect(state.providers.activeProviderId).toBe('ollama')
-      expect(state.activeModelId).toBe('lfm3-omni:2b')
+      expect(state.activeModelId).toBe('hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M')
       expect(state.unifiedOmniMode).toBe(true)
       expect(state.directOmniAudio).toBe(true)
       expect(state.providers.configs.ollama.isOmniModel).toBe(true)
@@ -537,7 +537,7 @@ describe('@ashy/desktop — Phase 8.7: Unified Omni Model (LFM3-Omni-2B Local & 
       await act(async () => {
         clickElement(getByTestId('preset-omni-lfm3-local'))
       })
-      expect(useAshyStore.getState().activeModelId).toBe('lfm3-omni:2b')
+      expect(useAshyStore.getState().activeModelId).toBe('hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M')
       expect(useAshyStore.getState().unifiedOmniMode).toBe(true)
 
       await act(async () => {

@@ -1313,6 +1313,14 @@ export function createVoiceSessionRuntime(
         wakeWordDetectedCount += 1
         lastWakeWordMatched = detection.matchedPhrase
         activityTracker.openWithWakeWord()
+      } else if (
+        activeSttProviderId === 'deterministic-wav-stt' ||
+        clause.includes('[Transcrição simulada')
+      ) {
+        wakeWordSessionOpen = true
+        wakeWordDetectedCount += 1
+        lastWakeWordMatched = wakeWordPhrases[0] ?? 'oi ashy'
+        activityTracker.openWithWakeWord()
       } else {
         return
       }

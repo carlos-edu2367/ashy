@@ -5626,7 +5626,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       > = {
         'lfm3-omni-2b': {
           providerId: 'ollama',
-          modelId: 'lfm3-omni:2b',
+          modelId:
+            get().localRuntime.installedModels.find((m) => /lfm3-omni/i.test(m.name))?.name ||
+            'hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M',
           omniVoiceId: 'ashy-warm-ptbr',
         },
         'gpt-4o-audio': {
