@@ -202,6 +202,10 @@ export interface ElectronBrowserWindowInstanceLike {
   unmaximize?(): void
   isMaximized?(): boolean
   close?(): void
+  getBounds?(): { x: number; y: number; width: number; height: number }
+  setBounds?(bounds: { x: number; y: number; width: number; height: number }): void
+  getPosition?(): [number, number]
+  setPosition?(x: number, y: number): void
 }
 
 function isWindowUsable(
@@ -337,6 +341,7 @@ export function registerAshyElectronIpc(
     const candidate = overlayOptions?.getHubWindow?.() ?? overlayOptions?.hubWindow ?? null
     return isWindowUsable(candidate) ? candidate : null
   }
+  let fallbackOverlayBounds = { x: 120, y: 120, width: 380, height: 460 }
 
   ipcMain.handle('ashy:rpc', async (event, request) => {
     validateIpcSender(event)
@@ -392,6 +397,72 @@ export function registerAshyElectronIpc(
   ipcMain.handle('ashy:getOverlayState', async (event) => {
     validateIpcSender(event)
     return overlayController.getState()
+  })
+
+  ipcMain.handle('ashy:getOverlayBounds', async (event) => {
+    validateIpcSender(event)
+    const overlayWin = resolveOverlayWindow()
+    if (overlayWin?.getBounds) {
+      const b = overlayWin.getBounds()
+      if (
+        b &&
+        typeof b.x === 'number' &&
+        typeof b.y === 'number' &&
+        typeof b.width === 'number' &&
+        typeof b.height === 'number'
+      ) {
+        fallbackOverlayBounds = { ...b }
+        return b
+      }
+    }
+    if (overlayWin?.getPosition) {
+      const pos = overlayWin.getPosition()
+      if (Array.isArray(pos) && typeof pos[0] === 'number' && typeof pos[1] === 'number') {
+        fallbackOverlayBounds = {
+          ...fallbackOverlayBounds,
+          x: pos[0],
+          y: pos[1],
+        }
+      }
+    }
+    return { ...fallbackOverlayBounds }
+  })
+
+  ipcMain.handle('ashy:setOverlayPosition', async (event, payload) => {
+    validateIpcSender(event)
+    if (!payload || typeof payload !== 'object') {
+      return { ...fallbackOverlayBounds }
+    }
+    const rawX = Number((payload as { x?: unknown }).x)
+    const rawY = Number((payload as { y?: unknown }).y)
+    if (!Number.isFinite(rawX) || !Number.isFinite(rawY)) {
+      return { ...fallbackOverlayBounds }
+    }
+    const clampedX = Math.max(-10000, Math.min(10000, Math.round(rawX)))
+    const clampedY = Math.max(-10000, Math.min(10000, Math.round(rawY)))
+    const overlayWin = resolveOverlayWindow()
+    const cur = overlayWin?.getBounds?.() ?? fallbackOverlayBounds
+    const nextBounds = {
+      x: clampedX,
+      y: clampedY,
+      width: cur.width || 380,
+      height: cur.height || 460,
+    }
+    fallbackOverlayBounds = nextBounds
+    if (overlayWin?.setBounds) {
+      overlayWin.setBounds(nextBounds)
+    } else {
+      overlayWin?.setPosition?.(clampedX, clampedY)
+    }
+    return nextBounds
+  })
+
+  ipcMain.handle('ashy:focusHubWindow', async (event) => {
+    validateIpcSender(event)
+    const hub = resolveHubWindow()
+    hub?.show?.()
+    hub?.focus?.()
+    return { focused: true }
   })
 
   ipcMain.handle('ashy:windowMinimize', async (event) => {
@@ -467,6 +538,9 @@ export function registerAshyElectronIpc(
     ipcMain.removeHandler('ashy:setOverlayIgnoreMouse')
     ipcMain.removeHandler('ashy:setOverlayVisible')
     ipcMain.removeHandler('ashy:getOverlayState')
+    ipcMain.removeHandler('ashy:getOverlayBounds')
+    ipcMain.removeHandler('ashy:setOverlayPosition')
+    ipcMain.removeHandler('ashy:focusHubWindow')
     ipcMain.removeHandler('ashy:windowMinimize')
     ipcMain.removeHandler('ashy:windowMaximize')
     ipcMain.removeHandler('ashy:windowClose')
@@ -621,6 +695,7 @@ export async function bootAshyElectronMain(
   overlayWindowRef = overlayWindow
   overlayWindow.setAlwaysOnTop?.(true, 'screen-saver')
   if (embeddedServer) {
+    overlayController.setIgnoreMouseEvents(true, true)
     overlayWindow.setIgnoreMouseEvents?.(true, { forward: true })
   }
   attachWindowSecurityGuards(overlayWindow)

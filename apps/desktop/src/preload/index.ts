@@ -41,6 +41,12 @@ export interface AshyPreloadApi {
   }): Promise<StageOverlayRuntimeState>
   setOverlayVisible?(input: { visible: boolean }): Promise<StageOverlayRuntimeState>
   getOverlayState?(): Promise<StageOverlayRuntimeState>
+  getOverlayBounds?(): Promise<{ x: number; y: number; width: number; height: number }>
+  setOverlayPosition?(input: {
+    x: number
+    y: number
+  }): Promise<{ x: number; y: number; width: number; height: number }>
+  focusHubWindow?(): Promise<{ focused: boolean }>
   minimizeWindow?(): Promise<{ minimized: boolean }>
   maximizeWindow?(): Promise<{ maximized: boolean }>
   closeWindow?(): Promise<{ closed: boolean }>
@@ -115,6 +121,28 @@ export function createAshyPreloadApi(
     },
     getOverlayState(): Promise<StageOverlayRuntimeState> {
       return ipcRenderer.invoke('ashy:getOverlayState') as Promise<StageOverlayRuntimeState>
+    },
+    getOverlayBounds(): Promise<{ x: number; y: number; width: number; height: number }> {
+      return ipcRenderer.invoke('ashy:getOverlayBounds') as Promise<{
+        x: number
+        y: number
+        width: number
+        height: number
+      }>
+    },
+    setOverlayPosition(input: {
+      x: number
+      y: number
+    }): Promise<{ x: number; y: number; width: number; height: number }> {
+      return ipcRenderer.invoke('ashy:setOverlayPosition', input) as Promise<{
+        x: number
+        y: number
+        width: number
+        height: number
+      }>
+    },
+    focusHubWindow(): Promise<{ focused: boolean }> {
+      return ipcRenderer.invoke('ashy:focusHubWindow') as Promise<{ focused: boolean }>
     },
     minimizeWindow(): Promise<{ minimized: boolean }> {
       return ipcRenderer.invoke('ashy:windowMinimize') as Promise<{ minimized: boolean }>

@@ -415,6 +415,7 @@ export interface AshyStageCanvasProps {
   height?: number
   fullBleed?: boolean
   hideBubble?: boolean
+  lockInteractiveMouse?: boolean
   uiIslandRects?: readonly UiIslandRect[]
   onIgnoreMouseChange?: (shouldIgnore: boolean) => void
 }
@@ -446,6 +447,7 @@ export function AshyStageCanvas({
   height = 460,
   fullBleed = false,
   hideBubble = false,
+  lockInteractiveMouse = false,
   uiIslandRects,
   onIgnoreMouseChange,
 }: AshyStageCanvasProps): React.ReactElement {
@@ -799,6 +801,13 @@ export function AshyStageCanvas({
     }
 
     if (!onIgnoreMouseChange) return
+    if (lockInteractiveMouse) {
+      if (lastIgnoreMouseRef.current !== false) {
+        lastIgnoreMouseRef.current = false
+        onIgnoreMouseChange(false)
+      }
+      return
+    }
     const targetEl = event.target as HTMLElement | null
     const isOverUiIsland = Boolean(targetEl?.closest?.('[data-ui-island="true"]'))
 
@@ -881,34 +890,36 @@ export function AshyStageCanvas({
             width={width}
             height={height}
           />
-          <div
-            data-testid="live2d-parameter-hud"
-            style={{
-              position: 'absolute',
-              bottom: '8px',
-              left: '8px',
-              padding: '6px 10px',
-              borderRadius: '10px',
-              background: 'rgba(15, 23, 42, 0.85)',
-              border: '1px solid rgba(192, 132, 252, 0.4)',
-              color: '#e2e8f0',
-              fontFamily: 'monospace',
-              fontSize: '10px',
-              lineHeight: 1.35,
-              pointerEvents: 'none',
-              zIndex: 9,
-            }}
-          >
-            <div>
-              Live2D Cubism v{effectiveLive2dControls.version} · Expr:{' '}
-              {effectiveLive2dControls.expressions.length}
+          {!transparentBackground && (
+            <div
+              data-testid="live2d-parameter-hud"
+              style={{
+                position: 'absolute',
+                bottom: '8px',
+                left: '8px',
+                padding: '6px 10px',
+                borderRadius: '10px',
+                background: 'rgba(15, 23, 42, 0.85)',
+                border: '1px solid rgba(192, 132, 252, 0.4)',
+                color: '#e2e8f0',
+                fontFamily: 'monospace',
+                fontSize: '10px',
+                lineHeight: 1.35,
+                pointerEvents: 'none',
+                zIndex: 9,
+              }}
+            >
+              <div>
+                Live2D Cubism v{effectiveLive2dControls.version} · Expr:{' '}
+                {effectiveLive2dControls.expressions.length}
+              </div>
+              <div>
+                ParamMouthOpenY: {live2dParams.ParamMouthOpenY.toFixed(2)} · ParamEyeLOpen:{' '}
+                {live2dParams.ParamEyeLOpen.toFixed(2)} · ParamAngleX:{' '}
+                {live2dParams.ParamAngleX.toFixed(1)}
+              </div>
             </div>
-            <div>
-              ParamMouthOpenY: {live2dParams.ParamMouthOpenY.toFixed(2)} · ParamEyeLOpen:{' '}
-              {live2dParams.ParamEyeLOpen.toFixed(2)} · ParamAngleX:{' '}
-              {live2dParams.ParamAngleX.toFixed(1)}
-            </div>
-          </div>
+          )}
         </>
       ) : (
         <div
@@ -982,14 +993,22 @@ export function AshyStageCanvas({
         }}
       />
 
-      {!hideBubble && (
-        <PresenceBubble
-          text={bubbleText}
-          emotion={emotion}
-          statusLabel={statusLabel}
-          springOffset={bubbleOffset}
-        />
-      )}
+      {!hideBubble &&
+        !(
+          transparentBackground &&
+          !isSpeaking &&
+          ((bubbleText ?? '').trim() === '' ||
+            (bubbleText ?? '').trim() === '...' ||
+            (bubbleText ?? '').trim() === 'Fico por aqui. No seu ritmo. ♡') &&
+          (!statusLabel || String(statusLabel).toLowerCase() === 'idle')
+        ) && (
+          <PresenceBubble
+            text={bubbleText}
+            emotion={emotion}
+            statusLabel={statusLabel}
+            springOffset={bubbleOffset}
+          />
+        )}
     </div>
   )
 }

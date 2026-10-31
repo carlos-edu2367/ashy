@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import {
   ASHY_EMOTIONS,
   ASHY_MOTION_PRESETS,
@@ -205,6 +205,34 @@ export function App(): React.ReactElement {
   const [soulArchiveJsonDraft, setSoulArchiveJsonDraft] = useState('')
   const [showWipeConfirm, setShowWipeConfirm] = useState(false)
   const [customLocalModelDraft, setCustomLocalModelDraft] = useState('')
+  const [isDraggingOverlay, setIsDraggingOverlay] = useState(false)
+  const [isHoveringOverlay, setIsHoveringOverlay] = useState(false)
+  const overlayBoundsRef = useRef<{ x: number; y: number }>({ x: 100, y: 100 })
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+    if (state.isTransparentOverlayWindow) {
+      document.documentElement.classList.add('ashy-transparent-overlay')
+      document.documentElement.style.backgroundColor = 'transparent'
+      document.body.style.backgroundColor = 'transparent'
+      document.body.style.overflow = 'hidden'
+      if (typeof window !== 'undefined') {
+        void window.ashyHost
+          ?.getOverlayBounds?.()
+          .then((bounds) => {
+            if (bounds && typeof bounds.x === 'number' && typeof bounds.y === 'number') {
+              overlayBoundsRef.current = { x: bounds.x, y: bounds.y }
+            }
+          })
+          .catch(() => {})
+      }
+    } else {
+      document.documentElement.classList.remove('ashy-transparent-overlay')
+      document.documentElement.style.backgroundColor = ''
+      document.body.style.backgroundColor = ''
+      document.body.style.overflow = ''
+    }
+  }, [state.isTransparentOverlayWindow])
 
   useEffect(() => {
     void useAshyStore.getState().bootstrapFromHost().catch(() => {})
@@ -269,29 +297,91 @@ export function App(): React.ReactElement {
       state.setEyesMode(next)
     }
 
+    const handleOverlayMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return
+      const targetEl = event.target as HTMLElement | null
+      if (targetEl?.closest?.('[data-ui-island="true"]')) return
+      if (typeof window === 'undefined') return
+
+      state.setStageIgnoreMouseEvents(false)
+      void window.ashyHost?.setOverlayIgnoreMouse?.({ ignore: false, forward: true })
+      setIsDraggingOverlay(true)
+
+      const startScreenX = event.screenX
+      const startScreenY = event.screenY
+      let baseBounds = { ...overlayBoundsRef.current }
+      let hasMovedDuringDrag = false
+
+      void window.ashyHost
+        ?.getOverlayBounds?.()
+        .then((bounds) => {
+          if (
+            !hasMovedDuringDrag &&
+            bounds &&
+            typeof bounds.x === 'number' &&
+            typeof bounds.y === 'number'
+          ) {
+            baseBounds = { x: bounds.x, y: bounds.y }
+            overlayBoundsRef.current = { x: bounds.x, y: bounds.y }
+          }
+        })
+        .catch(() => {})
+
+      const onMouseMove = (moveEvent: MouseEvent) => {
+        hasMovedDuringDrag = true
+        const nextX = Math.round(baseBounds.x + (moveEvent.screenX - startScreenX))
+        const nextY = Math.round(baseBounds.y + (moveEvent.screenY - startScreenY))
+        overlayBoundsRef.current = { x: nextX, y: nextY }
+        void window.ashyHost?.setOverlayPosition?.({ x: nextX, y: nextY })
+      }
+
+      const onMouseUp = () => {
+        setIsDraggingOverlay(false)
+        window.removeEventListener('mousemove', onMouseMove)
+        window.removeEventListener('mouseup', onMouseUp)
+      }
+
+      window.addEventListener('mousemove', onMouseMove)
+      window.addEventListener('mouseup', onMouseUp)
+    }
+
     return (
       <div
         data-testid="floating-stage-overlay"
+        onMouseEnter={() => setIsHoveringOverlay(true)}
+        onMouseMove={() => {
+          if (!isHoveringOverlay) setIsHoveringOverlay(true)
+        }}
+        onMouseLeave={() => setIsHoveringOverlay(false)}
+        onMouseDown={handleOverlayMouseDown}
         style={{
           minHeight: '100vh',
+          width: state.isTransparentOverlayWindow ? '100vw' : undefined,
+          height: state.isTransparentOverlayWindow ? '100vh' : undefined,
+          overflow: state.isTransparentOverlayWindow ? 'hidden' : undefined,
           display: 'flex',
           flexDirection: 'column',
           alignItems: 'center',
           justifyContent: 'center',
-          padding: '24px',
+          padding: state.isTransparentOverlayWindow ? '0px' : '24px',
           background: state.isTransparentOverlayWindow
             ? 'transparent'
             : 'radial-gradient(circle at 50% 38%, #261f35 0%, #111017 80%)',
+          cursor: isDraggingOverlay ? 'grabbing' : 'grab',
         }}
       >
         <div
           className="ashy-card"
           style={{
-            width: '410px',
+            width: state.isTransparentOverlayWindow ? '380px' : '410px',
+            height: state.isTransparentOverlayWindow ? '460px' : undefined,
+            padding: state.isTransparentOverlayWindow ? '0px' : undefined,
+            position: state.isTransparentOverlayWindow ? 'relative' : undefined,
             display: 'flex',
             flexDirection: 'column',
             alignItems: 'center',
-            gap: '14px',
+            justifyContent: state.isTransparentOverlayWindow ? 'center' : undefined,
+            gap: state.isTransparentOverlayWindow ? '0px' : '14px',
             background: state.isTransparentOverlayWindow
               ? 'transparent'
               : 'rgba(24, 21, 34, 0.92)',
@@ -306,23 +396,48 @@ export function App(): React.ReactElement {
         >
           <div
             data-ui-island="true"
-            style={{
-              width: '100%',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-            }}
+            style={
+              state.isTransparentOverlayWindow
+                ? {
+                    position: 'absolute',
+                    top: '6px',
+                    right: '6px',
+                    zIndex: 20,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'flex-end',
+                    opacity: isHoveringOverlay ? 0.95 : 0,
+                    transition: 'opacity 0.2s ease',
+                  }
+                : {
+                    width: '100%',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                  }
+            }
           >
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <span className="ashy-badge peach">Modo flutuante</span>
-              <span className="ashy-badge violet">{state.activeModelId}</span>
-            </div>
+            {!state.isTransparentOverlayWindow && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span className="ashy-badge peach">Modo flutuante</span>
+                <span className="ashy-badge violet">{state.activeModelId}</span>
+              </div>
+            )}
             <button
               type="button"
               className="ashy-peach-btn"
-              style={{ padding: '7px 14px', fontSize: '12.5px' }}
+              style={{
+                padding: state.isTransparentOverlayWindow ? '5px 10px' : '7px 14px',
+                fontSize: state.isTransparentOverlayWindow ? '11px' : '12.5px',
+              }}
               data-testid="btn-expand-hub"
-              onClick={() => state.setViewMode('hub')}
+              onClick={() => {
+                if (state.isTransparentOverlayWindow && window.ashyHost?.focusHubWindow) {
+                  void window.ashyHost.focusHubWindow()
+                } else {
+                  state.setViewMode('hub')
+                }
+              }}
             >
               Voltar ao estúdio
             </button>
@@ -363,7 +478,16 @@ export function App(): React.ReactElement {
                 live2dControls={state.live2dModelControls}
                 live2dModelUrl={state.live2dModelUrl}
                 transparentBackground={state.isTransparentOverlayWindow}
-                onIgnoreMouseChange={(ignore) => state.setStageIgnoreMouseEvents(ignore)}
+                lockInteractiveMouse={isDraggingOverlay}
+                onIgnoreMouseChange={(ignore) => {
+                  if (
+                    state.ignoringMouseEvents === ignore &&
+                    state.ignoreMouseTransitionCount === 0
+                  ) {
+                    void window.ashyHost?.setOverlayIgnoreMouse?.({ ignore, forward: true })
+                  }
+                  state.setStageIgnoreMouseEvents(ignore)
+                }}
                 width={380}
                 height={460}
               />
@@ -374,16 +498,35 @@ export function App(): React.ReactElement {
           <div
             data-testid="stage-quick-controls"
             data-ui-island="true"
-            style={{
-              width: '100%',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '8px',
-              padding: '10px 12px',
-              borderRadius: '12px',
-              background: 'rgba(21, 19, 31, 0.94)',
-              border: '1px solid rgba(244, 166, 136, 0.35)',
-            }}
+            style={
+              state.isTransparentOverlayWindow
+                ? {
+                    position: 'absolute',
+                    bottom: '6px',
+                    left: '8px',
+                    right: '8px',
+                    zIndex: 20,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '6px',
+                    padding: '8px 10px',
+                    borderRadius: '12px',
+                    background: 'rgba(21, 19, 31, 0.92)',
+                    border: '1px solid rgba(244, 166, 136, 0.35)',
+                    opacity: isHoveringOverlay ? 0.95 : 0,
+                    transition: 'opacity 0.2s ease',
+                  }
+                : {
+                    width: '100%',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '8px',
+                    padding: '10px 12px',
+                    borderRadius: '12px',
+                    background: 'rgba(21, 19, 31, 0.94)',
+                    border: '1px solid rgba(244, 166, 136, 0.35)',
+                  }
+            }
           >
             <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
               <button
@@ -535,53 +678,57 @@ export function App(): React.ReactElement {
             </div>
           )}
 
-          <div
-            data-ui-island="true"
-            style={{
-              width: '100%',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              gap: '8px',
-              padding: '8px 12px',
-              borderRadius: '10px',
-              background: '#15131f',
-              fontSize: '12px',
-              color: 'var(--text-secondary)',
-            }}
-          >
-            <span>Voz: {state.privacyState.micMode}</span>
-            <span>Tela: {state.privacyState.eyesMode}</span>
-            <span>Silêncio: {state.privacyState.dndMode ? 'Ativo' : 'Livre'}</span>
-            <button
-              type="button"
-              className="ashy-danger-outline-btn"
-              style={{ padding: '5px 10px', fontSize: '11.5px' }}
-              data-testid="btn-stage-barge-in"
-              onClick={() => state.triggerBargeIn(600)}
-            >
-              Interromper
-            </button>
-          </div>
+          {!state.isTransparentOverlayWindow && (
+            <>
+              <div
+                data-ui-island="true"
+                style={{
+                  width: '100%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '8px',
+                  padding: '8px 12px',
+                  borderRadius: '10px',
+                  background: '#15131f',
+                  fontSize: '12px',
+                  color: 'var(--text-secondary)',
+                }}
+              >
+                <span>Voz: {state.privacyState.micMode}</span>
+                <span>Tela: {state.privacyState.eyesMode}</span>
+                <span>Silêncio: {state.privacyState.dndMode ? 'Ativo' : 'Livre'}</span>
+                <button
+                  type="button"
+                  className="ashy-danger-outline-btn"
+                  style={{ padding: '5px 10px', fontSize: '11.5px' }}
+                  data-testid="btn-stage-barge-in"
+                  onClick={() => state.triggerBargeIn(600)}
+                >
+                  Interromper
+                </button>
+              </div>
 
-          <form
-            data-ui-island="true"
-            onSubmit={handleSendChat}
-            style={{ width: '100%', display: 'flex', gap: '8px' }}
-          >
-            <input
-              type="text"
-              className="ashy-input"
-              data-testid="stage-chat-input"
-              style={{ flex: 1 }}
-              placeholder="Fale com a Ashy..."
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-            />
-            <button type="submit" className="ashy-peach-btn" data-testid="btn-stage-send">
-              Enviar
-            </button>
-          </form>
+              <form
+                data-ui-island="true"
+                onSubmit={handleSendChat}
+                style={{ width: '100%', display: 'flex', gap: '8px' }}
+              >
+                <input
+                  type="text"
+                  className="ashy-input"
+                  data-testid="stage-chat-input"
+                  style={{ flex: 1 }}
+                  placeholder="Fale com a Ashy..."
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                />
+                <button type="submit" className="ashy-peach-btn" data-testid="btn-stage-send">
+                  Enviar
+                </button>
+              </form>
+            </>
+          )}
         </div>
       </div>
     )
