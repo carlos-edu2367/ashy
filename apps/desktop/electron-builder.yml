@@ -1,6 +1,7 @@
 appId: com.ashy.desktop
 productName: Ashy
 copyright: Copyright © 2026 Ashy Cozy Night Studio
+electronVersion: 35.1.5
 asar: true
 npmRebuild: false
 directories:

@@ -52,8 +52,14 @@ $setup = Join-Path $env:TEMP "AshySetup-$PID.exe"
 
 try {
   Write-Host "✨ Ashy — Cozy Night Studio Installer" -ForegroundColor Magenta
-  Write-Host "⬇️  Baixando AshySetup.exe de: $downloadUrl" -ForegroundColor Cyan
-  Invoke-WebRequest -Uri $downloadUrl -OutFile $setup -UseBasicParsing
+  $localReleaseSetup = if ($PSScriptRoot) { Join-Path $PSScriptRoot "apps\desktop\release\AshySetup.exe" } else { $null }
+  if ($localReleaseSetup -and (Test-Path $localReleaseSetup) -and -not $env:ASHY_RELEASE_BASE_URL) {
+    Write-Host "📦 Usando instalador local compilado: $localReleaseSetup" -ForegroundColor Cyan
+    Copy-Item -Path $localReleaseSetup -Destination $setup -Force
+  } else {
+    Write-Host "⬇️  Baixando AshySetup.exe de: $downloadUrl" -ForegroundColor Cyan
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $setup -UseBasicParsing
+  }
 
   if (-not (Test-Path $setup)) {
     throw "O instalador não foi salvo em '$setup'."

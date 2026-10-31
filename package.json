@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "pnpm --filter @ashy/desktop dev",
     "build": "pnpm --filter @ashy/desktop build",
+    "dist:win": "pnpm build && pnpm --filter @ashy/desktop build:electron && electron-builder --projectDir apps/desktop --win --publish never",
     "test": "vitest run",
     "test:e2e": "playwright test",
     "test:watch": "vitest",
@@ -22,6 +23,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "electron-builder": "^26.18.0",
     "jsdom": "^26.0.0",
     "lucide-react": "^0.487.0",
     "react": "^19.0.0",
