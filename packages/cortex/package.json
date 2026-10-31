@@ -6,7 +6,8 @@
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "scripts": {
-    "test": "vitest run --root ../.. packages/cortex"
+    "test": "vitest run --root ../.. packages/cortex",
+    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
   "dependencies": {
     "valibot": "^1.0.0",

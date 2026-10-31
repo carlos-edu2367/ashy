@@ -6,6 +6,7 @@ import {
   type AutobiographicalMilestone,
   type ChatMessageRecord,
   type ChatSessionRecord,
+  type CortexSoulSnapshot,
   type CrossEpisodeLink,
   type DreamJournalEntry,
   type DreamReflectionCycleResult,
@@ -42,6 +43,7 @@ import {
   CortexDatabase,
   createCortexDatabase,
   type CortexDatabaseOptions,
+  type CortexEncryptionCodec,
 } from './db/cortex-db'
 import {
   detectCrossEpisodeLinks,
@@ -156,14 +158,51 @@ export interface CompileTurnPromptInput {
   prospectiveIntents?: readonly ProspectiveIntent[]
 }
 
+export interface AshyCortexOptions extends CortexDatabaseOptions {
+  encryptionCodec?: CortexEncryptionCodec
+}
+
 export class AshyCortex {
   public readonly db: CortexDatabase
   private readonly consolidationLocks = new Map<string, Promise<ConsolidateSessionMemoriesResult>>()
+  private mutationEpoch = 0
 
-  constructor(options?: CortexDatabaseOptions) {
+  constructor(options?: AshyCortexOptions) {
     this.db = createCortexDatabase(options)
     this.db.seedDefaultGoldenExemplars()
     this.pruneCorruptedAndTrivialEpisodes()
+  }
+
+  public getMutationEpoch(): number {
+    return this.mutationEpoch
+  }
+
+  public incrementMutationEpoch(): number {
+    this.mutationEpoch += 1
+    return this.mutationEpoch
+  }
+
+  public exportSoulSnapshot(): CortexSoulSnapshot {
+    return this.db.exportSoulSnapshot()
+  }
+
+  public importSoulSnapshot(snapshot: CortexSoulSnapshot): void {
+    this.incrementMutationEpoch()
+    this.db.importSoulSnapshot(snapshot)
+  }
+
+  public wipeAll(): void {
+    this.incrementMutationEpoch()
+    this.db.wipeAll()
+  }
+
+  public setEncryptionAtRest(enabled: boolean, codec?: CortexEncryptionCodec): void {
+    this.incrementMutationEpoch()
+    this.db.setEncryptionAtRest(enabled, codec)
+  }
+
+  public isEncryptionAtRestEnabled(): boolean {
+    return this.db.isEncryptionAtRestEnabled()
   }
 
   public pruneCorruptedAndTrivialEpisodes(): void {
@@ -684,10 +723,11 @@ export class AshyCortex {
   public async consolidateSessionMemories(
     params: ConsolidateSessionMemoriesParams,
   ): Promise<ConsolidateSessionMemoriesResult> {
+    const epochAtStart = this.mutationEpoch
     const lockKey = params.sessionId.trim() || '__default__'
     const prevLock = this.consolidationLocks.get(lockKey)
     const nextPromise = (prevLock ? prevLock.catch(() => undefined) : Promise.resolve()).then(
-      () => this.executeConsolidateSessionMemories(params),
+      () => this.executeConsolidateSessionMemories(params, epochAtStart),
     )
     this.consolidationLocks.set(lockKey, nextPromise)
     try {
@@ -701,11 +741,30 @@ export class AshyCortex {
 
   private async executeConsolidateSessionMemories(
     params: ConsolidateSessionMemoriesParams,
+    epochAtStart = this.mutationEpoch,
   ): Promise<ConsolidateSessionMemoriesResult> {
     const safeNow =
       params.nowMs !== undefined && Number.isFinite(params.nowMs) && params.nowMs >= 0
         ? params.nowMs
         : Date.now()
+
+    if (this.mutationEpoch !== epochAtStart) {
+      return {
+        consolidated: false,
+        boundary: {
+          shouldConsolidate: false,
+          boundaryType: null,
+          reason: null,
+          batchMessages: [],
+        },
+        episode: null,
+        facts: [],
+        motifs: [],
+        habits: [],
+        intents: [],
+        milestones: [],
+      }
+    }
 
     const unconsolidated = this.db.listUnconsolidatedChatMessages(params.sessionId)
     const boundary = detectEpisodeBoundary(unconsolidated, {
@@ -741,6 +800,19 @@ export class AshyCortex {
       generateJsonFn: params.generateJsonFn,
       nowMs: safeNow,
     })
+
+    if (this.mutationEpoch !== epochAtStart) {
+      return {
+        consolidated: false,
+        boundary,
+        episode: null,
+        facts: [],
+        motifs: [],
+        habits: [],
+        intents: [],
+        milestones: [],
+      }
+    }
 
     // Supersede any per-turn draft `ep-turn-*` episodes created during this batch window
     const supersededDraftIds = new Set<string>()
@@ -1112,6 +1184,12 @@ export class AshyCortex {
     return this.db.saveAffectiveState(nextMood, state.traits, nowMs)
   }
 
+  public async runDreamReflection(
+    params?: Parameters<AshyCortex['runDreamReflectionCycle']>[0],
+  ): Promise<DreamReflectionCycleResult> {
+    return this.runDreamReflectionCycle(params)
+  }
+
   public async runDreamReflectionCycle(params?: {
     sessionId?: string
     nowMs?: number
@@ -1120,10 +1198,20 @@ export class AshyCortex {
     maxEvolutions?: number
     generateJsonFn?: (prompt: string) => Promise<string>
   }): Promise<DreamReflectionCycleResult> {
+    const epochAtStart = this.mutationEpoch
     const safeNow =
       params?.nowMs !== undefined && Number.isFinite(params.nowMs) && params.nowMs >= 0
         ? params.nowMs
         : Date.now()
+
+    const abortedResult = (): DreamReflectionCycleResult => ({
+      ranAt: safeNow,
+      consolidatedEpisodesCount: 0,
+      reviewedMemoriesCount: 0,
+      crossEpisodeLinks: [],
+      appliedEvolutions: [],
+      skippedReason: 'no_new_episodes',
+    })
 
     let consolidatedEpisodesCount = 0
     if (params?.forceConsolidate !== false) {
@@ -1131,6 +1219,9 @@ export class AshyCortex {
         ? [params.sessionId]
         : this.db.listSessions().map((s) => s.id)
       for (const sid of targetSessionIds) {
+        if (this.mutationEpoch !== epochAtStart) {
+          return abortedResult()
+        }
         if (this.db.listUnconsolidatedMessages(sid).length > 0) {
           const cRes = await this.consolidateSessionMemories({
             sessionId: sid,
@@ -1138,11 +1229,18 @@ export class AshyCortex {
             force: true,
             generateJsonFn: params?.generateJsonFn,
           })
+          if (this.mutationEpoch !== epochAtStart) {
+            return abortedResult()
+          }
           if (cRes.consolidated && cRes.episode) {
             consolidatedEpisodesCount += 1
           }
         }
       }
+    }
+
+    if (this.mutationEpoch !== epochAtStart) {
+      return abortedResult()
     }
 
     const allEpisodes = this.db.listEpisodicMemories(200)
@@ -1163,14 +1261,6 @@ export class AshyCortex {
       new Set(crossEpisodeLinks.flatMap((link) => [link.fromEpisodeId, link.toEpisodeId])),
     ).slice(0, 6)
 
-    let reviewedMemoriesCount = 0
-    for (const epId of uniqueLinkedEpisodeIds) {
-      if (this.db.getEpisodicMemory(epId)) {
-        this.reviewMemory(epId, 'good', safeNow)
-        reviewedMemoriesCount += 1
-      }
-    }
-
     const existingLog = this.db.listPersonalityEvolution(200)
     const affect = this.db.getAffectiveState()
     const evoRes = proposeGroundedTraitEvolutions({
@@ -1180,16 +1270,6 @@ export class AshyCortex {
       nowMs: safeNow,
       maxEvolutions: params?.maxEvolutions,
     })
-
-    for (const record of evoRes.records) {
-      this.db.insertPersonalityEvolution(record)
-    }
-    for (const ms of evoRes.milestones) {
-      this.db.upsertMilestone(ms)
-    }
-    if (evoRes.records.length > 0) {
-      this.db.saveAffectiveState({ ...affect, traits: evoRes.traits, updatedAt: safeNow })
-    }
 
     const skippedReason = evoRes.records.length === 0 ? 'already_reflected' : null
 
@@ -1202,10 +1282,12 @@ export class AshyCortex {
       [...latestEntry.sourceEpisodeIds].sort().join(',') === sortedSourceKey &&
       evoRes.records.length === 0
 
-    if (
+    const shouldWriteJournalEntry =
       (skippedReason === null || params?.force === true || existingJournal.length === 0) &&
       !hasSameEpisodeSetAsLatest
-    ) {
+
+    let finalSummary = ''
+    if (shouldWriteJournalEntry) {
       const themesLabel =
         crossEpisodeLinks.length > 0
           ? crossEpisodeLinks
@@ -1222,7 +1304,7 @@ export class AshyCortex {
               ? `Reflexão sobre ${reflectable.length} episódio(s): ${evoRes.records.map((r) => r.explanation).join(' ')}`
               : `Síntese reflexiva sobre ${reflectable.length} memória(s) permanente(s) do estúdio.`
 
-      let finalSummary = summary
+      finalSummary = summary
       if (params?.generateJsonFn) {
         try {
           const reflectionPrompt = [
@@ -1254,7 +1336,31 @@ export class AshyCortex {
           // Keep deterministic summary fallback
         }
       }
+    }
 
+    if (this.mutationEpoch !== epochAtStart) {
+      return abortedResult()
+    }
+
+    let reviewedMemoriesCount = 0
+    for (const epId of uniqueLinkedEpisodeIds) {
+      if (this.db.getEpisodicMemory(epId)) {
+        this.reviewMemory(epId, 'good', safeNow)
+        reviewedMemoriesCount += 1
+      }
+    }
+
+    for (const record of evoRes.records) {
+      this.db.insertPersonalityEvolution(record)
+    }
+    for (const ms of evoRes.milestones) {
+      this.db.upsertMilestone(ms)
+    }
+    if (evoRes.records.length > 0) {
+      this.db.saveAffectiveState({ ...affect, traits: evoRes.traits, updatedAt: safeNow })
+    }
+
+    if (shouldWriteJournalEntry) {
       this.db.insertDreamJournalEntry({
         id: `dream-journal-${safeNow}-${existingJournal.length + 1}-${Math.random().toString(36).slice(2, 7)}`,
         summary: finalSummary,
@@ -1437,6 +1543,6 @@ export class AshyCortex {
   }
 }
 
-export function createAshyCortex(options?: CortexDatabaseOptions): AshyCortex {
+export function createAshyCortex(options?: AshyCortexOptions): AshyCortex {
   return new AshyCortex(options)
 }

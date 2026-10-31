@@ -49,6 +49,7 @@ describe('Phase 8.1 — Latency, Reasoning Effort Control & Pre-Turn Overhead El
     const baseProtector = createNodeAesSecretProtector(userDataDir)
     let decryptCalls = 0
     const spyProtector: SecretProtector = {
+      ...baseProtector,
       encrypt: (plain) => baseProtector.encrypt(plain),
       decrypt: (cipher) => {
         decryptCalls += 1

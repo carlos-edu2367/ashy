@@ -6,6 +6,21 @@ export interface WriteAtomicOptions {
   rotateBackup?: boolean
 }
 
+export function removeFileAtomicWithBackups(filePath: string, maxBackups = 3): void {
+  const safeMax = Number.isFinite(maxBackups) && maxBackups > 0 ? Math.floor(maxBackups) : 3
+  const targets = [filePath, `${filePath}.tmp`]
+  for (let i = 1; i <= safeMax; i++) {
+    targets.push(`${filePath}.bak${i}`)
+  }
+  for (const target of targets) {
+    try {
+      fs.rmSync(target, { force: true })
+    } catch {
+      // Ignore ENOENT or cleanup errors
+    }
+  }
+}
+
 export function writeAtomicWithBackup(
   filePath: string,
   content: string,

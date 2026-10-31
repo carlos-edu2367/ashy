@@ -34,6 +34,7 @@ import {
   type ChatMessageRecord,
   type ChatSessionRecord,
   type ComputerActionsPolicy,
+  type CortexSoulSnapshot,
   type DreamJournalEntry,
   type EpisodicMemory,
   type ExternalMcpServerConfig,
@@ -105,11 +106,17 @@ export const DEFAULT_GOLDEN_STYLE_EXEMPLARS: readonly StyleExemplar[] = Object.f
   },
 ])
 
+export interface CortexEncryptionCodec {
+  encrypt(plainText: string, aad: string): string
+  decrypt(cipherText: string, aad: string): string
+}
+
 export interface CortexDatabaseOptions {
   filePath?: string
   dbPath?: string
   forceMemoryFallback?: boolean
   inMemory?: boolean
+  encryptionCodec?: CortexEncryptionCodec
 }
 
 export interface SchemaMigrationRecord {
@@ -375,13 +382,17 @@ export class MemoryStorageAdapter {
 
 export class CortexDatabase {
   private readonly sqlite: SqliteDatabaseLike | null
-  private readonly memory: MemoryStorageAdapter
+  private memory: MemoryStorageAdapter
+  private encryptionCodec: CortexEncryptionCodec | null
+  private encryptionAtRestEnabled = false
+  private encryptionUpdatedAt: string | null = null
   public readonly isNativeSqlite: boolean
   public readonly isPersistent: boolean
   public readonly filePath: string
 
   constructor(options?: CortexDatabaseOptions) {
     this.memory = new MemoryStorageAdapter()
+    this.encryptionCodec = options?.encryptionCodec ?? null
     const targetPath =
       options?.inMemory === true
         ? ':memory:'
@@ -411,6 +422,8 @@ export class CortexDatabase {
     if (this.sqlite) {
       try {
         this.initializeSqliteSchema()
+        this.loadEncryptionStateFromSqlite()
+        this.hydrateMemoryFromSqlite()
       } catch (err) {
         try {
           this.sqlite.close()
@@ -419,6 +432,139 @@ export class CortexDatabase {
         }
         throw err
       }
+    }
+  }
+
+  private encryptField(value: string, aad: string): string {
+    if (!this.encryptionAtRestEnabled || !this.encryptionCodec || !value) {
+      return value
+    }
+    if (value.startsWith('enc:v1:')) {
+      return value
+    }
+    return this.encryptionCodec.encrypt(value, aad)
+  }
+
+  private decryptField(value: string, aad: string): string {
+    if (typeof value !== 'string' || !value.startsWith('enc:v1:')) {
+      return value
+    }
+    if (!this.encryptionCodec) {
+      throw new Error(
+        'CORTEX_ENCRYPTION_CODEC_REQUIRED: Database contains encrypted records (enc:v1:) but no encryptionCodec was provided.',
+      )
+    }
+    return this.encryptionCodec.decrypt(value, aad)
+  }
+
+  private loadEncryptionStateFromSqlite(): void {
+    if (!this.sqlite) return
+    const row = this.sqlite
+      .prepare(
+        'SELECT enabled, key_check_cipher, updated_at FROM cortex_encryption_state WHERE singleton_id = 1',
+      )
+      .get()
+    this.encryptionAtRestEnabled = row ? Number(row.enabled ?? 0) === 1 : false
+    this.encryptionUpdatedAt =
+      row && typeof row.updated_at === 'string' && row.updated_at.length > 0
+        ? row.updated_at
+        : null
+
+    if (this.encryptionAtRestEnabled) {
+      if (!this.encryptionCodec) {
+        throw new Error(
+          'CORTEX_ENCRYPTION_CODEC_REQUIRED: Database has encryption at rest enabled but no encryptionCodec was provided.',
+        )
+      }
+      if (row && typeof row.key_check_cipher === 'string' && row.key_check_cipher.length > 0) {
+        const verified = this.encryptionCodec.decrypt(
+          row.key_check_cipher,
+          'cortex_encryption_state.key_check',
+        )
+        if (verified !== 'ASHY_CORTEX_KEY_OK') {
+          throw new Error('CORTEX_ENCRYPTION_KEY_MISMATCH: Key verification token mismatch.')
+        }
+      }
+    }
+  }
+
+  private hydrateMemoryFromSqlite(): void {
+    if (!this.sqlite) return
+    this.memory.episodicMemories.clear()
+    for (const ep of this.listEpisodicMemories()) {
+      this.memory.episodicMemories.set(ep.id, ep)
+    }
+
+    this.memory.semanticFacts.clear()
+    for (const fact of this.listSemanticFacts()) {
+      this.memory.semanticFacts.set(fact.id, fact)
+    }
+
+    this.memory.relationalMotifs.clear()
+    for (const motif of this.listRelationalMotifs()) {
+      this.memory.relationalMotifs.set(motif.id, motif)
+    }
+
+    this.memory.milestones.clear()
+    for (const ms of this.listMilestones()) {
+      this.memory.milestones.set(ms.id, ms)
+    }
+
+    this.memory.userHabits.clear()
+    for (const habit of this.listUserHabits()) {
+      this.memory.userHabits.set(habit.id, habit)
+    }
+
+    this.memory.prospectiveIntents.clear()
+    for (const intent of this.listProspectiveIntents()) {
+      this.memory.prospectiveIntents.set(intent.id, intent)
+    }
+
+    this.memory.personalityEvolution.clear()
+    for (const rec of this.listPersonalityEvolution()) {
+      this.memory.personalityEvolution.set(rec.id, rec)
+    }
+
+    this.memory.affectiveState = this.getAffectiveState()
+
+    this.memory.styleExemplars.clear()
+    for (const ex of this.listStyleExemplars()) {
+      this.memory.styleExemplars.set(ex.id, ex)
+    }
+
+    this.memory.goldenExemplars.clear()
+    for (const ex of this.listGoldenExemplars()) {
+      this.memory.goldenExemplars.set(ex.id, ex)
+    }
+
+    this.memory.chatSessions.clear()
+    for (const sess of this.listChatSessions()) {
+      this.memory.chatSessions.set(sess.id, sess)
+    }
+
+    this.memory.chatMessages.length = 0
+    for (const msg of this.listAllChatMessages()) {
+      this.memory.chatMessages.push(msg)
+    }
+
+    this.memory.governancePolicy = this.getMemoryGovernancePolicy()
+
+    this.memory.actionAuditLog.length = 0
+    for (const entry of this.listActionAuditLog(10_000).reverse()) {
+      this.memory.actionAuditLog.push(entry)
+    }
+
+    this.memory.agencyConsentState = this.getAgencyConsentState()
+    this.memory.initiativePolicy = this.getInitiativePolicy()
+
+    this.memory.proactiveInitiativeLog.length = 0
+    for (const rec of this.listProactiveInitiativeLog(10_000).reverse()) {
+      this.memory.proactiveInitiativeLog.push(rec)
+    }
+
+    this.memory.dreamJournal.clear()
+    for (const entry of this.listDreamJournalEntries(10_000)) {
+      this.memory.dreamJournal.set(entry.id, entry)
     }
   }
 
@@ -664,6 +810,13 @@ export class CortexDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_dream_reflection_journal_created
         ON dream_reflection_journal(created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS cortex_encryption_state (
+        singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+        enabled INTEGER NOT NULL DEFAULT 0,
+        key_check_cipher TEXT,
+        updated_at TEXT NOT NULL
+      );
     `)
 
     // Idempotent column upgrades for pre-existing v1/v2 database files
@@ -688,6 +841,23 @@ export class CortexDatabase {
     insertMigration.run(3, 'v3_phase2_self_writing_memory', now)
     insertMigration.run(4, 'v4_phase7_agency_audit_and_consent', now)
     insertMigration.run(5, 'v5_phase8_initiative_and_reflection_journal', now)
+
+    this.seedDefaultsIfEmpty()
+  }
+
+  public seedDefaultsIfEmpty(): void {
+    for (const ex of DEFAULT_GOLDEN_STYLE_EXEMPLARS) {
+      if (!this.memory.styleExemplars.has(ex.id)) {
+        this.memory.styleExemplars.set(ex.id, ex)
+      }
+    }
+    for (const ex of DEFAULT_GOLDEN_EXEMPLARS) {
+      if (!this.memory.goldenExemplars.has(ex.id)) {
+        this.memory.goldenExemplars.set(ex.id, ex)
+      }
+    }
+
+    if (!this.sqlite) return
 
     // Seed default Golden Style Exemplars if empty
     const countRow = this.sqlite
@@ -787,9 +957,9 @@ export class CortexDatabase {
         )
         .run(
           memory.id,
-          memory.title,
-          memory.summary,
-          memory.content,
+          this.encryptField(memory.title, 'episodic_memories.title'),
+          this.encryptField(memory.summary, 'episodic_memories.summary'),
+          this.encryptField(memory.content, 'episodic_memories.content'),
           memory.createdAt,
           memory.lastReviewedAt,
           memory.stability,
@@ -802,11 +972,13 @@ export class CortexDatabase {
         )
 
       this.sqlite.prepare('DELETE FROM episodic_fts WHERE memory_id = ?').run(memory.id)
-      this.sqlite
-        .prepare(
-          'INSERT INTO episodic_fts (memory_id, title, summary, content) VALUES (?, ?, ?, ?)',
-        )
-        .run(memory.id, memory.title, memory.summary, memory.content)
+      if (!this.encryptionAtRestEnabled) {
+        this.sqlite
+          .prepare(
+            'INSERT INTO episodic_fts (memory_id, title, summary, content) VALUES (?, ?, ?, ?)',
+          )
+          .run(memory.id, memory.title, memory.summary, memory.content)
+      }
     }
 
     return memory
@@ -979,7 +1151,7 @@ export class CortexDatabase {
 
     const bm25ScoresById = new Map<string, number>()
 
-    if (this.sqlite) {
+    if (this.sqlite && !this.encryptionAtRestEnabled) {
       const tokens = tokenizeForSearch(queryText)
       if (tokens.length > 0) {
         const ftsMatchQuery = tokens.map((t) => `"${t.replace(/"/g, '')}"*`).join(' OR ')
@@ -1018,9 +1190,9 @@ export class CortexDatabase {
     const embeddingJson = row.embedding_json
     return v.parse(EpisodicMemorySchema, {
       id: String(row.id),
-      title: String(row.title),
-      summary: String(row.summary),
-      content: String(row.content),
+      title: this.decryptField(String(row.title), 'episodic_memories.title'),
+      summary: this.decryptField(String(row.summary), 'episodic_memories.summary'),
+      content: this.decryptField(String(row.content), 'episodic_memories.content'),
       createdAt: Number(row.created_at),
       lastReviewedAt: Number(row.last_reviewed_at),
       stability: Number(row.stability),
@@ -1065,7 +1237,7 @@ export class CortexDatabase {
           fact.category,
           fact.subject,
           fact.predicate,
-          fact.object,
+          this.encryptField(fact.object, 'semantic_facts.object'),
           fact.confidence,
           JSON.stringify(fact.sourceEpisodeIds),
           fact.validFrom,
@@ -1114,7 +1286,7 @@ export class CortexDatabase {
           category: String(row.category),
           subject: String(row.subject),
           predicate: String(row.predicate),
-          object: String(row.object),
+          object: this.decryptField(String(row.object), 'semantic_facts.object'),
           confidence: Number(row.confidence),
           sourceEpisodeIds: JSON.parse(String(row.source_episode_ids_json ?? '[]')),
           validFrom: Number(row.valid_from),
@@ -1177,8 +1349,8 @@ export class CortexDatabase {
         )
         .run(
           motif.id,
-          motif.motif,
-          motif.originSummary,
+          this.encryptField(motif.motif, 'relational_motifs.motif'),
+          this.encryptField(motif.originSummary, 'relational_motifs.origin_summary'),
           motif.originEpisodeId ?? null,
           JSON.stringify(motif.triggerCues),
           motif.stage,
@@ -1218,8 +1390,11 @@ export class CortexDatabase {
       const embeddingJson = row.embedding_json
       return v.parse(RelationalMotifSchema, {
         id: String(row.id),
-        motif: String(row.motif),
-        originSummary: String(row.origin_summary),
+        motif: this.decryptField(String(row.motif), 'relational_motifs.motif'),
+        originSummary: this.decryptField(
+          String(row.origin_summary),
+          'relational_motifs.origin_summary',
+        ),
         originEpisodeId:
           row.origin_episode_id === null || row.origin_episode_id === undefined
             ? undefined
@@ -1256,8 +1431,8 @@ export class CortexDatabase {
         )
         .run(
           milestone.id,
-          milestone.title,
-          milestone.narrative,
+          this.encryptField(milestone.title, 'autobiographical_milestones.title'),
+          this.encryptField(milestone.narrative, 'autobiographical_milestones.narrative'),
           milestone.category,
           milestone.episodeId ?? null,
           milestone.roomTrophyId ?? null,
@@ -1336,8 +1511,11 @@ export class CortexDatabase {
     return rows.map((row) =>
       v.parse(AutobiographicalMilestoneSchema, {
         id: String(row.id),
-        title: String(row.title),
-        narrative: String(row.narrative),
+        title: this.decryptField(String(row.title), 'autobiographical_milestones.title'),
+        narrative: this.decryptField(
+          String(row.narrative),
+          'autobiographical_milestones.narrative',
+        ),
         category: String(row.category),
         episodeId:
           row.episode_id === null || row.episode_id === undefined
@@ -1372,7 +1550,7 @@ export class CortexDatabase {
         .run(
           habit.id,
           habit.patternKey,
-          habit.description,
+          this.encryptField(habit.description, 'user_habits.description'),
           habit.confidence,
           habit.observationCount,
           habit.updatedAt,
@@ -1404,7 +1582,7 @@ export class CortexDatabase {
       v.parse(UserHabitSchema, {
         id: String(row.id),
         patternKey: String(row.pattern_key),
-        description: String(row.description),
+        description: this.decryptField(String(row.description), 'user_habits.description'),
         confidence: Number(row.confidence),
         observationCount: Number(row.observation_count),
         updatedAt: Number(row.updated_at),
@@ -1436,8 +1614,8 @@ export class CortexDatabase {
         )
         .run(
           intent.id,
-          intent.topic,
-          intent.contextCue,
+          this.encryptField(intent.topic, 'prospective_intents.topic'),
+          this.encryptField(intent.contextCue, 'prospective_intents.context_cue'),
           intent.dueAt ?? null,
           intent.status,
           intent.createdAt,
@@ -1469,8 +1647,11 @@ export class CortexDatabase {
       intents = rows.map((row) =>
         v.parse(ProspectiveIntentSchema, {
           id: String(row.id),
-          topic: String(row.topic),
-          contextCue: String(row.context_cue),
+          topic: this.decryptField(String(row.topic), 'prospective_intents.topic'),
+          contextCue: this.decryptField(
+            String(row.context_cue),
+            'prospective_intents.context_cue',
+          ),
           dueAt: row.due_at === null || row.due_at === undefined ? null : Number(row.due_at),
           status: String(row.status),
           createdAt: Number(row.created_at),
@@ -1875,11 +2056,11 @@ export class CortexDatabase {
         )
         .run(
           session.id,
-          session.title,
+          this.encryptField(session.title, 'chat_sessions.title'),
           session.startedAt,
           session.updatedAt,
           session.turnCount,
-          session.lastMessagePreview,
+          this.encryptField(session.lastMessagePreview, 'chat_sessions.last_message_preview'),
         )
       const persisted = this.getChatSession(session.id) ?? session
       this.memory.chatSessions.set(session.id, persisted)
@@ -2003,8 +2184,8 @@ export class CortexDatabase {
           record.id,
           record.sessionId,
           record.role,
-          record.content,
-          record.rawContent,
+          this.encryptField(record.content, 'chat_messages.content'),
+          this.encryptField(record.rawContent, 'chat_messages.raw_content'),
           record.emotion,
           record.markersJson,
           record.providerId ?? null,
@@ -2022,7 +2203,12 @@ export class CortexDatabase {
                turn_count = turn_count + ?
            WHERE id = ?`,
         )
-        .run(record.createdAt, preview, turnDelta, record.sessionId)
+        .run(
+          record.createdAt,
+          this.encryptField(preview, 'chat_sessions.last_message_preview'),
+          turnDelta,
+          record.sessionId,
+        )
 
       this.sqlite.exec('COMMIT')
     } catch (err) {
@@ -2138,6 +2324,7 @@ export class CortexDatabase {
       } catch (err) {
         try {
           this.sqlite.exec('ROLLBACK')
+          this.hydrateMemoryFromSqlite()
         } catch {
           // Ignore rollback failure
         }
@@ -2146,14 +2333,27 @@ export class CortexDatabase {
     }
   }
 
+  public listAllChatMessages(): ChatMessageRecord[] {
+    if (!this.sqlite) {
+      return [...this.memory.chatMessages].sort((a, b) => a.createdAt - b.createdAt)
+    }
+    const rows = this.sqlite
+      .prepare('SELECT rowid AS _rowid, * FROM chat_messages ORDER BY created_at ASC, _rowid ASC')
+      .all()
+    return rows.map((row) => this.mapRowToChatMessage(row))
+  }
+
   private mapRowToChatSession(row: Record<string, unknown>): ChatSessionRecord {
     return {
       id: String(row.id),
-      title: String(row.title),
+      title: this.decryptField(String(row.title), 'chat_sessions.title'),
       startedAt: Number(row.started_at),
       updatedAt: Number(row.updated_at),
       turnCount: Number(row.turn_count ?? 0),
-      lastMessagePreview: String(row.last_message_preview ?? ''),
+      lastMessagePreview: this.decryptField(
+        String(row.last_message_preview ?? ''),
+        'chat_sessions.last_message_preview',
+      ),
     }
   }
 
@@ -2166,8 +2366,8 @@ export class CortexDatabase {
       id: String(row.id),
       sessionId: String(row.session_id),
       role: String(row.role) as ChatMessageRecord['role'],
-      content: String(row.content),
-      rawContent: String(row.raw_content),
+      content: this.decryptField(String(row.content), 'chat_messages.content'),
+      rawContent: this.decryptField(String(row.raw_content), 'chat_messages.raw_content'),
       emotion,
       markersJson: String(row.markers_json ?? '[]'),
       providerId:
@@ -2235,13 +2435,17 @@ export class CortexDatabase {
           record.serverName,
           record.riskTier,
           record.decision,
-          record.argsPreview,
+          this.encryptField(record.argsPreview, 'action_audit_log.args_preview'),
           record.actionId ?? null,
           record.reason ?? null,
           record.blastRadiusWarning ?? null,
           record.targetPath ?? null,
-          record.commandPreview ?? null,
-          record.diffPreview ?? null,
+          record.commandPreview !== null && record.commandPreview !== undefined
+            ? this.encryptField(record.commandPreview, 'action_audit_log.command_preview')
+            : null,
+          record.diffPreview !== null && record.diffPreview !== undefined
+            ? this.encryptField(record.diffPreview, 'action_audit_log.diff_preview')
+            : null,
         )
     }
 
@@ -2333,16 +2537,29 @@ export class CortexDatabase {
     const sourceServers = Array.isArray(patch.externalMcpServers)
       ? patch.externalMcpServers
       : current.externalMcpServers
-    const externalMcpServers: ExternalMcpServerConfig[] = sourceServers.map((srv) => ({
-      id: String(srv.id).trim(),
-      name: String(srv.name).trim(),
-      description: String(srv.description ?? '').trim(),
-      transport: srv.transport === 'stdio' ? 'stdio' : 'http',
-      ...(srv.url !== undefined ? { url: String(srv.url).trim() } : {}),
-      ...(srv.command !== undefined ? { command: String(srv.command).trim() } : {}),
-      args: Array.isArray(srv.args) ? srv.args.map((a) => String(a)) : [],
-      enabled: srv.enabled !== undefined ? Boolean(srv.enabled) : true,
-    }))
+    const externalMcpServers: ExternalMcpServerConfig[] = sourceServers.map((srv) => {
+      const rawEnv = (srv as { env?: Record<string, unknown> }).env
+      let cleanEnv: Record<string, string> | undefined
+      if (rawEnv && typeof rawEnv === 'object' && !Array.isArray(rawEnv)) {
+        cleanEnv = {}
+        for (const [k, v] of Object.entries(rawEnv)) {
+          if (typeof k === 'string' && k.trim()) {
+            cleanEnv[k.trim()] = String(v ?? '')
+          }
+        }
+      }
+      return {
+        id: String(srv.id).trim(),
+        name: String(srv.name).trim(),
+        description: String(srv.description ?? '').trim(),
+        transport: srv.transport === 'stdio' ? 'stdio' : 'http',
+        ...(srv.url !== undefined ? { url: String(srv.url).trim() } : {}),
+        ...(srv.command !== undefined ? { command: String(srv.command).trim() } : {}),
+        args: Array.isArray(srv.args) ? srv.args.map((a) => String(a)) : [],
+        enabled: srv.enabled !== undefined ? Boolean(srv.enabled) : true,
+        ...(cleanEnv ? { env: cleanEnv } : {}),
+      } as ExternalMcpServerConfig
+    })
 
     const updatedAt =
       patch.updatedAt !== undefined && Number.isFinite(patch.updatedAt)
@@ -2422,7 +2639,10 @@ export class CortexDatabase {
       serverName: String(row.server_name),
       riskTier,
       decision,
-      argsPreview: String(row.args_preview ?? '{}'),
+      argsPreview: this.decryptField(
+        String(row.args_preview ?? '{}'),
+        'action_audit_log.args_preview',
+      ),
       actionId:
         row.action_id === null || row.action_id === undefined ? null : String(row.action_id),
       reason: row.reason === null || row.reason === undefined ? null : String(row.reason),
@@ -2435,11 +2655,11 @@ export class CortexDatabase {
       commandPreview:
         row.command_preview === null || row.command_preview === undefined
           ? null
-          : String(row.command_preview),
+          : this.decryptField(String(row.command_preview), 'action_audit_log.command_preview'),
       diffPreview:
         row.diff_preview === null || row.diff_preview === undefined
           ? null
-          : String(row.diff_preview),
+          : this.decryptField(String(row.diff_preview), 'action_audit_log.diff_preview'),
     }
   }
 
@@ -2502,6 +2722,15 @@ export class CortexDatabase {
           const id = String(rec.id ?? '').trim()
           const name = String(rec.name ?? '').trim()
           if (!id || !name) continue
+          let cleanEnv: Record<string, string> | undefined
+          if (rec.env && typeof rec.env === 'object' && !Array.isArray(rec.env)) {
+            cleanEnv = {}
+            for (const [k, v] of Object.entries(rec.env as Record<string, unknown>)) {
+              if (typeof k === 'string' && k.trim()) {
+                cleanEnv[k.trim()] = String(v ?? '')
+              }
+            }
+          }
           externalMcpServers.push({
             id,
             name,
@@ -2511,7 +2740,8 @@ export class CortexDatabase {
             ...(typeof rec.command === 'string' ? { command: rec.command.trim() } : {}),
             args: Array.isArray(rec.args) ? rec.args.map((a) => String(a)) : [],
             enabled: rec.enabled !== undefined ? Boolean(rec.enabled) : true,
-          })
+            ...(cleanEnv ? { env: cleanEnv } : {}),
+          } as ExternalMcpServerConfig)
         }
       }
     }
@@ -2702,7 +2932,7 @@ export class CortexDatabase {
         )
         .run(
           parsed.id,
-          parsed.summary,
+          this.encryptField(parsed.summary, 'dream_reflection_journal.summary'),
           JSON.stringify(parsed.sourceEpisodeIds),
           parsed.crossLinksCount,
           parsed.traitEvolutionsCount,
@@ -2743,7 +2973,7 @@ export class CortexDatabase {
     return rows.map((row) =>
       v.parse(DreamJournalEntrySchema, {
         id: String(row.id),
-        summary: String(row.summary),
+        summary: this.decryptField(String(row.summary), 'dream_reflection_journal.summary'),
         sourceEpisodeIds: safeParseJson<string[]>(row.source_episode_ids_json, []),
         crossLinksCount: Number(row.cross_links_count ?? 0),
         traitEvolutionsCount: Number(row.trait_evolutions_count ?? 0),
@@ -2752,8 +2982,961 @@ export class CortexDatabase {
     )
   }
 
+  // 13. Phase 9 — Encryption at Rest (`AES-256-GCM` + AAD) & Soul Portability (`export` / `import` / `wipeAll`)
+  public isEncryptionAtRestEnabled(): boolean {
+    return this.encryptionAtRestEnabled
+  }
+
+  public getEncryptionUpdatedAt(): string | null {
+    return this.encryptionUpdatedAt
+  }
+
+  private checkpointAndVacuumSqlite(): void {
+    if (!this.sqlite) return
+    try {
+      this.sqlite.exec('PRAGMA wal_checkpoint(TRUNCATE);')
+    } catch {
+      // Ignore if in-memory or non-WAL
+    }
+    try {
+      this.sqlite.exec('VACUUM;')
+    } catch {
+      // Ignore if vacuum fails
+    }
+  }
+
+  public setEncryptionAtRest(enabled: boolean, codec?: CortexEncryptionCodec): void {
+    if (codec) {
+      this.encryptionCodec = codec
+    }
+    if (enabled && !this.encryptionCodec) {
+      throw new Error(
+        'CORTEX_ENCRYPTION_CODEC_REQUIRED: Cannot enable encryption at rest without an encryptionCodec.',
+      )
+    }
+
+    // Ensure this.memory holds all current decrypted records before toggling encryptionAtRestEnabled
+    if (this.sqlite) {
+      this.hydrateMemoryFromSqlite()
+    }
+
+    this.encryptionAtRestEnabled = Boolean(enabled)
+    const updatedAt = new Date().toISOString()
+    this.encryptionUpdatedAt = updatedAt
+
+    if (!this.sqlite) {
+      return
+    }
+
+    const keyCheckCipher = this.encryptionAtRestEnabled
+      ? this.encryptionCodec!.encrypt('ASHY_CORTEX_KEY_OK', 'cortex_encryption_state.key_check')
+      : null
+
+    this.sqlite.exec('BEGIN IMMEDIATE')
+    try {
+      this.sqlite
+        .prepare(
+          `INSERT INTO cortex_encryption_state (singleton_id, enabled, key_check_cipher, updated_at)
+           VALUES (1, ?, ?, ?)
+           ON CONFLICT(singleton_id) DO UPDATE SET
+             enabled = excluded.enabled,
+             key_check_cipher = excluded.key_check_cipher,
+             updated_at = excluded.updated_at`,
+        )
+        .run(this.encryptionAtRestEnabled ? 1 : 0, keyCheckCipher, updatedAt)
+
+      // 1. episodic_memories & episodic_fts
+      this.sqlite.prepare('DELETE FROM episodic_fts').run()
+      const updateEpStmt = this.sqlite.prepare(
+        'UPDATE episodic_memories SET title = ?, summary = ?, content = ? WHERE id = ?',
+      )
+      const insertFtsStmt = this.sqlite.prepare(
+        'INSERT INTO episodic_fts (memory_id, title, summary, content) VALUES (?, ?, ?, ?)',
+      )
+      for (const ep of this.memory.episodicMemories.values()) {
+        updateEpStmt.run(
+          this.encryptField(ep.title, 'episodic_memories.title'),
+          this.encryptField(ep.summary, 'episodic_memories.summary'),
+          this.encryptField(ep.content, 'episodic_memories.content'),
+          ep.id,
+        )
+        if (!this.encryptionAtRestEnabled) {
+          insertFtsStmt.run(ep.id, ep.title, ep.summary, ep.content)
+        }
+      }
+      this.sqlite.exec("INSERT INTO episodic_fts(episodic_fts) VALUES('rebuild');")
+
+      // 2. semantic_facts
+      const updateFactStmt = this.sqlite.prepare(
+        'UPDATE semantic_facts SET object = ? WHERE id = ?',
+      )
+      for (const fact of this.memory.semanticFacts.values()) {
+        updateFactStmt.run(this.encryptField(fact.object, 'semantic_facts.object'), fact.id)
+      }
+
+      // 3. relational_motifs
+      const updateMotifStmt = this.sqlite.prepare(
+        'UPDATE relational_motifs SET motif = ?, origin_summary = ? WHERE id = ?',
+      )
+      for (const motif of this.memory.relationalMotifs.values()) {
+        updateMotifStmt.run(
+          this.encryptField(motif.motif, 'relational_motifs.motif'),
+          this.encryptField(motif.originSummary, 'relational_motifs.origin_summary'),
+          motif.id,
+        )
+      }
+
+      // 4. autobiographical_milestones
+      const updateMsStmt = this.sqlite.prepare(
+        'UPDATE autobiographical_milestones SET title = ?, narrative = ? WHERE id = ?',
+      )
+      for (const ms of this.memory.milestones.values()) {
+        updateMsStmt.run(
+          this.encryptField(ms.title, 'autobiographical_milestones.title'),
+          this.encryptField(ms.narrative, 'autobiographical_milestones.narrative'),
+          ms.id,
+        )
+      }
+
+      // 5. user_habits
+      const updateHabitStmt = this.sqlite.prepare(
+        'UPDATE user_habits SET description = ? WHERE id = ?',
+      )
+      for (const habit of this.memory.userHabits.values()) {
+        updateHabitStmt.run(
+          this.encryptField(habit.description, 'user_habits.description'),
+          habit.id,
+        )
+      }
+
+      // 6. prospective_intents
+      const updateIntentStmt = this.sqlite.prepare(
+        'UPDATE prospective_intents SET topic = ?, context_cue = ? WHERE id = ?',
+      )
+      for (const intent of this.memory.prospectiveIntents.values()) {
+        updateIntentStmt.run(
+          this.encryptField(intent.topic, 'prospective_intents.topic'),
+          this.encryptField(intent.contextCue, 'prospective_intents.context_cue'),
+          intent.id,
+        )
+      }
+
+      // 7. chat_sessions
+      const updateSessStmt = this.sqlite.prepare(
+        'UPDATE chat_sessions SET title = ?, last_message_preview = ? WHERE id = ?',
+      )
+      for (const sess of this.memory.chatSessions.values()) {
+        updateSessStmt.run(
+          this.encryptField(sess.title, 'chat_sessions.title'),
+          this.encryptField(sess.lastMessagePreview, 'chat_sessions.last_message_preview'),
+          sess.id,
+        )
+      }
+
+      // 8. chat_messages
+      const updateMsgStmt = this.sqlite.prepare(
+        'UPDATE chat_messages SET content = ?, raw_content = ? WHERE id = ?',
+      )
+      for (const msg of this.memory.chatMessages) {
+        updateMsgStmt.run(
+          this.encryptField(msg.content, 'chat_messages.content'),
+          this.encryptField(msg.rawContent, 'chat_messages.raw_content'),
+          msg.id,
+        )
+      }
+
+      // 9. action_audit_log
+      const updateAuditStmt = this.sqlite.prepare(
+        'UPDATE action_audit_log SET args_preview = ?, command_preview = ?, diff_preview = ? WHERE id = ?',
+      )
+      for (const entry of this.memory.actionAuditLog) {
+        updateAuditStmt.run(
+          this.encryptField(entry.argsPreview, 'action_audit_log.args_preview'),
+          entry.commandPreview !== null && entry.commandPreview !== undefined
+            ? this.encryptField(entry.commandPreview, 'action_audit_log.command_preview')
+            : null,
+          entry.diffPreview !== null && entry.diffPreview !== undefined
+            ? this.encryptField(entry.diffPreview, 'action_audit_log.diff_preview')
+            : null,
+          entry.id,
+        )
+      }
+
+      // 10. dream_reflection_journal
+      const updateDreamStmt = this.sqlite.prepare(
+        'UPDATE dream_reflection_journal SET summary = ? WHERE id = ?',
+      )
+      for (const entry of this.memory.dreamJournal.values()) {
+        updateDreamStmt.run(
+          this.encryptField(entry.summary, 'dream_reflection_journal.summary'),
+          entry.id,
+        )
+      }
+
+      this.sqlite.exec('COMMIT')
+    } catch (err) {
+      try {
+        this.sqlite.exec('ROLLBACK')
+      } catch {
+        // Ignore rollback failure
+      }
+      throw err
+    }
+
+    this.checkpointAndVacuumSqlite()
+  }
+
+  public exportSoulSnapshot(): CortexSoulSnapshot {
+    const rawConsent = this.getAgencyConsentState()
+    const sanitizedConsent: PersistedAgencyConsentState = {
+      ...rawConsent,
+      externalMcpServers: rawConsent.externalMcpServers.map((srv) => {
+        const rawEnv = (srv as { env?: Record<string, unknown> }).env
+        if (rawEnv && typeof rawEnv === 'object' && !Array.isArray(rawEnv)) {
+          const redactedEnv: Record<string, string> = {}
+          for (const key of Object.keys(rawEnv)) {
+            redactedEnv[key] = '***REDACTED***'
+          }
+          return {
+            ...srv,
+            env: redactedEnv,
+          } as ExternalMcpServerConfig
+        }
+        return { ...srv }
+      }),
+    }
+
+    return {
+      episodicMemories: this.listEpisodicMemories(),
+      semanticFacts: this.listSemanticFacts(),
+      relationalMotifs: this.listRelationalMotifs(),
+      milestones: this.listMilestones(),
+      userHabits: this.listUserHabits(),
+      prospectiveIntents: this.listProspectiveIntents(),
+      personalityEvolution: this.listPersonalityEvolution(),
+      affectiveState: this.getAffectiveState(),
+      styleExemplars: this.listStyleExemplars(),
+      goldenExemplars: this.listGoldenExemplars(),
+      chatSessions: this.listChatSessions(),
+      chatMessages: this.listAllChatMessages(),
+      memoryGovernance: this.getMemoryGovernancePolicy(),
+      actionAuditLog: this.listActionAuditLog(10_000),
+      agencyConsent: sanitizedConsent,
+      initiativePolicy: this.getInitiativePolicy(),
+      proactiveInitiativeLog: this.listProactiveInitiativeLog(10_000),
+      dreamJournalEntries: this.listDreamJournalEntries(10_000),
+    }
+  }
+
+  public importSoulSnapshot(snapshot: CortexSoulSnapshot): void {
+    if (!snapshot || typeof snapshot !== 'object') {
+      throw new Error('Invalid CortexSoulSnapshot: expected an object')
+    }
+
+    // 1. Validate all collections up-front before touching SQLite or MemoryStorageAdapter
+    const validatedEpisodes: EpisodicMemory[] = (snapshot.episodicMemories ?? []).map((raw) => {
+      const ep = raw as EpisodicMemory
+      if (!ep || typeof ep.id !== 'string' || !ep.id.trim()) {
+        throw new Error('Invalid EpisodicMemory in snapshot: missing id')
+      }
+      if (
+        !Number.isFinite(ep.stability) ||
+        !Number.isFinite(ep.difficulty) ||
+        !Number.isFinite(ep.surprise) ||
+        !Number.isFinite(ep.createdAt) ||
+        !Number.isFinite(ep.lastReviewedAt)
+      ) {
+        throw new Error(`Invalid non-finite FSRS parameters in EpisodicMemory ${ep.id}`)
+      }
+      const autoEmbedding =
+        ep.embedding && ep.embedding.length > 0
+          ? ep.embedding
+          : embedTextSync128(`${ep.title} ${ep.summary} ${ep.content} ${(ep.tags ?? []).join(' ')}`)
+      return v.parse(EpisodicMemorySchema, {
+        ...ep,
+        embedding: autoEmbedding,
+        approvalStatus: ep.approvalStatus ?? 'approved',
+      })
+    })
+
+    const validatedFacts: SemanticFact[] = (snapshot.semanticFacts ?? []).map((raw) => {
+      const f = raw as SemanticFact
+      if (!f || typeof f.id !== 'string' || !f.id.trim()) {
+        throw new Error('Invalid SemanticFact in snapshot: missing id')
+      }
+      if (!Number.isFinite(f.confidence) || !Number.isFinite(f.validFrom)) {
+        throw new Error(`Invalid non-finite numbers in SemanticFact ${f.id}`)
+      }
+      const autoEmbedding =
+        f.embedding && f.embedding.length > 0
+          ? f.embedding
+          : embedTextSync128(`${f.category} ${f.subject} ${f.predicate} ${f.object}`)
+      return v.parse(SemanticFactSchema, {
+        ...f,
+        embedding: autoEmbedding,
+        approvalStatus: f.approvalStatus ?? 'approved',
+      })
+    })
+
+    const validatedMotifs: RelationalMotif[] = (snapshot.relationalMotifs ?? []).map((raw) => {
+      const m = raw as RelationalMotif
+      if (!m || typeof m.id !== 'string' || !m.id.trim()) {
+        throw new Error('Invalid RelationalMotif in snapshot: missing id')
+      }
+      if (
+        !Number.isFinite(m.timesUsed) ||
+        !Number.isFinite(m.cooldownHours) ||
+        !Number.isFinite(m.createdAt)
+      ) {
+        throw new Error(`Invalid non-finite numbers in RelationalMotif ${m.id}`)
+      }
+      const autoEmbedding =
+        m.embedding && m.embedding.length > 0
+          ? m.embedding
+          : embedTextSync128(
+              [m.motif, m.originSummary ?? '', ...(m.triggerCues ?? [])].join(' '),
+            )
+      return v.parse(RelationalMotifSchema, {
+        ...m,
+        embedding: autoEmbedding,
+        approvalStatus: m.approvalStatus ?? 'approved',
+      })
+    })
+
+    const validatedMilestones: AutobiographicalMilestone[] = (snapshot.milestones ?? []).map(
+      (raw) => v.parse(AutobiographicalMilestoneSchema, raw),
+    )
+
+    const validatedHabits: UserHabit[] = (snapshot.userHabits ?? []).map((raw) => {
+      const h = raw as UserHabit
+      return v.parse(UserHabitSchema, {
+        ...h,
+        approvalStatus: h?.approvalStatus ?? 'approved',
+      })
+    })
+
+    const validatedIntents: ProspectiveIntent[] = (snapshot.prospectiveIntents ?? []).map(
+      (raw) => {
+        const i = raw as ProspectiveIntent
+        return v.parse(ProspectiveIntentSchema, {
+          ...i,
+          approvalStatus: i?.approvalStatus ?? 'approved',
+        })
+      },
+    )
+
+    const validatedEvolution: PersonalityEvolutionRecord[] = (
+      snapshot.personalityEvolution ?? []
+    ).map((raw) => v.parse(PersonalityEvolutionRecordSchema, raw))
+
+    const rawAffective = (snapshot.affectiveState ?? snapshot.personalityProfile) as
+      | AffectiveStateSnapshot
+      | undefined
+    let validatedAffective: AffectiveStateSnapshot = {
+      mood: { ...ASHY_BASELINE_MOOD },
+      traits: { ...ASHY_DEFAULT_TRAITS },
+      updatedAt: 0,
+    }
+    if (rawAffective && typeof rawAffective === 'object') {
+      const validatedMood = v.parse(MoodVectorSchema, rawAffective.mood ?? ASHY_BASELINE_MOOD)
+      const validatedTraits = v.parse(
+        PersonalityTraitsSchema,
+        rawAffective.traits ?? ASHY_DEFAULT_TRAITS,
+      )
+      const updatedAt =
+        rawAffective.updatedAt !== undefined ? Number(rawAffective.updatedAt) : Date.now()
+      if (!Number.isFinite(updatedAt)) {
+        throw new Error('Invalid non-finite affectiveState.updatedAt in snapshot')
+      }
+      validatedAffective = {
+        mood: validatedMood,
+        traits: validatedTraits,
+        updatedAt,
+      }
+    }
+
+    const validatedStyleExemplars: StyleExemplar[] =
+      Array.isArray(snapshot.styleExemplars) && snapshot.styleExemplars.length > 0
+        ? snapshot.styleExemplars.map((ex: StyleExemplar) => ({
+            id: String(ex.id).trim(),
+            situation: String(ex.situation ?? ''),
+            userSample: String(ex.userSample ?? ''),
+            ashySample: String(ex.ashySample ?? ''),
+            notes: String(ex.notes ?? ''),
+          }))
+        : [...DEFAULT_GOLDEN_STYLE_EXEMPLARS]
+
+    const validatedGoldenExemplars: GoldenExemplarRecord[] =
+      Array.isArray(snapshot.goldenExemplars) && snapshot.goldenExemplars.length > 0
+        ? snapshot.goldenExemplars.map((ex: GoldenExemplarRecord) => ({
+            id: String(ex.id).trim(),
+            stage: ex.stage,
+            context: String(ex.context ?? ''),
+            userUtterance: String(ex.userUtterance ?? ''),
+            ashyResponse: String(ex.ashyResponse ?? ''),
+          }))
+        : [...DEFAULT_GOLDEN_EXEMPLARS]
+
+    const sessionsById = new Map<string, ChatSessionRecord>()
+    for (const rawSess of snapshot.chatSessions ?? []) {
+      const s = rawSess as ChatSessionRecord
+      const id = String(s?.id ?? '').trim()
+      if (!id) {
+        throw new Error('Invalid ChatSessionRecord in snapshot: missing id')
+      }
+      if (
+        !Number.isFinite(s.startedAt) ||
+        !Number.isFinite(s.updatedAt) ||
+        !Number.isFinite(s.turnCount ?? 0)
+      ) {
+        throw new Error(`Invalid non-finite numbers in ChatSessionRecord ${id}`)
+      }
+      sessionsById.set(id, {
+        id,
+        title: String(s.title ?? 'Nova Conversa').trim() || 'Nova Conversa',
+        startedAt: Number(s.startedAt),
+        updatedAt: Number(s.updatedAt),
+        turnCount: Number(s.turnCount ?? 0),
+        lastMessagePreview: String(s.lastMessagePreview ?? ''),
+      })
+    }
+
+    const validatedMessages: ChatMessageRecord[] = (snapshot.chatMessages ?? []).map((rawMsg) => {
+      const m = rawMsg as ChatMessageRecord
+      const id = String(m?.id ?? '').trim()
+      const sessionId = String(m?.sessionId ?? '').trim()
+      if (!id || !sessionId) {
+        throw new Error('Invalid ChatMessageRecord in snapshot: missing id or sessionId')
+      }
+      if (!VALID_CHAT_ROLES.has(m.role)) {
+        throw new Error(`Invalid role in ChatMessageRecord ${id}: ${String(m.role)}`)
+      }
+      if (!Number.isFinite(m.createdAt)) {
+        throw new Error(`Invalid non-finite createdAt in ChatMessageRecord ${id}`)
+      }
+      const content = String(m.content ?? '')
+      const rawContent = String(m.rawContent ?? content)
+      const emotion: AshyEmotion = VALID_EMOTIONS.has(m.emotion) ? m.emotion : 'neutral'
+
+      // Synthesize fallback ChatSessionRecord if orphan sessionId is referenced
+      if (!sessionsById.has(sessionId)) {
+        sessionsById.set(sessionId, {
+          id: sessionId,
+          title: 'Conversa Importada',
+          startedAt: Number(m.createdAt),
+          updatedAt: Number(m.createdAt),
+          turnCount: m.role === 'assistant' ? 1 : 0,
+          lastMessagePreview: content.slice(0, 140),
+        })
+      }
+
+      return {
+        id,
+        sessionId,
+        role: m.role,
+        content,
+        rawContent,
+        emotion,
+        markersJson: String(m.markersJson || '[]'),
+        providerId: m.providerId ?? null,
+        modelId: m.modelId ?? null,
+        latencyMs: m.latencyMs ?? null,
+        consolidatedEpisodeId: m.consolidatedEpisodeId ?? null,
+        createdAt: Number(m.createdAt),
+      }
+    })
+
+    const validatedGovernance: MemoryGovernancePolicy = {
+      ...DEFAULT_MEMORY_GOVERNANCE_POLICY,
+    }
+    if (snapshot.memoryGovernance && typeof snapshot.memoryGovernance === 'object') {
+      for (const cat of MEMORY_GOVERNANCE_CATEGORIES) {
+        const val = (snapshot.memoryGovernance as Record<string, unknown>)[cat]
+        if (typeof val === 'boolean') {
+          validatedGovernance[cat] = val
+        }
+      }
+    }
+
+    const validatedAuditLog: SharedActionAuditLogEntry[] = (snapshot.actionAuditLog ?? []).map(
+      (rawEntry) => {
+        const e = rawEntry as SharedActionAuditLogEntry
+        const id = String(e?.id ?? '').trim()
+        if (!id || !Number.isFinite(e.timestamp)) {
+          throw new Error('Invalid ActionAuditLogEntry in snapshot')
+        }
+        return {
+          id,
+          timestamp: Math.floor(e.timestamp),
+          toolName: String(e.toolName ?? ''),
+          serverName: String(e.serverName ?? ''),
+          riskTier: VALID_ACTION_RISK_TIERS.has(e.riskTier) ? e.riskTier : 'staged-confirm',
+          decision: VALID_AUDIT_DECISIONS.has(e.decision) ? e.decision : 'denied',
+          argsPreview: String(e.argsPreview ?? '{}'),
+          actionId: e.actionId ?? null,
+          reason: e.reason ?? null,
+          blastRadiusWarning: e.blastRadiusWarning ?? null,
+          targetPath: e.targetPath ?? null,
+          commandPreview: e.commandPreview ?? null,
+          diffPreview: e.diffPreview ?? null,
+        }
+      },
+    )
+
+    const validatedInitiativePolicy: InitiativePolicy = snapshot.initiativePolicy
+      ? v.parse(InitiativePolicySchema, snapshot.initiativePolicy)
+      : { ...DEFAULT_INITIATIVE_POLICY }
+
+    const validatedProactiveLog: ProactiveInitiativeRecord[] = (
+      snapshot.proactiveInitiativeLog ?? []
+    ).map((raw) => v.parse(ProactiveInitiativeRecordSchema, raw))
+
+    const validatedDreamEntries: DreamJournalEntry[] = (snapshot.dreamJournalEntries ?? []).map(
+      (raw) => v.parse(DreamJournalEntrySchema, raw),
+    )
+
+    // 2. Apply atomically inside BEGIN IMMEDIATE ... COMMIT when SQLite is active
+    if (this.sqlite) {
+      this.sqlite.exec('BEGIN IMMEDIATE')
+      try {
+        this.clearAllDataTablesInTransaction()
+
+        const epStmt = this.sqlite.prepare(
+          `INSERT INTO episodic_memories (
+            id, title, summary, content, created_at, last_reviewed_at,
+            stability, difficulty, surprise, is_flashbulb, tags_json,
+            embedding_json, approval_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        const ftsStmt = this.sqlite.prepare(
+          'INSERT INTO episodic_fts (memory_id, title, summary, content) VALUES (?, ?, ?, ?)',
+        )
+        for (const ep of validatedEpisodes) {
+          epStmt.run(
+            ep.id,
+            this.encryptField(ep.title, 'episodic_memories.title'),
+            this.encryptField(ep.summary, 'episodic_memories.summary'),
+            this.encryptField(ep.content, 'episodic_memories.content'),
+            ep.createdAt,
+            ep.lastReviewedAt,
+            ep.stability,
+            ep.difficulty,
+            ep.surprise,
+            ep.isFlashbulb ? 1 : 0,
+            JSON.stringify(ep.tags),
+            ep.embedding ? JSON.stringify(ep.embedding) : null,
+            ep.approvalStatus ?? 'approved',
+          )
+          if (!this.encryptionAtRestEnabled) {
+            ftsStmt.run(ep.id, ep.title, ep.summary, ep.content)
+          }
+        }
+
+        const factStmt = this.sqlite.prepare(
+          `INSERT INTO semantic_facts (
+            id, category, subject, predicate, object, confidence,
+            source_episode_ids_json, valid_from, invalid_at,
+            embedding_json, approval_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        for (const fact of validatedFacts) {
+          factStmt.run(
+            fact.id,
+            fact.category,
+            fact.subject,
+            fact.predicate,
+            this.encryptField(fact.object, 'semantic_facts.object'),
+            fact.confidence,
+            JSON.stringify(fact.sourceEpisodeIds),
+            fact.validFrom,
+            fact.invalidAt ?? null,
+            fact.embedding ? JSON.stringify(fact.embedding) : null,
+            fact.approvalStatus ?? 'approved',
+          )
+        }
+
+        const motifStmt = this.sqlite.prepare(
+          `INSERT INTO relational_motifs (
+            id, motif, origin_summary, origin_episode_id, trigger_cues_json,
+            stage, times_used, last_used_at, cooldown_hours, created_at,
+            embedding_json, approval_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        for (const motif of validatedMotifs) {
+          motifStmt.run(
+            motif.id,
+            this.encryptField(motif.motif, 'relational_motifs.motif'),
+            this.encryptField(motif.originSummary, 'relational_motifs.origin_summary'),
+            motif.originEpisodeId ?? null,
+            JSON.stringify(motif.triggerCues),
+            motif.stage,
+            motif.timesUsed,
+            motif.lastUsedAt ?? null,
+            motif.cooldownHours,
+            motif.createdAt,
+            motif.embedding ? JSON.stringify(motif.embedding) : null,
+            motif.approvalStatus ?? 'approved',
+          )
+        }
+
+        const msStmt = this.sqlite.prepare(
+          `INSERT INTO autobiographical_milestones (
+            id, title, narrative, category, episode_id, room_trophy_id, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        for (const ms of validatedMilestones) {
+          msStmt.run(
+            ms.id,
+            this.encryptField(ms.title, 'autobiographical_milestones.title'),
+            this.encryptField(ms.narrative, 'autobiographical_milestones.narrative'),
+            ms.category,
+            ms.episodeId ?? null,
+            ms.roomTrophyId ?? null,
+            ms.createdAt,
+          )
+        }
+
+        const habitStmt = this.sqlite.prepare(
+          `INSERT INTO user_habits (
+            id, pattern_key, description, confidence, observation_count,
+            updated_at, source_episode_id, approval_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        for (const habit of validatedHabits) {
+          habitStmt.run(
+            habit.id,
+            habit.patternKey,
+            this.encryptField(habit.description, 'user_habits.description'),
+            habit.confidence,
+            habit.observationCount,
+            habit.updatedAt,
+            habit.sourceEpisodeId ?? null,
+            habit.approvalStatus ?? 'approved',
+          )
+        }
+
+        const intentStmt = this.sqlite.prepare(
+          `INSERT INTO prospective_intents (
+            id, topic, context_cue, due_at, status, created_at,
+            source_episode_id, approval_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        for (const intent of validatedIntents) {
+          intentStmt.run(
+            intent.id,
+            this.encryptField(intent.topic, 'prospective_intents.topic'),
+            this.encryptField(intent.contextCue, 'prospective_intents.context_cue'),
+            intent.dueAt ?? null,
+            intent.status,
+            intent.createdAt,
+            intent.sourceEpisodeId ?? null,
+            intent.approvalStatus ?? 'approved',
+          )
+        }
+
+        const evoStmt = this.sqlite.prepare(
+          `INSERT INTO personality_evolution_log (
+            id, trait, old_value, new_value, reason_episode_id, explanation, created_at, reverted_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        for (const rec of validatedEvolution) {
+          evoStmt.run(
+            rec.id,
+            rec.trait,
+            rec.oldValue,
+            rec.newValue,
+            rec.reasonEpisodeId,
+            rec.explanation,
+            rec.createdAt,
+            rec.revertedAt ?? null,
+          )
+        }
+
+        this.sqlite
+          .prepare(
+            `INSERT INTO affective_state (singleton_id, mood_json, traits_json, updated_at)
+             VALUES (1, ?, ?, ?)`,
+          )
+          .run(
+            JSON.stringify(validatedAffective.mood),
+            JSON.stringify(validatedAffective.traits),
+            validatedAffective.updatedAt,
+          )
+
+        const styleStmt = this.sqlite.prepare(
+          `INSERT INTO style_exemplars (id, situation, user_sample, ashy_sample, notes)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        for (const ex of validatedStyleExemplars) {
+          styleStmt.run(ex.id, ex.situation, ex.userSample, ex.ashySample, ex.notes)
+        }
+
+        const goldenStmt = this.sqlite.prepare(
+          `INSERT INTO golden_exemplars (id, stage, context, user_utterance, ashy_response)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        for (const ex of validatedGoldenExemplars) {
+          goldenStmt.run(ex.id, ex.stage, ex.context, ex.userUtterance, ex.ashyResponse)
+        }
+
+        const sessStmt = this.sqlite.prepare(
+          `INSERT INTO chat_sessions (
+            id, title, started_at, updated_at, turn_count, last_message_preview
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        for (const sess of sessionsById.values()) {
+          sessStmt.run(
+            sess.id,
+            this.encryptField(sess.title, 'chat_sessions.title'),
+            sess.startedAt,
+            sess.updatedAt,
+            sess.turnCount,
+            this.encryptField(sess.lastMessagePreview, 'chat_sessions.last_message_preview'),
+          )
+        }
+
+        const msgStmt = this.sqlite.prepare(
+          `INSERT INTO chat_messages (
+            id, session_id, role, content, raw_content, emotion,
+            markers_json, provider_id, model_id, latency_ms,
+            consolidated_episode_id, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        for (const msg of validatedMessages) {
+          msgStmt.run(
+            msg.id,
+            msg.sessionId,
+            msg.role,
+            this.encryptField(msg.content, 'chat_messages.content'),
+            this.encryptField(msg.rawContent, 'chat_messages.raw_content'),
+            msg.emotion,
+            msg.markersJson,
+            msg.providerId ?? null,
+            msg.modelId ?? null,
+            msg.latencyMs ?? null,
+            msg.consolidatedEpisodeId ?? null,
+            msg.createdAt,
+          )
+        }
+
+        const govStmt = this.sqlite.prepare(
+          `INSERT INTO memory_governance_settings (category, require_confirmation, updated_at)
+           VALUES (?, ?, ?)`,
+        )
+        const now = Date.now()
+        for (const cat of MEMORY_GOVERNANCE_CATEGORIES) {
+          govStmt.run(cat, validatedGovernance[cat] ? 1 : 0, now)
+        }
+
+        const auditStmt = this.sqlite.prepare(
+          `INSERT INTO action_audit_log (
+            id, timestamp, tool_name, server_name, risk_tier, decision,
+            args_preview, action_id, reason, blast_radius_warning,
+            target_path, command_preview, diff_preview
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        for (const entry of validatedAuditLog) {
+          auditStmt.run(
+            entry.id,
+            entry.timestamp,
+            entry.toolName,
+            entry.serverName,
+            entry.riskTier,
+            entry.decision,
+            this.encryptField(entry.argsPreview, 'action_audit_log.args_preview'),
+            entry.actionId ?? null,
+            entry.reason ?? null,
+            entry.blastRadiusWarning ?? null,
+            entry.targetPath ?? null,
+            entry.commandPreview !== null && entry.commandPreview !== undefined
+              ? this.encryptField(entry.commandPreview, 'action_audit_log.command_preview')
+              : null,
+            entry.diffPreview !== null && entry.diffPreview !== undefined
+              ? this.encryptField(entry.diffPreview, 'action_audit_log.diff_preview')
+              : null,
+          )
+        }
+
+        this.sqlite
+          .prepare(
+            `INSERT INTO initiative_policy_state (
+              id, enabled, cooldown_minutes, max_daily_initiatives,
+              quiet_hours_start, quiet_hours_end, respect_dnd, modulate_by_habits, updated_at
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            validatedInitiativePolicy.enabled ? 1 : 0,
+            validatedInitiativePolicy.cooldownMinutes,
+            validatedInitiativePolicy.maxDailyInitiatives,
+            validatedInitiativePolicy.quietHoursStart,
+            validatedInitiativePolicy.quietHoursEnd,
+            validatedInitiativePolicy.respectDnd ? 1 : 0,
+            validatedInitiativePolicy.modulateByHabits ? 1 : 0,
+            now,
+          )
+
+        const initLogStmt = this.sqlite.prepare(
+          `INSERT INTO proactive_initiative_log (
+            id, trigger_kind, source_id, source_title,
+            notice_prompt, reply_text, decision, reason, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        for (const rec of validatedProactiveLog) {
+          initLogStmt.run(
+            rec.id,
+            rec.triggerKind,
+            rec.sourceId ?? null,
+            rec.sourceTitle,
+            rec.noticePrompt,
+            rec.replyText ?? null,
+            rec.decision,
+            rec.reason,
+            rec.createdAt,
+          )
+        }
+
+        const dreamStmt = this.sqlite.prepare(
+          `INSERT INTO dream_reflection_journal (
+            id, summary, source_episode_ids_json,
+            cross_links_count, trait_evolutions_count, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        for (const entry of validatedDreamEntries) {
+          dreamStmt.run(
+            entry.id,
+            this.encryptField(entry.summary, 'dream_reflection_journal.summary'),
+            JSON.stringify(entry.sourceEpisodeIds),
+            entry.crossLinksCount,
+            entry.traitEvolutionsCount,
+            entry.createdAt,
+          )
+        }
+
+        this.saveAgencyConsentState(
+          (snapshot.agencyConsent && typeof snapshot.agencyConsent === 'object'
+            ? snapshot.agencyConsent
+            : DEFAULT_PERSISTED_AGENCY_CONSENT_STATE) as Partial<PersistedAgencyConsentState>,
+        )
+
+        const quickCheckRow = this.sqlite.prepare('PRAGMA quick_check(1)').get()
+        const quickCheckResult = quickCheckRow
+          ? String(Object.values(quickCheckRow)[0] ?? '').toLowerCase()
+          : ''
+        if (quickCheckResult !== 'ok') {
+          throw new Error(`SQLite quick_check failed after import: ${quickCheckResult}`)
+        }
+
+        this.sqlite.exec('COMMIT')
+      } catch (err) {
+        try {
+          this.sqlite.exec('ROLLBACK')
+          this.hydrateMemoryFromSqlite()
+        } catch {
+          // Ignore rollback failure
+        }
+        throw err
+      }
+
+      try {
+        this.sqlite.exec('VACUUM')
+        this.sqlite.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+      } catch {
+        // Ignore if in-memory SQLite
+      }
+
+      this.hydrateMemoryFromSqlite()
+      return
+    }
+
+    // In-memory fallback replacement
+    this.memory = new MemoryStorageAdapter()
+    for (const ep of validatedEpisodes) this.memory.episodicMemories.set(ep.id, ep)
+    for (const fact of validatedFacts) this.memory.semanticFacts.set(fact.id, fact)
+    for (const motif of validatedMotifs) this.memory.relationalMotifs.set(motif.id, motif)
+    for (const ms of validatedMilestones) this.memory.milestones.set(ms.id, ms)
+    for (const habit of validatedHabits) this.memory.userHabits.set(habit.id, habit)
+    for (const intent of validatedIntents) this.memory.prospectiveIntents.set(intent.id, intent)
+    for (const rec of validatedEvolution) this.memory.personalityEvolution.set(rec.id, rec)
+    this.memory.affectiveState = validatedAffective
+    this.memory.styleExemplars.clear()
+    for (const ex of validatedStyleExemplars) this.memory.styleExemplars.set(ex.id, ex)
+    this.memory.goldenExemplars.clear()
+    for (const ex of validatedGoldenExemplars) this.memory.goldenExemplars.set(ex.id, ex)
+    for (const sess of sessionsById.values()) this.memory.chatSessions.set(sess.id, sess)
+    this.memory.chatMessages.push(...validatedMessages)
+    this.memory.governancePolicy = { ...validatedGovernance }
+    this.memory.actionAuditLog.push(...validatedAuditLog)
+    if (snapshot.agencyConsent && typeof snapshot.agencyConsent === 'object') {
+      this.saveAgencyConsentState(snapshot.agencyConsent as Partial<PersistedAgencyConsentState>)
+    }
+    this.memory.initiativePolicy = { ...validatedInitiativePolicy }
+    this.memory.proactiveInitiativeLog.push(...validatedProactiveLog)
+    for (const entry of validatedDreamEntries) this.memory.dreamJournal.set(entry.id, entry)
+  }
+
+  private clearAllDataTablesInTransaction(): void {
+    if (!this.sqlite) return
+    const tablesInFkOrder = [
+      'episodic_fts',
+      'chat_messages',
+      'chat_sessions',
+      'personality_evolution_log',
+      'dream_reflection_journal',
+      'proactive_initiative_log',
+      'action_audit_log',
+      'prospective_intents',
+      'user_habits',
+      'relational_motifs',
+      'autobiographical_milestones',
+      'semantic_facts',
+      'episodic_memories',
+      'affective_state',
+      'style_exemplars',
+      'golden_exemplars',
+      'memory_governance_settings',
+      'agency_consent_state',
+      'initiative_policy_state',
+    ]
+    for (const table of tablesInFkOrder) {
+      this.sqlite.prepare(`DELETE FROM ${table}`).run()
+    }
+    this.sqlite.exec("INSERT INTO episodic_fts(episodic_fts) VALUES('rebuild');")
+  }
+
+  public wipeAll(): void {
+    if (this.sqlite) {
+      this.sqlite.exec('BEGIN IMMEDIATE')
+      try {
+        this.clearAllDataTablesInTransaction()
+        this.sqlite.exec('COMMIT')
+      } catch (err) {
+        try {
+          this.sqlite.exec('ROLLBACK')
+          this.hydrateMemoryFromSqlite()
+        } catch {
+          // Ignore rollback failure
+        }
+        throw err
+      }
+    }
+
+    this.memory = new MemoryStorageAdapter()
+    this.seedDefaultsIfEmpty()
+
+    if (this.sqlite) {
+      this.checkpointAndVacuumSqlite()
+    }
+  }
+
   public close(): void {
     if (this.sqlite) {
+      if (this.isPersistent) {
+        try {
+          this.sqlite.exec('PRAGMA wal_checkpoint(TRUNCATE);')
+        } catch {
+          // Ignore checkpoint failure on close
+        }
+      }
       try {
         this.sqlite.close()
       } catch {

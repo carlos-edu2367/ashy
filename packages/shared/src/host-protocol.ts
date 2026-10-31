@@ -1319,6 +1319,7 @@ export const CortexSoulSnapshotSchema = v.object({
   userHabits: v.array(v.any()),
   prospectiveIntents: v.array(v.any()),
   personalityEvolution: v.array(v.any()),
+  affectiveState: v.optional(v.any()),
   personalityProfile: v.optional(v.any()),
   relationshipState: v.optional(v.any()),
   styleExemplars: v.optional(v.array(v.any())),
