@@ -29,7 +29,7 @@
   "scripts": {
     "dev": "vite --port 5173",
     "dev:web": "vite --port 5173",
-    "build": "vite build",
+    "build": "vite build && node scripts/build-electron.mjs",
     "build:electron": "node scripts/build-electron.mjs",
     "electron:start": "pnpm build:electron && npx --yes electron ./dist/main/index.mjs",
     "pack:dir": "pnpm build && pnpm build:electron",
