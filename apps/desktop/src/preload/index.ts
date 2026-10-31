@@ -60,6 +60,18 @@ export interface AshyPreloadApi {
 export function createAshyPreloadApi(
   ipcRenderer: IpcRendererLike,
 ): AshyPreloadApi {
+  const listeners = new Set<(event: AshyHostStreamEvent) => void>()
+  let isIpcAttached = false
+  const dispatchIpcEvent = (_event: unknown, payload: AshyHostStreamEvent) => {
+    for (const fn of Array.from(listeners)) {
+      try {
+        fn(payload)
+      } catch {
+        // Isolate subscriber errors
+      }
+    }
+  }
+
   return {
     invoke(method: string, payload?: unknown): Promise<unknown> {
       return ipcRenderer.invoke('ashy:rpc', { method, payload })
@@ -166,12 +178,17 @@ export function createAshyPreloadApi(
       }) as Promise<LocalRuntimeStatus>
     },
     onEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
-      const wrapped = (_event: unknown, payload: AshyHostStreamEvent) => {
-        listener(payload)
+      listeners.add(listener)
+      if (!isIpcAttached) {
+        isIpcAttached = true
+        ipcRenderer.on('ashy:event', dispatchIpcEvent)
       }
-      ipcRenderer.on('ashy:event', wrapped)
       return () => {
-        ipcRenderer.removeListener('ashy:event', wrapped)
+        listeners.delete(listener)
+        if (listeners.size === 0 && isIpcAttached) {
+          isIpcAttached = false
+          ipcRenderer.removeListener('ashy:event', dispatchIpcEvent)
+        }
       }
     },
   }

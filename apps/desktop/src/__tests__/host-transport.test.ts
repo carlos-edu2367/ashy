@@ -962,4 +962,95 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
       await kernel.stop()
     }
   })
+
+  it('caches the preload bridge singleton in getAshyHostBridge() and deduplicates dual IPC + SSE events in createPreloadHostBridge', async () => {
+    const fakeIpcRenderer = {
+      invoke: vi.fn(async () => ({})),
+      on: vi.fn(),
+      removeListener: vi.fn(),
+    }
+    const preloadApi = createAshyPreloadApi(fakeIpcRenderer)
+    const g = globalThis as unknown as { window?: { ashyHost?: unknown; location?: { protocol?: string } } }
+    const prevWindow = g.window
+    g.window = {
+      ashyHost: preloadApi,
+      location: { protocol: 'http:' },
+    }
+
+    try {
+      setAshyHostBridgeForTesting(null)
+      const b1 = getAshyHostBridge()
+      const b2 = getAshyHostBridge()
+      expect(b1).toBe(b2)
+
+      // Dual-channel event delivery & deduplication (IPC + fallback SSE)
+      let ipcListener = null as ((ev: AshyHostStreamEvent) => void) | null
+      let sseTarget = null as {
+        onmessage: ((ev: { data: string }) => void) | null
+        onerror: ((err: unknown) => void) | null
+        close: () => void
+      } | null
+
+      const customPreload = {
+        ...preloadApi,
+        onEvent: (cb: (ev: AshyHostStreamEvent) => void) => {
+          ipcListener = cb
+          return () => {
+            if (ipcListener === cb) ipcListener = null
+          }
+        },
+      }
+
+      const dualBridge = createPreloadHostBridge(customPreload, {
+        createEventSource: () => {
+          sseTarget = {
+            onmessage: null,
+            onerror: null,
+            close: vi.fn(),
+          }
+          return sseTarget
+        },
+      })
+
+      const received: AshyHostStreamEvent[] = []
+      const unsub = dualBridge.onHostEvent((ev) => received.push(ev))
+
+      const deltaEvent: AshyHostStreamEvent = {
+        type: 'turn:delta',
+        turnId: 'turn-dual-1',
+        sessionId: 'session-1',
+        textDelta: 'Olá!',
+      }
+      // Emit over IPC AND SSE — subscriber must receive it only ONCE
+      ipcListener?.(deltaEvent)
+      sseTarget?.onmessage?.({ data: JSON.stringify(deltaEvent) })
+      expect(received.filter((e) => e.type === 'turn:delta')).toHaveLength(1)
+
+      // Emit turn:completed ONLY over SSE (simulating dropped IPC event) — subscriber MUST receive it
+      const completedEvent: AshyHostStreamEvent = {
+        type: 'turn:completed',
+        turnId: 'turn-dual-1',
+        sessionId: 'session-1',
+        assistantMessage: {
+          id: 'msg-assistant-turn-dual-1',
+          sessionId: 'session-1',
+          role: 'assistant',
+          content: 'Olá!',
+          rawContent: 'Olá!',
+          markersJson: '[]',
+          emotion: 'happy',
+          createdAt: Date.now(),
+        },
+        snapshot: {} as never,
+        persistenceWarning: null,
+      }
+      sseTarget?.onmessage?.({ data: JSON.stringify(completedEvent) })
+      expect(received.filter((e) => e.type === 'turn:completed')).toHaveLength(1)
+
+      unsub()
+    } finally {
+      g.window = prevWindow
+      setAshyHostBridgeForTesting(null)
+    }
+  })
 })

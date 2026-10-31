@@ -240,6 +240,78 @@ function buildAgencyChatTools(agencyRuntime: HostAgencyRuntime): ToolDefinition[
   return tools
 }
 
+const SYNTHETIC_OMNI_REVISION_REGEX = /^ashy-omni-turn-rev-\d+$/i
+
+export function isSyntheticOmniRevisionTag(value: string | null | undefined): boolean {
+  if (!value) return false
+  return SYNTHETIC_OMNI_REVISION_REGEX.test(value.trim())
+}
+
+export function resolveOmniTurnUserText(input: {
+  sessionId?: string
+  text: string
+  transcriptHint?: string
+  inputAudio?: {
+    dataBase64: string
+    format: 'wav' | 'pcm16' | 'mp3'
+    sampleRate?: number
+    durationMs?: number
+    transcriptHint?: string
+  }
+}): {
+  effectiveUserText: string
+  inputTranscriptSource: 'stt-preflight' | 'wav-metadata' | null
+  emittedTranscript: string | null
+} {
+  const trimmedText = input.text.trim()
+  if (trimmedText.length > 0 && !isSyntheticOmniRevisionTag(trimmedText)) {
+    return {
+      effectiveUserText: input.text,
+      inputTranscriptSource: null,
+      emittedTranscript: null,
+    }
+  }
+  const hint = (input.inputAudio?.transcriptHint ?? input.transcriptHint)?.trim()
+  if (hint && hint.length > 0 && !isSyntheticOmniRevisionTag(hint)) {
+    return {
+      effectiveUserText: hint,
+      inputTranscriptSource: 'stt-preflight',
+      emittedTranscript: hint,
+    }
+  }
+  if (input.inputAudio?.format === 'wav') {
+    try {
+      const cleanB64 = input.inputAudio.dataBase64.replace(/^data:audio\/[\w+-]+;base64,/, '')
+      const wavBytes = Buffer.from(cleanB64, 'base64')
+      const decoded = decodeWavToPcmBlocks(
+        wavBytes.buffer.slice(wavBytes.byteOffset, wavBytes.byteOffset + wavBytes.byteLength),
+      )
+      const icmt = decoded.metadataComment?.trim()
+      if (icmt && icmt.length > 0 && !isSyntheticOmniRevisionTag(icmt)) {
+        return {
+          effectiveUserText: icmt,
+          inputTranscriptSource: 'wav-metadata',
+          emittedTranscript: icmt,
+        }
+      }
+    } catch {
+      // Ignore malformed WAV when extracting optional ICMT comment
+    }
+  }
+  if (input.inputAudio) {
+    return {
+      effectiveUserText: '[Mensagem de voz Omni]',
+      inputTranscriptSource: null,
+      emittedTranscript: null,
+    }
+  }
+  return {
+    effectiveUserText: '[Mídia enviada para análise Omni]',
+    inputTranscriptSource: null,
+    emittedTranscript: null,
+  }
+}
+
 export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOrchestrator {
   const { cortex, voiceStore, providerVault } = options
   const keepaliveIntervalMs = Math.max(
@@ -294,53 +366,6 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     const entry = activeTurnsBySession.get(sessionId)
     if (!entry) return
     finalizeAbortEntry(entry)
-  }
-
-  function resolveOmniTurnUserText(input: SendTurnInput): {
-    effectiveUserText: string
-    inputTranscriptSource: 'stt-preflight' | 'wav-metadata' | null
-  } {
-    if (input.text.trim().length > 0) {
-      return {
-        effectiveUserText: input.text,
-        inputTranscriptSource: null,
-      }
-    }
-    const hint = input.inputAudio?.transcriptHint?.trim()
-    if (hint && hint.length > 0) {
-      return {
-        effectiveUserText: hint,
-        inputTranscriptSource: 'stt-preflight',
-      }
-    }
-    if (input.inputAudio?.format === 'wav') {
-      try {
-        const cleanB64 = input.inputAudio.dataBase64.replace(/^data:audio\/[\w+-]+;base64,/, '')
-        const wavBytes = Buffer.from(cleanB64, 'base64')
-        const decoded = decodeWavToPcmBlocks(
-          wavBytes.buffer.slice(wavBytes.byteOffset, wavBytes.byteOffset + wavBytes.byteLength),
-        )
-        const icmt = decoded.metadataComment?.trim()
-        if (icmt && icmt.length > 0) {
-          return {
-            effectiveUserText: icmt,
-            inputTranscriptSource: 'wav-metadata',
-          }
-        }
-      } catch {
-        // Ignore malformed WAV when extracting optional ICMT comment
-      }
-    }
-    if (input.inputAudio) {
-      return {
-        effectiveUserText: '[Mensagem de voz Omni]',
-        inputTranscriptSource: null,
-      }
-    }
-    return {
-      effectiveUserText: '[Mídia enviada para análise Omni]',
-      inputTranscriptSource: null,
-    }
   }
 
   function abortAll(): void {

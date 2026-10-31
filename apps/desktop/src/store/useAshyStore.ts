@@ -1432,11 +1432,161 @@ function buildAgencyStatePatch(
 }
 
 const completedTurnEvents = new Map<string, AshyHostStreamEvent>()
+const completedTurnIdsInFlight = new Set<string>()
 const pendingTurnResolvers = new Map<string, () => void>()
 const pendingTurnSeriousness = new Map<string, boolean>()
 const streamedDeltaTurnIds = new Set<string>()
+const enqueuedSpeechDeltaTurnIds = new Set<string>()
 const bargeInTurnIds = new Set<string>()
 const omniAudioReceivedTurnIds = new Set<string>()
+
+const SYNTHETIC_OMNI_REV_REGEX = /^ashy-omni-turn-rev-\d+$/i
+let latestBrowserSpeechTranscript = ''
+let activeSpeechRecognition: { stop: () => void } | null = null
+
+function cleanTextForBrowserSpeech(rawText: string): string {
+  return rawText
+    .replace(/<\|[^|]*\|>/g, ' ')
+    .replace(/\uFFFC/g, ' ')
+    .replace(/[`*_~#>]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function cancelBrowserSpeechSynthesis(): void {
+  try {
+    if (
+      typeof window !== 'undefined' &&
+      'speechSynthesis' in window &&
+      window.speechSynthesis &&
+      typeof window.speechSynthesis.cancel === 'function'
+    ) {
+      window.speechSynthesis.cancel()
+    }
+  } catch {
+    // Ignore browser speech synthesis cancellation errors
+  }
+}
+
+function speakBrowserTextOutLoud(rawText: string): void {
+  const clean = cleanTextForBrowserSpeech(rawText)
+  if (!clean) return
+  try {
+    if (
+      typeof window === 'undefined' ||
+      !('speechSynthesis' in window) ||
+      !window.speechSynthesis ||
+      typeof window.SpeechSynthesisUtterance !== 'function' ||
+      typeof window.speechSynthesis.speak !== 'function'
+    ) {
+      return
+    }
+    const synth = window.speechSynthesis
+    const UtteranceCtor = window.SpeechSynthesisUtterance
+    const utterance = new UtteranceCtor(clean)
+    utterance.lang = 'pt-BR'
+    utterance.rate = 1.02
+    utterance.pitch = 1.04
+    if (typeof synth.getVoices === 'function') {
+      const voices = synth.getVoices() ?? []
+      const ptVoice =
+        voices.find((v) => /^pt[-_]BR/i.test(v.lang)) ??
+        voices.find((v) => /^pt/i.test(v.lang) || /portugu/i.test(v.name))
+      if (ptVoice) {
+        utterance.voice = ptVoice
+      }
+    }
+    synth.speak(utterance)
+  } catch {
+    // Ignore browser speech synthesis playback errors
+  }
+}
+
+function playBase64AudioInBrowser(audioBase64?: string, mimeType = 'audio/wav'): void {
+  if (!audioBase64) return
+  try {
+    if (typeof window === 'undefined' || typeof window.Audio !== 'function') {
+      return
+    }
+    const src = audioBase64.startsWith('data:')
+      ? audioBase64
+      : `data:${mimeType};base64,${audioBase64}`
+    const audio = new window.Audio(src)
+    const playPromise = audio.play()
+    if (playPromise && typeof playPromise.catch === 'function') {
+      void playPromise.catch(() => {})
+    }
+  } catch {
+    // Ignore HTMLAudioElement playback errors in headless environments
+  }
+}
+
+function startBrowserSpeechRecognition(): void {
+  stopBrowserSpeechRecognition()
+  try {
+    if (typeof window === 'undefined') return
+    const w = window as unknown as {
+      SpeechRecognition?: new () => {
+        lang: string
+        continuous: boolean
+        interimResults: boolean
+        onresult: ((ev: { results?: ArrayLike<ArrayLike<{ transcript?: string }>> }) => void) | null
+        onerror: (() => void) | null
+        start: () => void
+        stop: () => void
+      }
+      webkitSpeechRecognition?: new () => {
+        lang: string
+        continuous: boolean
+        interimResults: boolean
+        onresult: ((ev: { results?: ArrayLike<ArrayLike<{ transcript?: string }>> }) => void) | null
+        onerror: (() => void) | null
+        start: () => void
+        stop: () => void
+      }
+    }
+    const RecognitionCtor = w.SpeechRecognition ?? w.webkitSpeechRecognition
+    if (typeof RecognitionCtor !== 'function') return
+    const rec = new RecognitionCtor()
+    rec.lang = 'pt-BR'
+    rec.continuous = true
+    rec.interimResults = true
+    rec.onresult = (ev) => {
+      try {
+        const results = ev.results
+        if (!results || results.length === 0) return
+        const parts: string[] = []
+        for (let i = 0; i < results.length; i += 1) {
+          const item = results[i]?.[0]?.transcript?.trim()
+          if (item) parts.push(item)
+        }
+        const combined = parts.join(' ').trim()
+        if (combined.length > 0) {
+          latestBrowserSpeechTranscript = combined
+        }
+      } catch {
+        // Ignore recognition event parse errors
+      }
+    }
+    rec.onerror = () => {
+      // Ignore Web Speech API network/permission errors; fallback STT still applies
+    }
+    rec.start()
+    activeSpeechRecognition = rec
+  } catch {
+    activeSpeechRecognition = null
+  }
+}
+
+function stopBrowserSpeechRecognition(): void {
+  if (!activeSpeechRecognition) return
+  try {
+    activeSpeechRecognition.stop()
+  } catch {
+    // Ignore stop error
+  }
+  activeSpeechRecognition = null
+}
 
 const webcamSampler = createLiveWebcamSampler({
   fps: 2,
@@ -1637,6 +1787,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
                   voiceRuntimeError: null,
                 })
               }
+              if (res.audioBase64) {
+                playBase64AudioInBrowser(res.audioBase64, res.mimeType)
+              } else {
+                speakBrowserTextOutLoud(text)
+              }
               return {
                 providerId: activeTts,
                 durationMs: res.durationMs,
@@ -1646,8 +1801,15 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
             } catch (err) {
               const errMsg = err instanceof Error ? err.message : String(err)
               set({ voiceRuntimeError: errMsg })
+              if (Boolean(state.autoSpeakReplies)) {
+                speakBrowserTextOutLoud(text)
+              }
             }
           }
+        }
+
+        if (Boolean(state.autoSpeakReplies)) {
+          speakBrowserTextOutLoud(text)
         }
 
         return {
@@ -1870,6 +2032,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       }
       streamedDeltaTurnIds.add(event.turnId)
       if (!isExpectingNativeOmniAudio) {
+        enqueuedSpeechDeltaTurnIds.add(event.turnId)
         pipeline.enqueueDelta(deltaText)
       }
 
@@ -2005,11 +2168,16 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     }
 
     if (event.type === 'turn:completed') {
+      if (completedTurnIdsInFlight.has(event.turnId) || completedTurnEvents.has(event.turnId)) {
+        return
+      }
+      completedTurnIdsInFlight.add(event.turnId)
       void (async () => {
         const parsed = parseAssistantRawOutput(
           event.assistantMessage.rawContent || event.assistantMessage.content,
         )
         const hadStreamedDeltas = streamedDeltaTurnIds.delete(event.turnId)
+        const hadEnqueuedSpeechDeltas = enqueuedSpeechDeltaTurnIds.delete(event.turnId)
         const hadNativeOmniAudio = omniAudioReceivedTurnIds.delete(event.turnId)
         const pipeline =
           hadStreamedDeltas && activeSpeechPipeline
@@ -2022,15 +2190,8 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
         if (hadNativeOmniAudio) {
           voiceRuntime.getPlayer().markStreamComplete(true)
-        } else if (hadStreamedDeltas) {
-          if (pipeline.getScheduledChunks().length === 0) {
-            pipeline.enqueue(
-              parsed.textWithSentinels || event.assistantMessage.content,
-              parsed.signals,
-            )
-          } else {
-            pipeline.flush()
-          }
+        } else if (hadEnqueuedSpeechDeltas && pipeline.getScheduledChunks().length > 0) {
+          pipeline.flush()
         } else {
           pipeline.enqueue(
             parsed.textWithSentinels || event.assistantMessage.content,
@@ -2044,7 +2205,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         const wasSerious = pendingTurnSeriousness.get(event.turnId) === true
         pendingTurnSeriousness.delete(event.turnId)
 
-        if (event.snapshot) {
+        if (event.snapshot && event.snapshot.memories) {
           get().applyBootstrapSnapshot(event.snapshot)
         }
 
@@ -2080,15 +2241,32 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           scheduledAudioChunks: scheduledChunks,
           ttfaByProvider: voiceRuntime.getTtfaTelemetry(),
           lastStageSignals: parsed.signals,
-          chatMessages: state.chatMessages.map((m) =>
-            m.id === event.assistantMessage.id
-              ? {
-                  ...m,
+          chatMessages: state.chatMessages.some((m) => m.id === event.assistantMessage.id)
+            ? state.chatMessages.map((m) =>
+                m.id === event.assistantMessage.id
+                  ? {
+                      ...m,
+                      content: event.assistantMessage.content,
+                      text: event.assistantMessage.content,
+                      emotion: targetEmotion,
+                      seriousnessTriggered: wasSerious,
+                    }
+                  : m,
+              )
+            : [
+                ...state.chatMessages,
+                {
+                  id: event.assistantMessage.id,
+                  role: 'assistant' as const,
+                  content: event.assistantMessage.content,
+                  text: event.assistantMessage.content,
                   emotion: targetEmotion,
+                  modelId: state.activeModelId,
+                  timeLabel: formatLocalTimeHHMM(event.assistantMessage.createdAt),
+                  timestamp: event.assistantMessage.createdAt,
                   seriousnessTriggered: wasSerious,
-                }
-              : m,
-          ),
+                },
+              ],
         }))
 
         const lastEndSec = scheduledChunks.at(-1)?.endTimeSec ?? 0.35
@@ -2188,6 +2366,71 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       unsubscribeHostEvents = bridge.onHostEvent?.(handleHostStreamEvent) ?? null
     }
     return bridge
+  }
+
+  async function waitForTurnCompletionWithFallback(
+    bridge: AshyHostBridge,
+    turnId: string,
+  ): Promise<void> {
+    if (completedTurnEvents.has(turnId)) {
+      completedTurnEvents.delete(turnId)
+      return
+    }
+    if (
+      typeof bridge.onHostEvent !== 'function' &&
+      typeof bridge.getBootstrapSnapshot !== 'function'
+    ) {
+      return
+    }
+
+    let isPolling = false
+    const pollOnce = async () => {
+      if (isPolling || !pendingTurnResolvers.has(turnId) || completedTurnEvents.has(turnId)) {
+        return
+      }
+      if (typeof bridge.getBootstrapSnapshot !== 'function') {
+        return
+      }
+      isPolling = true
+      try {
+        const snap = await bridge.getBootstrapSnapshot()
+        if (!pendingTurnResolvers.has(turnId) || completedTurnEvents.has(turnId)) {
+          return
+        }
+        const assistantMsg = snap?.messages?.find((m) => m.id === `msg-assistant-${turnId}`)
+        if (assistantMsg) {
+          handleHostStreamEvent({
+            type: 'turn:completed',
+            turnId,
+            sessionId: snap.activeSession?.id ?? get().activeSessionId,
+            assistantMessage: assistantMsg,
+            snapshot: snap,
+            persistenceWarning: snap.runtimeDiagnostics?.lastPersistenceWarning ?? null,
+          })
+        }
+      } catch {
+        // Ignore snapshot poll errors
+      } finally {
+        isPolling = false
+      }
+    }
+
+    const quickTimer = setTimeout(() => {
+      void pollOnce()
+    }, 35)
+    const fallbackTimer = setInterval(() => {
+      void pollOnce()
+    }, 800)
+
+    try {
+      await new Promise<void>((resolve) => {
+        pendingTurnResolvers.set(turnId, resolve)
+      })
+    } finally {
+      clearTimeout(quickTimer)
+      clearInterval(fallbackTimer)
+      completedTurnEvents.delete(turnId)
+    }
   }
 
   const initialWindowMode = resolveInitialWindowMode()
@@ -3202,19 +3445,12 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         }
       })
 
-      if (completedTurnEvents.has(turnId)) {
-        completedTurnEvents.delete(turnId)
-        return
-      }
-
-      await new Promise<void>((resolve) => {
-        pendingTurnResolvers.set(turnId, resolve)
-      })
-      completedTurnEvents.delete(turnId)
+      await waitForTurnCompletionWithFallback(bridge, turnId)
     },
 
     triggerBargeIn(interruptAtMs = 600) {
       clearActivePlaybackEndTimer()
+      cancelBrowserSpeechSynthesis()
       const activeTurnId = get().activeTurnId ?? get().activeStreamingTurnId ?? null
       if (activeTurnId !== null) {
         bargeInTurnIds.add(activeTurnId)
@@ -4640,6 +4876,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     async toggleVoiceConversation(active) {
       const shouldActivate = active !== undefined ? Boolean(active) : !get().isVoiceListening
       if (!shouldActivate) {
+        stopBrowserSpeechRecognition()
         await voiceRuntime.stopMicrophoneCapture()
         set((state) => ({
           isVoiceListening: false,
@@ -4654,6 +4891,8 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       if (get().privacyState.micMode === 'muted') {
         get().setMicMode('continuous')
       }
+
+      startBrowserSpeechRecognition()
 
       const hasGetUserMedia =
         typeof navigator !== 'undefined' &&
@@ -4940,6 +5179,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
             voiceId: state.voiceSettings.ttsVoiceId,
           })
           const firstFrame = res.vowelFrames?.[0]
+          if (res.audioBase64) {
+            playBase64AudioInBrowser(res.audioBase64, res.mimeType)
+          } else {
+            speakBrowserTextOutLoud(text)
+          }
           set({
             isTestingTts: false,
             isSpeaking: true,
@@ -4965,6 +5209,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           }
         }
 
+        speakBrowserTextOutLoud(text)
         await voiceRuntime.enqueueAssistantReply(text)
         const chunks = voiceRuntime.getSpeechPipeline().getScheduledChunks()
         const durationMs = chunks.reduce((acc, c) => acc + c.durationMs, 0) || 400
@@ -5553,26 +5798,86 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
       if (s.isBootstrapped) {
         const bridge = ensureHostSubscription()
-        await bridge.sendTurn({
+        const rawHint = turn.transcriptHint?.trim() ?? ''
+        let effectiveHint =
+          rawHint.length > 0 && !SYNTHETIC_OMNI_REV_REGEX.test(rawHint) ? rawHint : ''
+
+        if (!effectiveHint && latestBrowserSpeechTranscript.trim().length > 0) {
+          effectiveHint = latestBrowserSpeechTranscript.trim()
+          latestBrowserSpeechTranscript = ''
+        }
+
+        if (
+          !effectiveHint &&
+          typeof bridge.transcribeVoiceAudio === 'function' &&
+          s.voiceSettings.activeSttProviderId !== 'deterministic-wav-stt'
+        ) {
+          try {
+            const sttRes = await bridge.transcribeVoiceAudio({
+              audioBase64: turn.wavBase64,
+              mimeType: turn.mimeType || 'audio/wav',
+              providerId: s.voiceSettings.activeSttProviderId,
+              baseUrl: s.voiceSettings.sttBaseUrl,
+              modelId: s.voiceSettings.sttModelId,
+            })
+            const cleanedStt = sttRes?.text?.trim() ?? ''
+            if (
+              cleanedStt.length > 0 &&
+              !SYNTHETIC_OMNI_REV_REGEX.test(cleanedStt) &&
+              cleanedStt !== '[Transcrição simulada de áudio WAV]'
+            ) {
+              effectiveHint = cleanedStt
+            }
+          } catch {
+            // Ignore STT preflight failure and proceed with native Omni audio turn
+          }
+        }
+
+        const res = await bridge.sendTurn({
           sessionId: s.activeSessionId,
-          text: turn.transcriptHint ?? '',
+          text: effectiveHint,
           inputAudio: {
             dataBase64: turn.wavBase64,
             format: 'wav',
             sampleRate: turn.sampleRate,
             durationMs: turn.durationMs,
-            ...(turn.transcriptHint ? { transcriptHint: turn.transcriptHint } : {}),
+            ...(effectiveHint ? { transcriptHint: effectiveHint } : {}),
           },
           ...(videoFrames ? { videoFrames } : {}),
           ...(attachments ? { attachments } : {}),
           ...(interruptionNote ? { interruptionControlNote: interruptionNote } : {}),
           omniExecutionModeOverride: 'native-omni',
         })
+
+        if (res?.userMessage && res?.turnId) {
+          const userTurn: ChatTurnMessage = {
+            id: res.userMessage.id,
+            role: 'user',
+            content: res.userMessage.content,
+            text: res.userMessage.content,
+            timeLabel: formatLocalTimeHHMM(res.userMessage.createdAt),
+            timestamp: res.userMessage.createdAt,
+          }
+          set((state) => ({
+            isStreamingTurn: true,
+            activeTurnId: res.turnId,
+            presenceStatus: 'Thinking',
+            lastTurnError: null,
+            chatMessages: state.chatMessages.some((m) => m.id === userTurn.id)
+              ? state.chatMessages
+              : [...state.chatMessages, userTurn],
+          }))
+          await waitForTurnCompletionWithFallback(bridge, res.turnId)
+        }
         return
       }
 
+      const cleanFallbackHint =
+        turn.transcriptHint && !SYNTHETIC_OMNI_REV_REGEX.test(turn.transcriptHint.trim())
+          ? turn.transcriptHint.trim()
+          : ''
       const fallbackText =
-        turn.transcriptHint || '🎤 [Mensagem de voz enviada diretamente ao modelo Omni]'
+        cleanFallbackHint || '🎤 [Mensagem de voz enviada diretamente ao modelo Omni]'
       await get().sendUserMessage(fallbackText)
     },
 
@@ -5801,11 +6106,16 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       activeSpeechPipeline = null
 
       completedTurnEvents.clear()
+      completedTurnIdsInFlight.clear()
       pendingTurnResolvers.clear()
       pendingTurnSeriousness.clear()
       streamedDeltaTurnIds.clear()
+      enqueuedSpeechDeltaTurnIds.clear()
       bargeInTurnIds.clear()
       omniAudioReceivedTurnIds.clear()
+      latestBrowserSpeechTranscript = ''
+      stopBrowserSpeechRecognition()
+      cancelBrowserSpeechSynthesis()
       agency = createAgencyRuntime()
       voiceRuntime = createStoreVoiceRuntime()
 
@@ -6027,11 +6337,16 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       agencyRpcChain = Promise.resolve()
       providerCatalogSeq.clear()
       completedTurnEvents.clear()
+      completedTurnIdsInFlight.clear()
       pendingTurnResolvers.clear()
       pendingTurnSeriousness.clear()
       streamedDeltaTurnIds.clear()
+      enqueuedSpeechDeltaTurnIds.clear()
       bargeInTurnIds.clear()
       omniAudioReceivedTurnIds.clear()
+      latestBrowserSpeechTranscript = ''
+      stopBrowserSpeechRecognition()
+      cancelBrowserSpeechSynthesis()
       webcamSampler.stop()
       webcamSampler.clearFrames()
       agency = createAgencyRuntime()

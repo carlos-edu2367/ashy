@@ -82,9 +82,155 @@ declare global {
 
 export function createPreloadHostBridge(
   preloadApi: AshyPreloadApi,
+  options: HttpSseHostBridgeOptions = {},
 ): AshyHostBridge {
   const invoke = <T>(method: string, payload?: unknown): Promise<T> =>
     preloadApi.invoke(method, payload) as Promise<T>
+
+  const baseUrl = (options.baseUrl ?? '').replace(/\/+$/, '')
+  const listeners = new Set<(event: AshyHostStreamEvent) => void>()
+  let unsubscribePreload: (() => void) | null = null
+  let activeEventSource: EventSourceLike | null = null
+
+  const channelSeqByPrefix = {
+    ipc: new Map<string, number>(),
+    sse: new Map<string, number>(),
+  }
+  const seenTurnEventKeys = new Set<string>()
+  const recentNonTurnEventTimestamps = new Map<string, number>()
+
+  function computeEventDedupeKey(
+    channel: 'ipc' | 'sse',
+    event: AshyHostStreamEvent,
+  ): string | null {
+    const seqMap = channelSeqByPrefix[channel]
+    switch (event.type) {
+      case 'turn:delta': {
+        const prefix = `turn:delta:${event.turnId}`
+        const idx = (seqMap.get(prefix) ?? 0) + 1
+        seqMap.set(prefix, idx)
+        return `${prefix}:#${idx}:${event.textDelta}`
+      }
+      case 'turn:marker': {
+        const prefix = `turn:marker:${event.turnId}`
+        const idx = (seqMap.get(prefix) ?? 0) + 1
+        seqMap.set(prefix, idx)
+        return `${prefix}:#${idx}:${JSON.stringify(event.marker)}`
+      }
+      case 'turn:audio-delta':
+        return `turn:audio-delta:${event.turnId}:${event.seq}`
+      case 'turn:input-transcript':
+        return `turn:input-transcript:${event.turnId}:${event.isFinal ? '1' : '0'}:${event.transcript}`
+      case 'turn:completed':
+        return `turn:completed:${event.turnId}`
+      case 'turn:error':
+        return `turn:error:${event.turnId}:${event.message}`
+      default:
+        return null
+    }
+  }
+
+  function dispatchDeduplicatedEvent(
+    channel: 'ipc' | 'sse',
+    event: AshyHostStreamEvent,
+  ): void {
+    if (!event || typeof event !== 'object' || typeof event.type !== 'string') {
+      return
+    }
+    const turnKey = computeEventDedupeKey(channel, event)
+    if (turnKey) {
+      if (seenTurnEventKeys.has(turnKey)) {
+        return
+      }
+      seenTurnEventKeys.add(turnKey)
+      if (seenTurnEventKeys.size > 4000) {
+        const first = seenTurnEventKeys.values().next().value
+        if (first) seenTurnEventKeys.delete(first)
+      }
+    } else {
+      const now = Date.now()
+      let sig: string = event.type
+      try {
+        sig = `${event.type}:${JSON.stringify(event)}`
+      } catch {
+        sig = event.type
+      }
+      const prevTs = recentNonTurnEventTimestamps.get(sig)
+      if (prevTs !== undefined && now - prevTs < 150) {
+        return
+      }
+      recentNonTurnEventTimestamps.set(sig, now)
+      if (recentNonTurnEventTimestamps.size > 200) {
+        const oldestKey = recentNonTurnEventTimestamps.keys().next().value
+        if (oldestKey) recentNonTurnEventTimestamps.delete(oldestKey)
+      }
+    }
+
+    for (const listener of Array.from(listeners)) {
+      try {
+        listener(event)
+      } catch {
+        // Isolate subscriber errors
+      }
+    }
+  }
+
+  function ensureSubscriptions(): void {
+    if (listeners.size === 0) return
+
+    if (!unsubscribePreload) {
+      unsubscribePreload = preloadApi.onEvent((ev) => {
+        dispatchDeduplicatedEvent('ipc', ev)
+      })
+    }
+
+    if (!activeEventSource) {
+      const createEs =
+        options.createEventSource ??
+        (typeof globalThis.EventSource === 'function' &&
+        typeof window !== 'undefined' &&
+        (window.location?.protocol === 'http:' || window.location?.protocol === 'https:')
+          ? (url: string) => new globalThis.EventSource(url) as unknown as EventSourceLike
+          : null)
+
+      if (createEs) {
+        try {
+          const es = createEs(`${baseUrl}/__ashy_host/events`)
+          es.onmessage = (ev) => {
+            try {
+              const parsed = JSON.parse(ev.data) as AshyHostStreamEvent
+              dispatchDeduplicatedEvent('sse', parsed)
+            } catch {
+              // Ignore malformed SSE frame
+            }
+          }
+          activeEventSource = es
+        } catch {
+          activeEventSource = null
+        }
+      }
+    }
+  }
+
+  function releaseSubscriptionsIfIdle(): void {
+    if (listeners.size > 0) return
+    if (unsubscribePreload) {
+      try {
+        unsubscribePreload()
+      } catch {
+        // Ignore
+      }
+      unsubscribePreload = null
+    }
+    if (activeEventSource) {
+      try {
+        activeEventSource.close()
+      } catch {
+        // Ignore
+      }
+      activeEventSource = null
+    }
+  }
 
   return {
     getBootstrapSnapshot(): Promise<AshyBootstrapSnapshot> {
@@ -366,7 +512,12 @@ export function createPreloadHostBridge(
       return invoke<LocalRuntimeStatus>('localRuntime:deleteModel', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
-      return preloadApi.onEvent(listener)
+      listeners.add(listener)
+      ensureSubscriptions()
+      return () => {
+        listeners.delete(listener)
+        releaseSubscriptionsIfIdle()
+      }
     },
   }
 }
@@ -739,12 +890,17 @@ export function createHttpSseHostBridge(
 }
 
 let testBridgeOverride: AshyHostBridge | null = null
+let cachedPreloadApiRef: AshyPreloadApi | null = null
+let cachedPreloadBridge: AshyHostBridge | null = null
 let cachedDefaultBridge: AshyHostBridge | null = null
 
 export function setAshyHostBridgeForTesting(
   bridge: AshyHostBridge | null,
 ): void {
   testBridgeOverride = bridge
+  cachedPreloadApiRef = null
+  cachedPreloadBridge = null
+  cachedDefaultBridge = null
 }
 
 export function getAshyHostBridge(): AshyHostBridge {
@@ -757,7 +913,11 @@ export function getAshyHostBridge(): AshyHostBridge {
     (globalThis as unknown as { ashyHost?: AshyPreloadApi }).ashyHost
 
   if (globalPreload) {
-    return createPreloadHostBridge(globalPreload)
+    if (cachedPreloadApiRef !== globalPreload || !cachedPreloadBridge) {
+      cachedPreloadApiRef = globalPreload
+      cachedPreloadBridge = createPreloadHostBridge(globalPreload)
+    }
+    return cachedPreloadBridge
   }
 
   if (!cachedDefaultBridge) {

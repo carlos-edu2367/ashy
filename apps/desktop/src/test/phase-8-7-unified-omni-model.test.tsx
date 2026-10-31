@@ -2,8 +2,9 @@
 import React, { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { uint8ArrayToBase64 } from '@ashy/voice'
-import type { AshyHostBridge, ChatMessageRecord } from '@ashy/shared'
+import { encodeWavPcm16, uint8ArrayToBase64 } from '@ashy/voice'
+import type { AshyBootstrapSnapshot, AshyHostBridge, ChatMessageRecord } from '@ashy/shared'
+import { resolveOmniTurnUserText } from '../host/turn-orchestrator'
 import {
   createLiveWebcamSampler,
   createSyntheticVideoFrameDataUrl,
@@ -385,6 +386,142 @@ describe('@ashy/desktop — Phase 8.7: Unified Omni Model (LFM3-Omni-2B Local & 
       expect(useAshyStore.getState().isWebcamStreaming).toBe(false)
       expect(useAshyStore.getState().webcamPreviewDataUrl).toBeNull()
       expect(useAshyStore.getState().pendingVideoFrames).toHaveLength(0)
+    })
+
+    it('ignores synthetic ashy-omni-turn-rev-* WAV ICMT comments in resolveOmniTurnUserText so voice turns never send "ashy-omni-turn-rev-1" as user text', () => {
+      const wavBytes = encodeWavPcm16(new Float32Array(1600), 16000, 'ashy-omni-turn-rev-1')
+      const wavBase64 = uint8ArrayToBase64(wavBytes)
+
+      const resolved = resolveOmniTurnUserText({
+        sessionId: 'session-default',
+        text: '',
+        transcriptHint: 'ashy-omni-turn-rev-1',
+        inputAudio: {
+          dataBase64: wavBase64,
+          format: 'wav',
+          sampleRate: 16000,
+          durationMs: 100,
+        },
+      })
+
+      expect(resolved.effectiveUserText).not.toContain('ashy-omni-turn-rev')
+      expect(resolved.effectiveUserText).toBe('[Mensagem de voz Omni]')
+      expect(resolved.emittedTranscript).toBeNull()
+    })
+
+    it('appends userMessage immediately in sendOmniAudioTurn, recovers turn completion via getBootstrapSnapshot fallback when SSE/IPC drops turn:completed, and speaks out loud via window.speechSynthesis', async () => {
+      const spokenUtterances: string[] = []
+      const fakeSpeechSynthesis = {
+        cancel: vi.fn(),
+        getVoices: vi.fn(() => [{ lang: 'pt-BR', name: 'Microsoft Maria' }]),
+        speak: vi.fn((utterance: { text: string; onend?: () => void }) => {
+          spokenUtterances.push(utterance.text)
+          setTimeout(() => utterance.onend?.(), 5)
+        }),
+      }
+      class FakeSpeechSynthesisUtterance {
+        text: string
+        lang = 'pt-BR'
+        rate = 1
+        pitch = 1
+        volume = 1
+        voice: unknown = null
+        onend?: () => void
+        onerror?: () => void
+        constructor(text: string) {
+          this.text = text
+        }
+      }
+      Object.defineProperty(window, 'speechSynthesis', {
+        value: fakeSpeechSynthesis,
+        configurable: true,
+        writable: true,
+      })
+      Object.defineProperty(window, 'SpeechSynthesisUtterance', {
+        value: FakeSpeechSynthesisUtterance,
+        configurable: true,
+        writable: true,
+      })
+
+      const now = Date.now()
+      const turnId = 'turn-fallback-sync-1'
+      const userMsg: ChatMessageRecord = {
+        id: `msg-user-${turnId}`,
+        sessionId: 'session-default',
+        role: 'user',
+        content: 'Oi Ashy, está me ouvindo?',
+        rawContent: 'Oi Ashy, está me ouvindo?',
+        markersJson: '[]',
+        emotion: 'neutral',
+        createdAt: now,
+      }
+      const assistantMsg: ChatMessageRecord = {
+        id: `msg-assistant-${turnId}`,
+        sessionId: 'session-default',
+        role: 'assistant',
+        content: 'Oi Carlos! Estou te ouvindo perfeitamente e respondendo em voz alta!',
+        rawContent: '<|ACT:v=0.45;a=0.35;g=wave;b=0.80|>Oi Carlos! Estou te ouvindo perfeitamente e respondendo em voz alta!',
+        markersJson: '[]',
+        emotion: 'happy',
+        createdAt: now + 50,
+      }
+
+      const fakeBridge = {
+        sendTurn: vi.fn(async () => ({
+          turnId,
+          userMessage: userMsg,
+        })),
+        getBootstrapSnapshot: vi.fn(async () => ({
+          activeSession: {
+            id: 'session-default',
+            title: 'Conversa',
+            createdAt: now,
+            updatedAt: now + 50,
+          },
+          messages: [userMsg, assistantMsg],
+          runtimeDiagnostics: {
+            lastPersistenceWarning: null,
+          },
+        } as unknown as AshyBootstrapSnapshot)),
+        onHostEvent: vi.fn(() => () => {}),
+      } as unknown as AshyHostBridge
+
+      setAshyHostBridgeForTesting(fakeBridge)
+      useAshyStore.setState({
+        isBootstrapped: true,
+        activeSessionId: 'session-default',
+        chatMessages: [],
+      })
+      useAshyStore.getState().applyOmniModelPreset('lfm3-omni-2b')
+
+      // Notice we do NOT emit turn:completed on onHostEvent!
+      // sendOmniAudioTurn must still append userMsg, poll getBootstrapSnapshot, complete the turn, and speak out loud!
+      await useAshyStore.getState().sendOmniAudioTurn({
+        wavBytes: new Uint8Array([82, 73, 70, 70]),
+        wavBase64: 'UklGRg==',
+        mimeType: 'audio/wav',
+        sampleRate: 16000,
+        durationMs: 900,
+        rmsPeak: 0.3,
+        preRollBlocksCount: 12,
+        revision: 1,
+        reason: 'vad-silence',
+        transcriptHint: 'Oi Ashy, está me ouvindo?',
+      })
+
+      const messages = useAshyStore.getState().chatMessages
+      expect(messages.some((m) => m.id === userMsg.id)).toBe(true)
+      expect(
+        messages.some(
+          (m) =>
+            m.id === assistantMsg.id &&
+            (m.text ?? m.content).includes('Estou te ouvindo perfeitamente'),
+        ),
+      ).toBe(true)
+
+      await vi.waitFor(() => {
+        expect(spokenUtterances.some((u) => u.includes('Estou te ouvindo perfeitamente'))).toBe(true)
+      })
     })
   })
 
