@@ -719,7 +719,7 @@ export async function createAshyHostKernel(
     progressPercent: null,
     errorMessage: null,
     checkedAt: null,
-    autoDownload: true,
+    autoDownload: false,
   }
 
   const cortexEncryptionCodec = {
