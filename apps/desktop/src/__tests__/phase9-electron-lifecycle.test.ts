@@ -570,7 +570,7 @@ describe('Phase 9 — Native Electron Lifecycle (System Tray, Global Shortcuts P
     }
   })
 
-  it('5. verifies electron-builder.yml (valid v26 schema, github publish, AshySetup.exe), 256x256 icon.ico, macOS entitlements, package.json metadata/scripts, and Orin-style install.ps1 / install.sh / release.yml', () => {
+  it('5. verifies electron-builder.yml (valid v26 schema, github publish, AshySetup.exe), 256x256 icon.ico, macOS entitlements, package.json metadata/scripts, and Orin-style install.ps1 / install.sh / release.yml', async () => {
     const desktopRoot = path.resolve(__dirname, '../..')
     const repoRoot = path.resolve(desktopRoot, '../..')
     const builderYmlPath = path.join(desktopRoot, 'electron-builder.yml')
@@ -650,6 +650,22 @@ describe('Phase 9 — Native Electron Lifecycle (System Tray, Global Shortcuts P
     expect(installPs1).toContain('carlos-edu2367/ashy')
     expect(installPs1).toContain('AshySetup.exe')
     expect(installPs1).toContain('-Uninstall')
+    // Must be 100% 7-bit ASCII so Windows PowerShell 5.1 (ANSI/CP1252 when no BOM) never fails on UTF-8 bytes 0x93/0x94
+    expect(/^[\x00-\x7F]*$/.test(installPs1)).toBe(true)
+    if (process.platform === 'win32') {
+      const { execFileSync } = await import('node:child_process')
+      const parseOut = execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile('${installPs1Path.replace(/'/g, "''")}', [ref]$null, [ref]$errors); if ($errors.Count -gt 0) { throw ($errors | Out-String) }; Write-Output 'AST_OK'`,
+        ],
+        { encoding: 'utf8', windowsHide: true },
+      )
+      expect(parseOut.trim()).toContain('AST_OK')
+    }
 
     const installSh = fs.readFileSync(installShPath, 'utf8')
     expect(installSh).toContain('carlos-edu2367/ashy')
