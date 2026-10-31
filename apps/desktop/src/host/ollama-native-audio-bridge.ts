@@ -150,6 +150,29 @@ function sanitizeTextForNativeTts(rawText: string): string {
     .trim()
 }
 
+function createBoundedAbortSignal(
+  parentSignal: AbortSignal | undefined,
+  timeoutMs = 20_000,
+): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController()
+  const onParentAbort = () => controller.abort()
+  if (parentSignal?.aborted) {
+    controller.abort()
+  } else if (parentSignal) {
+    parentSignal.addEventListener('abort', onParentAbort, { once: true })
+  }
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer)
+      if (parentSignal) {
+        parentSignal.removeEventListener('abort', onParentAbort)
+      }
+    },
+  }
+}
+
 export async function synthesizeNativeOllamaOmniSpeech(input: {
   text: string
   voice?: string
@@ -157,6 +180,7 @@ export async function synthesizeNativeOllamaOmniSpeech(input: {
   llamaServerBaseUrl?: string
   ollamaLogPath?: string
   signal?: AbortSignal
+  timeoutMs?: number
   fetchImpl?: typeof fetch
 }): Promise<{ wavBytes: Uint8Array; sampleRate: number } | null> {
   const cleanText = sanitizeTextForNativeTts(input.text)
@@ -186,6 +210,7 @@ export async function synthesizeNativeOllamaOmniSpeech(input: {
     'utf8',
   )
 
+  const bounded = createBoundedAbortSignal(input.signal, input.timeoutMs ?? 20_000)
   try {
     const res = await fetchFn(`${baseUrl.replace(/\/+$/, '')}/tts`, {
       method: 'POST',
@@ -193,7 +218,7 @@ export async function synthesizeNativeOllamaOmniSpeech(input: {
         'Content-Type': 'application/json; charset=utf-8',
       },
       body: payload,
-      signal: input.signal,
+      signal: bounded.signal,
     })
     if (!res.ok) {
       return null
@@ -222,6 +247,8 @@ export async function synthesizeNativeOllamaOmniSpeech(input: {
     return { wavBytes, sampleRate }
   } catch {
     return null
+  } finally {
+    bounded.cleanup()
   }
 }
 
@@ -233,6 +260,7 @@ export async function transcribeNativeOllamaOmniAudio(input: {
   ollamaLogPath?: string
   modelId?: string
   signal?: AbortSignal
+  timeoutMs?: number
   fetchImpl?: typeof fetch
 }): Promise<string | null> {
   const cleanBase64 = input.audioWavBase64
@@ -283,6 +311,7 @@ export async function transcribeNativeOllamaOmniAudio(input: {
     'utf8',
   )
 
+  const bounded = createBoundedAbortSignal(input.signal, input.timeoutMs ?? 20_000)
   try {
     const res = await fetchFn(endpoint, {
       method: 'POST',
@@ -290,7 +319,7 @@ export async function transcribeNativeOllamaOmniAudio(input: {
         'Content-Type': 'application/json; charset=utf-8',
       },
       body: payload,
-      signal: input.signal,
+      signal: bounded.signal,
     })
     if (!res.ok) {
       return null
@@ -303,6 +332,8 @@ export async function transcribeNativeOllamaOmniAudio(input: {
     return cleaned.length > 0 ? cleaned : null
   } catch {
     return null
+  } finally {
+    bounded.cleanup()
   }
 }
 

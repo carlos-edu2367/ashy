@@ -322,6 +322,42 @@ export interface RegisterAshyElectronIpcOverlayOptions {
   getOverlayWindow?: () => ElectronBrowserWindowInstanceLike | null | undefined
   hubWindow?: ElectronBrowserWindowInstanceLike | null
   getHubWindow?: () => ElectronBrowserWindowInstanceLike | null | undefined
+  overlayPositionFilePath?: string
+}
+
+function readSavedOverlayPosition(filePath?: string): { x: number; y: number } | null {
+  if (!filePath) return null
+  try {
+    if (!fs.existsSync(filePath)) return null
+    const raw = JSON.parse(fs.readFileSync(filePath, 'utf8')) as {
+      x?: unknown
+      y?: unknown
+    }
+    const x = Number(raw?.x)
+    const y = Number(raw?.y)
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      return {
+        x: Math.max(-10000, Math.min(10000, Math.round(x))),
+        y: Math.max(-10000, Math.min(10000, Math.round(y))),
+      }
+    }
+  } catch {
+    // Ignore corrupt or missing overlay position file
+  }
+  return null
+}
+
+function writeSavedOverlayPosition(
+  filePath: string | undefined,
+  pos: { x: number; y: number },
+): void {
+  if (!filePath) return
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    fs.writeFileSync(filePath, JSON.stringify({ x: pos.x, y: pos.y }), 'utf8')
+  } catch {
+    // Ignore write errors in sandboxed/test environments
+  }
 }
 
 export function registerAshyElectronIpc(
@@ -341,7 +377,13 @@ export function registerAshyElectronIpc(
     const candidate = overlayOptions?.getHubWindow?.() ?? overlayOptions?.hubWindow ?? null
     return isWindowUsable(candidate) ? candidate : null
   }
-  let fallbackOverlayBounds = { x: 120, y: 120, width: 380, height: 460 }
+  const initialSavedPos = readSavedOverlayPosition(overlayOptions?.overlayPositionFilePath)
+  let fallbackOverlayBounds = {
+    x: initialSavedPos?.x ?? 120,
+    y: initialSavedPos?.y ?? 120,
+    width: 380,
+    height: 460,
+  }
 
   ipcMain.handle('ashy:rpc', async (event, request) => {
     validateIpcSender(event)
@@ -454,6 +496,10 @@ export function registerAshyElectronIpc(
     } else {
       overlayWin?.setPosition?.(clampedX, clampedY)
     }
+    writeSavedOverlayPosition(overlayOptions?.overlayPositionFilePath, {
+      x: clampedX,
+      y: clampedY,
+    })
     return nextBounds
   })
 
@@ -620,6 +666,8 @@ export async function bootAshyElectronMain(
   kernel.quitAndInstallUpdate = async () => autoUpdater.quitAndInstallUpdate()
 
   // airi invariant: register all ipcMain.handle channels strictly BEFORE window.loadURL / loadFile
+  const overlayPositionFilePath = path.join(userDataDir, 'overlay-bounds.json')
+  const savedOverlayPos = readSavedOverlayPosition(overlayPositionFilePath)
   const cleanupIpc = registerAshyElectronIpc(
     deps.ipcMain,
     kernel,
@@ -628,6 +676,7 @@ export async function bootAshyElectronMain(
       overlayController,
       getOverlayWindow: () => overlayWindowRef,
       getHubWindow: () => hubWindowRef,
+      overlayPositionFilePath,
     },
   )
 
@@ -683,6 +732,7 @@ export async function bootAshyElectronMain(
 
   const overlayWindow = new deps.BrowserWindow({
     ...overlayController.browserWindowOptions,
+    ...(savedOverlayPos ? { x: savedOverlayPos.x, y: savedOverlayPos.y } : {}),
     webPreferences: {
       ...overlayController.browserWindowOptions.webPreferences,
       preload: preloadPath,
@@ -693,6 +743,9 @@ export async function bootAshyElectronMain(
     },
   })
   overlayWindowRef = overlayWindow
+  if (savedOverlayPos) {
+    overlayWindow.setPosition?.(savedOverlayPos.x, savedOverlayPos.y)
+  }
   overlayWindow.setAlwaysOnTop?.(true, 'screen-saver')
   if (embeddedServer) {
     overlayController.setIgnoreMouseEvents(true, true)

@@ -70,7 +70,18 @@ function stripOuterDelimiters(input: string): string {
 
 export function stripResidualStageMarkers(raw: string): string {
   if (typeof raw !== 'string' || raw.length === 0) return ''
-  return raw
+  let literalAccum = ''
+  const parser = createTailSafeMarkerParser({
+    onLiteral(chunk) {
+      literalAccum += chunk
+    },
+    onSpecial() {
+      // Discard parsed stage markers
+    },
+  })
+  parser.write(raw)
+  parser.flush()
+  return literalAccum
     .replace(/<\|[\s\S]*?(?:\|>|\}>|>)/g, '')
     .replace(/<\{'\|'\}[\s\S]*?(?:\{'\|'\}>|\}>|>)/g, '')
     .trim()

@@ -298,9 +298,11 @@ describe('Phase 9.2 — 100% Transparent Overlay & Free Pointer Dragging', () =>
       focus: vi.fn(),
     }
 
+    const overlayPositionFilePath = path.join(dir, 'overlay-bounds.json')
     const cleanup = registerAshyElectronIpc(fakeIpcMain, kernel, () => [], {
       overlayWindow: fakeOverlayWindow,
       hubWindow: fakeHubWindow,
+      overlayPositionFilePath,
     })
 
     const preloadApi = createAshyPreloadApi({
@@ -323,6 +325,10 @@ describe('Phase 9.2 — 100% Transparent Overlay & Free Pointer Dragging', () =>
       y: 246,
       width: 380,
       height: 460,
+    })
+    expect(JSON.parse(fs.readFileSync(overlayPositionFilePath, 'utf8'))).toEqual({
+      x: 310,
+      y: 246,
     })
 
     // Clamps extreme coordinates to [-10000, 10000]

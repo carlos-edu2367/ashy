@@ -100,7 +100,7 @@ describe('Phase 9.2 — Ollama Native LFM3-Omni-2B 24kHz Voice Bridge & Compact 
     let capturedUrl = ''
     let capturedBody = ''
     const result = await synthesizeNativeOllamaOmniSpeech({
-      text: '<|ACT {"emotion":"warm"}>Oi Carlos! Tudo ótimo por aqui.',
+      text: '<|ACT {"emotion":"warm","note":"a > b"}>Oi Carlos! Tudo ótimo por aqui.',
       voice: 'female',
       language: 'pt',
       llamaServerBaseUrl: 'http://127.0.0.1:64597',
@@ -127,6 +127,20 @@ describe('Phase 9.2 — Ollama Native LFM3-Omni-2B 24kHz Voice Bridge & Compact 
     expect(result).not.toBeNull()
     expect(result?.sampleRate).toBe(24000)
     expect(result?.wavBytes.byteLength).toBeGreaterThan(1000)
+
+    // Bounded timeout aborts a stalled /tts call cleanly without hanging
+    const timedOut = await synthesizeNativeOllamaOmniSpeech({
+      text: 'Teste de timeout',
+      llamaServerBaseUrl: 'http://127.0.0.1:64597',
+      timeoutMs: 25,
+      fetchImpl: (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new Error('Aborted')), {
+            once: true,
+          })
+        }),
+    })
+    expect(timedOut).toBeNull()
   })
 
   it('transcribes audio via transcribeNativeOllamaOmniAudio using Perform ASR in Portuguese system prompt', async () => {

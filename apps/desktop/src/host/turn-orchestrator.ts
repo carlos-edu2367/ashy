@@ -649,6 +649,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
 
       const voiceIdentityMarkdown = voiceStore.read().content
       const activeConfig = providerState.configs[providerState.activeProviderId]
+      let nativeOllamaAsrSucceeded = false
       if (
         providerState.activeProviderId === 'ollama' &&
         input.inputAudio &&
@@ -666,6 +667,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
           fetchImpl: options.ollamaLlamaServerOptions?.fetchImpl,
         })
         if (asrTranscript && !controller.signal.aborted && !entry.abortedEmitted && !isStaleEpoch()) {
+          nativeOllamaAsrSucceeded = true
           currentEffectiveUserText = asrTranscript
           try {
             cortex.appendChatMessage({
@@ -752,7 +754,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
           : rawFinalSystemPrompt
 
       const hasMultimodalInputs =
-        Boolean(input.inputAudio) ||
+        Boolean(input.inputAudio && !nativeOllamaAsrSucceeded) ||
         Boolean(input.videoFrames && input.videoFrames.length > 0) ||
         Boolean(input.attachments && input.attachments.length > 0)
       let userParts: ChatMessageContentPart[] | undefined
@@ -803,7 +805,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
             }
           }
         }
-        if (input.inputAudio) {
+        if (input.inputAudio && !nativeOllamaAsrSucceeded) {
           const cleanData = input.inputAudio.dataBase64.replace(
             /^data:audio\/[a-z0-9.+-]+;base64,/i,
             '',
