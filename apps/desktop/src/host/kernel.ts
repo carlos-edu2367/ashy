@@ -17,6 +17,7 @@ import {
   EvaluateInitiativeInputSchema,
   ExportSoulInputSchema,
   ImportSoulInputSchema,
+  inferModelOmniCapabilities,
   ListVoiceProviderModelsInputSchema,
   maskApiKey,
   PersistedStagePreferencesSchema,
@@ -971,11 +972,23 @@ export async function createAshyHostKernel(
     onModelReady: (modelName, openaiBaseUrl) => {
       options.localRuntimeOptions?.onModelReady?.(modelName, openaiBaseUrl)
       if (providerVaultInstance) {
+        const omniCaps = inferModelOmniCapabilities('ollama', modelName)
         providerVaultInstance.saveProviderConfig({
           providerId: 'ollama',
           baseUrl: openaiBaseUrl,
           modelId: modelName,
           reasoningEffort: 'none',
+          ...(omniCaps.isOmniModel
+            ? {
+                isOmniModel: true,
+                supportsOmniAudioIn: omniCaps.supportsOmniAudioIn,
+                supportsOmniAudioOut: omniCaps.supportsOmniAudioOut,
+                supportsOmniVideoIn: omniCaps.supportsOmniVideoIn,
+                inputModalities: omniCaps.inputModalities,
+                outputModalities: omniCaps.outputModalities,
+                omniExecutionMode: 'native-omni' as const,
+              }
+            : {}),
         })
         providerVaultInstance.setActiveProvider('ollama')
       }

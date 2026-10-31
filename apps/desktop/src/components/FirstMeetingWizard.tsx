@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import {
   FALLBACK_PROVIDER_MODELS,
+  inferModelOmniCapabilities,
   LLM_PROVIDER_IDS,
   type ComputerActionsPolicy,
   type LlmProviderId,
@@ -583,6 +584,51 @@ export function FirstMeetingWizard(): React.ReactElement {
               </div>
             )}
 
+            {localRuntime.installedModels.length > 0 && (
+              <div
+                data-testid="onboarding-installed-local-models"
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '6px',
+                  padding: '8px 10px',
+                  borderRadius: '10px',
+                  background: '#171422',
+                  border: '1px solid rgba(52, 211, 153, 0.35)',
+                }}
+              >
+                <span style={{ fontSize: '11.5px', color: 'var(--text-secondary)', fontWeight: 600 }}>
+                  Modelos já instalados no seu disco ({localRuntime.installedModels.length})
+                </span>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                  {localRuntime.installedModels.map((m) => {
+                    const isSelected = selectedProvider === 'ollama' && modelId === m.name
+                    return (
+                      <button
+                        key={m.name}
+                        type="button"
+                        data-testid={`btn-onboarding-use-installed-model-${m.name}`}
+                        className={`ashy-outline-btn ${isSelected ? 'active' : ''}`}
+                        style={{ padding: '5px 10px', fontSize: '11px' }}
+                        onClick={() => {
+                          setSelectedProvider('ollama')
+                          setBaseUrl('http://127.0.0.1:11434/v1')
+                          setModelId(m.name)
+                          const omniCaps = inferModelOmniCapabilities('ollama', m.name)
+                          setIsOmniModel(omniCaps.isOmniModel)
+                          if (omniCaps.isOmniModel) {
+                            setOmniExecutionMode('native-omni')
+                          }
+                        }}
+                      >
+                        {isSelected ? `✓ Ativo: ${m.name}` : `Usar ${m.name}`}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
               <span style={{ fontSize: '11.5px', color: 'var(--text-secondary)', fontWeight: 600 }}>
                 Catálogo de Modelos Locais (Download Direto no App)
@@ -598,6 +644,7 @@ export function FirstMeetingWizard(): React.ReactElement {
                   const isInstalled = localRuntime.installedModels.some(
                     (m) => m.name === rec.id,
                   )
+                  const isLfm3Omni = rec.id.includes('LFM3-Omni')
                   return (
                     <div
                       key={rec.id}
@@ -605,7 +652,9 @@ export function FirstMeetingWizard(): React.ReactElement {
                         padding: '8px 10px',
                         borderRadius: '10px',
                         background: '#171422',
-                        border: '1px solid var(--border-subtle)',
+                        border: isLfm3Omni
+                          ? '1px solid rgba(244, 166, 136, 0.55)'
+                          : '1px solid var(--border-subtle)',
                         display: 'flex',
                         flexDirection: 'column',
                         justifyContent: 'space-between',
@@ -624,10 +673,15 @@ export function FirstMeetingWizard(): React.ReactElement {
                         className={isInstalled ? 'ashy-outline-btn active' : 'ashy-peach-btn'}
                         style={{ padding: '5px 10px', fontSize: '11px', width: '100%' }}
                         onClick={async () => {
+                          const omniCaps = inferModelOmniCapabilities('ollama', rec.id)
                           if (isInstalled) {
                             setSelectedProvider('ollama')
                             setBaseUrl('http://127.0.0.1:11434/v1')
                             setModelId(rec.id)
+                            setIsOmniModel(omniCaps.isOmniModel)
+                            if (omniCaps.isOmniModel) {
+                              setOmniExecutionMode('native-omni')
+                            }
                             return
                           }
                           try {
@@ -635,6 +689,10 @@ export function FirstMeetingWizard(): React.ReactElement {
                             setSelectedProvider('ollama')
                             setBaseUrl('http://127.0.0.1:11434/v1')
                             setModelId(rec.id)
+                            setIsOmniModel(omniCaps.isOmniModel)
+                            if (omniCaps.isOmniModel) {
+                              setOmniExecutionMode('native-omni')
+                            }
                           } catch (err) {
                             setErrorMsg(err instanceof Error ? err.message : String(err))
                           }

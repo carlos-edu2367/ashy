@@ -212,6 +212,12 @@ describe('Phase 9.1 Task 3 — In-App Local Runtime UI (FirstMeetingWizard & Set
     )
     expect(getByTestId('onboarding-local-pull-progress').textContent).toContain('50%')
 
+    // Verify LFM3-Omni 2B is prominently available in the FirstMeetingWizard catalog
+    const pullLfm3OmniBtn = getByTestId(
+      'btn-onboarding-pull-model-hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M',
+    )
+    expect(pullLfm3OmniBtn.textContent).toContain('Baixar e Ativar (1.8 GB)')
+
     // Pull recommended model qwen2.5:3b with 1 click inside Wizard
     const pullQwenBtn = getByTestId('btn-onboarding-pull-model-qwen2.5:3b')
     expect(pullQwenBtn.textContent).toContain('Baixar e Ativar (1.9 GB)')
@@ -228,6 +234,8 @@ describe('Phase 9.1 Task 3 — In-App Local Runtime UI (FirstMeetingWizard & Set
     expect(getByTestId('onboarding-local-engine-status').textContent).toContain(
       '1 modelo(s) no disco',
     )
+    expect(getByTestId('onboarding-installed-local-models')).toBeTruthy()
+    expect(getByTestId('btn-onboarding-use-installed-model-qwen2.5:3b')).toBeTruthy()
     expect(getByTestId<HTMLSelectElement>('onboarding-provider-select').value).toBe('ollama')
     expect(getByTestId<HTMLInputElement>('onboarding-base-url-input').value).toBe(
       'http://127.0.0.1:11434/v1',

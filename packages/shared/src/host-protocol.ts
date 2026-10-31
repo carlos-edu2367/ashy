@@ -1483,6 +1483,24 @@ export const LocalRuntimeStatusSchema = v.object({
 
 export const RECOMMENDED_LOCAL_MODELS: readonly LocalRuntimeRecommendedModel[] = [
   {
+    id: 'hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M',
+    label: 'LFM3-Omni 2B (Oficial • Voz, Visão & Texto Unificados)',
+    sizeLabel: '1.8 GB',
+    vramHint: '4 GB+ RAM/VRAM',
+    description:
+      'Modelo Omni nativo da Liquid AI: escuta, fala, enxerga e conversa diretamente no seu PC.',
+    isMultimodal: true,
+  },
+  {
+    id: 'hf.co/LiquidAI/LFM3-1.7B-GGUF:Q4_K_M',
+    label: 'LFM3 1.7B (Liquid AI • Ultra-Rápido)',
+    sizeLabel: '1.1 GB',
+    vramHint: '3 GB+ RAM/VRAM',
+    description:
+      'Arquitetura híbrida Liquid AI super leve, resposta instantânea e baixíssimo consumo de RAM.',
+    isMultimodal: false,
+  },
+  {
     id: 'qwen2.5:3b',
     label: 'Qwen 2.5 3B (Recomendado • Leve & Rápido)',
     sizeLabel: '1.9 GB',
@@ -2614,6 +2632,30 @@ export const FALLBACK_PROVIDER_MODELS: Record<LlmProviderId, ProviderModelCatalo
     },
   ],
   ollama: [
+    {
+      id: 'hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M',
+      name: 'Liquid AI LFM3-Omni 2B GGUF (Oficial • Download Direto)',
+      providerId: 'ollama',
+      contextLength: 32768,
+      supportsTools: true,
+      supportsReasoning: false,
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: true,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text', 'audio'],
+      omniExecutionMode: 'native-omni',
+      omniVoiceId: 'female',
+    },
+    {
+      id: 'hf.co/LiquidAI/LFM3-1.7B-GGUF:Q4_K_M',
+      name: 'Liquid AI LFM3 1.7B GGUF (Ultra-Rápido)',
+      providerId: 'ollama',
+      contextLength: 32768,
+      supportsTools: true,
+      supportsReasoning: false,
+    },
     {
       id: 'qwen2.5:14b',
       name: 'qwen2.5:14b',

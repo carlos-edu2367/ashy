@@ -78,11 +78,15 @@ describe('Phase 9.1 — LocalRuntimeManager & In-App Zero-Terminal Local Model L
     ])
     expect(status.recommendedModels).toEqual(RECOMMENDED_LOCAL_MODELS)
     expect(status.recommendedModels.map((m) => m.id)).toEqual([
+      'hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M',
+      'hf.co/LiquidAI/LFM3-1.7B-GGUF:Q4_K_M',
       'qwen2.5:3b',
       'llama3.2:3b',
       'gemma3:4b',
       'qwen2.5:7b',
     ])
+    expect(status.recommendedModels[0]?.isMultimodal).toBe(true)
+    expect(status.recommendedModels[0]?.label).toContain('LFM3-Omni 2B')
   })
 
   it('2. headlessly starts ollama serve when engine is installed but stopped, polls until ready, and kills child process on dispose()', async () => {
