@@ -28,6 +28,8 @@ export interface AshyElectronBrowserWindowConfig {
   webPreferences: {
     contextIsolation: true
     nodeIntegration: false
+    sandbox: true
+    webSecurity: true
     backgroundThrottling: false
   }
 }
@@ -87,6 +89,8 @@ export function createAshyElectronOverlayConfig(
       webPreferences: {
         contextIsolation: true,
         nodeIntegration: false,
+        sandbox: true,
+        webSecurity: true,
         backgroundThrottling: false,
       },
     },

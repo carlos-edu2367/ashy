@@ -928,11 +928,6 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
     return getPublicState()
   }
 
-  function _unusedPlaceholder() {
-    return null
-  
-  }
-
   return {
     providersFilePath,
     secretsFilePath,

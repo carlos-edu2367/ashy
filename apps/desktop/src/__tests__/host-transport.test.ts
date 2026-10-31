@@ -716,13 +716,15 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
     })
 
     const overlayWin = createdWindows[1]!
-    expect(fakeGlobalShortcut.register).toHaveBeenCalledTimes(4)
+    expect(fakeGlobalShortcut.register).toHaveBeenCalledTimes(6)
     expect(Array.from(registeredShortcuts.keys())).toEqual(
       expect.arrayContaining([
         'CommandOrControl+Shift+M',
         'CommandOrControl+Shift+E',
         'CommandOrControl+Shift+D',
         'CommandOrControl+Shift+H',
+        'CommandOrControl+Shift+Space',
+        'CommandOrControl+Shift+K',
       ]),
     )
 

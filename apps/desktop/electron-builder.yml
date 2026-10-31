@@ -1,0 +1,47 @@
+appId: com.ashy.desktop
+productName: Ashy
+copyright: Copyright © 2026 Ashy Cozy Night Studio
+asar: true
+directories:
+  output: release
+  buildResources: build
+files:
+  - dist/**/*
+  - build/**/*
+  - package.json
+extraMetadata:
+  main: dist/main/index.mjs
+win:
+  icon: build/icon.ico
+  target:
+    - nsis
+    - portable
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+mac:
+  category: public.app-category.lifestyle
+  icon: build/icon.png
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  extendInfo:
+    NSMicrophoneUsageDescription: "Ashy precisa de acesso ao microfone para conversa de voz em tempo real e Push-to-Talk."
+    NSCameraUsageDescription: "Ashy precisa de acesso à câmera quando autorizado nas permissões visuais."
+  target:
+    - dmg
+    - zip
+linux:
+  icon: build/icon.png
+  category: Utility
+  synopsis: Ashy — Local-first virtual companion with shared history and 2D stage
+  target:
+    - AppImage
+    - deb
+publish:
+  provider: generic
+  url: https://releases.ashy.local/updates
+  autoUpdate: false

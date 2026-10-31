@@ -14,10 +14,32 @@ import {
 import { createAshyHostKernel, type AshyHostKernel } from '../host/kernel'
 import { createElectronSafeStorageProtector } from '../host/secret-protector'
 import { dispatchHostRpc } from '../host/vite-host-plugin'
+import {
+  createSafeAutoUpdater,
+  type ElectronAutoUpdaterDriverLike,
+  type SafeAutoUpdaterController,
+} from './auto-updater'
+import {
+  createAshySystemTray,
+  type AshySystemTrayController,
+  type ElectronMenuLike,
+  type ElectronTrayConstructorLike,
+} from './tray-manager'
+
+export interface ElectronWebContentsNavigationEventLike {
+  preventDefault(): void
+}
 
 export interface ElectronWebContentsLike {
   isDestroyed?: () => boolean
   send(channel: string, payload: AshyHostStreamEvent): void
+  on?(
+    event: 'will-navigate',
+    listener: (event: ElectronWebContentsNavigationEventLike, url: string) => void,
+  ): void
+  setWindowOpenHandler?(
+    handler: (details: { url: string }) => { action: 'deny' | 'allow' },
+  ): void
 }
 
 export interface ElectronIpcMainLike {
@@ -38,8 +60,21 @@ export interface ElectronBrowserWindowInstanceLike {
   loadFile?(filePath: string): Promise<void>
   isDestroyed?(): boolean
   setIgnoreMouseEvents?(ignore: boolean, options?: { forward?: boolean }): void
+  setAlwaysOnTop?(
+    flag: boolean,
+    level?:
+      | 'normal'
+      | 'floating'
+      | 'torn-off-menu'
+      | 'modal-panel'
+      | 'main-menu'
+      | 'status'
+      | 'pop-up-menu'
+      | 'screen-saver',
+  ): void
   show?(): void
   hide?(): void
+  focus?(): void
   isVisible?(): boolean
   minimize?(): void
   maximize?(): void
@@ -56,6 +91,54 @@ function isWindowUsable(
   return true
 }
 
+export function isTrustedRendererUrl(rawUrl: string): boolean {
+  const trimmed = rawUrl.trim()
+  if (!trimmed) return false
+  if (trimmed === 'about:blank') return true
+
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol === 'file:') {
+      return true
+    }
+    if (
+      parsed.protocol === 'http:' &&
+      (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')
+    ) {
+      return true
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
+export function validateIpcSender(event: unknown): void {
+  if (!event || typeof event !== 'object') {
+    return
+  }
+  const senderFrame = (event as { senderFrame?: unknown }).senderFrame
+  if (!senderFrame || typeof senderFrame !== 'object') {
+    return
+  }
+  const rawUrl = (senderFrame as { url?: unknown }).url
+  if (typeof rawUrl !== 'string' || rawUrl.trim().length === 0) {
+    return
+  }
+  if (!isTrustedRendererUrl(rawUrl)) {
+    throw new Error('Unauthorized IPC sender origin')
+  }
+}
+
+function attachWindowSecurityGuards(win: ElectronBrowserWindowInstanceLike): void {
+  win.webContents.on?.('will-navigate', (event, url) => {
+    if (!isTrustedRendererUrl(url)) {
+      event.preventDefault()
+    }
+  })
+  win.webContents.setWindowOpenHandler?.(() => ({ action: 'deny' }))
+}
+
 export interface ElectronBrowserWindowConstructorLike {
   new (options: Record<string, unknown>): ElectronBrowserWindowInstanceLike
 }
@@ -63,6 +146,9 @@ export interface ElectronBrowserWindowConstructorLike {
 export interface ElectronAppLike {
   getPath(name: 'userData'): string
   on(event: 'before-quit', listener: () => void | Promise<void>): void
+  quit?(): void
+  isPackaged?: boolean
+  getVersion?(): string
 }
 
 export interface ElectronSafeStorageLike {
@@ -82,6 +168,12 @@ export interface BootAshyElectronMainDeps {
   ipcMain: ElectronIpcMainLike
   safeStorage?: ElectronSafeStorageLike
   globalShortcut?: ElectronGlobalShortcutLike
+  Tray?: ElectronTrayConstructorLike
+  Menu?: ElectronMenuLike
+  trayIconPath?: string
+  autoUpdaterDriver?: ElectronAutoUpdaterDriverLike
+  isPackaged?: boolean
+  appVersion?: string
   kernel?: AshyHostKernel
   preloadPath?: string
   rendererUrl?: string
@@ -93,6 +185,8 @@ export interface BootedAshyElectronRuntime {
   hubWindow: ElectronBrowserWindowInstanceLike
   overlayWindow: ElectronBrowserWindowInstanceLike
   overlayController: AshyElectronOverlayController
+  autoUpdater: SafeAutoUpdaterController
+  trayController: AshySystemTrayController | null
   shutdown(): Promise<void>
 }
 
@@ -113,7 +207,8 @@ export function registerAshyElectronIpc(
   const overlayController =
     overlayOptions?.overlayController ?? createAshyElectronOverlayConfig()
   const resolveOverlayWindow = (): ElectronBrowserWindowInstanceLike | null => {
-    const candidate = overlayOptions?.getOverlayWindow?.() ?? overlayOptions?.overlayWindow ?? null
+    const candidate =
+      overlayOptions?.getOverlayWindow?.() ?? overlayOptions?.overlayWindow ?? null
     return isWindowUsable(candidate) ? candidate : null
   }
   const resolveHubWindow = (): ElectronBrowserWindowInstanceLike | null => {
@@ -121,26 +216,32 @@ export function registerAshyElectronIpc(
     return isWindowUsable(candidate) ? candidate : null
   }
 
-  ipcMain.handle('ashy:rpc', async (_event, request) => {
+  ipcMain.handle('ashy:rpc', async (event, request) => {
+    validateIpcSender(event)
     if (
       !request ||
       typeof request !== 'object' ||
       typeof request.method !== 'string'
     ) {
-      throw new Error('Invalid Ashy IPC RPC request: expected { method: string, payload?: unknown }')
+      throw new Error(
+        'Invalid Ashy IPC RPC request: expected { method: string, payload?: unknown }',
+      )
     }
     return dispatchHostRpc(kernel, request.method, request.payload)
   })
 
-  ipcMain.handle('ashy:runDreamReflection', async (_event, payload) => {
+  ipcMain.handle('ashy:runDreamReflection', async (event, payload) => {
+    validateIpcSender(event)
     return dispatchHostRpc(kernel, 'runDreamReflection', payload)
   })
 
-  ipcMain.handle('ashy:revertTraitEvolution', async (_event, payload) => {
+  ipcMain.handle('ashy:revertTraitEvolution', async (event, payload) => {
+    validateIpcSender(event)
     return dispatchHostRpc(kernel, 'revertTraitEvolution', payload)
   })
 
-  ipcMain.handle('ashy:setOverlayIgnoreMouse', async (_event, payload) => {
+  ipcMain.handle('ashy:setOverlayIgnoreMouse', async (event, payload) => {
+    validateIpcSender(event)
     const parsed = v.parse(SetStageOverlayIgnoreMouseInputSchema, payload)
     const forward = parsed.forward ?? true
     const { changed, state } = overlayController.setIgnoreMouseEvents(
@@ -153,7 +254,8 @@ export function registerAshyElectronIpc(
     return state
   })
 
-  ipcMain.handle('ashy:setOverlayVisible', async (_event, payload) => {
+  ipcMain.handle('ashy:setOverlayVisible', async (event, payload) => {
+    validateIpcSender(event)
     const parsed = v.parse(SetStageOverlayVisibleInputSchema, payload)
     const state = overlayController.setOverlayVisible(parsed.visible)
     const overlayWin = resolveOverlayWindow()
@@ -165,16 +267,19 @@ export function registerAshyElectronIpc(
     return state
   })
 
-  ipcMain.handle('ashy:getOverlayState', async () => {
+  ipcMain.handle('ashy:getOverlayState', async (event) => {
+    validateIpcSender(event)
     return overlayController.getState()
   })
 
-  ipcMain.handle('ashy:windowMinimize', async () => {
+  ipcMain.handle('ashy:windowMinimize', async (event) => {
+    validateIpcSender(event)
     resolveHubWindow()?.minimize?.()
     return { minimized: true }
   })
 
-  ipcMain.handle('ashy:windowMaximize', async () => {
+  ipcMain.handle('ashy:windowMaximize', async (event) => {
+    validateIpcSender(event)
     const win = resolveHubWindow()
     if (win?.isMaximized?.()) {
       win.unmaximize?.()
@@ -184,7 +289,8 @@ export function registerAshyElectronIpc(
     return { maximized: true }
   })
 
-  ipcMain.handle('ashy:windowClose', async () => {
+  ipcMain.handle('ashy:windowClose', async (event) => {
+    validateIpcSender(event)
     resolveHubWindow()?.close?.()
     return { closed: true }
   })
@@ -242,6 +348,51 @@ export async function bootAshyElectronMain(
   let hubWindowRef: ElectronBrowserWindowInstanceLike | null = null
   let overlayWindowRef: ElectronBrowserWindowInstanceLike | null = null
 
+  const broadcastHostStreamEvent = (evt: AshyHostStreamEvent): void => {
+    if (typeof kernel.emitHostEvent === 'function') {
+      kernel.emitHostEvent(evt)
+    } else {
+      for (const win of activeWindows) {
+        if (isWindowUsable(win) && !win.webContents.isDestroyed?.()) {
+          win.webContents.send('ashy:event', evt)
+        }
+      }
+    }
+  }
+
+  const broadcastShortcutEvent = (
+    action:
+      | 'toggleMic'
+      | 'toggleEyes'
+      | 'toggleDnd'
+      | 'toggleHideStage'
+      | 'togglePtt'
+      | 'activatePrivacyShield',
+  ): void => {
+    broadcastHostStreamEvent({
+      type: 'shortcut:triggered',
+      action,
+    })
+  }
+
+  const autoUpdater = createSafeAutoUpdater({
+    currentVersion: deps.appVersion ?? deps.app.getVersion?.() ?? '1.0.0',
+    isPackaged: deps.isPackaged ?? deps.app.isPackaged ?? false,
+    driver: deps.autoUpdaterDriver,
+    onStateChange: (state) => {
+      broadcastHostStreamEvent({
+        type: 'updater:status',
+        state,
+      })
+    },
+  })
+
+  // Wire SafeAutoUpdater into kernel so RPCs (getUpdateState, checkForUpdates, downloadUpdate, quitAndInstallUpdate) use it
+  kernel.getUpdateState = async () => autoUpdater.getState()
+  kernel.checkForUpdates = async () => autoUpdater.checkForUpdates()
+  kernel.downloadUpdate = async () => autoUpdater.downloadUpdate()
+  kernel.quitAndInstallUpdate = async () => autoUpdater.quitAndInstallUpdate()
+
   // airi invariant: register all ipcMain.handle channels strictly BEFORE window.loadURL / loadFile
   const cleanupIpc = registerAshyElectronIpc(
     deps.ipcMain,
@@ -272,43 +423,38 @@ export async function bootAshyElectronMain(
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      webSecurity: true,
     },
   })
   hubWindowRef = hubWindow
+  attachWindowSecurityGuards(hubWindow)
 
   const overlayWindow = new deps.BrowserWindow({
     ...overlayController.browserWindowOptions,
     webPreferences: {
       ...overlayController.browserWindowOptions.webPreferences,
       preload: preloadPath,
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
     },
   })
   overlayWindowRef = overlayWindow
+  overlayWindow.setAlwaysOnTop?.(true, 'screen-saver')
+  attachWindowSecurityGuards(overlayWindow)
 
   activeWindows.push(hubWindow, overlayWindow)
 
   await hubWindow.loadURL(baseRendererUrl)
   await overlayWindow.loadURL(overlayUrl)
 
-  if (deps.globalShortcut) {
-    const broadcastShortcutEvent = (
-      action: 'toggleMic' | 'toggleEyes' | 'toggleDnd' | 'toggleHideStage',
-    ) => {
-      const evt: AshyHostStreamEvent = {
-        type: 'shortcut:triggered',
-        action,
-      }
-      if (typeof kernel.emitHostEvent === 'function') {
-        kernel.emitHostEvent(evt)
-      } else {
-        for (const win of activeWindows) {
-          if (isWindowUsable(win) && !win.webContents.isDestroyed?.()) {
-            win.webContents.send('ashy:event', evt)
-          }
-        }
-      }
-    }
+  const activatePrivacyShieldAndBroadcast = async (): Promise<void> => {
+    await kernel.activatePrivacyShield()
+    broadcastShortcutEvent('activatePrivacyShield')
+  }
 
+  if (deps.globalShortcut) {
     deps.globalShortcut.register(DEFAULT_STAGE_SHORTCUTS.electronGlobalMic, () => {
       void (async () => {
         try {
@@ -323,6 +469,7 @@ export async function bootAshyElectronMain(
         }
       })()
     })
+
     deps.globalShortcut.register(DEFAULT_STAGE_SHORTCUTS.electronGlobalEyes, () => {
       void (async () => {
         try {
@@ -342,6 +489,7 @@ export async function bootAshyElectronMain(
         }
       })()
     })
+
     deps.globalShortcut.register(DEFAULT_STAGE_SHORTCUTS.electronGlobalDnd, () => {
       void (async () => {
         try {
@@ -356,6 +504,7 @@ export async function bootAshyElectronMain(
         }
       })()
     })
+
     deps.globalShortcut.register(DEFAULT_STAGE_SHORTCUTS.electronGlobalHideStage, () => {
       void (async () => {
         try {
@@ -375,15 +524,67 @@ export async function bootAshyElectronMain(
         }
       })()
     })
+
+    deps.globalShortcut.register(DEFAULT_STAGE_SHORTCUTS.electronGlobalPtt, () => {
+      void (async () => {
+        try {
+          const snap = await kernel.getAgencySnapshot?.()
+          if (snap) {
+            const nextMic = snap.consent.micMode === 'ptt' ? 'muted' : 'ptt'
+            await kernel.updateAgencyConsent?.({ micMode: nextMic })
+          }
+          broadcastShortcutEvent('togglePtt')
+        } catch {
+          // ignore shortcut error
+        }
+      })()
+    })
+
+    deps.globalShortcut.register(
+      DEFAULT_STAGE_SHORTCUTS.electronGlobalPrivacyShield,
+      () => {
+        void (async () => {
+          try {
+            await activatePrivacyShieldAndBroadcast()
+          } catch {
+            // ignore shortcut error
+          }
+        })()
+      },
+    )
   }
 
   let isShuttingDown = false
   const processRef = deps.processRef ?? process
 
+  let trayController: AshySystemTrayController | null = null
+  if (deps.Tray && deps.Menu) {
+    const trayIconPath =
+      deps.trayIconPath ?? path.resolve(process.cwd(), 'build/tray-icon.png')
+    trayController = createAshySystemTray({
+      Tray: deps.Tray,
+      Menu: deps.Menu,
+      iconPath: trayIconPath,
+      kernel,
+      overlayController,
+      getHubWindow: () => hubWindowRef,
+      getOverlayWindow: () => overlayWindowRef,
+      onActivatePrivacyShield: activatePrivacyShieldAndBroadcast,
+      onCheckForUpdates: async () => {
+        await autoUpdater.checkForUpdates()
+      },
+      onQuit: async () => {
+        await shutdown()
+        deps.app.quit?.()
+      },
+    })
+  }
+
   const shutdown = async (): Promise<void> => {
     if (isShuttingDown) return
     isShuttingDown = true
     processRef.removeListener('SIGINT', onSigInt)
+    trayController?.destroy()
     deps.globalShortcut?.unregisterAll()
     cleanupIpc()
     await kernel.stop()
@@ -403,6 +604,8 @@ export async function bootAshyElectronMain(
     hubWindow,
     overlayWindow,
     overlayController,
+    autoUpdater,
+    trayController,
     shutdown,
   }
 }

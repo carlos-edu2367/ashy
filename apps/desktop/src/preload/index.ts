@@ -1,5 +1,7 @@
 import type {
+  AshyBootstrapSnapshot,
   AshyHostStreamEvent,
+  AutoUpdaterState,
   ListProviderModelsInput,
   ListProviderModelsResult,
   StageOverlayRuntimeState,
@@ -39,6 +41,11 @@ export interface AshyPreloadApi {
   minimizeWindow?(): Promise<{ minimized: boolean }>
   maximizeWindow?(): Promise<{ maximized: boolean }>
   closeWindow?(): Promise<{ closed: boolean }>
+  activatePrivacyShield?(): Promise<AshyBootstrapSnapshot>
+  getUpdateState?(): Promise<AutoUpdaterState>
+  checkForUpdates?(): Promise<AutoUpdaterState>
+  downloadUpdate?(): Promise<AutoUpdaterState>
+  quitAndInstallUpdate?(): Promise<{ ok: boolean }>
   onEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
 
@@ -97,6 +104,31 @@ export function createAshyPreloadApi(
     },
     closeWindow(): Promise<{ closed: boolean }> {
       return ipcRenderer.invoke('ashy:windowClose') as Promise<{ closed: boolean }>
+    },
+    activatePrivacyShield(): Promise<AshyBootstrapSnapshot> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'activatePrivacyShield',
+      }) as Promise<AshyBootstrapSnapshot>
+    },
+    getUpdateState(): Promise<AutoUpdaterState> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'getUpdateState',
+      }) as Promise<AutoUpdaterState>
+    },
+    checkForUpdates(): Promise<AutoUpdaterState> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'checkForUpdates',
+      }) as Promise<AutoUpdaterState>
+    },
+    downloadUpdate(): Promise<AutoUpdaterState> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'downloadUpdate',
+      }) as Promise<AutoUpdaterState>
+    },
+    quitAndInstallUpdate(): Promise<{ ok: boolean }> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'quitAndInstallUpdate',
+      }) as Promise<{ ok: boolean }>
     },
     onEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       const wrapped = (_event: unknown, payload: AshyHostStreamEvent) => {

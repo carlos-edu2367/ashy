@@ -27,7 +27,10 @@
     "dev": "vite --port 5173",
     "dev:web": "vite --port 5173",
     "build": "vite build",
+    "build:electron": "node scripts/build-electron.mjs",
+    "pack:dir": "pnpm build && pnpm build:electron",
     "preview": "vite preview --port 4173",
-    "test": "vitest run --root ../.. --exclude \"packages/**\""
+    "test": "vitest run --root ../.. --exclude \"packages/**\"",
+    "typecheck": "tsc --noEmit -p ../../tsconfig.json"
   }
 }
