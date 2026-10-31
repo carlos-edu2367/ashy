@@ -117,6 +117,10 @@ export async function startLocalAiTestServer(
   const requests: RecordedAiRequest[] = []
   const wavSpeechBuffer = buildSyntheticSpeechWavBuffer(24000, 180)
   const omniPcm16Base64 = buildSyntheticPcm16Base64(24000, 180)
+  const dynamicModels: Array<{ name: string; model: string; size: number }> = [
+    { name: 'lfm3-omni:2b', model: 'lfm3-omni:2b', size: 1_600_000_000 },
+    { name: 'qwen3:8b', model: 'qwen3:8b', size: 4_900_000_000 },
+  ]
 
   const server = http.createServer((req, res) => {
     const method = req.method ?? 'GET'
@@ -124,7 +128,7 @@ export async function startLocalAiTestServer(
     const urlPath = rawUrl.split('?')[0] ?? '/'
 
     res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, xi-api-key')
 
     if (method === 'OPTIONS') {
@@ -162,8 +166,11 @@ export async function startLocalAiTestServer(
           JSON.stringify({
             object: 'list',
             data: [
-              { id: 'lfm3-omni:2b', object: 'model', name: 'Liquid LFM-3 Omni 2B' },
-              { id: 'qwen3:8b', object: 'model', name: 'Qwen 3 8B' },
+              ...dynamicModels.map((m) => ({
+                id: m.name,
+                object: 'model',
+                name: m.name,
+              })),
               { id: 'whisper-1', object: 'model', name: 'Whisper 1 Local' },
               { id: 'kokoro-v1', object: 'model', name: 'Kokoro v1 Local' },
             ],
@@ -177,12 +184,46 @@ export async function startLocalAiTestServer(
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(
           JSON.stringify({
-            models: [
-              { name: 'lfm3-omni:2b', model: 'lfm3-omni:2b' },
-              { name: 'qwen3:8b', model: 'qwen3:8b' },
-            ],
+            models: dynamicModels,
           }),
         )
+        return
+      }
+
+      // 2b. Ollama streaming model pull
+      if (method === 'POST' && urlPath === '/api/pull') {
+        const bodyObj =
+          typeof parsedBody === 'object' && parsedBody !== null
+            ? (parsedBody as Record<string, unknown>)
+            : {}
+        const name =
+          typeof bodyObj.name === 'string' && bodyObj.name.trim()
+            ? bodyObj.name.trim()
+            : 'qwen2.5:3b'
+        if (!dynamicModels.some((m) => m.name === name)) {
+          dynamicModels.push({ name, model: name, size: 1_900_000_000 })
+        }
+        res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8' })
+        res.write('{"status":"pulling manifest"}\n')
+        res.write('{"status":"pulling layers","completed":950000000,"total":1900000000}\n')
+        res.write('{"status":"success","completed":1900000000,"total":1900000000}\n')
+        res.end()
+        return
+      }
+
+      // 2c. Ollama model delete
+      if (method === 'DELETE' && urlPath === '/api/delete') {
+        const bodyObj =
+          typeof parsedBody === 'object' && parsedBody !== null
+            ? (parsedBody as Record<string, unknown>)
+            : {}
+        const name = typeof bodyObj.name === 'string' ? bodyObj.name.trim() : ''
+        const idx = dynamicModels.findIndex((m) => m.name === name)
+        if (idx >= 0) {
+          dynamicModels.splice(idx, 1)
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true }))
         return
       }
 

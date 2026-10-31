@@ -62,6 +62,7 @@ import {
   DEFAULT_VOICE_RUNTIME_SETTINGS,
   FALLBACK_PROVIDER_MODELS,
   LLM_PROVIDER_IDS,
+  RECOMMENDED_LOCAL_MODELS,
   canonicalizeJson,
   inferModelOmniCapabilities,
   isSafeLive2DModelUrl,
@@ -97,6 +98,7 @@ import {
   type ListProviderModelsResult,
   type Live2DBuiltinModelId,
   type LlmProviderId,
+  type LocalRuntimeStatus,
   type MemoryGovernanceCategory,
   type MemoryGovernancePolicy,
   type MilestoneCategory,
@@ -565,6 +567,14 @@ export interface AshyDesktopState {
   downloadAppUpdate: () => Promise<AutoUpdaterState>
   installAppUpdate: () => Promise<{ ok: boolean }>
 
+  // Phase 9.1 In-App Local Runtime & Zero-Terminal Model Lifecycle
+  localRuntime: LocalRuntimeStatus
+  refreshLocalRuntimeStatus: () => Promise<LocalRuntimeStatus>
+  ensureLocalEngineRunning: () => Promise<LocalRuntimeStatus>
+  installLocalEngine: () => Promise<LocalRuntimeStatus>
+  pullLocalModel: (model: string) => Promise<LocalRuntimeStatus>
+  deleteLocalModel: (model: string) => Promise<LocalRuntimeStatus>
+
   resetStoreForTesting: () => void
 }
 
@@ -664,6 +674,19 @@ const DEFAULT_AUTO_UPDATER_STATE: AutoUpdaterState = {
   errorMessage: null,
   checkedAt: null,
   autoDownload: false,
+}
+
+const DEFAULT_LOCAL_RUNTIME_STATUS: LocalRuntimeStatus = {
+  engineInstalled: false,
+  engineBinaryPath: null,
+  engineRunning: false,
+  managedByAshy: false,
+  baseUrl: 'http://127.0.0.1:11434',
+  installedModels: [],
+  recommendedModels: [...RECOMMENDED_LOCAL_MODELS],
+  activePull: null,
+  installingEngine: false,
+  lastError: null,
 }
 
 function formatQuietHoursRangeFromPolicy(
@@ -1737,6 +1760,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     }
 
     if (event.type === 'local-runtime:status') {
+      set({ localRuntime: event.status })
       return
     }
 
@@ -2333,6 +2357,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     activeStreamingMessageId: null,
     encryptionAtRestStatus: { ...DEFAULT_ENCRYPTION_AT_REST_STATUS },
     updaterState: { ...DEFAULT_AUTO_UPDATER_STATE },
+    localRuntime: {
+      ...DEFAULT_LOCAL_RUNTIME_STATUS,
+      installedModels: [],
+      recommendedModels: [...RECOMMENDED_LOCAL_MODELS],
+    },
     lastExportedSoulArchive: null,
     soulPortabilityStatus: { kind: 'idle', message: null },
 
@@ -2515,6 +2544,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           : {}),
         ...(snapshot.updaterState
           ? { updaterState: { ...snapshot.updaterState } }
+          : {}),
+        ...(snapshot.localRuntime
+          ? { localRuntime: snapshot.localRuntime }
           : {}),
         ...(snapshot.agency
           ? buildAgencyStatePatch(snapshot.agency, {
@@ -5922,6 +5954,64 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       return { ok: false }
     },
 
+    async refreshLocalRuntimeStatus() {
+      const bridge = ensureHostSubscription()
+      if (typeof bridge.getLocalRuntimeStatus === 'function') {
+        const status = await bridge.getLocalRuntimeStatus()
+        set({ localRuntime: status })
+        return status
+      }
+      return get().localRuntime
+    },
+
+    async ensureLocalEngineRunning() {
+      const bridge = ensureHostSubscription()
+      if (typeof bridge.ensureLocalEngineRunning === 'function') {
+        const status = await bridge.ensureLocalEngineRunning()
+        set({ localRuntime: status })
+        return status
+      }
+      return get().localRuntime
+    },
+
+    async installLocalEngine() {
+      const bridge = ensureHostSubscription()
+      if (typeof bridge.installLocalEngine === 'function') {
+        const status = await bridge.installLocalEngine()
+        set({ localRuntime: status })
+        return status
+      }
+      return get().localRuntime
+    },
+
+    async pullLocalModel(model) {
+      const bridge = ensureHostSubscription()
+      if (typeof bridge.pullLocalModel === 'function') {
+        const status = await bridge.pullLocalModel({ model })
+        try {
+          const snapshot = await bridge.getBootstrapSnapshot()
+          if (snapshot && typeof snapshot === 'object' && 'providers' in snapshot) {
+            get().applyBootstrapSnapshot(snapshot)
+          }
+        } catch {
+          // Ignore snapshot refresh failure
+        }
+        set({ localRuntime: status })
+        return status
+      }
+      return get().localRuntime
+    },
+
+    async deleteLocalModel(model) {
+      const bridge = ensureHostSubscription()
+      if (typeof bridge.deleteLocalModel === 'function') {
+        const status = await bridge.deleteLocalModel({ model })
+        set({ localRuntime: status })
+        return status
+      }
+      return get().localRuntime
+    },
+
     resetStoreForTesting() {
       clearActivePlaybackEndTimer()
       isRunningFixtureScenario = false
@@ -6110,6 +6200,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         activeStreamingMessageId: null,
         encryptionAtRestStatus: { ...DEFAULT_ENCRYPTION_AT_REST_STATUS },
         updaterState: { ...DEFAULT_AUTO_UPDATER_STATE },
+        localRuntime: {
+          ...DEFAULT_LOCAL_RUNTIME_STATUS,
+          installedModels: [],
+          recommendedModels: [...RECOMMENDED_LOCAL_MODELS],
+        },
         lastExportedSoulArchive: null,
         soulPortabilityStatus: { kind: 'idle', message: null },
       })

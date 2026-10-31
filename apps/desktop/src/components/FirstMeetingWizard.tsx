@@ -57,6 +57,11 @@ export function FirstMeetingWizard(): React.ReactElement {
   const providerModelCatalog = useAshyStore((s) => s.providerModelCatalog)
   const isLoadingProviderModels = useAshyStore((s) => s.isLoadingProviderModels)
   const listProviderModels = useAshyStore((s) => s.listProviderModels)
+  const localRuntime = useAshyStore((s) => s.localRuntime)
+  const refreshLocalRuntimeStatus = useAshyStore((s) => s.refreshLocalRuntimeStatus)
+  const ensureLocalEngineRunning = useAshyStore((s) => s.ensureLocalEngineRunning)
+  const installLocalEngine = useAshyStore((s) => s.installLocalEngine)
+  const pullLocalModel = useAshyStore((s) => s.pullLocalModel)
 
   const initialProvider: LlmProviderId = providers.activeProviderId ?? 'openrouter'
   const initialConfig = providers.configs[initialProvider]
@@ -109,6 +114,12 @@ export function FirstMeetingWizard(): React.ReactElement {
   useEffect(() => {
     void listProviderModels({ providerId: selectedProvider })
   }, [selectedProvider, listProviderModels])
+
+  useEffect(() => {
+    if (architectureMode === 'local-omni' || selectedProvider === 'ollama') {
+      void refreshLocalRuntimeStatus().catch(() => {})
+    }
+  }, [architectureMode, selectedProvider, refreshLocalRuntimeStatus])
 
   const handleSelectLocalOmniMode = () => {
     setArchitectureMode('local-omni')
@@ -461,6 +472,185 @@ export function FirstMeetingWizard(): React.ReactElement {
             </button>
           </div>
         </div>
+
+        {/* Motor Local Integrado (Zero Terminal) */}
+        {(architectureMode === 'local-omni' || selectedProvider === 'ollama') && (
+          <div
+            data-testid="onboarding-local-runtime-card"
+            style={{
+              padding: '14px 16px',
+              borderRadius: '14px',
+              background: 'rgba(17, 15, 24, 0.78)',
+              border: '1px solid rgba(244, 166, 136, 0.34)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '10px',
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '8px',
+                flexWrap: 'wrap',
+              }}
+            >
+              <span style={{ fontWeight: 600, fontSize: '12.5px', color: 'var(--text-primary)' }}>
+                Motor Local Integrado (Zero Terminal)
+              </span>
+              <span
+                data-testid="onboarding-local-engine-status"
+                className={`ashy-badge ${
+                  localRuntime.engineRunning
+                    ? 'emerald'
+                    : localRuntime.engineInstalled
+                      ? 'amber'
+                      : 'violet'
+                }`}
+              >
+                {localRuntime.engineRunning
+                  ? `Motor Local Ativo (${localRuntime.baseUrl}) • ${localRuntime.installedModels.length} modelo(s) no disco`
+                  : localRuntime.engineInstalled
+                    ? 'Motor Local Instalado (Parado)'
+                    : 'Motor Local (Ollama) não detectado'}
+              </span>
+            </div>
+
+            {!localRuntime.engineRunning && (
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                {localRuntime.engineInstalled ? (
+                  <button
+                    type="button"
+                    data-testid="btn-onboarding-start-local-engine"
+                    className="ashy-peach-btn"
+                    style={{ padding: '6px 12px', fontSize: '11.5px' }}
+                    onClick={async () => {
+                      try {
+                        await ensureLocalEngineRunning()
+                      } catch (err) {
+                        setErrorMsg(err instanceof Error ? err.message : String(err))
+                      }
+                    }}
+                  >
+                    Iniciar Motor Local (Sem Terminal)
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    data-testid="btn-onboarding-install-local-engine"
+                    className="ashy-peach-btn"
+                    style={{ padding: '6px 12px', fontSize: '11.5px' }}
+                    disabled={localRuntime.installingEngine}
+                    onClick={async () => {
+                      try {
+                        await installLocalEngine()
+                      } catch (err) {
+                        setErrorMsg(err instanceof Error ? err.message : String(err))
+                      }
+                    }}
+                  >
+                    Instalar Motor Local no App (1 Clique)
+                  </button>
+                )}
+              </div>
+            )}
+
+            {localRuntime.activePull && (
+              <div
+                data-testid="onboarding-local-pull-progress"
+                style={{
+                  padding: '8px 10px',
+                  borderRadius: '10px',
+                  background: '#171422',
+                  border: '1px solid var(--border-subtle)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '6px',
+                  fontSize: '11.5px',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px' }}>
+                  <span>{localRuntime.activePull.phaseText}</span>
+                  <strong>{localRuntime.activePull.percent}%</strong>
+                </div>
+                <div className="ashy-progress-track">
+                  <div
+                    className="ashy-progress-fill"
+                    style={{ width: `${localRuntime.activePull.percent}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              <span style={{ fontSize: '11.5px', color: 'var(--text-secondary)', fontWeight: 600 }}>
+                Catálogo de Modelos Locais (Download Direto no App)
+              </span>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                  gap: '8px',
+                }}
+              >
+                {localRuntime.recommendedModels.map((rec) => {
+                  const isInstalled = localRuntime.installedModels.some(
+                    (m) => m.name === rec.id,
+                  )
+                  return (
+                    <div
+                      key={rec.id}
+                      style={{
+                        padding: '8px 10px',
+                        borderRadius: '10px',
+                        background: '#171422',
+                        border: '1px solid var(--border-subtle)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        justifyContent: 'space-between',
+                        gap: '6px',
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontWeight: 600, fontSize: '11.5px' }}>{rec.label}</div>
+                        <div style={{ fontSize: '10.5px', color: 'var(--text-muted)' }}>
+                          {rec.sizeLabel} • {rec.vramHint}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        data-testid={`btn-onboarding-pull-model-${rec.id}`}
+                        className={isInstalled ? 'ashy-outline-btn active' : 'ashy-peach-btn'}
+                        style={{ padding: '5px 10px', fontSize: '11px', width: '100%' }}
+                        onClick={async () => {
+                          if (isInstalled) {
+                            setSelectedProvider('ollama')
+                            setBaseUrl('http://127.0.0.1:11434/v1')
+                            setModelId(rec.id)
+                            return
+                          }
+                          try {
+                            await pullLocalModel(rec.id)
+                            setSelectedProvider('ollama')
+                            setBaseUrl('http://127.0.0.1:11434/v1')
+                            setModelId(rec.id)
+                          } catch (err) {
+                            setErrorMsg(err instanceof Error ? err.message : String(err))
+                          }
+                        }}
+                      >
+                        {isInstalled
+                          ? `Usar ${rec.id} (Instalado ✓)`
+                          : `Baixar e Ativar (${rec.sizeLabel})`}
+                      </button>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Step 2: LLM Provider Setup */}
         <div

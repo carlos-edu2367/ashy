@@ -204,6 +204,7 @@ export function App(): React.ReactElement {
   const [ttsApiKeyDraft, setTtsApiKeyDraft] = useState('')
   const [soulArchiveJsonDraft, setSoulArchiveJsonDraft] = useState('')
   const [showWipeConfirm, setShowWipeConfirm] = useState(false)
+  const [customLocalModelDraft, setCustomLocalModelDraft] = useState('')
 
   useEffect(() => {
     void useAshyStore.getState().bootstrapFromHost().catch(() => {})
@@ -4030,6 +4031,331 @@ export function App(): React.ReactElement {
                 {/* Models & Provider Vault Panel (Ajustes > Modelos) */}
                 {(state.settingsSubTab === 'todas' || state.settingsSubTab === 'modelos') && (
                   <ModelsSettingsPanel />
+                )}
+
+                {/* Phase 9.1: Motor Local & Modelos Offline (Gerenciado pela Ashy) */}
+                {(state.settingsSubTab === 'todas' ||
+                  state.settingsSubTab === 'modelos' ||
+                  state.settingsSubTab === 'geral') && (
+                  <section
+                    className="ashy-settings-card"
+                    data-testid="panel-local-runtime-manager"
+                    style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        flexWrap: 'wrap',
+                        gap: '10px',
+                      }}
+                    >
+                      <div className="ashy-settings-section-head">
+                        <div className="ashy-settings-section-icon">
+                          <Box size={20} />
+                        </div>
+                        <div>
+                          <h3 className="ashy-setting-title">
+                            Motor Local &amp; Modelos Offline (Gerenciado pela Ashy)
+                          </h3>
+                          <p className="ashy-setting-desc">
+                            Instale, inicie em segundo plano (Zero CMD) e baixe modelos locais direto
+                            pela interface.
+                          </p>
+                        </div>
+                      </div>
+
+                      <span
+                        data-testid="settings-local-engine-status"
+                        className={`ashy-badge ${
+                          state.localRuntime.engineRunning
+                            ? 'emerald'
+                            : state.localRuntime.engineInstalled
+                              ? 'amber'
+                              : 'violet'
+                        }`}
+                      >
+                        {state.localRuntime.engineRunning
+                          ? 'Rodando em segundo plano (Zero CMD)'
+                          : state.localRuntime.engineInstalled
+                            ? 'Parado'
+                            : 'Não instalado'}
+                      </span>
+                    </div>
+
+                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                      <button
+                        type="button"
+                        data-testid="btn-settings-refresh-local-engine"
+                        className="ashy-outline-btn"
+                        onClick={() => {
+                          void state.refreshLocalRuntimeStatus().catch(() => {})
+                        }}
+                      >
+                        Atualizar Status
+                      </button>
+
+                      {!state.localRuntime.engineRunning && state.localRuntime.engineInstalled && (
+                        <button
+                          type="button"
+                          data-testid="btn-settings-start-local-engine"
+                          className="ashy-peach-btn"
+                          onClick={() => {
+                            void state.ensureLocalEngineRunning().catch(() => {})
+                          }}
+                        >
+                          Iniciar Motor Local (Sem Terminal)
+                        </button>
+                      )}
+
+                      {!state.localRuntime.engineInstalled && (
+                        <button
+                          type="button"
+                          data-testid="btn-settings-install-local-engine"
+                          className="ashy-peach-btn"
+                          disabled={state.localRuntime.installingEngine}
+                          onClick={() => {
+                            void state.installLocalEngine().catch(() => {})
+                          }}
+                        >
+                          Instalar Motor Local (1 Clique)
+                        </button>
+                      )}
+                    </div>
+
+                    {state.localRuntime.lastError && (
+                      <div
+                        data-testid="settings-local-runtime-error"
+                        style={{
+                          fontSize: '12px',
+                          color: '#fca5a5',
+                          background: 'rgba(239, 68, 68, 0.12)',
+                          border: '1px solid rgba(239, 68, 68, 0.3)',
+                          borderRadius: '8px',
+                          padding: '8px 12px',
+                        }}
+                      >
+                        {state.localRuntime.lastError}
+                      </div>
+                    )}
+
+                    {state.localRuntime.activePull && (
+                      <div
+                        data-testid="settings-local-pull-progress"
+                        className="ashy-setting-box"
+                        style={{
+                          flexDirection: 'column',
+                          alignItems: 'stretch',
+                          gap: '6px',
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            fontSize: '12px',
+                          }}
+                        >
+                          <span>{state.localRuntime.activePull.phaseText}</span>
+                          <strong>{state.localRuntime.activePull.percent}%</strong>
+                        </div>
+                        <div className="ashy-progress-track">
+                          <div
+                            className="ashy-progress-fill"
+                            style={{ width: `${state.localRuntime.activePull.percent}%` }}
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Modelos Instalados no Disco */}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <div
+                        style={{
+                          fontSize: '12px',
+                          fontWeight: 600,
+                          color: 'var(--text-secondary)',
+                        }}
+                      >
+                        Modelos Instalados no Disco ({state.localRuntime.installedModels.length})
+                      </div>
+                      {state.localRuntime.installedModels.length === 0 ? (
+                        <div
+                          className="ashy-setting-box"
+                          style={{ fontSize: '12px', color: 'var(--text-muted)' }}
+                        >
+                          Nenhum modelo local detectado no disco ainda.
+                        </div>
+                      ) : (
+                        state.localRuntime.installedModels.map((m) => {
+                          const sizeLabel =
+                            m.sizeBytes >= 1_000_000_000
+                              ? `${(m.sizeBytes / 1_000_000_000).toFixed(1)} GB`
+                              : `${Math.max(1, Math.round(m.sizeBytes / 1_000_000))} MB`
+                          return (
+                            <div
+                              key={m.name}
+                              data-testid={`installed-local-model-${m.name}`}
+                              className="ashy-setting-box"
+                              style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}
+                            >
+                              <div>
+                                <strong>{m.name}</strong>{' '}
+                                <span style={{ fontSize: '11.5px', color: 'var(--text-muted)' }}>
+                                  ({sizeLabel})
+                                </span>
+                              </div>
+                              <div style={{ display: 'flex', gap: '8px' }}>
+                                <button
+                                  type="button"
+                                  data-testid={`btn-activate-local-model-${m.name}`}
+                                  className="ashy-outline-btn"
+                                  style={{ padding: '4px 10px', fontSize: '11.5px' }}
+                                  onClick={() => {
+                                    state.setActiveModelId(m.name)
+                                    const cleanBase = state.localRuntime.baseUrl
+                                      .replace(/\/+$/, '')
+                                      .replace(/\/v1$/i, '')
+                                    void state
+                                      .saveProviderConfig({
+                                        providerId: 'ollama',
+                                        baseUrl: `${cleanBase}/v1`,
+                                        modelId: m.name,
+                                        reasoningEffort: 'none',
+                                      })
+                                      .then(() => state.setActiveProvider('ollama'))
+                                      .catch(() => {})
+                                  }}
+                                >
+                                  Ativar Modelo
+                                </button>
+                                <button
+                                  type="button"
+                                  data-testid={`btn-delete-local-model-${m.name}`}
+                                  className="ashy-danger-outline-btn"
+                                  style={{ padding: '4px 10px', fontSize: '11.5px' }}
+                                  onClick={() => {
+                                    void state.deleteLocalModel(m.name).catch(() => {})
+                                  }}
+                                >
+                                  Remover
+                                </button>
+                              </div>
+                            </div>
+                          )
+                        })
+                      )}
+                    </div>
+
+                    {/* Baixar Modelos Recomendados com 1 Clique */}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <div
+                        style={{
+                          fontSize: '12px',
+                          fontWeight: 600,
+                          color: 'var(--text-secondary)',
+                        }}
+                      >
+                        Baixar Modelos Recomendados com 1 Clique
+                      </div>
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                          gap: '8px',
+                        }}
+                      >
+                        {state.localRuntime.recommendedModels.map((rec) => {
+                          const isInstalled = state.localRuntime.installedModels.some(
+                            (m) => m.name === rec.id,
+                          )
+                          return (
+                            <div
+                              key={rec.id}
+                              className="ashy-setting-box"
+                              style={{
+                                flexDirection: 'column',
+                                alignItems: 'stretch',
+                                justifyContent: 'space-between',
+                                gap: '8px',
+                              }}
+                            >
+                              <div>
+                                <div style={{ fontWeight: 600, fontSize: '12px' }}>{rec.label}</div>
+                                <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                                  {rec.sizeLabel} • {rec.vramHint}
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                data-testid={`btn-settings-pull-model-${rec.id}`}
+                                className={isInstalled ? 'ashy-outline-btn active' : 'ashy-peach-btn'}
+                                style={{ padding: '6px 10px', fontSize: '11.5px' }}
+                                disabled={Boolean(state.localRuntime.activePull)}
+                                onClick={() => {
+                                  void state
+                                    .pullLocalModel(rec.id)
+                                    .then(() => {
+                                      state.setActiveModelId(rec.id)
+                                    })
+                                    .catch(() => {})
+                                }}
+                              >
+                                {isInstalled
+                                  ? 'Revalidar / Ativar'
+                                  : `Baixar no App (${rec.sizeLabel})`}
+                              </button>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Baixar Qualquer Modelo por Tag */}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                      <div
+                        style={{
+                          fontSize: '12px',
+                          fontWeight: 600,
+                          color: 'var(--text-secondary)',
+                        }}
+                      >
+                        Baixar Qualquer Modelo por Tag
+                      </div>
+                      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                        <input
+                          type="text"
+                          data-testid="input-custom-local-model"
+                          className="ashy-input"
+                          style={{ flex: 1, minWidth: '180px' }}
+                          placeholder="Ex.: deepseek-r1:1.5b ou gemma3:4b..."
+                          value={customLocalModelDraft}
+                          onChange={(e) => setCustomLocalModelDraft(e.target.value)}
+                        />
+                        <button
+                          type="button"
+                          data-testid="btn-pull-custom-local-model"
+                          className="ashy-peach-btn"
+                          disabled={
+                            !customLocalModelDraft.trim() || Boolean(state.localRuntime.activePull)
+                          }
+                          onClick={() => {
+                            const tag = customLocalModelDraft.trim()
+                            if (!tag) return
+                            void state
+                              .pullLocalModel(tag)
+                              .then(() => {
+                                setCustomLocalModelDraft('')
+                              })
+                              .catch(() => {})
+                          }}
+                        >
+                          Baixar Modelo
+                        </button>
+                      </div>
+                    </div>
+                  </section>
                 )}
 
                 {/* Phase 5: Voice Runtime, TTFA Telemetry & .wav Audio Fixtures Panel (Ajustes > Voz) */}
