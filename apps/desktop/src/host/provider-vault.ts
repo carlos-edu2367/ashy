@@ -4,6 +4,9 @@ import path from 'node:path'
 import * as v from 'valibot'
 import {
   FALLBACK_PROVIDER_MODELS,
+  inferModelOmniCapabilities,
+  OMNI_EXECUTION_MODES,
+  type OmniExecutionMode,
   ListProviderModelsInputSchema,
   LLM_PROVIDER_IDS,
   maskApiKey,
@@ -40,6 +43,8 @@ interface StoredProviderEntry {
   requiresApiKey: boolean
   lastVerifiedAt: number | null
   lastError: string | null
+  omniExecutionMode?: OmniExecutionMode
+  omniVoiceId?: string
 }
 
 interface StoredProvidersDocument {
@@ -98,6 +103,10 @@ export { FALLBACK_PROVIDER_MODELS }
 
 function isLlmProviderId(value: unknown): value is LlmProviderId {
   return typeof value === 'string' && (LLM_PROVIDER_IDS as readonly string[]).includes(value)
+}
+
+function isOmniExecutionMode(value: unknown): value is OmniExecutionMode {
+  return typeof value === 'string' && (OMNI_EXECUTION_MODES as readonly string[]).includes(value)
 }
 
 function isReasoningEffort(value: unknown): value is ReasoningEffort {
@@ -182,6 +191,12 @@ function parseAndValidateProviders(raw: string): StoredProvidersDocument {
           ? entry.lastVerifiedAt
           : null,
       lastError: typeof entry.lastError === 'string' ? entry.lastError : null,
+      ...(isOmniExecutionMode(entry.omniExecutionMode)
+        ? { omniExecutionMode: entry.omniExecutionMode }
+        : {}),
+      ...(typeof entry.omniVoiceId === 'string' && entry.omniVoiceId.trim().length > 0
+        ? { omniVoiceId: entry.omniVoiceId.trim() }
+        : {}),
     }
   }
 
@@ -370,6 +385,17 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
       maskedApiKey: hasApiKey ? maskApiKey(decryptedKey) : null,
       lastVerifiedAt: entry.lastVerifiedAt,
       lastError: entry.lastError,
+      ...inferModelOmniCapabilities(entry.providerId, entry.modelId),
+      omniExecutionMode:
+        entry.omniExecutionMode ??
+        (inferModelOmniCapabilities(entry.providerId, entry.modelId).supportsOmniAudioOut
+          ? 'native-omni'
+          : inferModelOmniCapabilities(entry.providerId, entry.modelId).supportsOmniAudioIn
+            ? 'hybrid-omni-in'
+            : 'modular'),
+      omniVoiceId:
+        entry.omniVoiceId ??
+        (/lfm3|lfm2|liquid/i.test(entry.modelId) ? 'female' : 'coral'),
     }
   }
 
@@ -419,7 +445,16 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
 
   function saveProviderConfig(rawInput: SaveProviderConfigInput): PublicProviderConfig {
     const parsed = v.parse(SaveProviderConfigInputSchema, rawInput)
-    const { providerId, baseUrl, modelId, reasoningEffort, apiKey, clearApiKey } = parsed
+    const {
+      providerId,
+      baseUrl,
+      modelId,
+      reasoningEffort,
+      omniExecutionMode,
+      omniVoiceId,
+      apiKey,
+      clearApiKey,
+    } = parsed
 
     const providersDoc = loadProvidersForMutation()
     const secretsDoc = loadSecretsForMutation()
@@ -430,6 +465,12 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
       baseUrl,
       modelId,
       reasoningEffort: reasoningEffort ?? existing.reasoningEffort ?? 'none',
+      ...(omniExecutionMode ?? existing.omniExecutionMode
+        ? { omniExecutionMode: omniExecutionMode ?? existing.omniExecutionMode }
+        : {}),
+      ...(omniVoiceId ?? existing.omniVoiceId
+        ? { omniVoiceId: omniVoiceId ?? existing.omniVoiceId }
+        : {}),
     }
     providersDoc.providers[providerId] = updatedEntry
 
@@ -697,6 +738,7 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
           name,
           providerId,
           contextLength,
+          ...inferModelOmniCapabilities(providerId, id),
           ...(supportedParams
             ? {
                 supportsTools: supportedParams.includes('tools'),
@@ -753,6 +795,7 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
                     name: rawName.slice(0, 256),
                     providerId: 'ollama',
                     contextLength: null,
+                    ...inferModelOmniCapabilities('ollama', id),
                   })
                 }
               }

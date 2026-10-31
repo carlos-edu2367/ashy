@@ -14,9 +14,24 @@ export interface ToolCallDescriptor {
   argsText: string
 }
 
+export type ChatMessageContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; imageUrl: { url: string; detail?: 'low' | 'high' | 'auto' } }
+  | { type: 'input_audio'; inputAudio: { data: string; format: 'wav' | 'pcm16' | 'mp3' } }
+  | {
+      type: 'video_frame'
+      videoFrame: {
+        dataUrl: string
+        timestampMs: number
+        width?: number
+        height?: number
+      }
+    }
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
   content: string
+  parts?: readonly ChatMessageContentPart[]
   name?: string
   toolCallId?: string
   toolCalls?: ToolCallDescriptor[]
@@ -62,6 +77,18 @@ export type LanguageModelEvent =
   | { type: 'text-delta'; text: string }
   | { type: 'reasoning-delta'; text: string }
   | {
+      type: 'audio-delta'
+      audioBase64: string
+      format: 'pcm16' | 'wav'
+      sampleRate: number
+      transcriptDelta?: string
+    }
+  | {
+      type: 'input-transcript'
+      transcript: string
+      isFinal?: boolean
+    }
+  | {
       type: 'tool-call'
       toolCallId: string
       toolName: string
@@ -77,6 +104,12 @@ export type LanguageModelEvent =
       error: unknown
     }
 
+export interface AudioOutputRequestConfig {
+  voice?: string
+  format?: 'pcm16' | 'wav' | 'mp3'
+  sampleRate?: number
+}
+
 export interface LanguageModelRequest {
   messages: ChatMessage[]
   tools?: ToolDefinition<AnyValibotSchema, unknown>[]
@@ -84,6 +117,8 @@ export interface LanguageModelRequest {
   temperature?: number
   maxTokens?: number
   reasoningEffort?: ReasoningEffort
+  modalities?: ReadonlyArray<'text' | 'audio'>
+  audioOutput?: AudioOutputRequestConfig
   signal?: AbortSignal
 }
 
@@ -124,6 +159,8 @@ export interface StreamTextOptions {
   temperature?: number
   maxTokens?: number
   reasoningEffort?: ReasoningEffort
+  modalities?: ReadonlyArray<'text' | 'audio'>
+  audioOutput?: AudioOutputRequestConfig
   signal?: AbortSignal
   preToolCall?: (
     ctx: PreToolCallContext,
@@ -134,6 +171,20 @@ export interface StreamTextOptions {
 export type TextStreamEvent =
   | { type: 'text-delta'; text: string; stepIndex: number }
   | { type: 'reasoning-delta'; text: string; stepIndex: number }
+  | {
+      type: 'audio-delta'
+      audioBase64: string
+      format: 'pcm16' | 'wav'
+      sampleRate: number
+      transcriptDelta?: string
+      stepIndex: number
+    }
+  | {
+      type: 'input-transcript'
+      transcript: string
+      isFinal?: boolean
+      stepIndex: number
+    }
   | {
       type: 'tool-call'
       toolCallId: string
@@ -280,6 +331,7 @@ export function streamText(
     for (let stepIndex = 0; stepIndex < maxSteps; stepIndex++) {
       let stepText = ''
       let stepReasoning = ''
+      let sawTextDeltaInStep = false
       const stepToolCalls: ToolCallDescriptor[] = []
       const stepToolResults: ToolResultRecord[] = []
       let stepFinishReason = 'stop'
@@ -287,12 +339,17 @@ export function streamText(
       let modelStream: ReadableStream<LanguageModelEvent>
       try {
         modelStream = await model({
-          messages: conversation.map((m) => ({ ...m })),
+          messages: conversation.map((m) => ({
+            ...m,
+            ...(m.parts ? { parts: [...m.parts] } : {}),
+          })),
           tools: options.tools,
           system: options.system,
           temperature: options.temperature,
           maxTokens: options.maxTokens,
           reasoningEffort: options.reasoningEffort,
+          modalities: options.modalities,
+          audioOutput: options.audioOutput,
           signal: options.signal,
         })
       } catch (err) {
@@ -375,6 +432,7 @@ export function streamText(
 
           if (value.type === 'text-delta') {
             if (value.text.length > 0) {
+              sawTextDeltaInStep = true
               for (const part of splitInlineReasoning(value.text)) {
                 if (part.kind === 'reasoning') {
                   stepReasoning += part.text
@@ -392,6 +450,30 @@ export function streamText(
               stepReasoning += value.text
               fullReasoning += value.text
               yield { type: 'reasoning-delta', text: value.text, stepIndex }
+            }
+          } else if (value.type === 'audio-delta') {
+            if (
+              typeof value.transcriptDelta === 'string' &&
+              value.transcriptDelta.length > 0 &&
+              !sawTextDeltaInStep
+            ) {
+              stepText += value.transcriptDelta
+              fullText += value.transcriptDelta
+            }
+            yield {
+              type: 'audio-delta',
+              audioBase64: value.audioBase64,
+              format: value.format,
+              sampleRate: value.sampleRate,
+              transcriptDelta: value.transcriptDelta,
+              stepIndex,
+            }
+          } else if (value.type === 'input-transcript') {
+            yield {
+              type: 'input-transcript',
+              transcript: value.transcript,
+              isFinal: value.isFinal,
+              stepIndex,
             }
           } else if (value.type === 'tool-call') {
             const descriptor: ToolCallDescriptor = {
@@ -707,6 +789,7 @@ export function streamText(
  */
 export async function collect(streamResult: StreamTextResult): Promise<GenerateTextResult> {
   let text = ''
+  let sawTextDelta = false
   let reasoning = ''
   const toolCalls: ToolCallDescriptor[] = []
   const toolResults: ToolResultRecord[] = []
@@ -716,7 +799,12 @@ export async function collect(streamResult: StreamTextResult): Promise<GenerateT
 
   for await (const event of streamResult) {
     if (event.type === 'text-delta') {
+      sawTextDelta = true
       text += event.text
+    } else if (event.type === 'audio-delta') {
+      if (!sawTextDelta && typeof event.transcriptDelta === 'string') {
+        text += event.transcriptDelta
+      }
     } else if (event.type === 'reasoning-delta') {
       reasoning += event.text
     } else if (event.type === 'tool-call') {

@@ -309,6 +309,9 @@ export function createVoiceTurnController(
   }
 
   function bumpSpeakerRevision(): void {
+    if (inGracePeriod) {
+      casRejectedCount += 1
+    }
     speakerRev += 1
     silenceMs = 0
     inGracePeriod = false

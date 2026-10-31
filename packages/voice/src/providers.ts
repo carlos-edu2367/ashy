@@ -314,6 +314,7 @@ function buildSttMultipartBody(
   const blob = new Blob([safeArrayBuffer], { type: 'audio/wav' })
   form.append('file', blob, 'speech.wav')
   form.append('model', modelId)
+  form.append('response_format', 'json')
   if (language) {
     form.append('language', language)
   }
@@ -330,6 +331,7 @@ export function createOpenAiWhisperSttProvider(
   const modelId = options.modelId ?? 'whisper-1'
   const timeoutMs = options.timeoutMs ?? 8000
   const fetchFn = options.fetchImpl ?? globalThis.fetch
+  const allowOfflineFallback = options.allowOfflineFallback ?? false
   const fallback = options.fallbackProvider ?? createDeterministicWavSttProvider()
 
   return {
@@ -382,7 +384,85 @@ export function createOpenAiWhisperSttProvider(
           confidence: typeof payload.confidence === 'number' ? payload.confidence : 0.95,
         }
       } catch (err) {
-        if (options.allowOfflineFallback) {
+        if (allowOfflineFallback) {
+          const fallbackRes = await fallback.transcribe({
+            ...request,
+            signal: undefined,
+          })
+          return {
+            ...fallbackRes,
+            usedFallback: true,
+          }
+        }
+        throw err
+      } finally {
+        cleanup()
+      }
+    },
+  }
+}
+
+export function createGroqWhisperSttProvider(
+  options: HttpSttProviderOptions = {},
+): SttProvider {
+  const baseUrl = stripTrailingSlashes(options.baseUrl ?? 'https://api.groq.com/openai/v1')
+  const modelId = options.modelId ?? 'whisper-large-v3-turbo'
+  const timeoutMs = options.timeoutMs ?? 8000
+  const fetchFn = options.fetchImpl ?? globalThis.fetch
+  const allowOfflineFallback = options.allowOfflineFallback ?? false
+  const fallback = options.fallbackProvider ?? createDeterministicWavSttProvider()
+
+  return {
+    id: 'groq-whisper',
+    async transcribe(request: SttTranscriptionRequest): Promise<SttTranscriptionResult> {
+      const startedAt = performance.now()
+      const { signal, cleanup } = createCombinedAbortSignal(request.signal, timeoutMs)
+
+      try {
+        if (signal.aborted) {
+          throw new Error('Groq Whisper STT aborted before dispatch')
+        }
+        if (typeof fetchFn !== 'function') {
+          throw new Error('Fetch implementation is unavailable for Groq Whisper STT')
+        }
+
+        const wavBytes = encodePcmBlocksToWav(request.blocks, request.metadataComment)
+        const form = buildSttMultipartBody(
+          wavBytes,
+          modelId,
+          request.language ?? options.language,
+          request.prompt,
+        )
+
+        const headers: Record<string, string> = {}
+        if (options.apiKey) {
+          headers.Authorization = `Bearer ${options.apiKey}`
+        }
+
+        const endpoint = baseUrl.endsWith('/audio/transcriptions')
+          ? baseUrl
+          : `${baseUrl}/audio/transcriptions`
+
+        const response = await fetchFn(endpoint, {
+          method: 'POST',
+          headers,
+          body: form,
+          signal,
+        })
+
+        if (!response.ok) {
+          throw new Error(`Groq Whisper STT failed with HTTP ${response.status}`)
+        }
+
+        const payload = (await response.json()) as { text?: string; confidence?: number }
+        return {
+          providerId: 'groq-whisper',
+          text: typeof payload.text === 'string' ? payload.text.trim() : '',
+          latencyMs: Math.max(0, Math.round(performance.now() - startedAt)),
+          confidence: typeof payload.confidence === 'number' ? payload.confidence : 0.96,
+        }
+      } catch (err) {
+        if (allowOfflineFallback) {
           const fallbackRes = await fallback.transcribe({
             ...request,
             signal: undefined,
@@ -407,6 +487,7 @@ export function createLocalWhisperHttpSttProvider(
   const modelId = options.modelId ?? 'whisper-1'
   const timeoutMs = options.timeoutMs ?? 6000
   const fetchFn = options.fetchImpl ?? globalThis.fetch
+  const allowOfflineFallback = options.allowOfflineFallback ?? false
   const fallback = options.fallbackProvider ?? createDeterministicWavSttProvider()
 
   return {
@@ -424,29 +505,43 @@ export function createLocalWhisperHttpSttProvider(
         }
 
         const wavBytes = encodePcmBlocksToWav(request.blocks, request.metadataComment)
-        const form = buildSttMultipartBody(
-          wavBytes,
-          modelId,
-          request.language ?? options.language,
-          request.prompt,
-        )
-
         const headers: Record<string, string> = {}
         if (options.apiKey) {
           headers.Authorization = `Bearer ${options.apiKey}`
         }
 
-        const endpoint =
+        const makeForm = () =>
+          buildSttMultipartBody(
+            wavBytes,
+            modelId,
+            request.language ?? options.language,
+            request.prompt,
+          )
+
+        const primaryEndpoint =
           baseUrl.endsWith('/audio/transcriptions') || baseUrl.endsWith('/inference')
             ? baseUrl
             : `${baseUrl}/audio/transcriptions`
 
-        const response = await fetchFn(endpoint, {
+        let response = await fetchFn(primaryEndpoint, {
           method: 'POST',
           headers,
-          body: form,
+          body: makeForm(),
           signal,
         })
+
+        if (response.status === 404 && !primaryEndpoint.endsWith('/inference')) {
+          const baseRoot = baseUrl
+            .replace(/\/(v1\/)?audio\/transcriptions$/, '')
+            .replace(/\/v1$/, '')
+          const inferenceEndpoint = `${baseRoot}/inference`
+          response = await fetchFn(inferenceEndpoint, {
+            method: 'POST',
+            headers,
+            body: makeForm(),
+            signal,
+          })
+        }
 
         if (!response.ok) {
           throw new Error(`Local Whisper HTTP STT failed with HTTP ${response.status}`)
@@ -460,7 +555,153 @@ export function createLocalWhisperHttpSttProvider(
           confidence: typeof payload.confidence === 'number' ? payload.confidence : 0.93,
         }
       } catch (err) {
-        if (options.allowOfflineFallback) {
+        if (allowOfflineFallback) {
+          const fallbackRes = await fallback.transcribe({
+            ...request,
+            signal: undefined,
+          })
+          return {
+            ...fallbackRes,
+            usedFallback: true,
+          }
+        }
+        throw err
+      } finally {
+        cleanup()
+      }
+    },
+  }
+}
+
+export interface WebSpeechRecognitionLike {
+  lang: string
+  continuous: boolean
+  interimResults: boolean
+  onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string; confidence?: number }>> }) => void) | null
+  onerror: ((event: { error?: string; message?: string }) => void) | null
+  onend: (() => void) | null
+  start(): void
+  stop(): void
+  abort?(): void
+}
+
+export interface WebSpeechSttProviderOptions {
+  lang?: string
+  timeoutMs?: number
+  recognitionFactory?: () => WebSpeechRecognitionLike | null
+  allowOfflineFallback?: boolean
+  fallbackProvider?: SttProvider
+}
+
+export function createWebSpeechSttProvider(
+  options: WebSpeechSttProviderOptions = {},
+): SttProvider {
+  const defaultLang = options.lang ?? 'pt-BR'
+  const timeoutMs = options.timeoutMs ?? 6000
+  const allowOfflineFallback = options.allowOfflineFallback ?? false
+  const fallback = options.fallbackProvider ?? createDeterministicWavSttProvider()
+
+  function resolveRecognition(): WebSpeechRecognitionLike | null {
+    if (options.recognitionFactory) {
+      return options.recognitionFactory()
+    }
+    const g = globalThis as unknown as {
+      SpeechRecognition?: new () => WebSpeechRecognitionLike
+      webkitSpeechRecognition?: new () => WebSpeechRecognitionLike
+    }
+    const Ctor = g.SpeechRecognition ?? g.webkitSpeechRecognition
+    return typeof Ctor === 'function' ? new Ctor() : null
+  }
+
+  return {
+    id: 'web-speech-stt',
+    async transcribe(request: SttTranscriptionRequest): Promise<SttTranscriptionResult> {
+      const startedAt = performance.now()
+      const { signal, cleanup } = createCombinedAbortSignal(request.signal, timeoutMs)
+
+      try {
+        if (signal.aborted) {
+          throw new Error('Web Speech STT aborted before start')
+        }
+        if (typeof request.metadataComment === 'string' && request.metadataComment.trim().length > 0) {
+          return {
+            providerId: 'web-speech-stt',
+            text: request.metadataComment.trim(),
+            latencyMs: Math.max(0, Math.round(performance.now() - startedAt)),
+            confidence: 0.99,
+          }
+        }
+
+        const recognition = resolveRecognition()
+        if (!recognition) {
+          throw new Error('Web Speech STT API is unavailable in this environment')
+        }
+
+        const result = await new Promise<{ text: string; confidence: number }>((resolve, reject) => {
+          let settled = false
+          let transcript = ''
+          let confidence = 0.92
+
+          const onAbort = () => {
+            if (settled) return
+            settled = true
+            try {
+              recognition.abort?.()
+            } catch {
+              // ignore
+            }
+            reject(new Error('Web Speech STT aborted'))
+          }
+
+          signal.addEventListener('abort', onAbort, { once: true })
+
+          recognition.lang = request.language ?? defaultLang
+          recognition.continuous = false
+          recognition.interimResults = false
+
+          recognition.onresult = (event) => {
+            const pieces: string[] = []
+            for (let i = 0; i < event.results.length; i++) {
+              const alt = event.results[i]?.[0]
+              if (alt && typeof alt.transcript === 'string') {
+                pieces.push(alt.transcript.trim())
+                if (typeof alt.confidence === 'number' && Number.isFinite(alt.confidence)) {
+                  confidence = alt.confidence
+                }
+              }
+            }
+            transcript = pieces.filter(Boolean).join(' ').trim()
+          }
+
+          recognition.onerror = (event) => {
+            if (settled) return
+            settled = true
+            signal.removeEventListener('abort', onAbort)
+            reject(
+              new Error(
+                `Web Speech STT error: ${event?.error ?? event?.message ?? 'recognition-failed'}`,
+              ),
+            )
+          }
+
+          recognition.onend = () => {
+            if (settled) return
+            settled = true
+            signal.removeEventListener('abort', onAbort)
+            resolve({ text: transcript, confidence })
+          }
+
+          recognition.start()
+        })
+
+        return {
+          providerId: 'web-speech-stt',
+          text: result.text,
+          latencyMs: Math.max(0, Math.round(performance.now() - startedAt)),
+          confidence: result.confidence,
+        }
+      } catch (err) {
+        if (allowOfflineFallback) {
           const fallbackRes = await fallback.transcribe({
             ...request,
             signal: undefined,
@@ -480,7 +721,9 @@ export function createLocalWhisperHttpSttProvider(
 
 export interface SttProviderRegistryOptions {
   openaiWhisper?: HttpSttProviderOptions
+  groqWhisper?: HttpSttProviderOptions
   localWhisperHttp?: HttpSttProviderOptions
+  webSpeechStt?: WebSpeechSttProviderOptions
   deterministicWav?: { defaultTranscript?: string }
   customProviders?: Partial<Record<SttProviderId, SttProvider>>
 }
@@ -505,16 +748,26 @@ export function createSttProviderRegistry(
     'openai-whisper':
       options.customProviders?.['openai-whisper'] ??
       createOpenAiWhisperSttProvider({
-        allowOfflineFallback: true,
         fallbackProvider: deterministicProvider,
         ...options.openaiWhisper,
+      }),
+    'groq-whisper':
+      options.customProviders?.['groq-whisper'] ??
+      createGroqWhisperSttProvider({
+        fallbackProvider: deterministicProvider,
+        ...options.groqWhisper,
       }),
     'local-whisper-http':
       options.customProviders?.['local-whisper-http'] ??
       createLocalWhisperHttpSttProvider({
-        allowOfflineFallback: true,
         fallbackProvider: deterministicProvider,
         ...options.localWhisperHttp,
+      }),
+    'web-speech-stt':
+      options.customProviders?.['web-speech-stt'] ??
+      createWebSpeechSttProvider({
+        fallbackProvider: deterministicProvider,
+        ...options.webSpeechStt,
       }),
     'deterministic-wav-stt': deterministicProvider,
   }
@@ -659,26 +912,227 @@ export function createLocalSynthFallbackTtsProvider(options?: {
   }
 }
 
-async function decodeHttpTtsResponse(
+export interface PcmFrameVowelWeights extends VowelFrameEnvelope {
+  dominantVowel: 'A' | 'E' | 'I' | 'O' | 'U' | 'closed'
+  rmsVolume: number
+}
+
+export function extractPcmFrameVowelWeights(
+  samples: Float32Array,
+  sampleRate = 16000,
+): PcmFrameVowelWeights {
+  if (!(samples instanceof Float32Array) || samples.length === 0) {
+    return { A: 0, E: 0, I: 0, O: 0, U: 0, dominantVowel: 'closed', rmsVolume: 0 }
+  }
+
+  let sumSq = 0
+  let diffSq = 0
+  for (let i = 0; i < samples.length; i++) {
+    const s = Number.isFinite(samples[i]) ? samples[i]! : 0
+    sumSq += s * s
+    if (i > 0) {
+      const prev = Number.isFinite(samples[i - 1]) ? samples[i - 1]! : 0
+      const d = s - prev
+      diffSq += d * d
+    }
+  }
+
+  const rms = Math.sqrt(sumSq / samples.length)
+  if (rms < 0.008) {
+    return { A: 0, E: 0, I: 0, O: 0, U: 0, dominantVowel: 'closed', rmsVolume: 0 }
+  }
+
+  const rmsVolume = Math.min(1, Number((rms * 2.2).toFixed(4)))
+  const normDiff = sumSq > 1e-12 ? Math.sqrt(diffSq / sumSq) : 0
+  const halfRatio = Math.min(1, Math.max(0, normDiff / 2))
+  const dominantHz = (sampleRate / Math.PI) * Math.asin(halfRatio)
+
+  const bandAffinity = (centerHz: number, widthHz: number) => {
+    const dist = (dominantHz - centerHz) / widthHz
+    return Math.exp(-0.5 * dist * dist)
+  }
+
+  const rawU = bandAffinity(200, 140)
+  const rawO = bandAffinity(340, 180)
+  const rawA = bandAffinity(950, 380)
+  const rawE = bandAffinity(1900, 480)
+  const rawI = bandAffinity(2650, 550)
+  const maxRaw = Math.max(1e-6, rawA, rawE, rawI, rawO, rawU)
+
+  const A = Number(Math.min(1, (rawA / maxRaw) * rmsVolume).toFixed(4))
+  const E = Number(Math.min(1, (rawE / maxRaw) * rmsVolume).toFixed(4))
+  const I = Number(Math.min(1, (rawI / maxRaw) * rmsVolume).toFixed(4))
+  const O = Number(Math.min(1, (rawO / maxRaw) * rmsVolume).toFixed(4))
+  const U = Number(Math.min(1, (rawU / maxRaw) * rmsVolume).toFixed(4))
+
+  const entries: Array<['A' | 'E' | 'I' | 'O' | 'U', number]> = [
+    ['A', A],
+    ['E', E],
+    ['I', I],
+    ['O', O],
+    ['U', U],
+  ]
+  entries.sort((a, b) => b[1] - a[1])
+  const dominantVowel = entries[0]![1] > 0.02 ? entries[0]![0] : 'closed'
+
+  return { A, E, I, O, U, dominantVowel, rmsVolume }
+}
+
+function isRiffWaveBuffer(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < 44) return false
+  return (
+    bytes[0] === 0x52 && // 'R'
+    bytes[1] === 0x49 && // 'I'
+    bytes[2] === 0x46 && // 'F'
+    bytes[3] === 0x46 && // 'F'
+    bytes[8] === 0x57 && // 'W'
+    bytes[9] === 0x41 && // 'A'
+    bytes[10] === 0x56 && // 'V'
+    bytes[11] === 0x45 // 'E'
+  )
+}
+
+function skipId3HeaderOffset(bytes: Uint8Array): number {
+  if (
+    bytes.byteLength >= 10 &&
+    bytes[0] === 0x49 && // 'I'
+    bytes[1] === 0x44 && // 'D'
+    bytes[2] === 0x33 // '3'
+  ) {
+    const size =
+      ((bytes[6]! & 0x7f) << 21) |
+      ((bytes[7]! & 0x7f) << 14) |
+      ((bytes[8]! & 0x7f) << 7) |
+      (bytes[9]! & 0x7f)
+    return Math.min(bytes.byteLength, 10 + size)
+  }
+  return 0
+}
+
+function decodeCompressedAudioEnvelopeToPcm(
+  bytes: Uint8Array,
+  text: string,
+  sampleRate = 16000,
+): { sampleRate: number; durationMs: number; samples: Float32Array } {
+  const payloadStart = skipId3HeaderOffset(bytes)
+  const audioBytes = bytes.subarray(payloadStart)
+  const words = text.trim().split(/\s+/).filter(Boolean).length
+  const estimatedByBytesMs = Math.round((Math.max(1, audioBytes.byteLength) / 16000) * 1000)
+  const durationMs = Math.max(360, Math.min(30_000, Math.max(words * 135, estimatedByBytesMs)))
+  const baseSamples = synthesizeVoicedSpeechPcm({
+    durationMs,
+    sampleRate,
+    fundamentalHz: 185,
+    amplitude: 0.44,
+  })
+
+  if (audioBytes.byteLength >= 16) {
+    const windowCount = Math.max(1, Math.min(128, Math.floor(audioBytes.byteLength / 16)))
+    const bytesPerWindow = Math.max(1, Math.floor(audioBytes.byteLength / windowCount))
+    const windowGain = new Float32Array(windowCount)
+    for (let w = 0; w < windowCount; w++) {
+      const start = w * bytesPerWindow
+      const end = Math.min(audioBytes.byteLength, start + bytesPerWindow)
+      let devSum = 0
+      for (let i = start; i < end; i++) {
+        devSum += Math.abs(audioBytes[i]! - 128) / 128
+      }
+      const meanDev = end > start ? devSum / (end - start) : 0.5
+      windowGain[w] = Math.max(0.25, Math.min(1.15, 0.45 + meanDev * 0.9))
+    }
+
+    for (let i = 0; i < baseSamples.length; i++) {
+      const wIdx = Math.min(
+        windowCount - 1,
+        Math.floor((i / Math.max(1, baseSamples.length)) * windowCount),
+      )
+      baseSamples[i] = Math.max(-1, Math.min(1, baseSamples[i]! * windowGain[wIdx]!))
+    }
+  }
+
+  return {
+    sampleRate,
+    durationMs,
+    samples: baseSamples,
+  }
+}
+
+function blendTextAndAcousticVowelFrames(
+  text: string,
+  durationMs: number,
+  samples: Float32Array,
+  sampleRate: number,
+  frameDurationMs = 20,
+): VowelFrameEnvelope[] {
+  const baseFrames = computeVowelLipSyncFrames(text, durationMs, frameDurationMs)
+  const samplesPerFrame = Math.max(1, Math.round((frameDurationMs / 1000) * sampleRate))
+
+  return baseFrames.map((base, idx) => {
+    const start = idx * samplesPerFrame
+    const end = Math.min(samples.length, start + samplesPerFrame)
+    if (start >= end) {
+      return base
+    }
+    const acoustic = extractPcmFrameVowelWeights(samples.subarray(start, end), sampleRate)
+    if (acoustic.rmsVolume <= 0.01) {
+      return { A: 0, E: 0, I: 0, O: 0, U: 0 }
+    }
+    return {
+      A: Number(Math.min(1, base.A * 0.65 + acoustic.A * 0.35).toFixed(4)),
+      E: Number(Math.min(1, base.E * 0.65 + acoustic.E * 0.35).toFixed(4)),
+      I: Number(Math.min(1, base.I * 0.65 + acoustic.I * 0.35).toFixed(4)),
+      O: Number(Math.min(1, base.O * 0.65 + acoustic.O * 0.35).toFixed(4)),
+      U: Number(Math.min(1, base.U * 0.65 + acoustic.U * 0.35).toFixed(4)),
+    }
+  })
+}
+
+export async function decodeHttpTtsResponse(
   providerId: TtsProviderId,
   response: Response,
   text: string,
   startedAt: number,
+  decodeAudioDataFn?: (
+    rawBytes: Uint8Array,
+  ) => Promise<{ sampleRate: number; samples: Float32Array }>,
 ): Promise<TtsProviderSynthesisResult> {
   const arrayBuffer = await response.arrayBuffer()
   const bytes = new Uint8Array(arrayBuffer)
-  const decoded = decodeWavToPcmBlocks(bytes, 20)
-  const durationMs = Math.max(1, decoded.totalDurationMs)
-  const durationSec = decoded.samples.length / decoded.sampleRate
-  const vowelFrames = computeVowelLipSyncFrames(text, durationMs)
+  if (bytes.byteLength === 0) {
+    throw new Error(`${providerId} TTS returned an empty audio payload (0 bytes)`)
+  }
+
+  let sampleRate = 16000
+  let durationMs = 400
+  let samples: Float32Array
+
+  if (isRiffWaveBuffer(bytes)) {
+    const decoded = decodeWavToPcmBlocks(bytes, 20)
+    sampleRate = decoded.sampleRate
+    durationMs = Math.max(1, decoded.totalDurationMs)
+    samples = decoded.samples
+  } else if (decodeAudioDataFn) {
+    const decoded = await decodeAudioDataFn(bytes)
+    sampleRate = decoded.sampleRate || 16000
+    samples = decoded.samples
+    durationMs = Math.max(1, Math.round((samples.length / sampleRate) * 1000))
+  } else {
+    const decoded = decodeCompressedAudioEnvelopeToPcm(bytes, text, 16000)
+    sampleRate = decoded.sampleRate
+    durationMs = decoded.durationMs
+    samples = decoded.samples
+  }
+
+  const durationSec = samples.length / sampleRate
+  const vowelFrames = blendTextAndAcousticVowelFrames(text, durationMs, samples, sampleRate, 20)
   const synthesisLatencyMs = Math.max(0, Math.round(performance.now() - startedAt))
 
   return {
     providerId,
     durationMs,
     durationSec,
-    sampleRate: decoded.sampleRate,
-    samples: decoded.samples,
+    sampleRate,
+    samples,
     vowelFrames,
     synthesisLatencyMs,
   }
@@ -690,6 +1144,7 @@ export function createElevenLabsTtsProvider(options: HttpTtsProviderOptions = {}
   const defaultModelId = options.modelId ?? 'eleven_multilingual_v2'
   const timeoutMs = options.timeoutMs ?? 8000
   const fetchFn = options.fetchImpl ?? globalThis.fetch
+  const allowOfflineFallback = options.allowOfflineFallback ?? false
   const fallback = options.fallbackProvider ?? createLocalSynthFallbackTtsProvider()
 
   return {
@@ -733,7 +1188,7 @@ export function createElevenLabsTtsProvider(options: HttpTtsProviderOptions = {}
 
         return await decodeHttpTtsResponse('elevenlabs', response, request.text, startedAt)
       } catch (err) {
-        if (options.allowOfflineFallback) {
+        if (allowOfflineFallback) {
           const fallbackRes = await fallback.synthesize({
             ...request,
             signal: undefined,
@@ -757,6 +1212,7 @@ export function createOpenAiTtsProvider(options: HttpTtsProviderOptions = {}): T
   const defaultModelId = options.modelId ?? 'tts-1'
   const timeoutMs = options.timeoutMs ?? 8000
   const fetchFn = options.fetchImpl ?? globalThis.fetch
+  const allowOfflineFallback = options.allowOfflineFallback ?? false
   const fallback = options.fallbackProvider ?? createLocalSynthFallbackTtsProvider()
 
   return {
@@ -802,7 +1258,7 @@ export function createOpenAiTtsProvider(options: HttpTtsProviderOptions = {}): T
 
         return await decodeHttpTtsResponse('openai-tts', response, request.text, startedAt)
       } catch (err) {
-        if (options.allowOfflineFallback) {
+        if (allowOfflineFallback) {
           const fallbackRes = await fallback.synthesize({
             ...request,
             signal: undefined,
@@ -828,6 +1284,7 @@ export function createLocalKokoroHttpTtsProvider(
   const defaultModelId = options.modelId ?? 'kokoro-v1'
   const timeoutMs = options.timeoutMs ?? 6000
   const fetchFn = options.fetchImpl ?? globalThis.fetch
+  const allowOfflineFallback = options.allowOfflineFallback ?? false
   const fallback = options.fallbackProvider ?? createLocalSynthFallbackTtsProvider()
 
   return {
@@ -873,7 +1330,7 @@ export function createLocalKokoroHttpTtsProvider(
 
         return await decodeHttpTtsResponse('local-kokoro-http', response, request.text, startedAt)
       } catch (err) {
-        if (options.allowOfflineFallback) {
+        if (allowOfflineFallback) {
           const fallbackRes = await fallback.synthesize({
             ...request,
             signal: undefined,
@@ -891,10 +1348,134 @@ export function createLocalKokoroHttpTtsProvider(
   }
 }
 
+export interface WebSpeechSynthesisVoiceLike {
+  voiceURI: string
+  name: string
+  lang: string
+}
+
+export interface WebSpeechSynthesisUtteranceLike {
+  text: string
+  lang?: string
+  voice?: WebSpeechSynthesisVoiceLike | null
+  rate?: number
+  pitch?: number
+  onend?: (() => void) | null
+  onerror?: ((event: { error?: string }) => void) | null
+}
+
+export interface WebSpeechSynthesisLike {
+  speak(utterance: WebSpeechSynthesisUtteranceLike): void
+  cancel(): void
+  getVoices?(): ReadonlyArray<WebSpeechSynthesisVoiceLike>
+}
+
+export interface WebSpeechTtsProviderOptions {
+  lang?: string
+  voiceURI?: string
+  sampleRate?: number
+  speechSynthesis?: WebSpeechSynthesisLike | null
+  allowOfflineFallback?: boolean
+  fallbackProvider?: TtsProvider
+}
+
+export function createWebSpeechTtsProvider(
+  options: WebSpeechTtsProviderOptions = {},
+): TtsProvider {
+  const sampleRate = options.sampleRate ?? 16000
+  const defaultLang = options.lang ?? 'pt-BR'
+  const allowOfflineFallback = options.allowOfflineFallback ?? false
+  const fallback = options.fallbackProvider ?? createLocalSynthFallbackTtsProvider({ sampleRate })
+
+  function resolveSpeechSynthesis(): WebSpeechSynthesisLike | null {
+    if (options.speechSynthesis !== undefined) {
+      return options.speechSynthesis
+    }
+    const g = globalThis as unknown as { speechSynthesis?: WebSpeechSynthesisLike }
+    return g.speechSynthesis ?? null
+  }
+
+  return {
+    id: 'web-speech-tts',
+    async synthesize(request: TtsSynthesisRequest): Promise<TtsProviderSynthesisResult> {
+      const startedAt = performance.now()
+      try {
+        if (request.signal?.aborted) {
+          throw new Error('Web Speech TTS aborted before dispatch')
+        }
+
+        const synth = resolveSpeechSynthesis()
+        if (!synth || typeof synth.speak !== 'function') {
+          throw new Error('Web Speech TTS API is unavailable in this environment')
+        }
+
+        const UtteranceCtor = (
+          globalThis as unknown as {
+            SpeechSynthesisUtterance?: new (text: string) => WebSpeechSynthesisUtteranceLike
+          }
+        ).SpeechSynthesisUtterance
+
+        const utterance: WebSpeechSynthesisUtteranceLike =
+          typeof UtteranceCtor === 'function'
+            ? new UtteranceCtor(request.text)
+            : { text: request.text }
+        utterance.lang = defaultLang
+
+        const desiredVoiceUri = request.voiceId ?? options.voiceURI
+        if (desiredVoiceUri && typeof synth.getVoices === 'function') {
+          const matchedVoice = synth
+            .getVoices()
+            .find((v) => v.voiceURI === desiredVoiceUri || v.name === desiredVoiceUri)
+          if (matchedVoice) {
+            utterance.voice = matchedVoice
+          }
+        }
+
+        synth.speak(utterance)
+
+        const words = request.text.trim().split(/\s+/).filter(Boolean).length
+        const durationMs = Math.max(400, words * 140)
+        const durationSec = durationMs / 1000
+        const samples = synthesizeVoicedSpeechPcm({
+          durationMs,
+          sampleRate,
+          fundamentalHz: 185,
+          amplitude: 0.42,
+        })
+        const vowelFrames = computeVowelLipSyncFrames(request.text, durationMs)
+        const synthesisLatencyMs = Math.max(0, Math.round(performance.now() - startedAt))
+
+        return {
+          providerId: 'web-speech-tts',
+          durationMs,
+          durationSec,
+          sampleRate,
+          samples,
+          vowelFrames,
+          synthesisLatencyMs,
+        }
+      } catch (err) {
+        if (allowOfflineFallback) {
+          const fallbackRes = await fallback.synthesize({
+            ...request,
+            signal: undefined,
+          })
+          return {
+            ...fallbackRes,
+            usedFallback: true,
+          }
+        }
+        throw err
+      }
+    },
+  }
+}
+
 export interface TtsProviderRegistryOptions {
   elevenlabs?: HttpTtsProviderOptions
   openaiTts?: HttpTtsProviderOptions
   localKokoroHttp?: HttpTtsProviderOptions
+  webSpeechTts?: WebSpeechTtsProviderOptions
   localSynthFallback?: { sampleRate?: number }
   customProviders?: Partial<Record<TtsProviderId, TtsProvider>>
 }
@@ -919,23 +1500,26 @@ export function createTtsProviderRegistry(
     elevenlabs:
       options.customProviders?.elevenlabs ??
       createElevenLabsTtsProvider({
-        allowOfflineFallback: true,
         fallbackProvider: localFallback,
         ...options.elevenlabs,
       }),
     'openai-tts':
       options.customProviders?.['openai-tts'] ??
       createOpenAiTtsProvider({
-        allowOfflineFallback: true,
         fallbackProvider: localFallback,
         ...options.openaiTts,
       }),
     'local-kokoro-http':
       options.customProviders?.['local-kokoro-http'] ??
       createLocalKokoroHttpTtsProvider({
-        allowOfflineFallback: true,
         fallbackProvider: localFallback,
         ...options.localKokoroHttp,
+      }),
+    'web-speech-tts':
+      options.customProviders?.['web-speech-tts'] ??
+      createWebSpeechTtsProvider({
+        fallbackProvider: localFallback,
+        ...options.webSpeechTts,
       }),
     'local-synth-fallback': localFallback,
   }

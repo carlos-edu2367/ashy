@@ -42,6 +42,14 @@ import type {
   UpdateStagePreferencesInput,
   UpsertFactInput,
   VisionObservationResult,
+  ListVoiceProviderModelsInput,
+  SaveVoiceRuntimeSettingsInput,
+  SynthesizeVoiceSpeechInput,
+  TranscribeVoiceAudioInput,
+  VoiceProviderModelsCatalog,
+  VoiceRuntimeSettings,
+  VoiceSynthesizeSpeechResult,
+  VoiceTranscribeAudioResult,
 } from '@ashy/shared'
 import type { AshyPreloadApi } from '../preload/index'
 
@@ -279,6 +287,29 @@ export function createPreloadHostBridge(
       input: UpdateStagePreferencesInput,
     ): Promise<PersistedStagePreferences> {
       return invoke<PersistedStagePreferences>('updateStagePreferences', input)
+    },
+    getVoiceRuntimeSettings(): Promise<VoiceRuntimeSettings> {
+      return invoke<VoiceRuntimeSettings>('getVoiceRuntimeSettings')
+    },
+    saveVoiceRuntimeSettings(
+      input: SaveVoiceRuntimeSettingsInput,
+    ): Promise<VoiceRuntimeSettings> {
+      return invoke<VoiceRuntimeSettings>('saveVoiceRuntimeSettings', input)
+    },
+    listVoiceProviderModels(
+      input: ListVoiceProviderModelsInput,
+    ): Promise<VoiceProviderModelsCatalog> {
+      return invoke<VoiceProviderModelsCatalog>('listVoiceProviderModels', input)
+    },
+    transcribeVoiceAudio(
+      input: TranscribeVoiceAudioInput,
+    ): Promise<VoiceTranscribeAudioResult> {
+      return invoke<VoiceTranscribeAudioResult>('transcribeVoiceAudio', input)
+    },
+    synthesizeVoiceSpeech(
+      input: SynthesizeVoiceSpeechInput,
+    ): Promise<VoiceSynthesizeSpeechResult> {
+      return invoke<VoiceSynthesizeSpeechResult>('synthesizeVoiceSpeech', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       return preloadApi.onEvent(listener)
@@ -572,6 +603,29 @@ export function createHttpSseHostBridge(
       input: UpdateStagePreferencesInput,
     ): Promise<PersistedStagePreferences> {
       return rpc<PersistedStagePreferences>('updateStagePreferences', input)
+    },
+    getVoiceRuntimeSettings(): Promise<VoiceRuntimeSettings> {
+      return rpc<VoiceRuntimeSettings>('getVoiceRuntimeSettings')
+    },
+    saveVoiceRuntimeSettings(
+      input: SaveVoiceRuntimeSettingsInput,
+    ): Promise<VoiceRuntimeSettings> {
+      return rpc<VoiceRuntimeSettings>('saveVoiceRuntimeSettings', input)
+    },
+    listVoiceProviderModels(
+      input: ListVoiceProviderModelsInput,
+    ): Promise<VoiceProviderModelsCatalog> {
+      return rpc<VoiceProviderModelsCatalog>('listVoiceProviderModels', input)
+    },
+    transcribeVoiceAudio(
+      input: TranscribeVoiceAudioInput,
+    ): Promise<VoiceTranscribeAudioResult> {
+      return rpc<VoiceTranscribeAudioResult>('transcribeVoiceAudio', input)
+    },
+    synthesizeVoiceSpeech(
+      input: SynthesizeVoiceSpeechInput,
+    ): Promise<VoiceSynthesizeSpeechResult> {
+      return rpc<VoiceSynthesizeSpeechResult>('synthesizeVoiceSpeech', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       listeners.add(listener)

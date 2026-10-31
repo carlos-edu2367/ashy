@@ -38,10 +38,19 @@ export interface ScriptedToolCallInput {
   args?: unknown
 }
 
+export interface ScriptedAudioChunkInput {
+  audioBase64: string
+  format?: 'pcm16' | 'wav'
+  sampleRate?: number
+  transcriptDelta?: string
+}
+
 export interface ScriptedStepConfig {
   text?: string
   chunks?: string[]
   reasoning?: string | string[]
+  audioChunks?: ScriptedAudioChunkInput[]
+  inputTranscript?: string
   toolCalls?: ScriptedToolCallInput[]
   events?: LanguageModelEvent[]
   finishReason?: string
@@ -156,7 +165,17 @@ export function valibotSchemaToJsonSchema(schema: AnyValibotSchema): Record<stri
   return pipeItems ? applyPipeMetadata(pipeItems, result) : result
 }
 
-function serializeOpenAIMessages(messages: ChatMessage[], system?: string): unknown[] {
+function stripDataUrlPrefix(raw: string): string {
+  const trimmed = raw.trim()
+  const match = /^data:[^;,]+;base64,([\s\S]+)$/i.exec(trimmed)
+  return match ? match[1]!.trim() : trimmed
+}
+
+export function isLfmOmniModel(modelId: string): boolean {
+  return /lfm3[-_]?omni|lfm3[-_]?audio|lfm2[-_]?audio/i.test(modelId)
+}
+
+export function serializeOpenAIMessages(messages: ChatMessage[], system?: string): unknown[] {
   const result: unknown[] = []
   if (system && system.trim().length > 0) {
     result.push({ role: 'system', content: system })
@@ -182,6 +201,48 @@ function serializeOpenAIMessages(messages: ChatMessage[], system?: string): unkn
         tool_call_id: m.toolCallId ?? '',
         name: m.name,
         content: m.content,
+      })
+    } else if (m.parts && m.parts.length > 0) {
+      const contentArray: Array<Record<string, unknown>> = []
+      for (const part of m.parts) {
+        if (part.type === 'text') {
+          contentArray.push({
+            type: 'text',
+            text: part.text,
+          })
+        } else if (part.type === 'image_url') {
+          contentArray.push({
+            type: 'image_url',
+            image_url: {
+              url: part.imageUrl.url,
+              detail: part.imageUrl.detail ?? 'auto',
+            },
+          })
+        } else if (part.type === 'input_audio') {
+          contentArray.push({
+            type: 'input_audio',
+            input_audio: {
+              data: stripDataUrlPrefix(part.inputAudio.data),
+              format: part.inputAudio.format === 'mp3' ? 'mp3' : 'wav',
+            },
+          })
+        } else if (part.type === 'video_frame') {
+          contentArray.push({
+            type: 'text',
+            text: `[Video Frame @ ${Math.round(part.videoFrame.timestampMs)}ms]`,
+          })
+          contentArray.push({
+            type: 'image_url',
+            image_url: {
+              url: part.videoFrame.dataUrl,
+              detail: 'low',
+            },
+          })
+        }
+      }
+      result.push({
+        role: m.role,
+        content: contentArray,
       })
     } else {
       result.push({
@@ -213,6 +274,14 @@ const REASONING_PAYLOAD_KEYS = [
   'reasoning_effort',
   'think',
   'chat_template_kwargs',
+] as const
+
+const OMNI_AUDIO_PAYLOAD_KEYS = [
+  'modalities',
+  'audio',
+  'audio_temperature',
+  'audio_repetition_penalty',
+  'audio_repetition_window',
 ] as const
 
 function applyOpenAIReasoningPayload(
@@ -303,12 +372,33 @@ export function createOpenAICompatibleModel(
     }
 
     const effectiveEffort = request.reasoningEffort ?? config.reasoningEffort
-    const hasReasoningParams = applyOpenAIReasoningPayload(
+    let hasReasoningParams = applyOpenAIReasoningPayload(
       bodyPayload,
       baseUrl,
       config.model,
       effectiveEffort,
     )
+
+    const lfmOmni = isLfmOmniModel(config.model)
+    if (lfmOmni) {
+      bodyPayload.think = false
+      bodyPayload.chat_template_kwargs = { enable_thinking: false }
+      hasReasoningParams = true
+    }
+
+    let hasOmniAudioParams = false
+    if (request.modalities?.includes('audio')) {
+      hasOmniAudioParams = true
+      bodyPayload.modalities = ['text', 'audio']
+      bodyPayload.audio = {
+        voice: request.audioOutput?.voice ?? (lfmOmni ? 'female' : 'coral'),
+        format: request.audioOutput?.format ?? 'pcm16',
+      }
+      if (lfmOmni) {
+        bodyPayload.audio_temperature = 0.4
+        bodyPayload.audio_repetition_penalty = 1.2
+      }
+    }
 
     let response = await fetchFn(`${baseUrl}/chat/completions`, {
       method: 'POST',
@@ -317,10 +407,17 @@ export function createOpenAICompatibleModel(
       signal: request.signal,
     })
 
-    // Adversarial resilience: if an OpenAI-compatible endpoint rejects reasoning/thinking fields with HTTP 400, retry cleanly without them
-    if (response.status === 400 && hasReasoningParams && !request.signal?.aborted) {
+    // Adversarial resilience (HIGH-2): if an OpenAI-compatible endpoint rejects omni audio or reasoning/thinking fields with HTTP 400/422, retry cleanly without them
+    if (
+      (response.status === 400 || response.status === 422) &&
+      (hasReasoningParams || hasOmniAudioParams) &&
+      !request.signal?.aborted
+    ) {
       await response.body?.cancel().catch(() => undefined)
       const fallbackPayload: Record<string, unknown> = { ...bodyPayload }
+      for (const key of OMNI_AUDIO_PAYLOAD_KEYS) {
+        delete fallbackPayload[key]
+      }
       for (const key of REASONING_PAYLOAD_KEYS) {
         delete fallbackPayload[key]
       }
@@ -378,6 +475,18 @@ export function createOpenAICompatibleModel(
         }
       }
 
+      const topLevelTranscript =
+        typeof parsed.input_transcript === 'string' && parsed.input_transcript.length > 0
+          ? parsed.input_transcript
+          : undefined
+      if (topLevelTranscript) {
+        controller.enqueue({
+          type: 'input-transcript',
+          transcript: topLevelTranscript,
+          isFinal: true,
+        })
+      }
+
       const choices = parsed.choices
       if (!Array.isArray(choices) || choices.length === 0) {
         return false
@@ -388,9 +497,21 @@ export function createOpenAICompatibleModel(
         finishReason = choice.finish_reason
       }
 
-      const delta = choice.delta as Record<string, unknown> | undefined
+      const delta = (choice.delta ?? choice.message) as Record<string, unknown> | undefined
       if (!delta) {
         return false
+      }
+
+      if (
+        !topLevelTranscript &&
+        typeof delta.input_transcript === 'string' &&
+        delta.input_transcript.length > 0
+      ) {
+        controller.enqueue({
+          type: 'input-transcript',
+          transcript: delta.input_transcript,
+          isFinal: true,
+        })
       }
 
       const reasoningChunk =
@@ -400,8 +521,36 @@ export function createOpenAICompatibleModel(
         controller.enqueue({ type: 'reasoning-delta', text: reasoningChunk })
       }
 
-      if (typeof delta.content === 'string' && delta.content.length > 0) {
-        controller.enqueue({ type: 'text-delta', text: delta.content })
+      const hasContentDelta = typeof delta.content === 'string' && delta.content.length > 0
+      if (hasContentDelta) {
+        controller.enqueue({ type: 'text-delta', text: delta.content as string })
+      }
+
+      const rawAudio =
+        (typeof delta.audio === 'object' && delta.audio !== null ? delta.audio : undefined) ??
+        (typeof (choice.message as Record<string, unknown> | undefined)?.audio === 'object' &&
+        (choice.message as Record<string, unknown>).audio !== null
+          ? (choice.message as Record<string, unknown>).audio
+          : undefined)
+
+      if (rawAudio) {
+        const audioObj = rawAudio as Record<string, unknown>
+        const audioTranscript =
+          typeof audioObj.transcript === 'string' && audioObj.transcript.length > 0
+            ? audioObj.transcript
+            : undefined
+        if (audioTranscript && !hasContentDelta) {
+          controller.enqueue({ type: 'text-delta', text: audioTranscript })
+        }
+        if (typeof audioObj.data === 'string' && audioObj.data.length > 0) {
+          controller.enqueue({
+            type: 'audio-delta',
+            audioBase64: audioObj.data,
+            format: audioObj.format === 'wav' ? 'wav' : 'pcm16',
+            sampleRate: typeof audioObj.sample_rate === 'number' ? audioObj.sample_rate : 24000,
+            transcriptDelta: audioTranscript,
+          })
+        }
       }
 
       if (Array.isArray(delta.tool_calls)) {
@@ -848,6 +997,17 @@ export function createScriptedMockModel(
     if (resolvedConfig.events) {
       events.push(...resolvedConfig.events)
     } else {
+      if (
+        typeof resolvedConfig.inputTranscript === 'string' &&
+        resolvedConfig.inputTranscript.length > 0
+      ) {
+        events.push({
+          type: 'input-transcript',
+          transcript: resolvedConfig.inputTranscript,
+          isFinal: true,
+        })
+      }
+
       if (resolvedConfig.reasoning !== undefined) {
         const reasoningChunks = Array.isArray(resolvedConfig.reasoning)
           ? resolvedConfig.reasoning
@@ -859,6 +1019,10 @@ export function createScriptedMockModel(
         }
       }
 
+      const hasExplicitText =
+        (resolvedConfig.chunks && resolvedConfig.chunks.length > 0) ||
+        (typeof resolvedConfig.text === 'string' && resolvedConfig.text.length > 0)
+
       if (resolvedConfig.chunks) {
         for (const chunk of resolvedConfig.chunks) {
           if (chunk.length > 0) {
@@ -867,6 +1031,23 @@ export function createScriptedMockModel(
         }
       } else if (typeof resolvedConfig.text === 'string' && resolvedConfig.text.length > 0) {
         events.push({ type: 'text-delta', text: resolvedConfig.text })
+      }
+
+      if (resolvedConfig.audioChunks && resolvedConfig.audioChunks.length > 0) {
+        for (const ac of resolvedConfig.audioChunks) {
+          if (!hasExplicitText && typeof ac.transcriptDelta === 'string' && ac.transcriptDelta.length > 0) {
+            events.push({ type: 'text-delta', text: ac.transcriptDelta })
+          }
+          if (ac.audioBase64.length > 0) {
+            events.push({
+              type: 'audio-delta',
+              audioBase64: ac.audioBase64,
+              format: ac.format === 'wav' ? 'wav' : 'pcm16',
+              sampleRate: ac.sampleRate ?? 24000,
+              transcriptDelta: ac.transcriptDelta,
+            })
+          }
+        }
       }
 
       if (resolvedConfig.toolCalls && resolvedConfig.toolCalls.length > 0) {

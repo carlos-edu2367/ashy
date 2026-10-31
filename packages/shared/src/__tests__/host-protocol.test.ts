@@ -87,6 +87,24 @@ import {
   RoomTrophyIconKeySchema,
   RoomTrophyItemSchema,
   RoomEnvironmentStateSchema,
+  ASHY_HOST_RPC_METHODS,
+  VoiceRuntimeSettingsSchema,
+  SaveVoiceRuntimeSettingsInputSchema,
+  ListVoiceProviderModelsInputSchema,
+  TranscribeVoiceAudioInputSchema,
+  SynthesizeVoiceSpeechInputSchema,
+  OMNI_EXECUTION_MODES,
+  OmniExecutionModeSchema,
+  OMNI_MODALITY_KINDS,
+  OmniModalityKindSchema,
+  TurnInputAudioSchema,
+  TurnVideoFrameSchema,
+  TurnAttachmentSchema,
+  ProviderModelCatalogItemSchema,
+  PublicProviderConfigSchema,
+  FALLBACK_PROVIDER_MODELS,
+  inferModelOmniCapabilities,
+  AshyHostStreamEventSchema,
 } from '../index'
 
 describe('@ashy/shared host-protocol', () => {
@@ -672,10 +690,12 @@ describe('@ashy/shared host-protocol', () => {
     expect(DEFAULT_ASHY_VOICE_MD).toContain('## Salvaguardas de Vínculo Saudável')
   })
 
-  it('validates Phase 5 STT/TTS provider schemas, voice fixture IDs, DEFAULT_VOICE_RUNTIME_SETTINGS, and SendTurnInputSchema.interruptionControlNote', () => {
+  it('validates Phase 5 & Phase 8.6 STT/TTS provider schemas, voice fixture IDs, DEFAULT_VOICE_RUNTIME_SETTINGS, and SendTurnInputSchema.interruptionControlNote', () => {
     expect(STT_PROVIDER_IDS).toEqual([
       'openai-whisper',
+      'groq-whisper',
       'local-whisper-http',
+      'web-speech-stt',
       'deterministic-wav-stt',
     ])
     for (const id of STT_PROVIDER_IDS) {
@@ -687,6 +707,7 @@ describe('@ashy/shared host-protocol', () => {
       'elevenlabs',
       'openai-tts',
       'local-kokoro-http',
+      'web-speech-tts',
       'local-synth-fallback',
     ])
     for (const id of TTS_PROVIDER_IDS) {
@@ -1416,5 +1437,431 @@ describe('Phase 8 Contextual Initiative & Own World Shared Contracts', () => {
         unlockedTrophies: [],
       }).success,
     ).toBe(false)
+  })
+
+  it('validates Phase 8.6 VoiceRuntimeSettingsSchema and Host Voice RPC input schemas', () => {
+    for (const rpcMethod of [
+      'getVoiceRuntimeSettings',
+      'saveVoiceRuntimeSettings',
+      'listVoiceProviderModels',
+      'transcribeVoiceAudio',
+      'synthesizeVoiceSpeech',
+    ]) {
+      expect(ASHY_HOST_RPC_METHODS).toContain(rpcMethod)
+    }
+
+    const baseSettingsRes = v.safeParse(
+      VoiceRuntimeSettingsSchema,
+      DEFAULT_VOICE_RUNTIME_SETTINGS,
+    )
+    expect(baseSettingsRes.success).toBe(true)
+
+    const extendedSettingsRes = v.safeParse(VoiceRuntimeSettingsSchema, {
+      ...DEFAULT_VOICE_RUNTIME_SETTINGS,
+      activeSttProviderId: 'groq-whisper',
+      activeTtsProviderId: 'local-kokoro-http',
+      groqSttModelId: 'whisper-large-v3-turbo',
+      openaiSttModelId: 'gpt-4o-mini-transcribe',
+      openaiTtsModelId: 'gpt-4o-mini-tts',
+      openaiTtsVoiceId: 'nova',
+      elevenLabsModelId: 'eleven_flash_v2_5',
+      localKokoroModelId: 'kokoro-v1',
+      localKokoroVoiceId: 'pf_dora',
+      webSpeechLang: 'pt-BR',
+      webSpeechVoiceURI: 'Google português do Brasil',
+      selectedMicDeviceId: 'mic-usb-1',
+      autoSpeakReplies: true,
+      hasOpenAiApiKey: true,
+      hasGroqApiKey: true,
+      hasElevenLabsApiKey: false,
+      hasLocalSttApiKey: false,
+      hasLocalTtsApiKey: false,
+      maskedOpenAiApiKey: 'sk-pro...9a2f',
+      maskedGroqApiKey: 'gsk_12...abcd',
+      maskedElevenLabsApiKey: null,
+    })
+    expect(extendedSettingsRes.success).toBe(true)
+
+    const validSaveInput = v.safeParse(SaveVoiceRuntimeSettingsInputSchema, {
+      activeSttProviderId: 'groq-whisper',
+      activeTtsProviderId: 'openai-tts',
+      sttBaseUrl: 'https://api.groq.com/openai/v1',
+      sttModelId: 'whisper-large-v3-turbo',
+      ttsBaseUrl: 'https://api.openai.com/v1',
+      ttsModelId: 'tts-1',
+      ttsVoiceId: 'nova',
+      autoSpeakReplies: true,
+      groqApiKey: 'gsk_live_secret_12345',
+      openaiApiKey: 'sk-live-secret-12345',
+    })
+    expect(validSaveInput.success).toBe(true)
+
+    expect(
+      v.safeParse(SaveVoiceRuntimeSettingsInputSchema, {
+        activeSttProviderId: 'invalid-provider',
+      }).success,
+    ).toBe(false)
+
+    const validListModels = v.safeParse(ListVoiceProviderModelsInputSchema, {
+      kind: 'stt',
+      providerId: 'groq-whisper',
+      baseUrl: 'https://api.groq.com/openai/v1',
+    })
+    expect(validListModels.success).toBe(true)
+
+    expect(
+      v.safeParse(ListVoiceProviderModelsInputSchema, {
+        kind: 'invalid',
+        providerId: 'groq-whisper',
+      }).success,
+    ).toBe(false)
+
+    const validTranscribe = v.safeParse(TranscribeVoiceAudioInputSchema, {
+      audioBase64: 'UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=',
+      mimeType: 'audio/wav',
+      providerId: 'local-whisper-http',
+      language: 'pt',
+    })
+    expect(validTranscribe.success).toBe(true)
+
+    expect(
+      v.safeParse(TranscribeVoiceAudioInputSchema, {
+        audioBase64: '',
+      }).success,
+    ).toBe(false)
+
+    const validSynthesize = v.safeParse(SynthesizeVoiceSpeechInputSchema, {
+      text: 'Olá Carlos, testando voz real no estúdio!',
+      providerId: 'local-kokoro-http',
+      voiceId: 'pf_dora',
+    })
+    expect(validSynthesize.success).toBe(true)
+
+    expect(
+      v.safeParse(SynthesizeVoiceSpeechInputSchema, {
+        text: '',
+      }).success,
+    ).toBe(false)
+    expect(
+      v.safeParse(SynthesizeVoiceSpeechInputSchema, {
+        text: 'a'.repeat(4097),
+      }).success,
+    ).toBe(false)
+  })
+
+  it('validates Phase 8.7 Unified Omni Model schemas, SendTurnInputSchema multimodal payloads, anti-SSRF guards, and inferModelOmniCapabilities', () => {
+    expect(OMNI_EXECUTION_MODES).toEqual(['modular', 'hybrid-omni-in', 'native-omni'])
+    for (const mode of OMNI_EXECUTION_MODES) {
+      expect(v.safeParse(OmniExecutionModeSchema, mode).success).toBe(true)
+    }
+    expect(v.safeParse(OmniExecutionModeSchema, 'invalid-omni-mode').success).toBe(false)
+
+    expect(OMNI_MODALITY_KINDS).toEqual(['text', 'audio', 'image', 'video'])
+    for (const kind of OMNI_MODALITY_KINDS) {
+      expect(v.safeParse(OmniModalityKindSchema, kind).success).toBe(true)
+    }
+    expect(v.safeParse(OmniModalityKindSchema, 'hologram').success).toBe(false)
+
+    // HIGH-1: Empty text without audio/video/attachments must fail
+    expect(
+      v.safeParse(SendTurnInputSchema, {
+        sessionId: 'sess-1',
+        text: '   ',
+      }).success,
+    ).toBe(false)
+
+    expect(
+      v.safeParse(SendTurnInputSchema, {
+        sessionId: 'sess-1',
+      }).success,
+    ).toBe(false)
+
+    // Accepts audio-only turn with empty text
+    const audioOnlyTurn = v.safeParse(SendTurnInputSchema, {
+      sessionId: 'sess-1',
+      text: '',
+      inputAudio: {
+        dataBase64: 'UklGRg==',
+        format: 'wav',
+        sampleRate: 16000,
+        durationMs: 1200,
+        transcriptHint: 'Oi Ashy, tudo bem?',
+      },
+    })
+    expect(audioOnlyTurn.success).toBe(true)
+
+    // Accepts videoFrames turn without text
+    const videoOnlyTurn = v.safeParse(SendTurnInputSchema, {
+      sessionId: 'sess-1',
+      videoFrames: [
+        {
+          dataUrl: 'data:image/jpeg;base64,/9j/4AAQ',
+          timestampMs: 500,
+          width: 512,
+          height: 512,
+          source: 'camera',
+          dHashHex: '0123456789abcdef',
+        },
+      ],
+      omniExecutionModeOverride: 'native-omni',
+    })
+    expect(videoOnlyTurn.success).toBe(true)
+    if (videoOnlyTurn.success) {
+      expect(videoOnlyTurn.output.text).toBe('')
+      expect(videoOnlyTurn.output.omniExecutionModeOverride).toBe('native-omni')
+    }
+
+    // Accepts attachments turn without text
+    const attachmentOnlyTurn = v.safeParse(SendTurnInputSchema, {
+      sessionId: 'sess-1',
+      attachments: [
+        {
+          id: 'att-1',
+          kind: 'image',
+          mimeType: 'image/png',
+          dataUrlOrBase64: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==',
+          name: 'screenshot.png',
+        },
+      ],
+    })
+    expect(attachmentOnlyTurn.success).toBe(true)
+
+    // CRITICAL-3: Rejects SSRF / external / file URLs in TurnVideoFrameSchema, TurnAttachmentSchema, and TurnInputAudioSchema
+    expect(
+      v.safeParse(TurnVideoFrameSchema, {
+        dataUrl: 'file:///etc/passwd',
+        timestampMs: 0,
+      }).success,
+    ).toBe(false)
+
+    expect(
+      v.safeParse(TurnVideoFrameSchema, {
+        dataUrl: 'http://169.254.169.254/latest/meta-data',
+        timestampMs: 0,
+      }).success,
+    ).toBe(false)
+
+    expect(
+      v.safeParse(TurnAttachmentSchema, {
+        kind: 'image',
+        mimeType: 'image/jpeg',
+        dataUrlOrBase64: 'file:///etc/passwd',
+      }).success,
+    ).toBe(false)
+
+    expect(
+      v.safeParse(TurnAttachmentSchema, {
+        kind: 'image',
+        mimeType: 'image/jpeg',
+        dataUrlOrBase64: 'http://169.254.169.254/latest/meta-data',
+      }).success,
+    ).toBe(false)
+
+    expect(
+      v.safeParse(TurnAttachmentSchema, {
+        kind: 'image',
+        mimeType: 'image/jpeg',
+        dataUrlOrBase64: 'javascript:alert(1)',
+      }).success,
+    ).toBe(false)
+
+    expect(
+      v.safeParse(TurnInputAudioSchema, {
+        dataBase64: 'file:///etc/passwd',
+        format: 'wav',
+      }).success,
+    ).toBe(false)
+
+    // Rejects > 16 videoFrames or > 8 attachments
+    expect(
+      v.safeParse(SendTurnInputSchema, {
+        sessionId: 'sess-1',
+        text: 'hello',
+        videoFrames: Array.from({ length: 17 }, (_, i) => ({
+          dataUrl: 'data:image/jpeg;base64,/9j/4AAQ',
+          timestampMs: i * 500,
+        })),
+      }).success,
+    ).toBe(false)
+
+    expect(
+      v.safeParse(SendTurnInputSchema, {
+        sessionId: 'sess-1',
+        text: 'hello',
+        attachments: Array.from({ length: 9 }, (_, i) => ({
+          id: `att-${i}`,
+          kind: 'image' as const,
+          mimeType: 'image/png',
+          dataUrlOrBase64: 'iVBORw0KGgo=',
+        })),
+      }).success,
+    ).toBe(false)
+
+    // inferModelOmniCapabilities for LFM3-Omni-2B, LFM3-Audio, GPT-4o Audio, Qwen 2.5 Omni, Gemini 2.5 Flash
+    const lfm3Caps = inferModelOmniCapabilities('ollama', 'lfm3-omni:2b')
+    expect(lfm3Caps).toEqual({
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: true,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text', 'audio'],
+    })
+
+    const lfm3GgufCaps = inferModelOmniCapabilities('ollama', 'LiquidAI/LFM3-Omni-2B-GGUF')
+    expect(lfm3GgufCaps.isOmniModel).toBe(true)
+    expect(lfm3GgufCaps.supportsOmniAudioIn).toBe(true)
+    expect(lfm3GgufCaps.supportsOmniAudioOut).toBe(true)
+    expect(lfm3GgufCaps.supportsOmniVideoIn).toBe(true)
+
+    const lfm3AudioCaps = inferModelOmniCapabilities('ollama', 'lfm3-audio:2b')
+    expect(lfm3AudioCaps.isOmniModel).toBe(true)
+    expect(lfm3AudioCaps.supportsOmniAudioIn).toBe(true)
+    expect(lfm3AudioCaps.supportsOmniAudioOut).toBe(true)
+    expect(lfm3AudioCaps.supportsOmniVideoIn).toBe(false)
+
+    const gpt4oAudioCaps = inferModelOmniCapabilities('openai', 'gpt-4o-audio-preview')
+    expect(gpt4oAudioCaps).toEqual({
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: true,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text', 'audio'],
+    })
+
+    const qwenOmniCaps = inferModelOmniCapabilities('openrouter', 'qwen/qwen2.5-omni-7b')
+    expect(qwenOmniCaps).toEqual({
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: true,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text', 'audio'],
+    })
+
+    const geminiCaps = inferModelOmniCapabilities('openrouter', 'google/gemini-2.5-flash')
+    expect(geminiCaps).toEqual({
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: false,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text'],
+    })
+
+    const nonOmniCaps = inferModelOmniCapabilities('ollama', 'deepseek-r1:8b')
+    expect(nonOmniCaps.isOmniModel).toBe(false)
+    expect(nonOmniCaps.supportsOmniAudioIn).toBe(false)
+    expect(nonOmniCaps.supportsOmniAudioOut).toBe(false)
+
+    // FALLBACK_PROVIDER_MODELS includes Omni presets
+    expect(FALLBACK_PROVIDER_MODELS.ollama.some((m) => m.id === 'lfm3-omni:2b')).toBe(true)
+    expect(
+      FALLBACK_PROVIDER_MODELS.ollama.some((m) => m.id === 'LiquidAI/LFM3-Omni-2B-GGUF'),
+    ).toBe(true)
+    expect(FALLBACK_PROVIDER_MODELS.ollama.some((m) => m.id === 'qwen2.5-omni:7b')).toBe(true)
+    expect(FALLBACK_PROVIDER_MODELS.openai.some((m) => m.id === 'gpt-4o-audio-preview')).toBe(true)
+    expect(FALLBACK_PROVIDER_MODELS.openrouter.some((m) => m.id === 'qwen/qwen2.5-omni-7b')).toBe(
+      true,
+    )
+    expect(
+      FALLBACK_PROVIDER_MODELS.openrouter.some((m) => m.id === 'openai/gpt-4o-audio-preview'),
+    ).toBe(true)
+
+    // ProviderModelCatalogItemSchema, PublicProviderConfigSchema, SaveProviderConfigInputSchema accept Omni fields
+    expect(
+      v.safeParse(ProviderModelCatalogItemSchema, {
+        id: 'lfm3-omni:2b',
+        name: 'LFM3-Omni 2B',
+        providerId: 'ollama',
+        isOmniModel: true,
+        inputModalities: ['text', 'audio', 'image', 'video'],
+        outputModalities: ['text', 'audio'],
+        supportsOmniAudioIn: true,
+        supportsOmniAudioOut: true,
+        supportsOmniVideoIn: true,
+        omniExecutionMode: 'native-omni',
+        omniVoiceId: 'female',
+      }).success,
+    ).toBe(true)
+
+    expect(
+      v.safeParse(PublicProviderConfigSchema, {
+        providerId: 'ollama',
+        label: 'Ollama (Local)',
+        baseUrl: 'http://127.0.0.1:11434/v1',
+        modelId: 'lfm3-omni:2b',
+        requiresApiKey: false,
+        hasApiKey: false,
+        maskedApiKey: null,
+        lastVerifiedAt: null,
+        lastError: null,
+        isOmniModel: true,
+        supportsOmniAudioIn: true,
+        supportsOmniAudioOut: true,
+        supportsOmniVideoIn: true,
+        omniExecutionMode: 'native-omni',
+        omniVoiceId: 'female',
+      }).success,
+    ).toBe(true)
+
+    expect(
+      v.safeParse(SaveProviderConfigInputSchema, {
+        providerId: 'ollama',
+        baseUrl: 'http://127.0.0.1:11434/v1',
+        modelId: 'lfm3-omni:2b',
+        omniExecutionMode: 'native-omni',
+        omniVoiceId: 'female',
+      }).success,
+    ).toBe(true)
+
+    // VoiceRuntimeSettingsSchema accepts unifiedOmniMode and directOmniAudio
+    expect(
+      v.safeParse(VoiceRuntimeSettingsSchema, {
+        ...DEFAULT_VOICE_RUNTIME_SETTINGS,
+        unifiedOmniMode: true,
+        directOmniAudio: true,
+      }).success,
+    ).toBe(true)
+
+    // AshyHostStreamEventSchema validates turn:input-transcript and turn:audio-delta
+    expect(
+      v.safeParse(AshyHostStreamEventSchema, {
+        type: 'turn:input-transcript',
+        turnId: 'turn-1',
+        sessionId: 'sess-1',
+        userMessageId: 'msg-1',
+        transcript: 'Oi Ashy, olha a minha tela',
+        isFinal: true,
+        source: 'omni-native',
+      }).success,
+    ).toBe(true)
+
+    expect(
+      v.safeParse(AshyHostStreamEventSchema, {
+        type: 'turn:audio-delta',
+        turnId: 'turn-1',
+        sessionId: 'sess-1',
+        seq: 0,
+        audioBase64: 'AAAA',
+        format: 'pcm16',
+        sampleRate: 24000,
+        durationMs: 80,
+        transcriptDelta: 'Oi Carlos!',
+        vowelFrames: [
+          {
+            timeSec: 0,
+            durationSec: 0.08,
+            A: 0.7,
+            E: 0.2,
+            I: 0.1,
+            O: 0.4,
+            U: 0.1,
+            dominantVowel: 'A',
+          },
+        ],
+      }).success,
+    ).toBe(true)
   })
 })

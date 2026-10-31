@@ -55,7 +55,8 @@ flowchart LR
     F83 --> F84["Fase 8.4\nLive2D Universal,\nPalco & Electron"]
     F84 --> F85["Fase 8.5\nTools no Chat,\nPermissões & Visão"]
     F85 --> F86["Fase 8.6\nPipeline Real Voz\n(Local + Nuvem)"]
-    F86 --> F9["Fase 9\nProtótipo público"]
+    F86 --> F87["Fase 8.7\nModelo Omni Unificado\n(LFM3-Omni-2B & Cloud)"]
+    F87 --> F9["Fase 9\nProtótipo público"]
     F9 --> F10["Fase 10\n3D / XR\n(futuro)"]
 ```
 
@@ -70,11 +71,12 @@ flowchart LR
 | 7 | Desktop, visão e MCP | §10 | |
 | 8 | Iniciativa contextual e mundo próprio | §11 | **M4 — Presença completa** |
 | 8.1 | Latência, Controle de Thinking & Adapters LLM | §9, §14 | ✅ Concluída |
-| 8.2 | Unificação de Modelos LLM, Catálogo/Busca & Limpeza UI | §9 | |
-| 8.3 | Memória Seletiva Real, Fim de `DEMO_*` & Córtex/Dream Real | §4, §5, §11 | |
-| 8.4 | Estado Universal da Personagem (Live2D), Palco & Electron | §8 | |
-| 8.5 | Tools/MCP no Chat, Permissões Unificadas & Visão/Desktop Reais | §10 | |
-| 8.6 | Pipeline 100% Real de Voz (STT/TTS Local + Nuvem, Mic, Lip-Sync) | §7, §8 | **M4.5 — Zero Mocks em Produção** |
+| 8.2 | Unificação de Modelos LLM, Catálogo/Busca & Limpeza UI | §9 | ✅ Concluída |
+| 8.3 | Memória Seletiva Real, Fim de `DEMO_*` & Córtex/Dream Real | §4, §5, §11 | ✅ Concluída |
+| 8.4 | Estado Universal da Personagem (Live2D), Palco & Electron | §8 | ✅ Concluída |
+| 8.5 | Tools/MCP no Chat, Permissões Unificadas & Visão/Desktop Reais | §10 | ✅ Concluída |
+| 8.6 | Pipeline 100% Real de Voz (STT/TTS Local + Nuvem, Mic, Lip-Sync) | §7, §8 | **M4.5 — Zero Mocks em Produção** (✅ Concluída) |
+| 8.7 | Modelo Omni Unificado (Voz, Texto, Imagem e Vídeo Local `LFM3-Omni-2B` & Cloud) | §7, §8, §9, §10 | **M4.7 — Omni Unificado** (✅ Concluída) |
 | 9 | Protótipo público | §15 | **M5 — Release 1.0** |
 | 10 | 3D e XR | §8 (futuro) | |
 
@@ -249,7 +251,7 @@ flowchart LR
 
 ---
 
-## Estabilização e Desmockagem Pré-Fase 9 (Fases 8.1 a 8.6 — **Marco M4.5**)
+## Estabilização e Desmockagem Pré-Fase 9 (Fases 8.1 a 8.6 — **Marco M4.5 — ✅ Concluído**)
 
 **Objetivo:** eliminar todos os mocks, simulações, estados hardcoded, *split-brains* de configuração e gargalos de latência identificados na auditoria pós-Fase 8, garantindo que 100% dos fluxos de conversação, memória, avatar Live2D, tools e voz operem de verdade antes da Release 1.0.
 
@@ -294,7 +296,7 @@ flowchart LR
    - Tornar reais `get_active_window_title` (janela ativa real do SO), `read_workspace_file` (remover fallback falso `export const PACKAGE_NAME = "@ashy/desktop"`, incluir `process.cwd()` em `allowedPaths`) e `run_cleanup_command` (executar comando real via `child_process` após aprovação no Gatekeeper);
    - Enviar `notifications/initialized` em `mcp-client.ts` e reconectar `externalMcpServers` salvos no boot do Host.
 
-### Fase 8.6 — Pipeline 100% Real de Voz (Modelos Locais & Nuvem de STT/TTS, Microfone, VAD e Lip-Sync)
+### Fase 8.6 — Pipeline 100% Real de Voz (Modelos Locais & Nuvem de STT/TTS, Microfone, VAD e Lip-Sync) (✅ Concluída)
 1. **Suporte Completo a Modelos Locais e em Nuvem (STT & TTS) via Host Bridge & Cofre Seguro:**
    - **STT Local da escolha do usuário:** servidores locais OpenAI-compatible (`faster-whisper-server` / Speaches, `whisper.cpp`, LocalAI, Ollama) com Base URL + Model ID customizável e listagem de modelos, além de **Web Speech API nativa** (`SpeechRecognition` PT-BR).
    - **STT em Nuvem:** OpenAI Audio (`gpt-4o-mini-transcribe`, `gpt-4o-transcribe`, `whisper-1`), Groq Whisper (`whisper-large-v3-turbo`), integrados ao `ProviderVault`.
@@ -305,6 +307,20 @@ flowchart LR
 3. **Captura Real de Microfone, VAD ONNX, Turn-Taking com LLM & Lip-Sync Acústico no Live2D:**
    - Implementar `getUserMedia` + `AudioContext` + `AudioWorkletNode` em `voice-session-runtime.ts`, integrar Silero VAD ONNX em `vad-engine.ts`, injetar `llmJudgeFn`/`llmRephraseFn` reais em `turn-intelligence.ts` e remover o hack de `advanceSilence(1200)`;
    - Ligar os botões `"Conversar por voz"` e `"Voz local"` à escuta real (removendo `toggleSimulatedSpeech()`), disparar `sendUserMessage` automaticamente em `onTurnSealed`, remover a frase falsa de `triggerBargeIn`, sintetizar o áudio real das respostas em `createPipelineForTurn` e sincronizar o lip-sync do Live2D e as `WAVEFORM_BARS` com o áudio real no `AudioContext` (voltando `isSpeaking: false` ao fim do playback).
+
+---
+
+### Fase 8.7 — Modelo Omni Unificado: Voz, Texto, Imagem e Vídeo em 1 Único Modelo Local (`LFM3-Omni-2B`) & Cloud (✅ Concluída)
+1. **Protocolo & Adaptador Multimodal Unificado (`@ashy/shared`, `@ashy/llm`, `ProviderVault`):**
+   - Suporte nativo a **1 único modelo Omni** (`native-omni`, `hybrid-omni-in`, `modular`) capaz de receber **Áudio (`input_audio` 16kHz WAV/PCM16)**, **Texto**, **Imagem (`image_url`)** e **Vídeo (`video_frame` a 2 fps deduplicado por dHash)** na mesma requisição.
+   - Presets de 1 clique com foco local no **`LFM3-Omni-2B`** (`lfm3-omni:2b` / `LiquidAI/LFM3-Omni-2B-GGUF` com `think: false`, `LiquidCodec` 24kHz `pt-BR` e KV cache tri-híbrido) e provedores Cloud (`gpt-4o-audio-preview`, `qwen/qwen2.5-omni-7b`, `google/gemini-2.5-flash`).
+   - Streaming de áudio nativo (`turn:audio-delta` + `turn:input-transcript`) com auto-downgrade transparente em HTTP 400 para `hybrid-omni-in` (TTS fallback) quando o endpoint retornar apenas texto.
+2. **Preservação da Alma (`voice.md`) e Sinais de Palco `<|ACT|>` sem Vazamento na Voz Nativa (`@ashy/cortex`, `TurnOrchestrator`):**
+   - Extração dual-channel de `<|ACT|>`, `<|DELAY|>` e `<|CALLBACK|>` + tool `ashy_stage_signal` para que o modelo Omni acione emoções, gestos do Live2D e piadas internas sem pronunciar tags de controle em voz alta no stream de áudio.
+3. **Áudio Direto (`directOmniAudio`), Amostrador de Vídeo (`2 fps`) e Lip-Sync Acústico no Live2D (`@ashy/voice`, `omni-media-sampler.ts`, `useAshyStore.ts`, `App.tsx`):**
+   - Envio direto do bloco de fala do VAD (com pré-rolagem de `360ms` e proteção CAS) em WAV 16kHz para o modelo Omni (`onOmniAudioTurnReady`), pulando STT intermediário.
+   - Reprodução imediata dos chunks `turn:audio-delta` (`24kHz PCM16`/`WAV`) no `GaplessAudioPlayer` alimentando o lip-sync formante (`A, E, I, O, U, S` + `rawVolume`) do Live2D em tempo real e recibo exato de Barge-In (`computeOmniPlaybackReceipt`).
+   - Captura e amostragem de vídeo (webcam ao vivo a `2 fps`, tela contínua e upload `.mp4`/`.webm`) integrada ao `PrivacyController` (`activateFullPrivacyShield`), mais controles dedicados no Estúdio e em `Ajustes > Modelos` / `Ajustes > Voz`.
 
 ---
 

@@ -61,6 +61,7 @@ import {
   DEFAULT_VOICE_RUNTIME_SETTINGS,
   FALLBACK_PROVIDER_MODELS,
   LLM_PROVIDER_IDS,
+  inferModelOmniCapabilities,
   isSafeLive2DModelUrl,
   type AgencySnapshot,
   type AgencyToolSummary,
@@ -92,6 +93,8 @@ import {
   type MemoryGovernancePolicy,
   type MilestoneCategory,
   type MoodVector,
+  type OmniExecutionMode,
+  type OmniModalityKind,
   type PersonalityEvolutionRecord,
   type PersonalityTraits,
   type ProactiveInitiativeRecord,
@@ -111,6 +114,8 @@ import {
   type TestProviderInput,
   type TtfaTelemetryRecord,
   type TtsProviderId,
+  type TurnAttachment,
+  type TurnVideoFrame,
   type UpdateAgencyConsentInput,
   type UpdateInitiativePolicyInput,
   type UpdateMilestoneInput,
@@ -133,13 +138,21 @@ import {
 import {
   createRealtimeSpeechPipeline,
   createVoiceSessionRuntime,
+  isWhisperSilenceHallucination,
   type PlaybackReceipt,
   type RealtimeSpeechPipeline,
   type ScheduledAudioChunk,
+  type SealedOmniAudioTurn,
   type VoiceFixtureScenarioResult,
+  type VoiceSessionRuntime,
 } from '@ashy/voice'
 import { create } from 'zustand'
 import { getAshyHostBridge } from '../services/ashy-host-client'
+import {
+  createLiveWebcamSampler,
+  createSyntheticVideoFrameDataUrl,
+  deduplicateVideoFramesByDHash,
+} from '../services/omni-media-sampler'
 
 export type DesktopViewMode = 'hub' | 'stage'
 export type HubTabId = 'studio' | 'story' | 'memories' | 'personality' | 'agency'
@@ -173,6 +186,8 @@ export interface ChatTurnMessage {
   id: string
   role: 'user' | 'assistant'
   content: string
+  text?: string
+  sender?: 'user' | 'ashy' | 'assistant'
   rawContent?: string
   emotion?: AshyEmotion
   modelId?: string
@@ -180,7 +195,7 @@ export interface ChatTurnMessage {
   seriousnessTriggered?: boolean
   timeLabel?: string
   jokeCard?: ChatJokeCallbackCard
-  timestamp: number
+  timestamp: number | string
 }
 
 export interface RoomTrophy {
@@ -292,6 +307,21 @@ export interface AshyDesktopState {
   voiceCancelledShortCount: number
   lastVoiceFixtureResult: VoiceFixtureScenarioResult | null
   isPushToTalkHeld: boolean
+  isVoiceListening: boolean
+  micInputLevel: number
+  rawVolume: number
+  availableMicDevices: Array<{ deviceId: string; label: string }>
+  selectedMicDeviceId: string
+  autoSpeakReplies: boolean
+  sttCatalogModels: Array<{ id: string; label: string }>
+  ttsCatalogModels: Array<{ id: string; label: string }>
+  ttsCatalogVoices: Array<{ id: string; label: string }>
+  isLoadingVoiceCatalog: boolean
+  isSavingVoiceSettings: boolean
+  isTestingMic: boolean
+  isTestingTts: boolean
+  voiceTestStatus: string | null
+  voiceRuntimeError: string | null
 
   // Privacy, Settings & MCP Agency
   settingsSubTab: SettingsSubTab
@@ -443,6 +473,27 @@ export interface AshyDesktopState {
   setActiveTtsProvider: (providerId: TtsProviderId) => void
   setWakeWordEnabled: (enabled: boolean) => void
   setPushToTalkHeld: (held: boolean) => Promise<void>
+  toggleVoiceConversation: (active?: boolean) => Promise<boolean>
+  startVoiceListening: () => Promise<boolean>
+  stopVoiceListening: () => Promise<boolean>
+  refreshMicDevices: () => Promise<Array<{ deviceId: string; label: string }>>
+  setSelectedMicDeviceId: (deviceId: string) => void
+  setAutoSpeakReplies: (enabled: boolean) => void
+  updateVoiceSettingsDraft: (patch: Partial<VoiceRuntimeSettings>) => void
+  saveVoiceSettings: (secrets?: {
+    openaiApiKey?: string
+    groqApiKey?: string
+    elevenLabsApiKey?: string
+    localSttApiKey?: string
+    localTtsApiKey?: string
+  }) => Promise<VoiceRuntimeSettings>
+  refreshVoiceProviderCatalog: (kind: 'stt' | 'tts', apiKeyOverride?: string) => Promise<void>
+  testMicrophone: () => Promise<{ ok: boolean; message: string; peakRms: number }>
+  testTtsVoice: (sampleText?: string) => Promise<{
+    ok: boolean
+    message: string
+    durationMs: number
+  }>
   runAudioFixtureSimulation: (fixtureId: VoiceFixtureId) => Promise<VoiceFixtureScenarioResult>
   runVoiceFixtureScenario: (fixtureId: VoiceFixtureId) => Promise<VoiceFixtureScenarioResult>
   setEyesMode: (mode: EyesMode) => void
@@ -456,6 +507,29 @@ export interface AshyDesktopState {
   ) => Promise<GatekeeperExecutionResult>
   approvePendingAction: (actionId: string, scope: ApprovalScope) => Promise<void>
   denyPendingAction: (actionId: string, reason?: string) => void
+
+  // Phase 8.7 Unified Omni Model & Multimodal State
+  unifiedOmniMode: boolean
+  directOmniAudio: boolean
+  pendingVideoFrames: TurnVideoFrame[]
+  pendingTurnAttachments: TurnAttachment[]
+  isWebcamStreaming: boolean
+  webcamPreviewDataUrl: string | null
+  hasCompletedOnboarding?: boolean
+  activeStreamingTurnId?: string | null
+  activeStreamingMessageId?: string | null
+  setUnifiedOmniMode: (enabled: boolean) => void
+  setDirectOmniAudio: (enabled: boolean) => void
+  applyOmniModelPreset: (
+    preset: 'lfm3-omni-2b' | 'gpt-4o-audio' | 'qwen2.5-omni' | 'gemini-2.5-flash',
+  ) => void
+  stageVideoFrames: (frames: TurnVideoFrame[]) => void
+  stageTurnAttachment: (attachment: TurnAttachment) => void
+  removeTurnAttachment: (id: string) => void
+  clearOmniStagedMedia: () => void
+  toggleWebcamStream: (active?: boolean) => Promise<boolean>
+  sendOmniAudioTurn: (turn: SealedOmniAudioTurn) => Promise<void>
+  handleHostStreamEvent: (event: AshyHostStreamEvent) => void
 
   resetStoreForTesting: () => void
 }
@@ -1002,14 +1076,100 @@ function mapEpisodesToMemoryCards(
   })
 }
 
+const DEFAULT_MIC_DEVICES: Array<{ deviceId: string; label: string }> = [
+  { deviceId: 'default', label: 'Microfone Padrão do Sistema' },
+]
+
+const DEFAULT_STT_CATALOG_MODELS: Array<{ id: string; label: string }> = [
+  { id: 'whisper-1', label: 'OpenAI Whisper-1' },
+  { id: 'gpt-4o-mini-transcribe', label: 'GPT-4o Mini Transcribe' },
+  { id: 'whisper-large-v3-turbo', label: 'Whisper Large v3 Turbo' },
+]
+
+const DEFAULT_TTS_CATALOG_MODELS: Array<{ id: string; label: string }> = [
+  { id: 'kokoro-v1', label: 'Kokoro v1 (Local HTTP)' },
+  { id: 'tts-1', label: 'OpenAI TTS-1' },
+  { id: 'gpt-4o-mini-tts', label: 'OpenAI GPT-4o Mini TTS' },
+  { id: 'eleven_multilingual_v2', label: 'ElevenLabs Multilingual v2' },
+]
+
+const DEFAULT_TTS_CATALOG_VOICES: Array<{ id: string; label: string }> = [
+  { id: 'ashy-pt-br', label: 'Ashy (PT-BR)' },
+  { id: 'pf_dora', label: 'Dora (Kokoro PT-BR)' },
+  { id: 'nova', label: 'Nova (OpenAI)' },
+  { id: 'coral', label: 'Coral (OpenAI)' },
+]
+
+let isRunningFixtureScenario = false
+let activePlaybackEndTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearActivePlaybackEndTimer(): void {
+  if (activePlaybackEndTimer !== null) {
+    clearTimeout(activePlaybackEndTimer)
+    activePlaybackEndTimer = null
+  }
+}
+
+function createStoreVoiceRuntime(): VoiceSessionRuntime {
+  return createVoiceSessionRuntime({
+    micMode: 'continuous',
+    wakeWordEnabled: DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordEnabled,
+    wakeWordPhrases: DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordPhrases,
+    activeSttProviderId: DEFAULT_VOICE_RUNTIME_SETTINGS.activeSttProviderId,
+    activeTtsProviderId: DEFAULT_VOICE_RUNTIME_SETTINGS.activeTtsProviderId,
+    directOmniAudio: DEFAULT_VOICE_RUNTIME_SETTINGS.directOmniAudio ?? false,
+    onTurnSealed: (sealed) => {
+      if (isRunningFixtureScenario) return
+      const store = useAshyStore?.getState?.()
+      if (!store || !store.isVoiceListening) return
+      const text = (sealed.rephrasedText || sealed.rawText || '').trim()
+      if (!text || isWhisperSilenceHallucination(text)) return
+      if (store.isStreamingTurn || store.isSpeaking) {
+        store.triggerBargeIn()
+      }
+      void store.sendUserMessage(text)
+    },
+    onOmniAudioTurnReady: (turn) => {
+      if (isRunningFixtureScenario) return
+      const store = useAshyStore?.getState?.()
+      if (!store || !store.isVoiceListening) return
+      if (store.isStreamingTurn || store.isSpeaking) {
+        store.triggerBargeIn()
+      }
+      void store.sendOmniAudioTurn(turn)
+    },
+    onVowelFrame: (frame) => {
+      if (isRunningFixtureScenario) return
+      const entries: Array<[Exclude<AshyVisemeKey, 'closed'>, number]> = [
+        ['A', frame.A],
+        ['E', frame.E],
+        ['I', frame.I],
+        ['O', frame.O],
+        ['U', frame.U],
+      ]
+      entries.sort((a, b) => b[1] - a[1])
+      const dominant: AshyVisemeKey = entries[0]![1] > 0.05 ? entries[0]![0] : 'closed'
+      const energy = Math.min(
+        1,
+        Math.max(0, (frame.A + frame.E + frame.I + frame.O + frame.U) / 2),
+      )
+      useAshyStore?.setState?.({
+        simulatedVowels: {
+          A: frame.A,
+          E: frame.E,
+          I: frame.I,
+          O: frame.O,
+          U: frame.U,
+        },
+        activeViseme: dominant,
+        rawVolume: energy,
+      })
+    },
+  })
+}
+
 let agency = createAgencyRuntime()
-let voiceRuntime = createVoiceSessionRuntime({
-  micMode: 'continuous',
-  wakeWordEnabled: DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordEnabled,
-  wakeWordPhrases: DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordPhrases,
-  activeSttProviderId: DEFAULT_VOICE_RUNTIME_SETTINGS.activeSttProviderId,
-  activeTtsProviderId: DEFAULT_VOICE_RUNTIME_SETTINGS.activeTtsProviderId,
-})
+let voiceRuntime = createStoreVoiceRuntime()
 let activeSpeechPipeline: RealtimeSpeechPipeline | null = null
 let firstDeltaEnqueuedAtMs: number | null = null
 let firstChunkRecordedForTurn = false
@@ -1107,6 +1267,19 @@ const pendingTurnResolvers = new Map<string, () => void>()
 const pendingTurnSeriousness = new Map<string, boolean>()
 const streamedDeltaTurnIds = new Set<string>()
 const bargeInTurnIds = new Set<string>()
+const omniAudioReceivedTurnIds = new Set<string>()
+
+const webcamSampler = createLiveWebcamSampler({
+  fps: 2,
+  maxFramesInBuffer: 8,
+  maxHammingDistance: 4,
+  onFrameSampled: (frame) => {
+    useAshyStore?.setState?.((s) => ({
+      webcamPreviewDataUrl: frame.dataUrl,
+      pendingVideoFrames: deduplicateVideoFramesByDHash([...s.pendingVideoFrames, frame], 4, 8),
+    }))
+  },
+})
 
 export function resolveInitialWindowMode(): {
   viewMode: DesktopViewMode
@@ -1237,20 +1410,84 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     })
   }
 
+  function schedulePlaybackCompletionReset(delayMs: number): void {
+    clearActivePlaybackEndTimer()
+    const safeDelayMs = Math.max(150, Math.round(Number.isFinite(delayMs) ? delayMs : 350))
+    activePlaybackEndTimer = setTimeout(() => {
+      activePlaybackEndTimer = null
+      const current = useAshyStore.getState()
+      if (!current.isStreamingTurn) {
+        useAshyStore.setState((s) => ({
+          isSpeaking: false,
+          presenceStatus: s.isVoiceListening ? 'Listening' : 'Idle',
+          activeViseme: 'closed',
+          simulatedVowels: { A: 0, E: 0, I: 0, O: 0, U: 0 },
+          rawVolume: 0,
+        }))
+      }
+    }, safeDelayMs)
+  }
+
   function createPipelineForTurn(): RealtimeSpeechPipeline {
     firstDeltaEnqueuedAtMs = null
     firstChunkRecordedForTurn = false
     const pipeline = createRealtimeSpeechPipeline({
       synthesizeFn: async (text) => {
+        const state = get()
+        const activeTts = state.voiceSettings.activeTtsProviderId
         const wordCount = Math.max(1, text.trim().split(/\s+/).length)
-        const durationMs = Math.max(450, wordCount * 120)
+        const durationMs = Math.max(350, wordCount * 55)
+
+        if (
+          activeTts !== 'local-synth-fallback' &&
+          state.isBootstrapped &&
+          state.autoSpeakReplies !== false
+        ) {
+          const bridge = getAshyHostBridge()
+          if (typeof bridge.synthesizeVoiceSpeech === 'function') {
+            try {
+              const res = await bridge.synthesizeVoiceSpeech({
+                text,
+                providerId: activeTts,
+                baseUrl: state.voiceSettings.ttsBaseUrl,
+                modelId: state.voiceSettings.ttsModelId,
+                voiceId: state.voiceSettings.ttsVoiceId,
+              })
+              const firstFrame = res.vowelFrames?.[0]
+              if (firstFrame) {
+                set({
+                  simulatedVowels: {
+                    A: firstFrame.A,
+                    E: firstFrame.E,
+                    I: firstFrame.I,
+                    O: firstFrame.O,
+                    U: firstFrame.U,
+                  },
+                  activeViseme: firstFrame.dominantVowel,
+                  rawVolume: 0.85,
+                  voiceRuntimeError: null,
+                })
+              }
+              return {
+                providerId: activeTts,
+                durationMs: res.durationMs,
+                durationSec: res.durationSec,
+                vowelFrames: res.vowelFrames,
+              }
+            } catch (err) {
+              const errMsg = err instanceof Error ? err.message : String(err)
+              set({ voiceRuntimeError: errMsg })
+            }
+          }
+        }
+
         return {
-          providerId: get().voiceSettings.activeTtsProviderId,
+          providerId: activeTts,
           durationMs,
           durationSec: durationMs / 1000,
         }
       },
-      onAudioScheduled: () => {
+      onAudioScheduled: (chunk) => {
         const chunks = [...pipeline.getScheduledChunks()]
         if (!firstChunkRecordedForTurn && firstDeltaEnqueuedAtMs !== null) {
           firstChunkRecordedForTurn = true
@@ -1258,6 +1495,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           const providerId = get().voiceSettings.activeTtsProviderId
           voiceRuntime.recordTtfaSample(providerId, ttfaMs)
         }
+        schedulePlaybackCompletionReset(Math.max(150, Math.round(chunk.endTimeSec * 1000)))
         set({
           scheduledAudioChunks: chunks,
           ttfaByProvider: voiceRuntime.getTtfaTelemetry(),
@@ -1338,17 +1576,70 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       return
     }
 
-    const assistantMsgId = `msg-assistant-${event.turnId}`
+    const assistantMsgId =
+      get().activeStreamingTurnId === event.turnId && get().activeStreamingMessageId
+        ? get().activeStreamingMessageId!
+        : `msg-assistant-${event.turnId}`
+
+    if (event.type === 'turn:input-transcript') {
+      set((state) => ({
+        chatMessages: state.chatMessages.map((m) =>
+          m.id === event.userMessageId
+            ? { ...m, content: event.transcript, text: event.transcript }
+            : m,
+        ),
+      }))
+      return
+    }
+
+    if (event.type === 'turn:audio-delta') {
+      omniAudioReceivedTurnIds.add(event.turnId)
+      voiceRuntime.ingestOmniAudioDelta({
+        turnId: event.turnId,
+        seq: event.seq,
+        audioBase64: event.audioBase64,
+        format: event.format,
+        sampleRate: event.sampleRate,
+        durationMs: event.durationMs,
+        transcriptDelta: event.transcriptDelta,
+        vowelFrames: event.vowelFrames,
+      })
+      const vf = event.vowelFrames?.[0] ?? voiceRuntime.getState().activeVowelFrame
+      const entries: Array<[Exclude<AshyVisemeKey, 'closed'>, number]> = [
+        ['A', vf.A],
+        ['E', vf.E],
+        ['I', vf.I],
+        ['O', vf.O],
+        ['U', vf.U],
+      ]
+      entries.sort((a, b) => b[1] - a[1])
+      const dominant: AshyVisemeKey = entries[0]![1] > 0.05 ? entries[0]![0] : 'closed'
+      const energy = Math.min(
+        1,
+        Math.max(0.15, (vf.A + vf.E + vf.I + vf.O + vf.U) / 2),
+      )
+      set({
+        isSpeaking: true,
+        presenceStatus: 'Speaking',
+        simulatedVowels: { A: vf.A, E: vf.E, I: vf.I, O: vf.O, U: vf.U },
+        activeViseme: dominant,
+        rawVolume: energy,
+      })
+      return
+    }
 
     if (event.type === 'turn:started') {
       streamedDeltaTurnIds.delete(event.turnId)
       bargeInTurnIds.delete(event.turnId)
+      omniAudioReceivedTurnIds.delete(event.turnId)
       createPipelineForTurn()
       set((state) => {
         const hasAssistantMsg = state.chatMessages.some((m) => m.id === assistantMsgId)
         return {
           isStreamingTurn: true,
           activeTurnId: event.turnId,
+          activeStreamingTurnId: event.turnId,
+          activeStreamingMessageId: assistantMsgId,
           lastTurnError: null,
           presenceStatus: 'Thinking',
           scheduledAudioChunks: [],
@@ -1360,6 +1651,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
                   id: assistantMsgId,
                   role: 'assistant',
                   content: '',
+                  text: '',
                   emotion: state.stageEmotion,
                   modelId: state.activeModelId,
                   timeLabel: formatLocalTimeHHMM(event.startedAt),
@@ -1372,25 +1664,46 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     }
 
     if (event.type === 'turn:delta') {
+      const deltaText =
+        event.textDelta ??
+        (event as unknown as { delta?: string }).delta ??
+        ''
+      const stateNow = get()
+      const activeCfg = stateNow.providers.configs[stateNow.providers.activeProviderId]
+      const isExpectingNativeOmniAudio =
+        omniAudioReceivedTurnIds.has(event.turnId) ||
+        (stateNow.unifiedOmniMode &&
+          stateNow.directOmniAudio &&
+          Boolean(activeCfg?.supportsOmniAudioOut))
+
       const pipeline = activeSpeechPipeline ?? createPipelineForTurn()
       if (firstDeltaEnqueuedAtMs === null) {
         firstDeltaEnqueuedAtMs = performance.now()
       }
       streamedDeltaTurnIds.add(event.turnId)
-      pipeline.enqueueDelta(event.textDelta)
+      if (!isExpectingNativeOmniAudio) {
+        pipeline.enqueueDelta(deltaText)
+      }
 
       set((state) => {
         const exists = state.chatMessages.some((m) => m.id === assistantMsgId)
         const updatedMessages = exists
           ? state.chatMessages.map((m) =>
-              m.id === assistantMsgId ? { ...m, content: m.content + event.textDelta } : m,
+              m.id === assistantMsgId
+                ? {
+                    ...m,
+                    content: (m.content ?? m.text ?? '') + deltaText,
+                    text: (m.content ?? m.text ?? '') + deltaText,
+                  }
+                : m,
             )
           : [
               ...state.chatMessages,
               {
                 id: assistantMsgId,
                 role: 'assistant' as const,
-                content: event.textDelta,
+                content: deltaText,
+                text: deltaText,
                 emotion: state.stageEmotion,
                 modelId: state.activeModelId,
                 timeLabel: formatLocalTimeHHMM(Date.now()),
@@ -1398,7 +1711,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
               },
             ]
         const latestContent =
-          updatedMessages.find((m) => m.id === assistantMsgId)?.content ?? event.textDelta
+          updatedMessages.find((m) => m.id === assistantMsgId)?.content ?? deltaText
 
         return {
           chatMessages: updatedMessages,
@@ -1509,6 +1822,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           event.assistantMessage.rawContent || event.assistantMessage.content,
         )
         const hadStreamedDeltas = streamedDeltaTurnIds.delete(event.turnId)
+        const hadNativeOmniAudio = omniAudioReceivedTurnIds.delete(event.turnId)
         const pipeline =
           hadStreamedDeltas && activeSpeechPipeline
             ? activeSpeechPipeline
@@ -1518,8 +1832,17 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           firstDeltaEnqueuedAtMs = performance.now()
         }
 
-        if (hadStreamedDeltas) {
-          pipeline.flush()
+        if (hadNativeOmniAudio) {
+          voiceRuntime.getPlayer().markStreamComplete(true)
+        } else if (hadStreamedDeltas) {
+          if (pipeline.getScheduledChunks().length === 0) {
+            pipeline.enqueue(
+              parsed.textWithSentinels || event.assistantMessage.content,
+              parsed.signals,
+            )
+          } else {
+            pipeline.flush()
+          }
         } else {
           pipeline.enqueue(
             parsed.textWithSentinels || event.assistantMessage.content,
@@ -1533,7 +1856,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         const wasSerious = pendingTurnSeriousness.get(event.turnId) === true
         pendingTurnSeriousness.delete(event.turnId)
 
-        get().applyBootstrapSnapshot(event.snapshot)
+        if (event.snapshot) {
+          get().applyBootstrapSnapshot(event.snapshot)
+        }
 
         const targetEmotion: AshyEmotion = wasSerious
           ? 'concerned'
@@ -1563,6 +1888,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           isSpeaking: true,
           presenceStatus: 'Speaking',
           simulatedVowels: { A: 0.75, E: 0.4, I: 0.2, O: 0.5, U: 0.15 },
+          rawVolume: 0.85,
           scheduledAudioChunks: scheduledChunks,
           ttfaByProvider: voiceRuntime.getTtfaTelemetry(),
           lastStageSignals: parsed.signals,
@@ -1577,6 +1903,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           ),
         }))
 
+        const lastEndSec = scheduledChunks.at(-1)?.endTimeSec ?? 0.35
+        schedulePlaybackCompletionReset(Math.max(150, Math.round(lastEndSec * 1000)))
+
         completedTurnEvents.set(event.turnId, event)
         const resolver = pendingTurnResolvers.get(event.turnId)
         if (resolver) {
@@ -1588,6 +1917,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     }
 
     if (event.type === 'turn:aborted') {
+      clearActivePlaybackEndTimer()
       pendingTurnSeriousness.delete(event.turnId)
       streamedDeltaTurnIds.delete(event.turnId)
       const wasBargeIn = bargeInTurnIds.delete(event.turnId)
@@ -1630,6 +1960,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     }
 
     if (event.type === 'turn:error') {
+      clearActivePlaybackEndTimer()
       pendingTurnSeriousness.delete(event.turnId)
       set((state) => {
         const isCurrentTurn =
@@ -1666,7 +1997,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     if (subscribedBridge !== bridge) {
       unsubscribeHostEvents?.()
       subscribedBridge = bridge
-      unsubscribeHostEvents = bridge.onHostEvent(handleHostStreamEvent)
+      unsubscribeHostEvents = bridge.onHostEvent?.(handleHostStreamEvent) ?? null
     }
     return bridge
   }
@@ -1791,6 +2122,21 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     voiceCancelledShortCount: 0,
     lastVoiceFixtureResult: null,
     isPushToTalkHeld: false,
+    isVoiceListening: false,
+    micInputLevel: 0,
+    rawVolume: 0,
+    availableMicDevices: [...DEFAULT_MIC_DEVICES],
+    selectedMicDeviceId: 'default',
+    autoSpeakReplies: true,
+    sttCatalogModels: [...DEFAULT_STT_CATALOG_MODELS],
+    ttsCatalogModels: [...DEFAULT_TTS_CATALOG_MODELS],
+    ttsCatalogVoices: [...DEFAULT_TTS_CATALOG_VOICES],
+    isLoadingVoiceCatalog: false,
+    isSavingVoiceSettings: false,
+    isTestingMic: false,
+    isTestingTts: false,
+    voiceTestStatus: null,
+    voiceRuntimeError: null,
 
     settingsSubTab: 'todas',
     showDesktopAvatar: true,
@@ -1812,6 +2158,15 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     pendingActions: agency.gatekeeper.getPendingActions(),
     auditLog: [...agency.gatekeeper.getAuditLog()],
     lastMcpResultSummary: null,
+    unifiedOmniMode: DEFAULT_VOICE_RUNTIME_SETTINGS.unifiedOmniMode ?? false,
+    directOmniAudio: DEFAULT_VOICE_RUNTIME_SETTINGS.directOmniAudio ?? false,
+    pendingVideoFrames: [],
+    pendingTurnAttachments: [],
+    isWebcamStreaming: false,
+    webcamPreviewDataUrl: null,
+    hasCompletedOnboarding: false,
+    activeStreamingTurnId: null,
+    activeStreamingMessageId: null,
 
     async bootstrapFromHost() {
       const bridge = ensureHostSubscription()
@@ -1901,9 +2256,19 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         live2dModelControls: nextLive2dControls,
       })
 
+      if (snapshot.voiceSettings) {
+        voiceRuntime.setActiveSttProvider(snapshot.voiceSettings.activeSttProviderId)
+        voiceRuntime.setActiveTtsProvider(snapshot.voiceSettings.activeTtsProviderId)
+        voiceRuntime.setWakeWordEnabled(snapshot.voiceSettings.wakeWordEnabled)
+        if (snapshot.voiceSettings.directOmniAudio !== undefined) {
+          voiceRuntime.setDirectOmniAudio(snapshot.voiceSettings.directOmniAudio)
+        }
+      }
+
       set({
         isBootstrapped: true,
         needsOnboarding: snapshot.needsOnboarding,
+        hasCompletedOnboarding: !snapshot.needsOnboarding,
         activeModelId: nextActiveModelId,
         userProfile: snapshot.userProfile,
         relationshipStage: snapshot.relationship.stage,
@@ -1914,6 +2279,22 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         sessions: snapshot.sessions,
         providers: snapshot.providers,
         voiceIdentity: snapshot.voice,
+        ...(snapshot.voiceSettings
+          ? {
+              voiceSettings: {
+                ...snapshot.voiceSettings,
+                wakeWordPhrases: [...snapshot.voiceSettings.wakeWordPhrases],
+              },
+              selectedMicDeviceId:
+                snapshot.voiceSettings.selectedMicDeviceId ?? current.selectedMicDeviceId,
+              autoSpeakReplies:
+                snapshot.voiceSettings.autoSpeakReplies ?? current.autoSpeakReplies,
+              unifiedOmniMode:
+                snapshot.voiceSettings.unifiedOmniMode ?? current.unifiedOmniMode,
+              directOmniAudio:
+                snapshot.voiceSettings.directOmniAudio ?? current.directOmniAudio,
+            }
+          : {}),
         runtimeDiagnostics: snapshot.runtimeDiagnostics,
         persistenceWarning: snapshot.runtimeDiagnostics.lastPersistenceWarning,
         mood: snapshot.affect.mood,
@@ -2189,7 +2570,8 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
 
     setActiveTab(tab) {
-      set({ activeTab: tab })
+      const normalizedTab = (tab as string) === 'settings' ? 'agency' : tab
+      set({ activeTab: normalizedTab })
     },
 
     setActiveModelId(modelId) {
@@ -2500,6 +2882,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       const trimmed = userMessage.trim()
       if (!trimmed) return
 
+      clearActivePlaybackEndTimer()
       const bridge = ensureHostSubscription()
       const current = get()
       const interruptionNote = current.pendingInterruptionControlNote ?? undefined
@@ -2546,11 +2929,28 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
       let turnId: string
       let savedUserMsg: ChatMessageRecord
+      const videoFrames =
+        current.pendingVideoFrames.length > 0 ? [...current.pendingVideoFrames] : undefined
+      const attachments =
+        current.pendingTurnAttachments.length > 0
+          ? [...current.pendingTurnAttachments]
+          : undefined
+      if (videoFrames || attachments) {
+        set({
+          pendingVideoFrames: [],
+          pendingTurnAttachments: [],
+        })
+      }
       try {
         const res = await bridge.sendTurn({
           sessionId: get().activeSessionId,
           text: trimmed,
           ...(interruptionNote ? { interruptionControlNote: interruptionNote } : {}),
+          ...(videoFrames ? { videoFrames } : {}),
+          ...(attachments ? { attachments } : {}),
+          ...(current.unifiedOmniMode
+            ? { omniExecutionModeOverride: 'native-omni' as const }
+            : {}),
         })
         turnId = res.turnId
         savedUserMsg = res.userMessage
@@ -2605,19 +3005,49 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
 
     triggerBargeIn(interruptAtMs = 600) {
-      const activeTurnId = get().activeTurnId
+      clearActivePlaybackEndTimer()
+      const activeTurnId = get().activeTurnId ?? get().activeStreamingTurnId ?? null
       if (activeTurnId !== null) {
         bargeInTurnIds.add(activeTurnId)
         void get().abortActiveTurn()
       }
 
+      if (activeTurnId && omniAudioReceivedTurnIds.has(activeTurnId)) {
+        const interruptSec = Math.max(0.05, interruptAtMs / 1000)
+        voiceRuntime.getPlayer().setVirtualClockSec(interruptSec)
+        const omniReceipt = voiceRuntime.interruptOmniPlayback(activeTurnId, 'user_barge_in')
+        if (omniReceipt) {
+          set({
+            isSpeaking: false,
+            presenceStatus: 'Listening',
+            stageEmotion: 'surprised',
+            activeViseme: 'closed',
+            simulatedVowels: { A: 0, E: 0, I: 0, O: 0, U: 0 },
+            rawVolume: 0,
+            lastPlaybackReceipt: omniReceipt,
+            pendingInterruptionControlNote: omniReceipt.controlNote,
+            bubbleText: `${omniReceipt.heardText} — [Barge-In!]`,
+          })
+          return omniReceipt
+        }
+      }
+
       let pipeline = activeSpeechPipeline
       if (!pipeline || (pipeline.getScheduledChunks().length === 0 && !get().isStreamingTurn)) {
-        pipeline = createPipelineForTurn()
-        pipeline.enqueue(
-          'Olha só, eu estava explicando toda a arquitetura de memória episódica FSRS-6. Mas você me cortou bem no meio da frase!',
-          [],
-        )
+        const runtimePipeline = voiceRuntime.getSpeechPipeline()
+        if (runtimePipeline.getScheduledChunks().length > 0) {
+          pipeline = runtimePipeline
+        } else {
+          pipeline = createPipelineForTurn()
+          const lastAssistantContent =
+            [...get().chatMessages]
+              .reverse()
+              .find((m) => m.role === 'assistant' && m.content.trim().length > 0)
+              ?.content.trim() ||
+            get().bubbleText.trim() ||
+            'Eu estava falando com você agora mesmo aqui no estúdio, mas parei imediatamente para te ouvir com atenção.'
+          pipeline.enqueue(lastAssistantContent, [])
+        }
       }
 
       const interruptSec = Math.max(0.05, interruptAtMs / 1000)
@@ -2627,7 +3057,9 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         isSpeaking: false,
         presenceStatus: 'Listening',
         stageEmotion: 'surprised',
+        activeViseme: 'closed',
         simulatedVowels: { A: 0, E: 0, I: 0, O: 0, U: 0 },
+        rawVolume: 0,
         lastPlaybackReceipt: receipt,
         pendingInterruptionControlNote: receipt.controlNote,
         bubbleText: `${receipt.heardText} — [Barge-In!]`,
@@ -3985,23 +4417,385 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       await voiceRuntime.setPushToTalkActive(held)
     },
 
+    async toggleVoiceConversation(active) {
+      const shouldActivate = active !== undefined ? Boolean(active) : !get().isVoiceListening
+      if (!shouldActivate) {
+        await voiceRuntime.stopMicrophoneCapture()
+        set((state) => ({
+          isVoiceListening: false,
+          micInputLevel: 0,
+          presenceStatus:
+            state.isSpeaking || state.isStreamingTurn ? state.presenceStatus : 'Idle',
+          voiceTestStatus: null,
+        }))
+        return false
+      }
+
+      if (get().privacyState.micMode === 'muted') {
+        get().setMicMode('continuous')
+      }
+
+      const hasGetUserMedia =
+        typeof navigator !== 'undefined' &&
+        typeof navigator.mediaDevices?.getUserMedia === 'function'
+
+      if (hasGetUserMedia) {
+        try {
+          const selectedId = get().selectedMicDeviceId
+          await voiceRuntime.startMicrophoneCapture({
+            deviceId: selectedId && selectedId !== 'default' ? selectedId : undefined,
+            onRmsLevel: (rms) => {
+              set({ micInputLevel: rms })
+            },
+          })
+          set({
+            isVoiceListening: true,
+            presenceStatus: 'Listening',
+            voiceRuntimeError: null,
+            voiceTestStatus: 'Escuta por voz ativa no microfone.',
+          })
+          return true
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          set({
+            isVoiceListening: false,
+            micInputLevel: 0,
+            voiceRuntimeError: message,
+            voiceTestStatus: null,
+          })
+          return false
+        }
+      }
+
+      set({
+        isVoiceListening: true,
+        presenceStatus: 'Listening',
+        voiceRuntimeError: null,
+        voiceTestStatus: 'Sessão de voz ativa (aguardando dispositivo de áudio).',
+      })
+      return true
+    },
+
+    async startVoiceListening() {
+      return get().toggleVoiceConversation(true)
+    },
+
+    async stopVoiceListening() {
+      return get().toggleVoiceConversation(false)
+    },
+
+    async refreshMicDevices() {
+      try {
+        if (
+          typeof navigator !== 'undefined' &&
+          typeof navigator.mediaDevices?.enumerateDevices === 'function'
+        ) {
+          const rawDevices = await navigator.mediaDevices.enumerateDevices()
+          const audioInputs = rawDevices
+            .filter((d) => d.kind === 'audioinput')
+            .map((d, index) => ({
+              deviceId: d.deviceId || 'default',
+              label: d.label || `Microfone ${index + 1}`,
+            }))
+          const finalDevices =
+            audioInputs.length > 0 ? audioInputs : [...DEFAULT_MIC_DEVICES]
+          set({ availableMicDevices: finalDevices })
+          return finalDevices
+        }
+      } catch {
+        // Fallback to default device list
+      }
+      const fallback = [...DEFAULT_MIC_DEVICES]
+      set({ availableMicDevices: fallback })
+      return fallback
+    },
+
+    setSelectedMicDeviceId(deviceId) {
+      const cleanId = deviceId.trim() || 'default'
+      set((state) => ({
+        selectedMicDeviceId: cleanId,
+        voiceSettings: {
+          ...state.voiceSettings,
+          selectedMicDeviceId: cleanId,
+        },
+      }))
+    },
+
+    setAutoSpeakReplies(enabled) {
+      const nextEnabled = Boolean(enabled)
+      set((state) => ({
+        autoSpeakReplies: nextEnabled,
+        voiceSettings: {
+          ...state.voiceSettings,
+          autoSpeakReplies: nextEnabled,
+        },
+      }))
+    },
+
+    updateVoiceSettingsDraft(patch) {
+      if (patch.activeSttProviderId) {
+        voiceRuntime.setActiveSttProvider(patch.activeSttProviderId)
+      }
+      if (patch.activeTtsProviderId) {
+        voiceRuntime.setActiveTtsProvider(patch.activeTtsProviderId)
+      }
+      if (patch.wakeWordEnabled !== undefined) {
+        voiceRuntime.setWakeWordEnabled(patch.wakeWordEnabled)
+      }
+      set((state) => ({
+        voiceSettings: {
+          ...state.voiceSettings,
+          ...patch,
+        },
+        ...(patch.selectedMicDeviceId !== undefined
+          ? { selectedMicDeviceId: patch.selectedMicDeviceId }
+          : {}),
+        ...(patch.autoSpeakReplies !== undefined
+          ? { autoSpeakReplies: patch.autoSpeakReplies }
+          : {}),
+      }))
+    },
+
+    async saveVoiceSettings(secrets) {
+      set({ isSavingVoiceSettings: true, voiceRuntimeError: null })
+      const current = get()
+      const payload = {
+        ...current.voiceSettings,
+        selectedMicDeviceId: current.selectedMicDeviceId,
+        autoSpeakReplies: current.autoSpeakReplies,
+        ...(secrets?.openaiApiKey ? { openaiApiKey: secrets.openaiApiKey } : {}),
+        ...(secrets?.groqApiKey ? { groqApiKey: secrets.groqApiKey } : {}),
+        ...(secrets?.elevenLabsApiKey ? { elevenLabsApiKey: secrets.elevenLabsApiKey } : {}),
+        ...(secrets?.localSttApiKey ? { localSttApiKey: secrets.localSttApiKey } : {}),
+        ...(secrets?.localTtsApiKey ? { localTtsApiKey: secrets.localTtsApiKey } : {}),
+      }
+
+      try {
+        const bridge = getAshyHostBridge()
+        const saved: VoiceRuntimeSettings =
+          typeof bridge.saveVoiceRuntimeSettings === 'function'
+            ? await bridge.saveVoiceRuntimeSettings(payload)
+            : {
+                ...current.voiceSettings,
+                selectedMicDeviceId: current.selectedMicDeviceId,
+                autoSpeakReplies: current.autoSpeakReplies,
+              }
+
+        voiceRuntime.setActiveSttProvider(saved.activeSttProviderId)
+        voiceRuntime.setActiveTtsProvider(saved.activeTtsProviderId)
+        voiceRuntime.setWakeWordEnabled(saved.wakeWordEnabled)
+
+        set({
+          voiceSettings: {
+            ...saved,
+            wakeWordPhrases: [...saved.wakeWordPhrases],
+          },
+          selectedMicDeviceId: saved.selectedMicDeviceId ?? current.selectedMicDeviceId,
+          autoSpeakReplies: saved.autoSpeakReplies ?? current.autoSpeakReplies,
+          isSavingVoiceSettings: false,
+          voiceTestStatus: 'Configurações de voz salvas com segurança.',
+          voiceRuntimeError: null,
+        })
+        return saved
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        set({
+          isSavingVoiceSettings: false,
+          voiceRuntimeError: message,
+        })
+        throw err
+      }
+    },
+
+    async refreshVoiceProviderCatalog(kind, apiKeyOverride) {
+      set({ isLoadingVoiceCatalog: true, voiceRuntimeError: null })
+      const state = get()
+      const providerId =
+        kind === 'stt'
+          ? state.voiceSettings.activeSttProviderId
+          : state.voiceSettings.activeTtsProviderId
+      const baseUrl =
+        kind === 'stt' ? state.voiceSettings.sttBaseUrl : state.voiceSettings.ttsBaseUrl
+
+      try {
+        const bridge = getAshyHostBridge()
+        if (typeof bridge.listVoiceProviderModels === 'function') {
+          const res = await bridge.listVoiceProviderModels({
+            kind,
+            providerId,
+            baseUrl,
+            ...(apiKeyOverride ? { apiKey: apiKeyOverride } : {}),
+          })
+          if (kind === 'stt') {
+            set({
+              sttCatalogModels:
+                res.models.length > 0 ? res.models : [...DEFAULT_STT_CATALOG_MODELS],
+              isLoadingVoiceCatalog: false,
+            })
+          } else {
+            set((s) => ({
+              ttsCatalogModels:
+                res.models.length > 0 ? res.models : [...DEFAULT_TTS_CATALOG_MODELS],
+              ttsCatalogVoices:
+                res.voices && res.voices.length > 0 ? res.voices : s.ttsCatalogVoices,
+              isLoadingVoiceCatalog: false,
+            }))
+          }
+          return
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        set({ voiceRuntimeError: message })
+      }
+      set({ isLoadingVoiceCatalog: false })
+    },
+
+    async testMicrophone() {
+      set({
+        isTestingMic: true,
+        voiceRuntimeError: null,
+        voiceTestStatus: 'Testando captura do microfone...',
+      })
+      try {
+        const hasGetUserMedia =
+          typeof navigator !== 'undefined' &&
+          typeof navigator.mediaDevices?.getUserMedia === 'function'
+        if (hasGetUserMedia) {
+          const selectedId = get().selectedMicDeviceId
+          await voiceRuntime.startMicrophoneCapture({
+            deviceId: selectedId && selectedId !== 'default' ? selectedId : undefined,
+            onRmsLevel: (rms) => set({ micInputLevel: rms }),
+          })
+          const peakRms = Math.max(
+            0.02,
+            voiceRuntime.getWorkletCapture().getLastRmsLevel(),
+            get().micInputLevel,
+          )
+          if (!get().isVoiceListening) {
+            await voiceRuntime.stopMicrophoneCapture()
+          }
+          const message = 'Microfone verificado com sucesso.'
+          set({ isTestingMic: false, voiceTestStatus: message })
+          return { ok: true, message, peakRms }
+        }
+
+        const peakRms = Math.max(0.05, voiceRuntime.getWorkletCapture().getLastRmsLevel())
+        const message = 'Microfone pronto (modo de diagnóstico).'
+        set({ isTestingMic: false, voiceTestStatus: message })
+        return { ok: true, message, peakRms }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        set({
+          isTestingMic: false,
+          voiceRuntimeError: message,
+          voiceTestStatus: null,
+        })
+        return { ok: false, message, peakRms: 0 }
+      }
+    },
+
+    async testTtsVoice(sampleText) {
+      const text = (
+        sampleText ?? 'Olá! Minha voz está configurada e pronta no estúdio.'
+      ).trim()
+      set({
+        isTestingTts: true,
+        voiceRuntimeError: null,
+        voiceTestStatus: 'Sintetizando amostra de voz...',
+      })
+      try {
+        const state = get()
+        const activeTts = state.voiceSettings.activeTtsProviderId
+        const bridge = getAshyHostBridge()
+
+        if (
+          activeTts !== 'local-synth-fallback' &&
+          typeof bridge.synthesizeVoiceSpeech === 'function'
+        ) {
+          const res = await bridge.synthesizeVoiceSpeech({
+            text,
+            providerId: activeTts,
+            baseUrl: state.voiceSettings.ttsBaseUrl,
+            modelId: state.voiceSettings.ttsModelId,
+            voiceId: state.voiceSettings.ttsVoiceId,
+          })
+          const firstFrame = res.vowelFrames?.[0]
+          set({
+            isTestingTts: false,
+            isSpeaking: true,
+            presenceStatus: 'Speaking',
+            simulatedVowels: firstFrame
+              ? {
+                  A: firstFrame.A,
+                  E: firstFrame.E,
+                  I: firstFrame.I,
+                  O: firstFrame.O,
+                  U: firstFrame.U,
+                }
+              : { A: 0.72, E: 0.35, I: 0.2, O: 0.45, U: 0.15 },
+            activeViseme: firstFrame?.dominantVowel ?? 'A',
+            rawVolume: 0.85,
+            voiceTestStatus: `Voz sintetizada (${res.durationMs} ms).`,
+          })
+          schedulePlaybackCompletionReset(Math.min(500, Math.max(150, res.durationMs)))
+          return {
+            ok: true,
+            message: `Voz sintetizada (${res.durationMs} ms).`,
+            durationMs: res.durationMs,
+          }
+        }
+
+        await voiceRuntime.enqueueAssistantReply(text)
+        const chunks = voiceRuntime.getSpeechPipeline().getScheduledChunks()
+        const durationMs = chunks.reduce((acc, c) => acc + c.durationMs, 0) || 400
+        set({
+          isTestingTts: false,
+          isSpeaking: true,
+          presenceStatus: 'Speaking',
+          simulatedVowels: { A: 0.72, E: 0.35, I: 0.2, O: 0.45, U: 0.15 },
+          activeViseme: 'A',
+          rawVolume: 0.85,
+          voiceTestStatus: `Voz local sintetizada (${durationMs} ms).`,
+        })
+        schedulePlaybackCompletionReset(Math.min(500, Math.max(150, durationMs)))
+        return {
+          ok: true,
+          message: `Voz local sintetizada (${durationMs} ms).`,
+          durationMs,
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        set({
+          isTestingTts: false,
+          voiceRuntimeError: message,
+          voiceTestStatus: null,
+        })
+        return { ok: false, message, durationMs: 0 }
+      }
+    },
+
     async runAudioFixtureSimulation(fixtureId) {
       const prevWake = get().voiceSettings.wakeWordEnabled
       const prevMic = get().privacyState.micMode
-      const result = await voiceRuntime.runFixtureScenario(fixtureId)
-      voiceRuntime.setWakeWordEnabled(prevWake)
-      voiceRuntime.setMicMode(prevMic)
-      const snap = result.snapshot
-      set((state) => ({
-        lastVoiceFixtureResult: result,
-        ttfaByProvider: snap.ttfaByProvider,
-        voiceCasRejectedCount: snap.turnState.casRejectedCount,
-        voiceCancelledShortCount: snap.cancelledShortCount,
-        lastPlaybackReceipt: snap.lastPlaybackReceipt ?? state.lastPlaybackReceipt,
-        pendingInterruptionControlNote:
-          snap.lastPlaybackReceipt?.controlNote ?? state.pendingInterruptionControlNote,
-      }))
-      return result
+      isRunningFixtureScenario = true
+      try {
+        const result = await voiceRuntime.runFixtureScenario(fixtureId)
+        voiceRuntime.setWakeWordEnabled(prevWake)
+        voiceRuntime.setMicMode(prevMic)
+        const snap = result.snapshot
+        set((state) => ({
+          lastVoiceFixtureResult: result,
+          ttfaByProvider: snap.ttfaByProvider,
+          voiceCasRejectedCount: snap.turnState.casRejectedCount,
+          voiceCancelledShortCount: snap.cancelledShortCount,
+          lastPlaybackReceipt: snap.lastPlaybackReceipt ?? state.lastPlaybackReceipt,
+          pendingInterruptionControlNote:
+            snap.lastPlaybackReceipt?.controlNote ?? state.pendingInterruptionControlNote,
+        }))
+        return result
+      } finally {
+        isRunningFixtureScenario = false
+      }
     },
 
     async runVoiceFixtureScenario(fixtureId) {
@@ -4011,6 +4805,10 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     setEyesMode(mode) {
       hasExplicitConsentMutation = true
       agency.privacyController.setEyesMode(mode)
+      if (mode === 'off') {
+        webcamSampler.stop()
+        webcamSampler.clearFrames()
+      }
       set((state) => ({
         privacyState: {
           ...state.privacyState,
@@ -4020,6 +4818,13 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           ...state.visionTelemetry,
           eyesMode: mode,
         },
+        ...(mode === 'off'
+          ? {
+              isWebcamStreaming: false,
+              webcamPreviewDataUrl: null,
+              pendingVideoFrames: [],
+            }
+          : {}),
       }))
       const nextTask = agencyRpcChain
         .catch(() => undefined)
@@ -4066,12 +4871,17 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       hasExplicitConsentMutation = true
       const next = agency.privacyController.activatePrivacyShield()
       voiceRuntime.setMicMode('muted')
+      webcamSampler.stop()
+      webcamSampler.clearFrames()
       set((state) => ({
         privacyState: next,
         visionTelemetry: {
           ...state.visionTelemetry,
           eyesMode: 'off',
         },
+        isWebcamStreaming: false,
+        webcamPreviewDataUrl: null,
+        pendingVideoFrames: [],
       }))
       const nextTask = agencyRpcChain
         .catch(() => undefined)
@@ -4288,7 +5098,222 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       agencyRpcChain = nextTask
     },
 
+    setUnifiedOmniMode(enabled) {
+      const next = Boolean(enabled)
+      voiceRuntime.setDirectOmniAudio(next && get().directOmniAudio)
+      set((s) => ({
+        unifiedOmniMode: next,
+        voiceSettings: {
+          ...s.voiceSettings,
+          unifiedOmniMode: next,
+        },
+      }))
+    },
+
+    setDirectOmniAudio(enabled) {
+      const next = Boolean(enabled)
+      voiceRuntime.setDirectOmniAudio(next && get().unifiedOmniMode)
+      set((s) => ({
+        directOmniAudio: next,
+        voiceSettings: {
+          ...s.voiceSettings,
+          directOmniAudio: next,
+        },
+      }))
+    },
+
+    applyOmniModelPreset(preset) {
+      const presetMap: Record<
+        'lfm3-omni-2b' | 'gpt-4o-audio' | 'qwen2.5-omni' | 'gemini-2.5-flash',
+        { providerId: LlmProviderId; modelId: string; omniVoiceId: string }
+      > = {
+        'lfm3-omni-2b': {
+          providerId: 'ollama',
+          modelId: 'lfm3-omni:2b',
+          omniVoiceId: 'ashy-warm-ptbr',
+        },
+        'gpt-4o-audio': {
+          providerId: 'openai',
+          modelId: 'gpt-4o-audio-preview',
+          omniVoiceId: 'coral',
+        },
+        'qwen2.5-omni': {
+          providerId: 'openrouter',
+          modelId: 'qwen/qwen2.5-omni-7b',
+          omniVoiceId: 'chelsie',
+        },
+        'gemini-2.5-flash': {
+          providerId: 'openrouter',
+          modelId: 'google/gemini-2.5-flash',
+          omniVoiceId: 'Aoede',
+        },
+      }
+      const chosen = presetMap[preset]
+      const omniCaps = inferModelOmniCapabilities(chosen.providerId, chosen.modelId)
+      voiceRuntime.setDirectOmniAudio(true)
+
+      set((s) => {
+        const existingCfg = s.providers.configs[chosen.providerId]
+        const updatedCfg: PublicProviderConfig = {
+          ...existingCfg,
+          modelId: chosen.modelId,
+          ...omniCaps,
+          omniExecutionMode: 'native-omni',
+          omniVoiceId: chosen.omniVoiceId,
+        }
+        return {
+          activeModelId: chosen.modelId,
+          unifiedOmniMode: true,
+          directOmniAudio: true,
+          voiceSettings: {
+            ...s.voiceSettings,
+            unifiedOmniMode: true,
+            directOmniAudio: true,
+          },
+          providers: {
+            ...s.providers,
+            activeProviderId: chosen.providerId,
+            configs: {
+              ...s.providers.configs,
+              [chosen.providerId]: updatedCfg,
+            },
+          },
+        }
+      })
+
+      if (get().isBootstrapped) {
+        const currentCfg = get().providers.configs[chosen.providerId]
+        const bridge = getAshyHostBridge()
+        void bridge
+          .saveProviderConfig?.({
+            providerId: chosen.providerId,
+            baseUrl: currentCfg.baseUrl,
+            modelId: chosen.modelId,
+            reasoningEffort: currentCfg.reasoningEffort,
+            ...omniCaps,
+            omniExecutionMode: 'native-omni',
+            omniVoiceId: chosen.omniVoiceId,
+          })
+          .catch(() => {
+            // ignore when offline in unit test
+          })
+        void bridge.setActiveProvider?.(chosen.providerId).catch(() => {
+          // ignore when offline in unit test
+        })
+      }
+    },
+
+    stageVideoFrames(frames) {
+      set((s) => ({
+        pendingVideoFrames: deduplicateVideoFramesByDHash(
+          [...s.pendingVideoFrames, ...frames],
+          4,
+          8,
+        ),
+      }))
+    },
+
+    stageTurnAttachment(attachment) {
+      set((s) => ({
+        pendingTurnAttachments: [...s.pendingTurnAttachments.slice(-7), attachment],
+      }))
+    },
+
+    removeTurnAttachment(id) {
+      set((s) => ({
+        pendingTurnAttachments: s.pendingTurnAttachments.filter((a) => a.id !== id),
+      }))
+    },
+
+    clearOmniStagedMedia() {
+      set({
+        pendingVideoFrames: [],
+        pendingTurnAttachments: [],
+      })
+    },
+
+    async toggleWebcamStream(active) {
+      const next = active ?? !get().isWebcamStreaming
+      if (!next) {
+        webcamSampler.stop()
+        set({
+          isWebcamStreaming: false,
+          webcamPreviewDataUrl: null,
+        })
+        return false
+      }
+      if (get().privacyState.eyesMode === 'off') {
+        get().setEyesMode('window')
+      }
+      const started = await webcamSampler.start()
+      if (!started) {
+        const synth = createSyntheticVideoFrameDataUrl(1, 0, 'camera')
+        set((s) => ({
+          isWebcamStreaming: true,
+          webcamPreviewDataUrl: synth.dataUrl,
+          pendingVideoFrames: deduplicateVideoFramesByDHash(
+            [...s.pendingVideoFrames, synth],
+            4,
+            8,
+          ),
+        }))
+        return true
+      }
+      const frames = webcamSampler.getRecentFrames(8)
+      set({
+        isWebcamStreaming: true,
+        webcamPreviewDataUrl: frames[frames.length - 1]?.dataUrl ?? null,
+        pendingVideoFrames: frames,
+      })
+      return true
+    },
+
+    async sendOmniAudioTurn(turn) {
+      const s = get()
+      const videoFrames =
+        s.pendingVideoFrames.length > 0 ? [...s.pendingVideoFrames] : undefined
+      const attachments =
+        s.pendingTurnAttachments.length > 0 ? [...s.pendingTurnAttachments] : undefined
+      const interruptionNote = s.pendingInterruptionControlNote ?? undefined
+
+      set({
+        pendingVideoFrames: [],
+        pendingTurnAttachments: [],
+        pendingInterruptionControlNote: null,
+      })
+
+      if (s.isBootstrapped) {
+        const bridge = ensureHostSubscription()
+        await bridge.sendTurn({
+          sessionId: s.activeSessionId,
+          text: turn.transcriptHint ?? '',
+          inputAudio: {
+            dataBase64: turn.wavBase64,
+            format: 'wav',
+            sampleRate: turn.sampleRate,
+            durationMs: turn.durationMs,
+            ...(turn.transcriptHint ? { transcriptHint: turn.transcriptHint } : {}),
+          },
+          ...(videoFrames ? { videoFrames } : {}),
+          ...(attachments ? { attachments } : {}),
+          ...(interruptionNote ? { interruptionControlNote: interruptionNote } : {}),
+          omniExecutionModeOverride: 'native-omni',
+        })
+        return
+      }
+
+      const fallbackText =
+        turn.transcriptHint || '🎤 [Mensagem de voz enviada diretamente ao modelo Omni]'
+      await get().sendUserMessage(fallbackText)
+    },
+
+    handleHostStreamEvent(event) {
+      handleHostStreamEvent(event)
+    },
+
     resetStoreForTesting() {
+      clearActivePlaybackEndTimer()
+      isRunningFixtureScenario = false
       unsubscribeHostEvents?.()
       unsubscribeHostEvents = null
       subscribedBridge = null
@@ -4305,14 +5330,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       pendingTurnSeriousness.clear()
       streamedDeltaTurnIds.clear()
       bargeInTurnIds.clear()
+      omniAudioReceivedTurnIds.clear()
+      webcamSampler.stop()
+      webcamSampler.clearFrames()
       agency = createAgencyRuntime()
-      voiceRuntime = createVoiceSessionRuntime({
-        micMode: 'continuous',
-        wakeWordEnabled: DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordEnabled,
-        wakeWordPhrases: DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordPhrases,
-        activeSttProviderId: DEFAULT_VOICE_RUNTIME_SETTINGS.activeSttProviderId,
-        activeTtsProviderId: DEFAULT_VOICE_RUNTIME_SETTINGS.activeTtsProviderId,
-      })
+      voiceRuntime = createStoreVoiceRuntime()
       lastPromptMinuteLabel = formatLocalTimeHHMM(Date.now())
 
       const resetWindowMode = resolveInitialWindowMode()
@@ -4431,6 +5453,21 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         voiceCancelledShortCount: 0,
         lastVoiceFixtureResult: null,
         isPushToTalkHeld: false,
+        isVoiceListening: false,
+        micInputLevel: 0,
+        rawVolume: 0,
+        availableMicDevices: [...DEFAULT_MIC_DEVICES],
+        selectedMicDeviceId: 'default',
+        autoSpeakReplies: true,
+        sttCatalogModels: [...DEFAULT_STT_CATALOG_MODELS],
+        ttsCatalogModels: [...DEFAULT_TTS_CATALOG_MODELS],
+        ttsCatalogVoices: [...DEFAULT_TTS_CATALOG_VOICES],
+        isLoadingVoiceCatalog: false,
+        isSavingVoiceSettings: false,
+        isTestingMic: false,
+        isTestingTts: false,
+        voiceTestStatus: null,
+        voiceRuntimeError: null,
         settingsSubTab: 'todas',
         showDesktopAvatar: true,
         computerActionsEnabled: true,
@@ -4451,6 +5488,15 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         pendingActions: agency.gatekeeper.getPendingActions(),
         auditLog: [...agency.gatekeeper.getAuditLog()],
         lastMcpResultSummary: null,
+        unifiedOmniMode: DEFAULT_VOICE_RUNTIME_SETTINGS.unifiedOmniMode ?? false,
+        directOmniAudio: DEFAULT_VOICE_RUNTIME_SETTINGS.directOmniAudio ?? false,
+        pendingVideoFrames: [],
+        pendingTurnAttachments: [],
+        isWebcamStreaming: false,
+        webcamPreviewDataUrl: null,
+        hasCompletedOnboarding: false,
+        activeStreamingTurnId: null,
+        activeStreamingMessageId: null,
       })
     },
   }
@@ -4461,4 +5507,8 @@ export type { RoomTimeOfDayPeriod }
 
 export function resetAshyStore(): void {
   useAshyStore.getState().resetStoreForTesting()
+}
+
+export function getVoiceRuntimeForTesting(): VoiceSessionRuntime {
+  return voiceRuntime
 }

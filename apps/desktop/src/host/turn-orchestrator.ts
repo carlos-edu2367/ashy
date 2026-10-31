@@ -1,5 +1,10 @@
 import * as v from 'valibot'
-import { analyzeUserAffectReaction, type AshyCortex } from '@ashy/cortex'
+import {
+  analyzeUserAffectReaction,
+  composeAshyTurnPrompt,
+  evaluateSeriousnessGate,
+  type AshyCortex,
+} from '@ashy/cortex'
 import {
   createTailSafeMarkerParser,
   defineTool,
@@ -8,10 +13,14 @@ import {
   stripBondManipulation,
   stripLeadingAssistantSlop,
   type ChatMessage,
+  type ChatMessageContentPart,
   type ToolDefinition,
 } from '@ashy/llm'
 import {
   ASHY_BASELINE_MOOD,
+  ASHY_EMOTIONS,
+  type OmniExecutionMode,
+  type VoiceSynthesizedVowelFrame,
   ASHY_DEFAULT_TRAITS,
   SendTurnInputSchema,
   type AshyBootstrapSnapshot,
@@ -22,6 +31,7 @@ import {
   type SeriousnessAssessment,
   type UserAffectReaction,
 } from '@ashy/shared'
+import { decodeWavToPcmBlocks, extractPcmFrameVowelWeights } from '@ashy/voice'
 import type { HostAgencyRuntime } from './agency-runtime'
 import type { ProviderVault } from './provider-vault'
 import type { VoiceIdentityStore } from './voice-identity-store'
@@ -285,6 +295,53 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     finalizeAbortEntry(entry)
   }
 
+  function resolveOmniTurnUserText(input: SendTurnInput): {
+    effectiveUserText: string
+    inputTranscriptSource: 'stt-preflight' | 'wav-metadata' | null
+  } {
+    if (input.text.trim().length > 0) {
+      return {
+        effectiveUserText: input.text,
+        inputTranscriptSource: null,
+      }
+    }
+    const hint = input.inputAudio?.transcriptHint?.trim()
+    if (hint && hint.length > 0) {
+      return {
+        effectiveUserText: hint,
+        inputTranscriptSource: 'stt-preflight',
+      }
+    }
+    if (input.inputAudio?.format === 'wav') {
+      try {
+        const cleanB64 = input.inputAudio.dataBase64.replace(/^data:audio\/[\w+-]+;base64,/, '')
+        const wavBytes = Buffer.from(cleanB64, 'base64')
+        const decoded = decodeWavToPcmBlocks(
+          wavBytes.buffer.slice(wavBytes.byteOffset, wavBytes.byteOffset + wavBytes.byteLength),
+        )
+        const icmt = decoded.metadataComment?.trim()
+        if (icmt && icmt.length > 0) {
+          return {
+            effectiveUserText: icmt,
+            inputTranscriptSource: 'wav-metadata',
+          }
+        }
+      } catch {
+        // Ignore malformed WAV when extracting optional ICMT comment
+      }
+    }
+    if (input.inputAudio) {
+      return {
+        effectiveUserText: '[Mensagem de voz Omni]',
+        inputTranscriptSource: null,
+      }
+    }
+    return {
+      effectiveUserText: '[Mídia enviada para análise Omni]',
+      inputTranscriptSource: null,
+    }
+  }
+
   function abortAll(): void {
     for (const entry of Array.from(activeTurnsById.values())) {
       finalizeAbortEntry(entry)
@@ -316,12 +373,13 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     const turnId = `turn-${now}-${turnSequence}`
 
     // 3. Append the user message via cortex.appendChatMessage
+    const { effectiveUserText, inputTranscriptSource } = resolveOmniTurnUserText(input)
     const userMessage = cortex.appendChatMessage({
       id: `msg-user-${turnId}`,
       sessionId: input.sessionId,
       role: 'user',
-      content: input.text,
-      rawContent: input.text,
+      content: effectiveUserText,
+      rawContent: effectiveUserText,
       emotion: 'neutral',
       markersJson: '[]',
       createdAt: now,
@@ -364,6 +422,8 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
         input,
         userMessage,
         providerState,
+        effectiveUserText,
+        inputTranscriptSource,
         appendCleanText: (chunk) => {
           cleanAccum += chunk
         },
@@ -379,10 +439,22 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     input: SendTurnInput
     userMessage: ChatMessageRecord
     providerState: AshyBootstrapSnapshot['providers']
+    effectiveUserText: string
+    inputTranscriptSource: 'stt-preflight' | 'wav-metadata' | null
     appendCleanText: (chunk: string) => void
     getCleanText: () => string
   }): Promise<void> {
-    const { entry, input, userMessage, providerState, appendCleanText, getCleanText } = params
+    const {
+      entry,
+      input,
+      userMessage,
+      providerState,
+      effectiveUserText,
+      inputTranscriptSource,
+      appendCleanText,
+      getCleanText,
+    } = params
+    let currentEffectiveUserText = effectiveUserText
     const { turnId, controller } = entry
     const sessionId = input.sessionId
 
@@ -398,6 +470,18 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
       sessionId,
       startedAt,
     })
+
+    if (input.inputAudio && inputTranscriptSource !== null) {
+      emit({
+        type: 'turn:input-transcript',
+        turnId,
+        sessionId,
+        userMessageId: userMessage.id,
+        transcript: currentEffectiveUserText,
+        isFinal: true,
+        source: inputTranscriptSource,
+      })
+    }
 
     let literalEmittedSinceLastTick = false
     const keepaliveTimer = setInterval(() => {
@@ -421,7 +505,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     const markers: TurnMarkerPayload[] = []
     const invokedMotifIds: string[] = []
     let compiledSeriousness: SeriousnessAssessment | undefined
-    let userReaction: UserAffectReaction = analyzeUserAffectReaction(input.text)
+    let userReaction: UserAffectReaction = analyzeUserAffectReaction(currentEffectiveUserText)
 
     const parser = createTailSafeMarkerParser({
       onLiteral(text) {
@@ -535,7 +619,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
           : options.getActiveVisionContext?.()
 
       const stage = cortex.deriveRelationshipStage()
-      const queryEmbedding = embedTextSync128(input.text)
+      const queryEmbedding = embedTextSync128(currentEffectiveUserText)
       const agencySnap = options.agencyRuntime?.getSnapshot()
       const agencyToolsContext = agencySnap
         ? {
@@ -551,7 +635,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
         : undefined
 
       const compiled = cortex.compileTurnPrompt({
-        userMessage: input.text,
+        userMessage: currentEffectiveUserText,
         modelId: activeConfig?.modelId,
         stage,
         queryEmbedding,
@@ -562,28 +646,202 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
         conversationHistory: priorConversationHistory,
       })
       compiledSeriousness = compiled.seriousness
-      userReaction = analyzeUserAffectReaction(input.text, {
+      userReaction = analyzeUserAffectReaction(currentEffectiveUserText, {
         seriousness: compiled.seriousness,
       })
+
+      const effectiveOmniMode: OmniExecutionMode =
+        input.omniExecutionModeOverride ?? activeConfig?.omniExecutionMode ?? 'modular'
+      const omniPromptOverlay =
+        effectiveOmniMode === 'native-omni'
+          ? composeAshyTurnPrompt({
+              userMessage: currentEffectiveUserText,
+              seriousness: compiled.seriousness,
+              omniOutputMode: 'native-audio',
+            }).systemPrompt
+          : ''
+      const nativeDirectiveMatch = omniPromptOverlay.match(
+        /\[NATIVE OMNI AUDIO OUTPUT DIRECTIVE\][\s\S]*?(?=\n\n\[|$)/,
+      )
+      const finalSystemPrompt =
+        effectiveOmniMode === 'native-omni' &&
+        nativeDirectiveMatch &&
+        !compiled.systemPrompt.includes('[NATIVE OMNI AUDIO OUTPUT DIRECTIVE]')
+          ? `${compiled.systemPrompt}\n\n${nativeDirectiveMatch[0]}`
+          : compiled.systemPrompt
+
+      const hasMultimodalInputs =
+        Boolean(input.inputAudio) ||
+        Boolean(input.videoFrames && input.videoFrames.length > 0) ||
+        Boolean(input.attachments && input.attachments.length > 0)
+      let userParts: ChatMessageContentPart[] | undefined
+      if (hasMultimodalInputs) {
+        userParts = []
+        if (input.videoFrames && input.videoFrames.length > 0) {
+          for (const vf of input.videoFrames) {
+            userParts.push({
+              type: 'video_frame',
+              videoFrame: {
+                dataUrl: vf.dataUrl,
+                timestampMs: vf.timestampMs,
+                ...(vf.width !== undefined ? { width: vf.width } : {}),
+                ...(vf.height !== undefined ? { height: vf.height } : {}),
+              },
+            })
+          }
+        }
+        if (input.attachments && input.attachments.length > 0) {
+          for (const att of input.attachments) {
+            if (att.kind === 'image') {
+              const url = att.dataUrlOrBase64.startsWith('data:')
+                ? att.dataUrlOrBase64
+                : `data:${att.mimeType};base64,${att.dataUrlOrBase64}`
+              userParts.push({
+                type: 'image_url',
+                imageUrl: { url, detail: 'auto' },
+              })
+            } else if (att.kind === 'audio') {
+              const lowerMime = att.mimeType.toLowerCase()
+              const format: 'wav' | 'pcm16' | 'mp3' =
+                lowerMime.includes('mp3') || lowerMime.includes('mpeg')
+                  ? 'mp3'
+                  : lowerMime.includes('pcm')
+                    ? 'pcm16'
+                    : 'wav'
+              const cleanData = att.dataUrlOrBase64.replace(
+                /^data:audio\/[a-z0-9.+-]+;base64,/i,
+                '',
+              )
+              userParts.push({
+                type: 'input_audio',
+                inputAudio: {
+                  data: cleanData,
+                  format,
+                },
+              })
+            }
+          }
+        }
+        if (input.inputAudio) {
+          const cleanData = input.inputAudio.dataBase64.replace(
+            /^data:audio\/[a-z0-9.+-]+;base64,/i,
+            '',
+          )
+          userParts.push({
+            type: 'input_audio',
+            inputAudio: {
+              data: cleanData,
+              format: input.inputAudio.format,
+            },
+          })
+        }
+        userParts.push({
+          type: 'text',
+          text: compiled.userTurnContent,
+        })
+      }
 
       const messages: ChatMessage[] = [
         ...priorConversationHistory,
         {
           role: 'user',
           content: compiled.userTurnContent,
+          ...(userParts ? { parts: userParts } : {}),
         },
       ]
 
       const model = providerVault.createActiveLanguageModel()
-      const tools = options.agencyRuntime
-        ? buildAgencyChatTools(options.agencyRuntime)
+      const ashyStageSignalTool: ToolDefinition | undefined =
+        effectiveOmniMode === 'native-omni'
+          ? defineTool({
+              name: 'ashy_stage_signal',
+              description:
+                'Emite sinal de atuação Live2D (emoção, intensidade e motion) sem poluir o áudio falado.',
+              parameters: v.object({
+                emotion: v.picklist(ASHY_EMOTIONS),
+                intensity: v.optional(v.pipe(v.number(), v.minValue(0), v.maxValue(1))),
+                motion: v.optional(v.string()),
+                callbackMotifId: v.optional(v.string()),
+              }),
+              execute: async (args) => {
+                const marker: TurnMarkerPayload = {
+                  type: 'act',
+                  emotion: args.emotion,
+                  intensity: args.intensity ?? 0.8,
+                  ...(args.motion ? { motion: args.motion } : {}),
+                }
+                markers.push(marker)
+                turnEmotion = args.emotion
+                currentDominantEmotion = args.emotion
+                options.onDominantEmotionChange?.(args.emotion)
+                try {
+                  cortex.recordEmotionPulse(
+                    args.emotion,
+                    args.intensity ?? 0.8,
+                    Date.now(),
+                    { seriousness: compiledSeriousness },
+                  )
+                } catch {
+                  // Fault-isolated
+                }
+                emit({
+                  type: 'turn:marker',
+                  turnId,
+                  sessionId,
+                  marker,
+                })
+                if (args.callbackMotifId && args.callbackMotifId.trim().length > 0) {
+                  const motifId = args.callbackMotifId.trim()
+                  const cbMarker: TurnMarkerPayload = {
+                    type: 'callback',
+                    motifId,
+                  }
+                  markers.push(cbMarker)
+                  invokedMotifIds.push(motifId)
+                  try {
+                    cortex.recordJokeCallback(
+                      motifId,
+                      userReaction.positiveJokeReaction,
+                      Date.now(),
+                    )
+                  } catch {
+                    // Ignore unknown/hallucinated motifId
+                  }
+                  emit({
+                    type: 'turn:marker',
+                    turnId,
+                    sessionId,
+                    marker: cbMarker,
+                  })
+                }
+                return { ok: true }
+              },
+            })
+          : undefined
+      const baseTools = options.agencyRuntime ? buildAgencyChatTools(options.agencyRuntime) : []
+      const tools: ToolDefinition[] | undefined =
+        baseTools.length > 0 || ashyStageSignalTool
+          ? [...baseTools, ...(ashyStageSignalTool ? [ashyStageSignalTool] : [])]
+          : undefined
+      // Omni tools wired above
+      void (true ? undefined
         : undefined
+      )
       const stream = streamText(model, {
-        system: compiled.systemPrompt,
+        system: finalSystemPrompt,
         messages,
         tools,
         maxSteps: 5,
         reasoningEffort: activeConfig?.reasoningEffort ?? 'none',
+        ...(effectiveOmniMode === 'native-omni'
+          ? {
+              modalities: ['text', 'audio'] as const,
+              audioOutput: {
+                voice: activeConfig?.omniVoiceId ?? 'female',
+                format: 'pcm16' as const,
+              },
+            }
+          : {}),
         signal: controller.signal,
       })
 
@@ -601,6 +859,8 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
       })
 
       let lastActivityAt = Date.now()
+      let sawTextDelta = false
+      let audioChunkSeq = 0
       try {
         while (true) {
           const { done, value } = await Promise.race([reader.read(), abortPromise])
@@ -617,6 +877,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
 
           if (value.type === 'text-delta') {
             lastActivityAt = Date.now()
+            sawTextDelta = true
             rawAccum += value.text
             parser.write(value.text)
           } else if (
@@ -625,6 +886,130 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
             value.type === 'step-finish'
           ) {
             lastActivityAt = Date.now()
+          } else if (value.type === 'input-transcript') {
+            lastActivityAt = Date.now()
+            const cleanTranscript = value.transcript.trim()
+            if (cleanTranscript.length > 0) {
+              currentEffectiveUserText = cleanTranscript
+              compiledSeriousness = evaluateSeriousnessGate(cleanTranscript)
+              userReaction = analyzeUserAffectReaction(cleanTranscript, {
+                seriousness: compiledSeriousness,
+              })
+              try {
+                cortex.appendChatMessage({
+                  ...userMessage,
+                  content: cleanTranscript,
+                  rawContent: cleanTranscript,
+                })
+              } catch {
+                // Fault-isolated
+              }
+              emit({
+                type: 'turn:input-transcript',
+                turnId,
+                sessionId,
+                userMessageId: userMessage.id,
+                transcript: cleanTranscript,
+                isFinal: value.isFinal ?? true,
+                source: 'omni-native',
+              })
+            }
+          } else if (value.type === 'audio-delta') {
+            lastActivityAt = Date.now()
+            if (!sawTextDelta && value.transcriptDelta) {
+              rawAccum += value.transcriptDelta
+              parser.write(value.transcriptDelta)
+            }
+            const cleanB64 = value.audioBase64.replace(/^data:audio\/[\w+-]+;base64,/, '')
+            const rawBytes = Buffer.from(cleanB64, 'base64')
+            let sampleRate = value.sampleRate > 0 ? value.sampleRate : 24000
+            let samples: Float32Array
+            if (
+              value.format === 'wav' ||
+              (rawBytes.byteLength >= 12 &&
+                rawBytes[0] === 0x52 &&
+                rawBytes[1] === 0x49 &&
+                rawBytes[2] === 0x46 &&
+                rawBytes[3] === 0x46)
+            ) {
+              try {
+                const decoded = decodeWavToPcmBlocks(
+                  rawBytes.buffer.slice(
+                    rawBytes.byteOffset,
+                    rawBytes.byteOffset + rawBytes.byteLength,
+                  ),
+                )
+                samples = decoded.samples
+                if (decoded.sampleRate > 0) {
+                  sampleRate = decoded.sampleRate
+                }
+              } catch {
+                samples = new Float32Array(0)
+              }
+            } else {
+              const sampleCount = Math.floor(rawBytes.byteLength / 2)
+              samples = new Float32Array(sampleCount)
+              const view = new DataView(
+                rawBytes.buffer,
+                rawBytes.byteOffset,
+                sampleCount * 2,
+              )
+              for (let i = 0; i < sampleCount; i++) {
+                samples[i] = view.getInt16(i * 2, true) / 32768
+              }
+            }
+
+            const samplesPerFrame = Math.max(1, Math.round(sampleRate * 0.02))
+            const frameDurationSec = Number((samplesPerFrame / sampleRate).toFixed(4))
+            const vowelFrames: VoiceSynthesizedVowelFrame[] = []
+            let frameIdx = 0
+            for (let offset = 0; offset < samples.length; offset += samplesPerFrame) {
+              const slice = samples.subarray(
+                offset,
+                Math.min(samples.length, offset + samplesPerFrame),
+              )
+              const weights = extractPcmFrameVowelWeights(slice, sampleRate)
+              const entries: Array<['A' | 'E' | 'I' | 'O' | 'U', number]> = [
+                ['A', weights.A],
+                ['E', weights.E],
+                ['I', weights.I],
+                ['O', weights.O],
+                ['U', weights.U],
+              ]
+              entries.sort((a, b) => b[1] - a[1])
+              const dominantVowel =
+                weights.rmsVolume > 0.01 && entries[0]![1] > 0.02 ? entries[0]![0] : 'closed'
+              vowelFrames.push({
+                timeSec: Number((frameIdx * frameDurationSec).toFixed(4)),
+                durationSec: frameDurationSec,
+                A: weights.A,
+                E: weights.E,
+                I: weights.I,
+                O: weights.O,
+                U: weights.U,
+                dominantVowel,
+              })
+              frameIdx += 1
+            }
+            const durationMs =
+              samples.length > 0
+                ? Math.max(1, Math.round((samples.length / sampleRate) * 1000))
+                : 20
+
+            const seq = audioChunkSeq
+            audioChunkSeq += 1
+            emit({
+              type: 'turn:audio-delta',
+              turnId,
+              sessionId,
+              seq,
+              audioBase64: cleanB64,
+              format: value.format === 'wav' ? 'wav' : 'pcm16',
+              sampleRate,
+              durationMs,
+              vowelFrames,
+              ...(value.transcriptDelta ? { transcriptDelta: value.transcriptDelta } : {}),
+            })
           } else if (value.type === 'error') {
             if (controller.signal.aborted || entry.abortedEmitted) {
               finalizeAbortEntry(entry)
@@ -682,7 +1067,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
         cortex.appendChatMessage(assistantMessage)
         cortex.indexTurnMemory({
           turnId,
-          userText: input.text,
+          userText: currentEffectiveUserText,
           assistantText: finalCleanContent,
           emotion: turnEmotion,
           now: completedAt,

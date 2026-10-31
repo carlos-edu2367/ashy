@@ -13,6 +13,7 @@ import type {
   EvaluateInitiativeInput,
   ExternalMcpServerConfig,
   ListProviderModelsInput,
+  ListVoiceProviderModelsInput,
   LlmProviderId,
   MemoryGovernanceCategory,
   PersonalityEvolutionRecord,
@@ -21,8 +22,11 @@ import type {
   RelationalMotif,
   RunCoreExperimentInput,
   SaveProviderConfigInput,
+  SaveVoiceRuntimeSettingsInput,
   SendTurnInput,
+  SynthesizeVoiceSpeechInput,
   TestProviderInput,
+  TranscribeVoiceAudioInput,
   UpdateAgencyConsentInput,
   UpdateInitiativePolicyInput,
   UpdateMilestoneInput,
@@ -32,7 +36,7 @@ import type {
 import type { AshyHostKernel, AshyHostKernelOptions } from './kernel'
 import { createNodeAesSecretProtector, type SecretProtector } from './secret-protector'
 
-const MAX_RPC_BODY_BYTES = 2 * 1024 * 1024
+const MAX_RPC_BODY_BYTES = 20 * 1024 * 1024
 
 const VALID_DELETABLE_MEMORY_KINDS: readonly DeletableMemoryKind[] = [
   'fact',
@@ -100,6 +104,11 @@ const ALLOWED_RPC_METHODS = new Set<string>([
   'updateInitiativePolicy',
   'evaluateAttentionInitiative',
   'updateStagePreferences',
+  'getVoiceRuntimeSettings',
+  'saveVoiceRuntimeSettings',
+  'listVoiceProviderModels',
+  'transcribeVoiceAudio',
+  'synthesizeVoiceSpeech',
 ])
 
 export class DisallowedRpcMethodError extends Error {
@@ -626,6 +635,45 @@ export async function dispatchHostRpc(
       return kernel.updateStagePreferences(obj)
     }
 
+    case 'getVoiceRuntimeSettings': {
+      if (!kernel.getVoiceRuntimeSettings) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      return kernel.getVoiceRuntimeSettings()
+    }
+
+    case 'saveVoiceRuntimeSettings': {
+      if (!kernel.saveVoiceRuntimeSettings) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<SaveVoiceRuntimeSettingsInput>(payload, method)
+      return kernel.saveVoiceRuntimeSettings(obj)
+    }
+
+    case 'listVoiceProviderModels': {
+      if (!kernel.listVoiceProviderModels) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<ListVoiceProviderModelsInput>(payload, method)
+      return kernel.listVoiceProviderModels(obj)
+    }
+
+    case 'transcribeVoiceAudio': {
+      if (!kernel.transcribeVoiceAudio) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<TranscribeVoiceAudioInput>(payload, method)
+      return kernel.transcribeVoiceAudio(obj)
+    }
+
+    case 'synthesizeVoiceSpeech': {
+      if (!kernel.synthesizeVoiceSpeech) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<SynthesizeVoiceSpeechInput>(payload, method)
+      return kernel.synthesizeVoiceSpeech(obj)
+    }
+
     default:
       throw new DisallowedRpcMethodError(method)
   }
@@ -643,7 +691,7 @@ function readJsonBody(req: IncomingMessage): Promise<{ method: string; payload?:
       totalBytes += buf.byteLength
       if (totalBytes > MAX_RPC_BODY_BYTES) {
         aborted = true
-        reject(new Error('RPC request payload exceeds maximum allowed size (2MB)'))
+        reject(new Error('RPC request payload exceeds maximum allowed size (10MB)'))
         return
       }
       chunks.push(buf)

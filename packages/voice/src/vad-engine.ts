@@ -6,10 +6,12 @@ export interface VadFrameAssessment {
   zeroCrossingRate: number
   bandEnergyRatio: number
   isSpeechCandidate: boolean
+  engineMode?: 'silero-onnx' | 'hybrid-dsp'
 }
 
 export interface VadEngine {
   processBlock(block: PcmAudioBlock): Promise<VadFrameAssessment> | VadFrameAssessment
+  getEngineMode?(): 'silero-onnx' | 'hybrid-dsp'
   reset(): void
 }
 
@@ -17,6 +19,102 @@ export interface HybridVadEngineOptions {
   modelInferFn?: (samples: Float32Array, sampleRate: number) => Promise<number> | number
   modelBlendWeight?: number
   candidateThreshold?: number
+}
+
+export interface SileroOnnxTensorLike {
+  data: Float32Array | BigInt64Array | Int32Array | number[]
+  dims?: readonly number[]
+}
+
+export interface SileroOnnxSessionLike {
+  run(feeds: Record<string, unknown>): Promise<Record<string, SileroOnnxTensorLike>>
+}
+
+export interface SileroOnnxVadEngineOptions {
+  onnxSession?: SileroOnnxSessionLike | null
+  sessionLoader?: () => Promise<SileroOnnxSessionLike | null>
+  tensorFactory?: (
+    type: 'float32' | 'int64',
+    data: Float32Array | BigInt64Array | number[],
+    dims: readonly number[],
+  ) => unknown
+  candidateThreshold?: number
+  modelBlendWeight?: number
+}
+
+export function downsamplePcmFloat32(
+  samples: Float32Array,
+  inputSampleRate: number,
+  targetSampleRate = 16000,
+): Float32Array {
+  if (
+    !Number.isFinite(inputSampleRate) ||
+    inputSampleRate <= 0 ||
+    !Number.isFinite(targetSampleRate) ||
+    targetSampleRate <= 0
+  ) {
+    throw new Error(
+      `Invalid sampleRate in downsamplePcmFloat32: inputSampleRate=${inputSampleRate}, targetSampleRate=${targetSampleRate}`,
+    )
+  }
+
+  if (!(samples instanceof Float32Array) || samples.length === 0) {
+    return new Float32Array(0)
+  }
+
+  if (inputSampleRate === targetSampleRate) {
+    const copy = new Float32Array(samples.length)
+    for (let i = 0; i < samples.length; i++) {
+      const v = samples[i]!
+      copy[i] = Number.isFinite(v) ? v : 0
+    }
+    return copy
+  }
+
+  const targetLength = Math.max(0, Math.round((samples.length * targetSampleRate) / inputSampleRate))
+  if (targetLength === 0) {
+    return new Float32Array(0)
+  }
+
+  const output = new Float32Array(targetLength)
+  const ratio = inputSampleRate / targetSampleRate
+
+  if (ratio > 1) {
+    // Anti-aliasing fractional box/window averaging across the decimation ratio
+    for (let i = 0; i < targetLength; i++) {
+      const start = i * ratio
+      const end = Math.min(samples.length, (i + 1) * ratio)
+      const startIdx = Math.floor(start)
+      const endIdx = Math.min(samples.length - 1, Math.ceil(end) - 1)
+
+      let weightedSum = 0
+      let totalWeight = 0
+
+      for (let j = startIdx; j <= endIdx; j++) {
+        const raw = samples[j]!
+        const sample = Number.isFinite(raw) ? raw : 0
+        const weight = Math.max(0, Math.min(end, j + 1) - Math.max(start, j))
+        weightedSum += sample * weight
+        totalWeight += weight
+      }
+
+      output[i] = totalWeight > 0 ? weightedSum / totalWeight : 0
+    }
+    return output
+  }
+
+  // Upsampling fallback via linear interpolation
+  for (let i = 0; i < targetLength; i++) {
+    const srcPos = i * ratio
+    const idx0 = Math.min(samples.length - 1, Math.floor(srcPos))
+    const idx1 = Math.min(samples.length - 1, idx0 + 1)
+    const frac = srcPos - idx0
+    const s0 = Number.isFinite(samples[idx0]!) ? samples[idx0]! : 0
+    const s1 = Number.isFinite(samples[idx1]!) ? samples[idx1]! : 0
+    output[i] = s0 + (s1 - s0) * frac
+  }
+
+  return output
 }
 
 export function computeFrameSpeechProbability(
@@ -31,6 +129,7 @@ export function computeFrameSpeechProbability(
       zeroCrossingRate: 0,
       bandEnergyRatio: 0,
       isSpeechCandidate: false,
+      engineMode: 'hybrid-dsp',
     }
   }
 
@@ -80,6 +179,7 @@ export function computeFrameSpeechProbability(
       zeroCrossingRate: Number(zeroCrossingRate.toFixed(6)),
       bandEnergyRatio: 0,
       isSpeechCandidate: false,
+      engineMode: 'hybrid-dsp',
     }
   }
 
@@ -113,6 +213,7 @@ export function computeFrameSpeechProbability(
     zeroCrossingRate: Number(zeroCrossingRate.toFixed(6)),
     bandEnergyRatio: Number(bandEnergyRatio.toFixed(6)),
     isSpeechCandidate: probability >= candidateThreshold,
+    engineMode: 'hybrid-dsp',
   }
 }
 
@@ -135,6 +236,7 @@ export function createHybridVadEngine(options: HybridVadEngineOptions = {}): Vad
       ...base,
       probability: blended,
       isSpeechCandidate: blended >= candidateThreshold,
+      engineMode: 'hybrid-dsp',
     }
   }
 
@@ -163,8 +265,152 @@ export function createHybridVadEngine(options: HybridVadEngineOptions = {}): Vad
         return base
       }
     },
+    getEngineMode(): 'hybrid-dsp' {
+      return 'hybrid-dsp'
+    },
     reset(): void {
       // Stateless per-frame hybrid evaluator; hook provided for stateful ONNX wrappers
+    },
+  }
+}
+
+const SILERO_STATE_SIZE = 2 * 1 * 128
+
+export function createSileroOnnxVadEngine(options: SileroOnnxVadEngineOptions = {}): VadEngine {
+  const candidateThreshold = options.candidateThreshold ?? 0.6
+  const blendWeight = Math.max(0, Math.min(1, options.modelBlendWeight ?? 0.8))
+  const fallbackVad = createHybridVadEngine({ candidateThreshold })
+
+  let state = new Float32Array(SILERO_STATE_SIZE)
+  let resolvedSession: SileroOnnxSessionLike | null | undefined = options.onnxSession
+  let loadingSessionPromise: Promise<SileroOnnxSessionLike | null> | null = null
+  let currentEngineMode: 'silero-onnx' | 'hybrid-dsp' = options.onnxSession
+    ? 'silero-onnx'
+    : 'hybrid-dsp'
+
+  async function resolveSession(): Promise<SileroOnnxSessionLike | null> {
+    if (resolvedSession !== undefined) {
+      return resolvedSession
+    }
+    if (!options.sessionLoader) {
+      resolvedSession = null
+      return null
+    }
+    if (!loadingSessionPromise) {
+      loadingSessionPromise = Promise.resolve()
+        .then(() => options.sessionLoader!())
+        .catch(() => null)
+    }
+    resolvedSession = await loadingSessionPromise
+    return resolvedSession
+  }
+
+  function buildTensor(
+    type: 'float32' | 'int64',
+    data: Float32Array | BigInt64Array | number[],
+    dims: readonly number[],
+  ): unknown {
+    if (options.tensorFactory) {
+      return options.tensorFactory(type, data, dims)
+    }
+    return { type, data, dims }
+  }
+
+  function updateRecurrentState(outputs: Record<string, SileroOnnxTensorLike>): void {
+    const nextStateTensor = outputs.stateN ?? outputs.hn
+    if (nextStateTensor && nextStateTensor.data) {
+      const nextData = nextStateTensor.data
+      const updated = new Float32Array(SILERO_STATE_SIZE)
+      const copyLen = Math.min(SILERO_STATE_SIZE, nextData.length)
+      for (let i = 0; i < copyLen; i++) {
+        const val = Number(nextData[i])
+        updated[i] = Number.isFinite(val) ? val : 0
+      }
+      if (outputs.cn?.data && copyLen <= SILERO_STATE_SIZE / 2) {
+        const cnData = outputs.cn.data
+        const half = SILERO_STATE_SIZE / 2
+        const cnLen = Math.min(half, cnData.length)
+        for (let i = 0; i < cnLen; i++) {
+          const val = Number(cnData[i])
+          updated[half + i] = Number.isFinite(val) ? val : 0
+        }
+      }
+      state = updated
+    }
+  }
+
+  return {
+    async processBlock(block: PcmAudioBlock): Promise<VadFrameAssessment> {
+      const samples16k =
+        block.sampleRate === 16000
+          ? block.samples
+          : downsamplePcmFloat32(block.samples, block.sampleRate || 16000, 16000)
+
+      const dspBase = computeFrameSpeechProbability(samples16k, 16000, candidateThreshold)
+      const session = await resolveSession()
+
+      if (!session) {
+        currentEngineMode = 'hybrid-dsp'
+        return {
+          ...dspBase,
+          engineMode: 'hybrid-dsp',
+        }
+      }
+
+      try {
+        const inputTensor = buildTensor('float32', samples16k, [1, samples16k.length])
+        const stateSnapshot = new Float32Array(state)
+        const stateTensor = buildTensor('float32', stateSnapshot, [2, 1, 128])
+        const srData =
+          typeof BigInt64Array !== 'undefined' ? new BigInt64Array([16000n]) : [16000]
+        const srTensor = buildTensor('int64', srData, [1])
+
+        const outputs = await session.run({
+          input: inputTensor,
+          state: stateTensor,
+          sr: srTensor,
+        })
+
+        const outputTensor = outputs.output ?? Object.values(outputs)[0]
+        const rawProb = outputTensor?.data ? Number(outputTensor.data[0]) : Number.NaN
+
+        if (!Number.isFinite(rawProb)) {
+          currentEngineMode = 'hybrid-dsp'
+          return {
+            ...dspBase,
+            engineMode: 'hybrid-dsp',
+          }
+        }
+
+        updateRecurrentState(outputs)
+        currentEngineMode = 'silero-onnx'
+
+        const clampedOnnx = Math.max(0, Math.min(1, rawProb))
+        const blendedProb = Number(
+          (blendWeight * clampedOnnx + (1 - blendWeight) * dspBase.probability).toFixed(6),
+        )
+
+        return {
+          ...dspBase,
+          probability: blendedProb,
+          isSpeechCandidate: blendedProb >= candidateThreshold,
+          engineMode: 'silero-onnx',
+        }
+      } catch {
+        currentEngineMode = 'hybrid-dsp'
+        const fallbackRes = await fallbackVad.processBlock(block)
+        return {
+          ...fallbackRes,
+          engineMode: 'hybrid-dsp',
+        }
+      }
+    },
+    getEngineMode() {
+      return currentEngineMode
+    },
+    reset(): void {
+      state.fill(0)
+      fallbackVad.reset()
     },
   }
 }

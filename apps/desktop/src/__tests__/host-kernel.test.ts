@@ -3,6 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AshyHostStreamEvent } from '@ashy/shared'
+import { encodeWavPcm16, synthesizeVoicedSpeechPcm } from '@ashy/voice'
 import { createAshyHostKernel } from '../host/kernel'
 
 const tempDirs: string[] = []
@@ -15,11 +16,378 @@ function makeTempDir(): string {
 
 afterEach(() => {
   while (tempDirs.length > 0) {
-    fs.rmSync(tempDirs.pop()!, { recursive: true, force: true })
+    try {
+      fs.rmSync(tempDirs.pop()!, { recursive: true, force: true })
+    } catch {
+      // Ignore Windows EPERM cleanup race
+    }
   }
 })
 
 describe('AshyHostKernel & TurnOrchestrator', () => {
+  it('persists omniExecutionMode and omniVoiceId in ProviderVault across restarts and surfaces Omni capabilities in listProviderModels for lfm3-omni:2b and gpt-4o-audio-preview', async () => {
+    const dir = makeTempDir()
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url =
+        typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      if (url.endsWith('/api/tags')) {
+        return new Response(
+          JSON.stringify({
+            models: [
+              { name: 'lfm3-omni:2b', model: 'lfm3-omni:2b' },
+              { name: 'qwen2.5:14b', model: 'qwen2.5:14b' },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      if (url.includes('api.openai.com') && url.endsWith('/models')) {
+        return new Response(
+          JSON.stringify({
+            data: [
+              { id: 'gpt-4o-audio-preview', name: 'GPT-4o Audio Preview', context_length: 128000 },
+              { id: 'gpt-4o-mini', name: 'GPT-4o Mini', context_length: 128000 },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      return new Response('Not Found', { status: 404 })
+    })
+
+    const kernel1 = await createAshyHostKernel({
+      userDataDir: dir,
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    })
+
+    const saved = await kernel1.saveProviderConfig({
+      providerId: 'ollama',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      modelId: 'lfm3-omni:2b',
+      omniExecutionMode: 'native-omni',
+      omniVoiceId: 'female',
+    })
+
+    expect(saved.config.isOmniModel).toBe(true)
+    expect(saved.config.supportsOmniAudioIn).toBe(true)
+    expect(saved.config.supportsOmniAudioOut).toBe(true)
+    expect(saved.config.supportsOmniVideoIn).toBe(true)
+    expect(saved.config.inputModalities).toEqual(['text', 'audio', 'image', 'video'])
+    expect(saved.config.outputModalities).toEqual(['text', 'audio'])
+    expect(saved.config.omniExecutionMode).toBe('native-omni')
+    expect(saved.config.omniVoiceId).toBe('female')
+
+    const ollamaCatalog = await kernel1.listProviderModels({ providerId: 'ollama' })
+    expect(ollamaCatalog.source).toBe('remote')
+    const lfm3Item = ollamaCatalog.models.find((m) => m.id === 'lfm3-omni:2b')
+    expect(lfm3Item).toBeDefined()
+    expect(lfm3Item?.isOmniModel).toBe(true)
+    expect(lfm3Item?.supportsOmniAudioIn).toBe(true)
+    expect(lfm3Item?.supportsOmniAudioOut).toBe(true)
+    expect(lfm3Item?.supportsOmniVideoIn).toBe(true)
+
+    const openaiCatalog = await kernel1.listProviderModels({
+      providerId: 'openai',
+      apiKey: 'sk-proj-test-1234',
+    })
+    expect(openaiCatalog.source).toBe('remote')
+    const gpt4oAudioItem = openaiCatalog.models.find((m) => m.id === 'gpt-4o-audio-preview')
+    expect(gpt4oAudioItem).toBeDefined()
+    expect(gpt4oAudioItem?.isOmniModel).toBe(true)
+    expect(gpt4oAudioItem?.supportsOmniAudioIn).toBe(true)
+    expect(gpt4oAudioItem?.supportsOmniAudioOut).toBe(true)
+    expect(gpt4oAudioItem?.supportsOmniVideoIn).toBe(true)
+
+    await kernel1.stop()
+
+    const kernel2 = await createAshyHostKernel({
+      userDataDir: dir,
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    })
+    const boot2 = await kernel2.getBootstrapSnapshot()
+    expect(boot2.providers.configs.ollama.modelId).toBe('lfm3-omni:2b')
+    expect(boot2.providers.configs.ollama.isOmniModel).toBe(true)
+    expect(boot2.providers.configs.ollama.omniExecutionMode).toBe('native-omni')
+    expect(boot2.providers.configs.ollama.omniVoiceId).toBe('female')
+    await kernel2.stop()
+  })
+
+  it('executes a direct native-omni turn (lfm3-omni:2b) with WAV ICMT audio + videoFrames: evaluates SeriousnessGate on spoken transcript (HIGH-4), sends multimodal parts + modalities:["text","audio"], emits turn:input-transcript, strips <|ACT|> from delta.audio.transcript, streams turn:audio-delta with vowelFrames, and supports ashy_stage_signal tool', async () => {
+    const dir = makeTempDir()
+    const capturedBodies: Array<Record<string, unknown>> = []
+    let callCount = 0
+
+    // Generate 60ms of 24kHz PCM16 voiced speech for native audio delta response
+    const pcmFloat = synthesizeVoicedSpeechPcm({
+      durationMs: 60,
+      sampleRate: 24000,
+      fundamentalHz: 210,
+      amplitude: 0.5,
+    })
+    const pcm16Bytes = new Uint8Array(pcmFloat.length * 2)
+    const pcmView = new DataView(pcm16Bytes.buffer)
+    for (let i = 0; i < pcmFloat.length; i++) {
+      const s = Math.max(-1, Math.min(1, pcmFloat[i]!))
+      pcmView.setInt16(i * 2, Math.round(s * 32767), true)
+    }
+    const pcm24kBase64 = Buffer.from(pcm16Bytes).toString('base64')
+
+    const mockFetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      callCount += 1
+      if (typeof init?.body === 'string') {
+        capturedBodies.push(JSON.parse(init.body) as Record<string, unknown>)
+      }
+
+      if (callCount === 1) {
+        // Turn 1: Direct audio-only WAV with ICMT serious crisis utterance + video frame
+        const sse = [
+          `data: ${JSON.stringify({
+            choices: [
+              {
+                delta: {
+                  audio: {
+                    transcript:
+                      '<|ACT {"emotion":"concerned","intensity":0.9,"motion":"nod"}|>Respira comigo, Carlos, estou aqui com você.',
+                    data: pcm24kBase64,
+                    format: 'pcm16',
+                    sample_rate: 24000,
+                  },
+                },
+              },
+            ],
+          })}\n\n`,
+          'data: [DONE]\n\n',
+        ].join('')
+        return new Response(sse, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        })
+      }
+
+      if (callCount === 2) {
+        // Turn 2 Step 1: Model invokes ashy_stage_signal tool silently before speaking
+        const sseTool = [
+          `data: ${JSON.stringify({
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: 'call_stage_1',
+                      type: 'function',
+                      function: {
+                        name: 'ashy_stage_signal',
+                        arguments: JSON.stringify({
+                          emotion: 'happy',
+                          intensity: 0.88,
+                          motion: 'sparkle',
+                          callbackMotifId: 'motif-padre-npm',
+                        }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: 'tool_calls',
+              },
+            ],
+          })}\n\n`,
+          'data: [DONE]\n\n',
+        ].join('')
+        return new Response(sseTool, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        })
+      }
+
+      // Turn 2 Step 2: Model streams native audio after tool call
+      const sseAfterTool = [
+        `data: ${JSON.stringify({
+          input_transcript: 'Olha o webcam frame, o build passou de primeira!',
+          choices: [
+            {
+              delta: {
+                audio: {
+                  transcript: 'Nem precisou chamar o padre pro npm dessa vez!',
+                  data: pcm24kBase64,
+                  format: 'pcm16',
+                  sample_rate: 24000,
+                },
+              },
+            },
+          ],
+        })}\n\n`,
+        'data: [DONE]\n\n',
+      ].join('')
+      return new Response(sseAfterTool, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    })
+
+    const kernel = await createAshyHostKernel({
+      userDataDir: dir,
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    })
+
+    await kernel.seedDemoFixtures()
+    const snap = await kernel.completeOnboarding({
+      userName: 'Carlos',
+      providerConfig: {
+        providerId: 'ollama',
+        baseUrl: 'http://127.0.0.1:11434/v1',
+        modelId: 'lfm3-omni:2b',
+        omniExecutionMode: 'native-omni',
+        omniVoiceId: 'female',
+      },
+    })
+
+    const events1: AshyHostStreamEvent[] = []
+    const unsub1 = kernel.onHostEvent((ev) => events1.push(ev))
+
+    // Encode WAV with ICMT metadata comment containing a SeriousnessGate trigger phrase
+    const spokenCrisisText =
+      'Estou exausto, tive uma crise de pânico horrível hoje e quero chorar.'
+    const userWavBytes = encodeWavPcm16(
+      synthesizeVoicedSpeechPcm(300, 16000),
+      16000,
+      spokenCrisisText,
+    )
+    const userWavBase64 = Buffer.from(userWavBytes).toString('base64')
+
+    const turn1Res = await kernel.sendTurn({
+      sessionId: snap.activeSession.id,
+      text: '',
+      inputAudio: {
+        dataBase64: `data:audio/wav;base64,${userWavBase64}`,
+        format: 'wav',
+        sampleRate: 16000,
+        durationMs: 300,
+      },
+      videoFrames: [
+        {
+          dataUrl: 'data:image/jpeg;base64,/9j/4AAQSkZJRg==',
+          timestampMs: 500,
+          width: 512,
+          height: 288,
+          source: 'camera',
+        },
+      ],
+    })
+
+    // HIGH-4: User message in SQLite has the resolved spoken transcript synchronously
+    expect(turn1Res.userMessage.content).toBe(spokenCrisisText)
+
+    await vi.waitFor(() => {
+      expect(events1.some((e) => e.type === 'turn:completed')).toBe(true)
+    })
+    unsub1()
+
+    // 1. Verify request payload sent to LFM3-Omni-2B
+    expect(capturedBodies.length).toBeGreaterThanOrEqual(1)
+    const req1 = capturedBodies[0]!
+    expect(req1.model).toBe('lfm3-omni:2b')
+    expect(req1.modalities).toEqual(['text', 'audio'])
+    expect(req1.audio).toEqual({ voice: 'female', format: 'pcm16' })
+    expect(req1.think).toBe(false)
+
+    const req1Str = JSON.stringify(req1)
+    // SeriousnessGate evaluated on spoken WAV transcript (HIGH-4)
+    expect(req1Str).toContain('[SERIOUSNESS GATE — HIGH PRIORITY]')
+    // Native Omni Audio Output Directive injected into system prompt
+    expect(req1Str).toContain('[NATIVE OMNI AUDIO OUTPUT DIRECTIVE]')
+    // Multimodal parts serialized (video_frame -> [Video Frame @ 500ms] + image_url, input_audio, text)
+    expect(req1Str).toContain('[Video Frame @ 500ms]')
+    expect(req1Str).toContain('input_audio')
+    expect(req1Str).toContain(spokenCrisisText)
+
+    // 2. Verify streamed events for Turn 1
+    const inputTranscriptEv = events1.find((e) => e.type === 'turn:input-transcript')
+    expect(inputTranscriptEv).toBeDefined()
+    if (inputTranscriptEv?.type === 'turn:input-transcript') {
+      expect(inputTranscriptEv.transcript).toBe(spokenCrisisText)
+      expect(inputTranscriptEv.source).toBe('wav-metadata')
+      expect(inputTranscriptEv.isFinal).toBe(true)
+    }
+
+    const markerEv = events1.find((e) => e.type === 'turn:marker')
+    expect(markerEv).toBeDefined()
+    if (markerEv?.type === 'turn:marker') {
+      expect(markerEv.marker).toEqual({
+        type: 'act',
+        emotion: 'concerned',
+        intensity: 0.9,
+        motion: 'nod',
+      })
+    }
+
+    const deltaText = events1
+      .filter((e): e is Extract<AshyHostStreamEvent, { type: 'turn:delta' }> => e.type === 'turn:delta')
+      .map((e) => e.textDelta)
+      .join('')
+    expect(deltaText).toBe('Respira comigo, Carlos, estou aqui com você.')
+    expect(deltaText).not.toContain('<|ACT')
+
+    const audioDeltaEv = events1.find((e) => e.type === 'turn:audio-delta')
+    expect(audioDeltaEv).toBeDefined()
+    if (audioDeltaEv?.type === 'turn:audio-delta') {
+      expect(audioDeltaEv.seq).toBe(0)
+      expect(audioDeltaEv.format).toBe('pcm16')
+      expect(audioDeltaEv.sampleRate).toBe(24000)
+      expect(audioDeltaEv.durationMs).toBeGreaterThanOrEqual(50)
+      expect(audioDeltaEv.vowelFrames).toBeDefined()
+      expect(audioDeltaEv.vowelFrames!.length).toBeGreaterThanOrEqual(2)
+      expect(audioDeltaEv.vowelFrames!.some((f) => f.dominantVowel !== 'closed')).toBe(true)
+    }
+
+    // 3. Turn 2: Test ashy_stage_signal tool call + omni-native input_transcript
+    const events2: AshyHostStreamEvent[] = []
+    const unsub2 = kernel.onHostEvent((ev) => events2.push(ev))
+
+    await kernel.sendTurn({
+      sessionId: snap.activeSession.id,
+      text: '',
+      inputAudio: {
+        dataBase64: Buffer.from(pcm16Bytes).toString('base64'),
+        format: 'pcm16',
+        sampleRate: 16000,
+      },
+    })
+
+    await vi.waitFor(() => {
+      expect(events2.some((e) => e.type === 'turn:completed')).toBe(true)
+    })
+    unsub2()
+
+    const markers2 = events2.filter(
+      (e): e is Extract<AshyHostStreamEvent, { type: 'turn:marker' }> => e.type === 'turn:marker',
+    )
+    expect(markers2.some((m) => m.marker.type === 'act' && m.marker.emotion === 'happy')).toBe(true)
+    expect(
+      markers2.some(
+        (m) => m.marker.type === 'callback' && m.marker.motifId === 'motif-padre-npm',
+      ),
+    ).toBe(true)
+
+    const nativeTranscriptEv = events2.find(
+      (e) => e.type === 'turn:input-transcript' && e.source === 'omni-native',
+    )
+    expect(nativeTranscriptEv).toBeDefined()
+
+    // 4. [Adversarial] Malformed WAV header in inputAudio does not crash sendTurn — falls back to '[Mensagem de voz Omni]'
+    const corruptedWavRes = await kernel.sendTurn({
+      sessionId: snap.activeSession.id,
+      text: '',
+      inputAudio: {
+        dataBase64: Buffer.from('NOT_A_RIFF_WAV_HEADER_12345').toString('base64'),
+        format: 'wav',
+        sampleRate: 16000,
+      },
+    })
+    expect(corruptedWavRes.userMessage.content).toBe('[Mensagem de voz Omni]')
+
+    await kernel.stop()
+  })
   it('boots clean with needsOnboarding=true, completes Phase 0 onboarding, and persists first_meeting across restarts', async () => {
     const dir = makeTempDir()
     const kernel1 = await createAshyHostKernel({ userDataDir: dir })

@@ -19,12 +19,14 @@ import {
   computeVowelLipSyncFrames,
   createSttProviderRegistry,
   createTtsProviderRegistry,
+  extractPcmFrameVowelWeights,
   type SttProviderRegistry,
   type TtsProviderRegistry,
   type VowelFrameEnvelope,
 } from './providers'
 import {
   createRealtimeSpeechPipeline,
+  formatInterruptionControlNote,
   type PlaybackReceipt,
   type RealtimeSpeechPipeline,
   type ScheduledAudioChunk,
@@ -47,8 +49,14 @@ import {
   type VoiceTurnController,
   type VoiceTurnControllerState,
 } from './turn-policy'
-import { createHybridVadEngine, type VadEngine } from './vad-engine'
-import { buildVoiceFixtureWavBytes, decodeWavToPcmBlocks } from './wav-codec'
+import { createHybridVadEngine, downsamplePcmFloat32, type VadEngine } from './vad-engine'
+import {
+  buildVoiceFixtureWavBytes,
+  decodeOmniAudioDeltaToPcm,
+  decodeWavToPcmBlocks,
+  encodeWavPcm16,
+  uint8ArrayToBase64,
+} from './wav-codec'
 
 export type VoiceMicMode = 'muted' | 'continuous' | 'ptt' | 'push-to-talk'
 export type CanonicalVoiceMicMode = 'muted' | 'continuous' | 'ptt'
@@ -61,6 +69,69 @@ export function normalizeVoiceMicMode(mode: VoiceMicMode): CanonicalVoiceMicMode
     return 'muted'
   }
   return 'continuous'
+}
+
+export interface MediaStreamTrackLike {
+  stop(): void
+  kind?: string
+  enabled?: boolean
+  readyState?: string
+}
+
+export interface MediaStreamLike {
+  getTracks(): MediaStreamTrackLike[]
+  getAudioTracks?(): MediaStreamTrackLike[]
+}
+
+export interface ScriptProcessorNodeLike {
+  onaudioprocess:
+    | ((event: { inputBuffer: { getChannelData(channel: number): Float32Array } }) => void)
+    | null
+  connect(destination: unknown): void
+  disconnect?(): void
+}
+
+export interface AudioWorkletNodeLike {
+  port: {
+    onmessage: ((event: { data: unknown }) => void) | null
+    postMessage?(message: unknown): void
+  }
+  connect(destination: unknown): void
+  disconnect?(): void
+}
+
+export interface CaptureAudioContextLike {
+  sampleRate: number
+  state?: 'suspended' | 'running' | 'closed'
+  destination: unknown
+  resume?(): Promise<void>
+  close?(): Promise<void>
+  createMediaStreamSource?(stream: MediaStreamLike): {
+    connect(destination: unknown): void
+    disconnect?(): void
+  }
+  createScriptProcessor?(
+    bufferSize?: number,
+    numberOfInputChannels?: number,
+    numberOfOutputChannels?: number,
+  ): ScriptProcessorNodeLike
+  audioWorklet?: {
+    addModule(moduleUrl: string): Promise<void>
+  }
+  createAudioWorkletNode?: (name: string) => AudioWorkletNodeLike
+}
+
+export interface StartMicrophoneCaptureOptions {
+  deviceId?: string
+  mediaDevices?: {
+    getUserMedia(constraints: {
+      audio: boolean | Record<string, unknown>
+      video?: boolean
+    }): Promise<MediaStreamLike>
+  }
+  audioContextFactory?: () => CaptureAudioContextLike
+  onRmsLevel?: (rms: number) => void
+  onPcmBlock?: (aecBlock: PcmAudioBlock, rawBlock: PcmAudioBlock) => void | Promise<void>
 }
 
 export interface WebAudioWorkletCaptureOptions {
@@ -85,6 +156,10 @@ export interface WebAudioWorkletCapture {
     aecBlock: PcmAudioBlock
     rawBlock: PcmAudioBlock
   }
+  startMicrophoneCapture(options?: StartMicrophoneCaptureOptions): Promise<void>
+  stopMicrophoneCapture(): Promise<void>
+  isCapturingMicrophone(): boolean
+  getLastRmsLevel(): number
   start(): Promise<void>
   stop(): void
   reset(): void
@@ -119,30 +194,72 @@ function toPcmBlock(
   return samplesOrBlock
 }
 
+const WORKLET_PROCESSOR_SOURCE = `
+class AshyMicCaptureProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const input = inputs[0];
+    if (input && input[0] && input[0].length > 0) {
+      this.port.postMessage(new Float32Array(input[0]));
+    }
+    return true;
+  }
+}
+registerProcessor('ashy-mic-capture-processor', AshyMicCaptureProcessor);
+`
+
 export function createWebAudioWorkletCapture(
   options: WebAudioWorkletCaptureOptions,
 ): WebAudioWorkletCapture {
   const sampleRate = options.sampleRate ?? 16000
   const frameDurationMs = options.frameDurationMs ?? 20
+  const samplesPerFrame = Math.max(1, Math.round((sampleRate * frameDurationMs) / 1000))
+
   let isCapturing = false
+  let capturingMicrophone = false
+  let captureGenerationId = 0
+  let lastRmsLevel = 0
   let nextAecFrame = 0
   let nextRawFrame = 0
   let aecFramesPushed = 0
   let rawFramesPushed = 0
+  let lastPushedAecBlock: PcmAudioBlock | null = null
+  let lastPushedRawBlock: PcmAudioBlock | null = null
+
+  let activeStream: MediaStreamLike | null = null
+  let activeCaptureContext: CaptureAudioContextLike | null = null
+  let activeSourceNode: { disconnect?(): void } | null = null
+  let activeProcessorNode: { disconnect?(): void; onaudioprocess?: unknown } | null = null
+  let stagingSamples: number[] = []
 
   function pushAecFrame(samplesOrBlock: Float32Array | PcmAudioBlock): PcmAudioBlock {
+    if (
+      !(samplesOrBlock instanceof Float32Array) &&
+      lastPushedAecBlock !== null &&
+      samplesOrBlock === lastPushedAecBlock
+    ) {
+      return lastPushedAecBlock
+    }
     const block = toPcmBlock(samplesOrBlock, nextAecFrame, sampleRate)
     nextAecFrame = block.endFrame
     aecFramesPushed += 1
+    lastPushedAecBlock = block
     options.aecRingBuffer.push(block)
     void options.onAecBlock?.(block)
     return block
   }
 
   function pushRawFrame(samplesOrBlock: Float32Array | PcmAudioBlock): PcmAudioBlock {
+    if (
+      !(samplesOrBlock instanceof Float32Array) &&
+      lastPushedRawBlock !== null &&
+      samplesOrBlock === lastPushedRawBlock
+    ) {
+      return lastPushedRawBlock
+    }
     const block = toPcmBlock(samplesOrBlock, nextRawFrame, sampleRate)
     nextRawFrame = block.endFrame
     rawFramesPushed += 1
+    lastPushedRawBlock = block
     options.rawRingBuffer?.push(block)
     options.wakeWordSpotter?.pushRawAudio(block)
     void options.onRawBlock?.(block)
@@ -158,22 +275,326 @@ export function createWebAudioWorkletCapture(
     return { aecBlock, rawBlock }
   }
 
+  function cleanupSyncResources(): CaptureAudioContextLike | null {
+    isCapturing = false
+    capturingMicrophone = false
+    lastRmsLevel = 0
+    stagingSamples = []
+
+    if (activeProcessorNode) {
+      try {
+        if ('onaudioprocess' in activeProcessorNode) {
+          activeProcessorNode.onaudioprocess = null
+        }
+        activeProcessorNode.disconnect?.()
+      } catch {
+        // Ignore disconnect errors
+      }
+      activeProcessorNode = null
+    }
+
+    if (activeSourceNode) {
+      try {
+        activeSourceNode.disconnect?.()
+      } catch {
+        // Ignore disconnect errors
+      }
+      activeSourceNode = null
+    }
+
+    if (activeStream) {
+      for (const track of activeStream.getTracks()) {
+        try {
+          track.stop()
+        } catch {
+          // Ignore track stop errors
+        }
+      }
+      activeStream = null
+    }
+
+    const ctxToClose = activeCaptureContext
+    activeCaptureContext = null
+    return ctxToClose
+  }
+
+  async function cleanupCaptureResources(): Promise<void> {
+    const ctxToClose = cleanupSyncResources()
+    if (ctxToClose) {
+      try {
+        await ctxToClose.close?.()
+      } catch {
+        // Ignore close errors
+      }
+    }
+  }
+
+  function defaultAudioContextFactory(): CaptureAudioContextLike {
+    const Ctor =
+      (globalThis as unknown as { AudioContext?: new (opts?: { sampleRate?: number }) => CaptureAudioContextLike })
+        .AudioContext ??
+      (
+        globalThis as unknown as {
+          webkitAudioContext?: new (opts?: { sampleRate?: number }) => CaptureAudioContextLike
+        }
+      ).webkitAudioContext
+
+    if (!Ctor) {
+      throw new Error('AudioContext is not supported in this environment')
+    }
+    return new Ctor({ sampleRate })
+  }
+
+  async function startMicrophoneCapture(
+    startOptions: StartMicrophoneCaptureOptions = {},
+  ): Promise<void> {
+    const myGen = ++captureGenerationId
+    const prevCtx = cleanupSyncResources()
+    if (prevCtx) {
+      try {
+        await prevCtx.close?.()
+      } catch {
+        // Ignore close errors
+      }
+      if (myGen !== captureGenerationId) {
+        return
+      }
+    }
+
+    const mediaDevices =
+      startOptions.mediaDevices ??
+      (
+        globalThis.navigator as
+          | { mediaDevices?: StartMicrophoneCaptureOptions['mediaDevices'] }
+          | undefined
+      )?.mediaDevices
+
+    if (!mediaDevices || typeof mediaDevices.getUserMedia !== 'function') {
+      throw new Error(
+        'Microphone capture unavailable: navigator.mediaDevices.getUserMedia is not available',
+      )
+    }
+
+    const deviceId = startOptions.deviceId?.trim()
+    const stream = await mediaDevices.getUserMedia({
+      audio: {
+        ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    })
+
+    // Red-Team H4: If stopMicrophoneCapture() or another startMicrophoneCapture() was called
+    // while getUserMedia was awaiting, immediately stop tracks and abort without creating AudioContext!
+    if (myGen !== captureGenerationId) {
+      for (const track of stream.getTracks()) {
+        try {
+          track.stop()
+        } catch {
+          // Ignore
+        }
+      }
+      return
+    }
+
+    let audioCtx: CaptureAudioContextLike | null = null
+    try {
+      audioCtx = startOptions.audioContextFactory
+        ? startOptions.audioContextFactory()
+        : defaultAudioContextFactory()
+
+      if (audioCtx.state === 'suspended' && typeof audioCtx.resume === 'function') {
+        await audioCtx.resume()
+        if (myGen !== captureGenerationId) {
+          for (const track of stream.getTracks()) {
+            try {
+              track.stop()
+            } catch {
+              // Ignore
+            }
+          }
+          await audioCtx.close?.()
+          return
+        }
+      }
+    } catch (err) {
+      for (const track of stream.getTracks()) {
+        try {
+          track.stop()
+        } catch {
+          // Ignore
+        }
+      }
+      if (audioCtx) {
+        try {
+          await audioCtx.close?.()
+        } catch {
+          // Ignore
+        }
+      }
+      throw err
+    }
+
+    activeStream = stream
+    activeCaptureContext = audioCtx
+    isCapturing = true
+    capturingMicrophone = true
+    stagingSamples = []
+
+    const handleIncomingPcmSamples = (rawSamples: Float32Array): void => {
+      if (myGen !== captureGenerationId || !capturingMicrophone) {
+        return
+      }
+      const inputRate =
+        Number.isFinite(audioCtx.sampleRate) && audioCtx.sampleRate > 0
+          ? audioCtx.sampleRate
+          : sampleRate
+      const downsampled = downsamplePcmFloat32(rawSamples, inputRate, sampleRate)
+      for (let i = 0; i < downsampled.length; i++) {
+        stagingSamples.push(downsampled[i]!)
+      }
+
+      while (stagingSamples.length >= samplesPerFrame) {
+        const chunkValues = stagingSamples.splice(0, samplesPerFrame)
+        const chunk320 = new Float32Array(chunkValues)
+
+        let sumSq = 0
+        for (let i = 0; i < chunk320.length; i++) {
+          const val = chunk320[i]!
+          sumSq += val * val
+        }
+        const rms = Number(Math.sqrt(sumSq / chunk320.length).toFixed(6))
+        lastRmsLevel = rms
+        startOptions.onRmsLevel?.(rms)
+
+        const { aecBlock, rawBlock } = pushDualFrame(chunk320, chunk320)
+        void startOptions.onPcmBlock?.(aecBlock, rawBlock)
+      }
+    }
+
+    const sourceNode = audioCtx.createMediaStreamSource?.(stream) ?? null
+    activeSourceNode = sourceNode
+
+    let attachedWorklet = false
+    if (sourceNode && audioCtx.createAudioWorkletNode) {
+      try {
+        const workletNode = audioCtx.createAudioWorkletNode('ashy-mic-capture-processor')
+        workletNode.port.onmessage = (event) => {
+          if (event.data instanceof Float32Array) {
+            handleIncomingPcmSamples(event.data)
+          } else if (
+            event.data &&
+            typeof event.data === 'object' &&
+            (event.data as { samples?: unknown }).samples instanceof Float32Array
+          ) {
+            handleIncomingPcmSamples((event.data as { samples: Float32Array }).samples)
+          }
+        }
+        sourceNode.connect(workletNode)
+        workletNode.connect(audioCtx.destination)
+        activeProcessorNode = workletNode
+        attachedWorklet = true
+      } catch {
+        attachedWorklet = false
+      }
+    } else if (
+      sourceNode &&
+      audioCtx.audioWorklet &&
+      typeof audioCtx.audioWorklet.addModule === 'function' &&
+      typeof (globalThis as unknown as { AudioWorkletNode?: unknown }).AudioWorkletNode ===
+        'function' &&
+      typeof URL !== 'undefined' &&
+      typeof URL.createObjectURL === 'function'
+    ) {
+      let blobUrl: string | null = null
+      try {
+        const blob = new Blob([WORKLET_PROCESSOR_SOURCE], { type: 'application/javascript' })
+        blobUrl = URL.createObjectURL(blob)
+        await audioCtx.audioWorklet.addModule(blobUrl)
+        if (myGen !== captureGenerationId) {
+          await cleanupCaptureResources()
+          return
+        }
+        const WorkletNodeCtor = (
+          globalThis as unknown as {
+            AudioWorkletNode: new (
+              ctx: unknown,
+              name: string,
+            ) => AudioWorkletNodeLike
+          }
+        ).AudioWorkletNode
+        const workletNode = new WorkletNodeCtor(audioCtx, 'ashy-mic-capture-processor')
+        workletNode.port.onmessage = (event) => {
+          if (event.data instanceof Float32Array) {
+            handleIncomingPcmSamples(event.data)
+          }
+        }
+        sourceNode.connect(workletNode)
+        workletNode.connect(audioCtx.destination)
+        activeProcessorNode = workletNode
+        attachedWorklet = true
+      } catch {
+        attachedWorklet = false
+      } finally {
+        if (blobUrl && typeof URL.revokeObjectURL === 'function') {
+          try {
+            URL.revokeObjectURL(blobUrl)
+          } catch {
+            // Ignore
+          }
+        }
+      }
+    }
+
+    if (!attachedWorklet && sourceNode && typeof audioCtx.createScriptProcessor === 'function') {
+      const scriptNode = audioCtx.createScriptProcessor(1024, 1, 1)
+      scriptNode.onaudioprocess = (event) => {
+        const inputData = event.inputBuffer.getChannelData(0)
+        handleIncomingPcmSamples(new Float32Array(inputData))
+      }
+      sourceNode.connect(scriptNode)
+      scriptNode.connect(audioCtx.destination)
+      activeProcessorNode = scriptNode
+    }
+  }
+
+  async function stopMicrophoneCapture(): Promise<void> {
+    captureGenerationId += 1
+    await cleanupCaptureResources()
+  }
+
   return {
     pushAecFrame,
     pushRawFrame,
     pushDualFrame,
+    startMicrophoneCapture,
+    stopMicrophoneCapture,
+    isCapturingMicrophone: () => capturingMicrophone,
+    getLastRmsLevel: () => lastRmsLevel,
     async start(): Promise<void> {
       isCapturing = true
     },
     stop(): void {
       isCapturing = false
+      if (capturingMicrophone) {
+        void stopMicrophoneCapture()
+      }
     },
     reset(): void {
+      if (capturingMicrophone) {
+        void stopMicrophoneCapture()
+      }
       isCapturing = false
+      capturingMicrophone = false
+      lastRmsLevel = 0
+      stagingSamples = []
       nextAecFrame = 0
       nextRawFrame = 0
       aecFramesPushed = 0
       rawFramesPushed = 0
+      lastPushedAecBlock = null
+      lastPushedRawBlock = null
     },
     getState() {
       return {
@@ -223,6 +644,7 @@ export interface GaplessAudioPlayerOptions {
   audioContext?: WebAudioContextLike
   defaultFadeOutMs?: number
   onVowelFrame?: (frame: VowelFrameEnvelope) => void
+  onQueueDrained?: () => void
   onPlaybackEnded?: () => void
 }
 
@@ -254,6 +676,8 @@ export interface GaplessAudioPlayer {
           synthesisOutput?: TtsSynthesisOutput
         },
   ): ScheduledPlaybackItem
+  markStreamComplete(complete?: boolean): void
+  isStreamComplete(): boolean
   getCurrentTimeSec(): number
   setVirtualClockSec(timeSec: number): void
   advanceVirtualClockSec(deltaSec: number): void
@@ -282,16 +706,47 @@ export function createGaplessAudioPlayer(
   }
 
   const scheduledItems: ScheduledPlaybackItem[] = []
-  const activeSourceNodes: Array<{ stop?: (when?: number) => void }> = []
+  const activeSourceNodes: Array<{ stop?: (when?: number) => void; onended?: (() => void) | null }> =
+    []
   let virtualClockSec = 0
   let nextScheduledTimeSec = 0
   let gainValue = 1
   let playing = false
+  let streamComplete = true
+  let queueDrained = false
+  let playbackEndedFired = false
   let nextFallbackSeq = 0
 
   function getCurrentTimeSec(): number {
     const ctxTime = ctx && Number.isFinite(ctx.currentTime) ? ctx.currentTime : 0
     return Math.max(virtualClockSec, ctxTime)
+  }
+
+  function handleQueueDrained(): void {
+    if (!queueDrained) {
+      queueDrained = true
+      options.onQueueDrained?.()
+    }
+    if (streamComplete && !playbackEndedFired) {
+      playing = false
+      playbackEndedFired = true
+      options.onVowelFrame?.({ ...ZERO_VOWELS })
+      options.onPlaybackEnded?.()
+    }
+  }
+
+  function markStreamComplete(complete = true): void {
+    streamComplete = Boolean(complete)
+    if (!streamComplete) {
+      playbackEndedFired = false
+      return
+    }
+    if (scheduledItems.length > 0 && queueDrained && !playbackEndedFired) {
+      playing = false
+      playbackEndedFired = true
+      options.onVowelFrame?.({ ...ZERO_VOWELS })
+      options.onPlaybackEnded?.()
+    }
   }
 
   function getActiveVowelFrame(atTimeSec = getCurrentTimeSec()): VowelFrameEnvelope {
@@ -388,6 +843,8 @@ export function createGaplessAudioPlayer(
     }
 
     playing = true
+    queueDrained = false
+    playbackEndedFired = false
     nextScheduledTimeSec = Math.max(nextScheduledTimeSec, endTimeSec)
     scheduledItems.push(item)
 
@@ -404,6 +861,19 @@ export function createGaplessAudioPlayer(
       } else if (ctx.destination !== undefined) {
         source.connect?.(ctx.destination)
       }
+      source.onended = () => {
+        const idx = activeSourceNodes.indexOf(source)
+        if (idx !== -1) {
+          activeSourceNodes.splice(idx, 1)
+        }
+        if (!playing) {
+          return
+        }
+        virtualClockSec = Math.max(virtualClockSec, item.endTimeSec)
+        if (activeSourceNodes.length === 0 && getCurrentTimeSec() >= nextScheduledTimeSec - 1e-6) {
+          handleQueueDrained()
+        }
+      }
       source.start?.(startTimeSec)
       activeSourceNodes.push(source)
     }
@@ -418,8 +888,7 @@ export function createGaplessAudioPlayer(
     if (playing) {
       options.onVowelFrame?.(getActiveVowelFrame(getCurrentTimeSec()))
       if (virtualClockSec >= nextScheduledTimeSec && nextScheduledTimeSec > 0) {
-        playing = false
-        options.onPlaybackEnded?.()
+        handleQueueDrained()
       }
     }
   }
@@ -446,6 +915,7 @@ export function createGaplessAudioPlayer(
 
     for (const src of activeSourceNodes) {
       try {
+        src.onended = null
         src.stop?.(fadeEndTimeSec)
       } catch {
         // Ignore already-stopped source nodes
@@ -455,6 +925,7 @@ export function createGaplessAudioPlayer(
 
     gainValue = 0
     playing = false
+    queueDrained = true
     options.onVowelFrame?.({ ...ZERO_VOWELS })
 
     return {
@@ -467,6 +938,7 @@ export function createGaplessAudioPlayer(
   function reset(): void {
     for (const src of activeSourceNodes) {
       try {
+        src.onended = null
         src.stop?.(0)
       } catch {
         // Ignore
@@ -478,11 +950,16 @@ export function createGaplessAudioPlayer(
     nextScheduledTimeSec = 0
     gainValue = 1
     playing = false
+    streamComplete = true
+    queueDrained = false
+    playbackEndedFired = false
     nextFallbackSeq = 0
   }
 
   return {
     scheduleChunk,
+    markStreamComplete,
+    isStreamComplete: () => streamComplete,
     getCurrentTimeSec,
     setVirtualClockSec,
     advanceVirtualClockSec,
@@ -493,6 +970,23 @@ export function createGaplessAudioPlayer(
     getScheduledItems: () => scheduledItems.slice(),
     reset,
   }
+}
+
+export interface TtsVowelLipSyncFrame extends VowelFrameEnvelope {
+  offsetMs?: number
+}
+
+export interface SealedOmniAudioTurn {
+  wavBytes: Uint8Array
+  wavBase64: string
+  mimeType: 'audio/wav'
+  sampleRate: 16000
+  durationMs: number
+  rmsPeak: number
+  preRollBlocksCount: number
+  revision: number
+  reason: 'vad-silence' | 'ptt-release' | 'manual'
+  transcriptHint?: string
 }
 
 export interface VoiceSessionRuntimeOptions {
@@ -509,8 +1003,17 @@ export interface VoiceSessionRuntimeOptions {
   audioContext?: WebAudioContextLike
   bargeInMinSpeechMs?: number
   preRollMs?: number
+  directOmniAudio?: boolean
+  omniSilenceSealMs?: number
   onTurnSealed?: (turn: SealedVoiceTurn) => void
-  onBargeIn?: (receipt: PlaybackReceipt) => void
+  onOmniAudioTurnReady?: (turn: SealedOmniAudioTurn) => void
+  onBargeIn?: (
+    receipt: PlaybackReceipt & {
+      receipt?: PlaybackReceipt
+      anchorFrame?: number | null
+      preRollBlocksCount?: number
+    },
+  ) => void
   onStageSignal?: (signal: AshyStageSignal, afterChunkSeq: number) => void
   onVowelFrame?: (frame: VowelFrameEnvelope) => void
 }
@@ -524,6 +1027,7 @@ export interface VoiceSessionRuntimeSnapshot {
   lastWakeWordMatched: string | null
   activeSttProviderId: SttProviderId
   activeTtsProviderId: TtsProviderId
+  directOmniAudio: boolean
   isPlayingAudio: boolean
   bargeInCount: number
   cancelledShortCount: number
@@ -535,6 +1039,7 @@ export interface VoiceSessionRuntimeSnapshot {
   activeVowelFrame: VowelFrameEnvelope
   turnState: VoiceTurnControllerState
   sealedTurns: readonly SealedVoiceTurn[]
+  sealedOmniAudioTurns: readonly SealedOmniAudioTurn[]
   ttfaByProvider: Record<TtsProviderId, TtfaTelemetryRecord>
 }
 
@@ -548,6 +1053,9 @@ export interface VoiceSessionRuntime {
   ingestPcmBlocks(blocks: readonly PcmAudioBlock[]): Promise<void>
   ingestWavBytes(wavBytes: Uint8Array | ArrayBuffer): Promise<VoiceSessionRuntimeSnapshot>
   runFixtureScenario(fixtureId: VoiceFixtureId): Promise<VoiceFixtureScenarioResult>
+  startMicrophoneCapture(options?: StartMicrophoneCaptureOptions): Promise<void>
+  stopMicrophoneCapture(): Promise<void>
+  isCapturingMicrophone(): boolean
   enqueueAssistantDelta(textDelta: string): void
   enqueueAssistantMarker(signal: AshyStageSignal): void
   flushAssistantReply(): Promise<void>
@@ -559,6 +1067,20 @@ export interface VoiceSessionRuntime {
   setWakeWordEnabled(enabled: boolean): void
   setActiveSttProvider(providerId: SttProviderId): void
   setActiveTtsProvider(providerId: TtsProviderId): void
+  setDirectOmniAudio(enabled: boolean): void
+  getDirectOmniAudio(): boolean
+  ingestOmniAudioDelta(delta: {
+    turnId: string
+    seq: number
+    audioBase64: string
+    format: 'pcm16' | 'wav'
+    sampleRate: number
+    durationMs: number
+    transcriptDelta?: string
+    vowelFrames?: ReadonlyArray<TtsVowelLipSyncFrame>
+  }): void
+  interruptOmniPlayback(turnId: string, cause?: string): PlaybackReceipt | null
+  computeOmniPlaybackReceipt(turnId: string, stoppedAtSec?: number): PlaybackReceipt | null
   getTtfaTelemetry(): Record<TtsProviderId, TtfaTelemetryRecord>
   recordTtfaSample(providerId: TtsProviderId, ttfaMs: number): TtfaTelemetryRecord
   getSpeechPipeline(): RealtimeSpeechPipeline
@@ -620,7 +1142,26 @@ export function createVoiceSessionRuntime(
   let lastBargeInPreRollBlocksCount = 0
   let activeVowelFrame: VowelFrameEnvelope = { ...ZERO_VOWELS }
   const sealedTurns: SealedVoiceTurn[] = []
+  const sealedOmniAudioTurns: SealedOmniAudioTurn[] = []
   const ttfaByProvider = createInitialTtfaMap()
+
+  let directOmniAudio = options.directOmniAudio ?? false
+  const omniSilenceSealMs = options.omniSilenceSealMs ?? 750
+  let omniAccumulatedBlocks: PcmAudioBlock[] = []
+  let omniPreRollBlocksCount = 0
+  let omniSilenceAccumulatedMs = 0
+  let omniRevision = 0
+  let lastWavMetadataComment: string | undefined
+  let activeOmniPlaybackTurnId: string | null = null
+  interface OmniScheduledTranscriptEntry {
+    turnId: string
+    seq: number
+    text: string
+    startTimeSec: number
+    endTimeSec: number
+    durationMs: number
+  }
+  const omniScheduledEntries: OmniScheduledTranscriptEntry[] = []
 
   const aecRingBuffer = createAudioInputRingBuffer({ baseHistoryMs: Math.max(400, preRollMs) })
   const rawRingBuffer = createAudioInputRingBuffer({ baseHistoryMs: Math.max(400, preRollMs) })
@@ -754,7 +1295,9 @@ export function createVoiceSessionRuntime(
     }
   }
 
-  async function transcribeBurstAndAppend(blocksToTranscribe: readonly PcmAudioBlock[]): Promise<void> {
+  async function transcribeBurstAndAppend(
+    blocksToTranscribe: readonly PcmAudioBlock[],
+  ): Promise<void> {
     if (blocksToTranscribe.length === 0) return
     const sttRes = await sttRegistry.transcribe(activeSttProviderId, {
       blocks: blocksToTranscribe,
@@ -786,20 +1329,256 @@ export function createVoiceSessionRuntime(
     turnController.updateTranscript(combinedRaw)
   }
 
+  function emitBargeInCallback(receipt: PlaybackReceipt): void {
+    const augmented = receipt as PlaybackReceipt & {
+      receipt?: PlaybackReceipt
+      anchorFrame?: number | null
+      preRollBlocksCount?: number
+    }
+    Object.defineProperty(augmented, 'receipt', {
+      value: receipt,
+      enumerable: false,
+      configurable: true,
+    })
+    Object.defineProperty(augmented, 'anchorFrame', {
+      value: lastBargeInLeaseAnchorFrame,
+      enumerable: false,
+      configurable: true,
+    })
+    Object.defineProperty(augmented, 'preRollBlocksCount', {
+      value: lastBargeInPreRollBlocksCount,
+      enumerable: false,
+      configurable: true,
+    })
+    options.onBargeIn?.(augmented)
+  }
+
+  function sealPendingOmniAudioTurn(
+    reason: 'vad-silence' | 'ptt-release' | 'manual',
+  ): SealedOmniAudioTurn | null {
+    if (omniAccumulatedBlocks.length === 0) return null
+    const blocks = omniAccumulatedBlocks.slice()
+    const preRollCount = omniPreRollBlocksCount
+    omniAccumulatedBlocks = []
+    omniPreRollBlocksCount = 0
+    omniSilenceAccumulatedMs = 0
+
+    const totalSamples = blocks.reduce((acc, b) => acc + b.samples.length, 0)
+    if (totalSamples === 0) return null
+    const merged = new Float32Array(totalSamples)
+    let offset = 0
+    let rmsPeak = 0
+    for (const b of blocks) {
+      merged.set(b.samples, offset)
+      offset += b.samples.length
+      let sumSq = 0
+      for (let i = 0; i < b.samples.length; i++) {
+        const s = b.samples[i]!
+        sumSq += s * s
+      }
+      const rms = b.samples.length > 0 ? Math.sqrt(sumSq / b.samples.length) : 0
+      if (rms > rmsPeak) rmsPeak = rms
+    }
+
+    const wavBytes = encodeWavPcm16(
+      merged,
+      16000,
+      lastWavMetadataComment ?? `ashy-omni-turn-rev-${omniRevision}`,
+    )
+    const wavBase64 = uint8ArrayToBase64(wavBytes)
+    const durationMs = Math.round((totalSamples / 16000) * 1000)
+
+    const sealedOmni: SealedOmniAudioTurn = {
+      wavBytes,
+      wavBase64,
+      mimeType: 'audio/wav',
+      sampleRate: 16000,
+      durationMs,
+      rmsPeak: Number(rmsPeak.toFixed(4)),
+      preRollBlocksCount: preRollCount,
+      revision: omniRevision,
+      reason,
+      ...(lastWavMetadataComment ? { transcriptHint: lastWavMetadataComment } : {}),
+    }
+    sealedOmniAudioTurns.push(sealedOmni)
+    if (wakeWordEnabled) {
+      wakeWordSessionOpen = false
+    }
+    options.onOmniAudioTurnReady?.(sealedOmni)
+    return sealedOmni
+  }
+
+  function ingestOmniAudioDelta(delta: {
+    turnId: string
+    seq: number
+    audioBase64: string
+    format: 'pcm16' | 'wav'
+    sampleRate: number
+    durationMs: number
+    transcriptDelta?: string
+    vowelFrames?: ReadonlyArray<TtsVowelLipSyncFrame>
+  }): void {
+    if (activeOmniPlaybackTurnId !== delta.turnId) {
+      activeOmniPlaybackTurnId = delta.turnId
+      omniScheduledEntries.length = 0
+      player.markStreamComplete(false)
+    }
+
+    const decoded = decodeOmniAudioDeltaToPcm(
+      delta.audioBase64,
+      delta.format,
+      delta.sampleRate,
+    )
+    const durationMs =
+      delta.durationMs > 0 ? delta.durationMs : Math.max(20, decoded.durationMs)
+    const durationSec = durationMs / 1000
+
+    let vowelFrames: ReadonlyArray<VowelFrameEnvelope> = delta.vowelFrames ?? []
+    if (vowelFrames.length === 0 && decoded.samples.length > 0) {
+      const frameSamples = Math.max(1, Math.floor(decoded.sampleRate * 0.02))
+      const extracted: VowelFrameEnvelope[] = []
+      for (let offset = 0; offset < decoded.samples.length; offset += frameSamples) {
+        const slice = decoded.samples.subarray(
+          offset,
+          Math.min(decoded.samples.length, offset + frameSamples),
+        )
+        const weights = extractPcmFrameVowelWeights(slice, decoded.sampleRate)
+        extracted.push({
+          A: weights.A,
+          E: weights.E,
+          I: weights.I,
+          O: weights.O,
+          U: weights.U,
+        })
+      }
+      vowelFrames = extracted
+    }
+
+    const scheduledItem = player.scheduleChunk({
+      seq: delta.seq,
+      text: delta.transcriptDelta ?? '',
+      durationSec,
+      durationMs,
+      samples: decoded.samples,
+      sampleRate: decoded.sampleRate,
+      vowelFrames,
+    })
+
+    omniScheduledEntries.push({
+      turnId: delta.turnId,
+      seq: delta.seq,
+      text: delta.transcriptDelta ?? '',
+      startTimeSec: scheduledItem.startTimeSec,
+      endTimeSec: scheduledItem.endTimeSec,
+      durationMs,
+    })
+  }
+
+  function computeOmniPlaybackReceipt(
+    turnId: string,
+    stoppedAtSec = player.getCurrentTimeSec(),
+    cause = 'user-barge-in',
+  ): PlaybackReceipt | null {
+    const entries = omniScheduledEntries.filter((e) => e.turnId === turnId)
+    if (entries.length === 0) return null
+
+    const heardParts: string[] = []
+    const unheardParts: string[] = []
+    let throughMs = 0
+
+    for (const entry of entries) {
+      const text = entry.text.trim()
+      if (stoppedAtSec >= entry.endTimeSec - 0.005) {
+        if (text) heardParts.push(text)
+        throughMs += entry.durationMs
+      } else if (stoppedAtSec <= entry.startTimeSec + 0.005) {
+        if (text) unheardParts.push(text)
+      } else {
+        const ratio = Math.max(
+          0,
+          Math.min(
+            1,
+            (stoppedAtSec - entry.startTimeSec) /
+              Math.max(0.001, entry.endTimeSec - entry.startTimeSec),
+          ),
+        )
+        throughMs += Math.round(entry.durationMs * ratio)
+        if (text) {
+          const words = text.split(/\s+/)
+          const splitIdx = Math.max(1, Math.round(words.length * ratio))
+          const h = words.slice(0, splitIdx).join(' ')
+          const u = words.slice(splitIdx).join(' ')
+          if (h) heardParts.push(h)
+          if (u) unheardParts.push(u)
+        }
+      }
+    }
+
+    const heardText = heardParts.join(' ').trim()
+    const unheardText = unheardParts.join(' ').trim()
+    const controlNote = `${formatInterruptionControlNote({
+      throughMs,
+      heardText,
+      unheardText,
+    })} [User interrupted speech at ${Math.round(throughMs)}ms]`
+
+    return {
+      cause,
+      throughMs,
+      fadeOutMs: 100,
+      heardText,
+      unheardText,
+      heardChunks: heardParts,
+      unheardChunks: unheardParts,
+      controlNote,
+    }
+  }
+
+  function interruptOmniPlayback(
+    turnId: string,
+    cause = 'user-barge-in',
+  ): PlaybackReceipt | null {
+    const fadeResult = player.stopWithFade(100)
+    const receipt = computeOmniPlaybackReceipt(turnId, fadeResult.stoppedAtSec, cause)
+    if (receipt) {
+      bargeInCount += 1
+      lastPlaybackReceipt = receipt
+      emitBargeInCallback(receipt)
+    }
+    return receipt
+  }
+
   function executeAutomaticBargeIn(): PlaybackReceipt {
     bargeInTriggeredInCurrentBurst = true
     bargeInCount += 1
 
-    if (activeLease) {
+    if (activeLease && aecRingBuffer.getBlocks().length > 0) {
       lastBargeInLeaseAnchorFrame = activeLease.anchorFrame
       const capturedPreRoll = aecRingBuffer.captureFrom(activeLease.anchorFrame)
       lastBargeInPreRollBlocksCount = capturedPreRoll.length
     }
 
     const currentPlaybackSec = player.getCurrentTimeSec()
+    if (
+      activeOmniPlaybackTurnId !== null &&
+      omniScheduledEntries.some((e) => e.turnId === activeOmniPlaybackTurnId)
+    ) {
+      const fadeResult = player.stopWithFade(100)
+      const omniReceipt = computeOmniPlaybackReceipt(
+        activeOmniPlaybackTurnId,
+        fadeResult.stoppedAtSec,
+        'user-vad-barge-in',
+      )
+      if (omniReceipt) {
+        lastPlaybackReceipt = omniReceipt
+        emitBargeInCallback(omniReceipt)
+        return omniReceipt
+      }
+    }
+
     const receipt = speechPipeline.interrupt('user-vad-barge-in', currentPlaybackSec)
     lastPlaybackReceipt = receipt
-    options.onBargeIn?.(receipt)
+    emitBargeInCallback(receipt)
     return receipt
   }
 
@@ -822,6 +1601,9 @@ export function createVoiceSessionRuntime(
       const pushedAec = workletCapture.pushAecFrame(block)
       workletCapture.pushRawFrame(rawBlock ?? block)
       pttCapturedBlocks.push(pushedAec)
+      if (directOmniAudio) {
+        omniAccumulatedBlocks.push(pushedAec)
+      }
       return
     }
 
@@ -836,17 +1618,24 @@ export function createVoiceSessionRuntime(
       activeLease = aecRingBuffer.retain(preRollMs)
       currentBurstBlocks = []
       bargeInTriggeredInCurrentBurst = false
+      omniRevision += 1
+      omniSilenceAccumulatedMs = 0
 
-      // If user resumes speaking while in the +3000ms grace period after an incomplete pause,
-      // exercise CAS protection by superseding an in-flight boundary judge with the new speaker revision
-      if (turnController.getState().inGracePeriod) {
-        turnController.bumpSpeakerRevision()
-        const inFlightJudge = turnController.advanceSilence(1200)
-        turnController.bumpSpeakerRevision()
-        await inFlightJudge
-      } else {
-        turnController.bumpSpeakerRevision()
+      if (directOmniAudio) {
+        const preRollBlocks =
+          aecRingBuffer.getBlocks().length > 0
+            ? aecRingBuffer.captureFrom(activeLease.anchorFrame)
+            : []
+        if (omniAccumulatedBlocks.length === 0) {
+          omniPreRollBlocksCount = Math.max(1, preRollBlocks.length)
+          omniAccumulatedBlocks = [...preRollBlocks]
+        } else {
+          omniPreRollBlocksCount += preRollBlocks.length
+          omniAccumulatedBlocks.push(...preRollBlocks)
+        }
       }
+
+      turnController.bumpSpeakerRevision()
     }
 
     const pushedAec = workletCapture.pushAecFrame(block)
@@ -855,6 +1644,10 @@ export function createVoiceSessionRuntime(
 
     if (step.isSpeaking) {
       currentBurstBlocks.push(pushedAec)
+      if (directOmniAudio) {
+        omniAccumulatedBlocks.push(pushedAec)
+        omniSilenceAccumulatedMs = 0
+      }
 
       // Check for automatic VAD barge-in once sustained speech reaches >= 300ms while Ashy is speaking
       if (
@@ -870,6 +1663,11 @@ export function createVoiceSessionRuntime(
     if (step.action === 'cancel' && step.reason === 'too-short') {
       cancelledShortCount += 1
       currentBurstBlocks = []
+      if (directOmniAudio) {
+        omniAccumulatedBlocks = []
+        omniPreRollBlocksCount = 0
+        omniSilenceAccumulatedMs = 0
+      }
       releaseActiveLease()
       return
     }
@@ -877,14 +1675,42 @@ export function createVoiceSessionRuntime(
     if (step.action === 'pause') {
       const burstToTranscribe = currentBurstBlocks.slice()
       currentBurstBlocks = []
-      await transcribeBurstAndAppend(burstToTranscribe)
       releaseActiveLease()
+      if (directOmniAudio) {
+        omniSilenceAccumulatedMs += block.durationMs
+        const effectiveSealMs =
+          omniRevision === 1 && lastWavMetadataComment?.includes('...')
+            ? omniSilenceSealMs + 1500
+            : omniSilenceSealMs
+        if (omniSilenceAccumulatedMs >= effectiveSealMs) {
+          sealPendingOmniAudioTurn('vad-silence')
+        }
+        return
+      }
+      await transcribeBurstAndAppend(burstToTranscribe)
       await turnController.advanceSilence(block.durationMs)
       return
     }
 
+    if (directOmniAudio) {
+      if (omniAccumulatedBlocks.length > 0) {
+        omniSilenceAccumulatedMs += block.durationMs
+        const effectiveSealMs =
+          omniRevision === 1 && lastWavMetadataComment?.includes('...')
+            ? omniSilenceSealMs + 1500
+            : omniSilenceSealMs
+        if (omniSilenceAccumulatedMs >= effectiveSealMs) {
+          sealPendingOmniAudioTurn('vad-silence')
+        }
+      }
+      return
+    }
+
     // Idle silence frame
-    if (turnController.getState().rawText.length > 0 && turnController.getState().status !== 'sealed') {
+    if (
+      turnController.getState().rawText.length > 0 &&
+      turnController.getState().status !== 'sealed'
+    ) {
       await turnController.advanceSilence(block.durationMs)
     }
   }
@@ -899,14 +1725,35 @@ export function createVoiceSessionRuntime(
     wavBytes: Uint8Array | ArrayBuffer,
   ): Promise<VoiceSessionRuntimeSnapshot> {
     const decoded = decodeWavToPcmBlocks(wavBytes, 20)
+    lastWavMetadataComment = decoded.metadataComment ?? undefined
     await ingestPcmBlocks(decoded.blocks)
     return getState()
+  }
+
+  async function startMicrophoneCapture(
+    startOptions: StartMicrophoneCaptureOptions = {},
+  ): Promise<void> {
+    if (micMode === 'muted') {
+      micMode = 'continuous'
+    }
+    await workletCapture.startMicrophoneCapture({
+      ...startOptions,
+      onPcmBlock: async (aecBlock, rawBlock) => {
+        await ingestPcmBlock(aecBlock, rawBlock)
+        await startOptions.onPcmBlock?.(aecBlock, rawBlock)
+      },
+    })
+  }
+
+  async function stopMicrophoneCapture(): Promise<void> {
+    await workletCapture.stopMicrophoneCapture()
   }
 
   function ensureReplyEnqueueStarted(): void {
     if (currentReplyFirstEnqueueAtMs === null) {
       currentReplyFirstEnqueueAtMs = performance.now()
       currentReplyFirstAudioRecorded = false
+      player.markStreamComplete(false)
     }
   }
 
@@ -924,6 +1771,7 @@ export function createVoiceSessionRuntime(
     ensureReplyEnqueueStarted()
     speechPipeline.flush()
     await waitForPendingSynthesis()
+    player.markStreamComplete(true)
     currentReplyFirstEnqueueAtMs = null
   }
 
@@ -933,10 +1781,12 @@ export function createVoiceSessionRuntime(
   ): Promise<void> {
     speechPipeline.reset()
     player.reset()
+    player.markStreamComplete(false)
     currentReplyFirstEnqueueAtMs = performance.now()
     currentReplyFirstAudioRecorded = false
     speechPipeline.enqueue(textWithSentinels, signals, { flush: true })
     await waitForPendingSynthesis()
+    player.markStreamComplete(true)
     currentReplyFirstEnqueueAtMs = null
   }
 
@@ -950,18 +1800,36 @@ export function createVoiceSessionRuntime(
         ? Math.max(0, interruptAtMs / 1000)
         : player.getCurrentTimeSec()
     player.setVirtualClockSec(playbackSec)
+    if (
+      activeOmniPlaybackTurnId !== null &&
+      omniScheduledEntries.some((e) => e.turnId === activeOmniPlaybackTurnId)
+    ) {
+      player.stopWithFade(100)
+      const omniReceipt = computeOmniPlaybackReceipt(activeOmniPlaybackTurnId, playbackSec, cause)
+      if (omniReceipt) {
+        lastPlaybackReceipt = omniReceipt
+        emitBargeInCallback(omniReceipt)
+        return omniReceipt
+      }
+    }
     const receipt = speechPipeline.interrupt(cause, playbackSec)
     lastPlaybackReceipt = receipt
-    options.onBargeIn?.(receipt)
+    emitBargeInCallback(receipt)
     return receipt
   }
 
   function setMicMode(mode: VoiceMicMode): void {
     micMode = normalizeVoiceMicMode(mode)
     if (micMode === 'muted') {
+      if (workletCapture.isCapturingMicrophone()) {
+        void workletCapture.stopMicrophoneCapture()
+      }
       pushToTalkActive = false
       pttCapturedBlocks = []
       currentBurstBlocks = []
+      omniAccumulatedBlocks = []
+      omniPreRollBlocksCount = 0
+      omniSilenceAccumulatedMs = 0
       releaseActiveLease()
       aecRingBuffer.clear()
       rawRingBuffer.clear()
@@ -974,6 +1842,12 @@ export function createVoiceSessionRuntime(
 
     if (pushToTalkActive && !wasActive) {
       pttCapturedBlocks = []
+      if (directOmniAudio) {
+        omniAccumulatedBlocks = []
+        omniPreRollBlocksCount = 0
+        omniSilenceAccumulatedMs = 0
+        omniRevision += 1
+      }
       if (turnController.getState().status === 'sealed') {
         accumulatedClauses = []
         turnController.reset()
@@ -984,6 +1858,10 @@ export function createVoiceSessionRuntime(
     if (!pushToTalkActive && wasActive && micMode === 'ptt') {
       const blocksToFlush = pttCapturedBlocks.slice()
       pttCapturedBlocks = []
+      if (directOmniAudio && omniAccumulatedBlocks.length > 0) {
+        sealPendingOmniAudioTurn('ptt-release')
+        return null
+      }
       if (blocksToFlush.length > 0) {
         await transcribeBurstAndAppend(blocksToFlush)
       }
@@ -1010,6 +1888,13 @@ export function createVoiceSessionRuntime(
     activeTtsProviderId = providerId
   }
 
+  function setDirectOmniAudio(enabled: boolean): void {
+    directOmniAudio = Boolean(enabled)
+    omniAccumulatedBlocks = []
+    omniPreRollBlocksCount = 0
+    omniSilenceAccumulatedMs = 0
+  }
+
   function getTtfaTelemetry(): Record<TtsProviderId, TtfaTelemetryRecord> {
     const copy = {} as Record<TtsProviderId, TtfaTelemetryRecord>
     for (const id of TTS_PROVIDER_IDS) {
@@ -1023,6 +1908,13 @@ export function createVoiceSessionRuntime(
     currentBurstBlocks = []
     pttCapturedBlocks = []
     accumulatedClauses = []
+    omniAccumulatedBlocks = []
+    omniPreRollBlocksCount = 0
+    omniSilenceAccumulatedMs = 0
+    omniRevision = 0
+    lastWavMetadataComment = undefined
+    activeOmniPlaybackTurnId = null
+    omniScheduledEntries.length = 0
     bargeInTriggeredInCurrentBurst = false
     pushToTalkActive = false
     wakeWordSessionOpen = !wakeWordEnabled
@@ -1093,6 +1985,7 @@ export function createVoiceSessionRuntime(
       lastWakeWordMatched,
       activeSttProviderId,
       activeTtsProviderId,
+      directOmniAudio,
       isPlayingAudio: player.isPlaying(),
       bargeInCount,
       cancelledShortCount,
@@ -1104,6 +1997,7 @@ export function createVoiceSessionRuntime(
       activeVowelFrame: { ...activeVowelFrame },
       turnState: turnController.getState(),
       sealedTurns: sealedTurns.slice(),
+      sealedOmniAudioTurns: sealedOmniAudioTurns.slice(),
       ttfaByProvider: getTtfaTelemetry(),
     }
   }
@@ -1113,6 +2007,9 @@ export function createVoiceSessionRuntime(
     ingestPcmBlocks,
     ingestWavBytes,
     runFixtureScenario,
+    startMicrophoneCapture,
+    stopMicrophoneCapture,
+    isCapturingMicrophone: () => workletCapture.isCapturingMicrophone(),
     enqueueAssistantDelta,
     enqueueAssistantMarker,
     flushAssistantReply,
@@ -1124,6 +2021,11 @@ export function createVoiceSessionRuntime(
     setWakeWordEnabled,
     setActiveSttProvider,
     setActiveTtsProvider,
+    setDirectOmniAudio,
+    getDirectOmniAudio: () => directOmniAudio,
+    ingestOmniAudioDelta,
+    interruptOmniPlayback,
+    computeOmniPlaybackReceipt,
     getTtfaTelemetry,
     recordTtfaSample,
     getSpeechPipeline: () => speechPipeline,

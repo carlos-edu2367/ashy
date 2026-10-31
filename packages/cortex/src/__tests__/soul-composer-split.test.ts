@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createAshyCortex } from '../index'
+import { composeAshyTurnPrompt, createAshyCortex } from '../index'
 
 describe('@ashy/cortex SoulComposer static/volatile split & turn memory indexing', () => {
   it('splits staticSystemPrompt (voice.md + soul truths + exemplars) from volatileTurnContext without hardcoded 21:15 or VS Code', () => {
@@ -186,5 +186,23 @@ describe('@ashy/cortex SoulComposer static/volatile split & turn memory indexing
     expect(cortex.getChatSession('sess-cortex-1')).toBeNull()
 
     cortex.close()
+  })
+
+  it('appends [NATIVE OMNI AUDIO OUTPUT DIRECTIVE] to systemPrompt when omniOutputMode is native-audio', () => {
+    const nativeAudioCompiled = composeAshyTurnPrompt({
+      userMessage: 'Me responde usando sua voz nativa do LFM3-Omni-2B!',
+      omniOutputMode: 'native-audio',
+    })
+
+    expect(nativeAudioCompiled.systemPrompt).toContain('[NATIVE OMNI AUDIO OUTPUT DIRECTIVE]')
+    expect(nativeAudioCompiled.systemPrompt).toContain('ashy_stage_signal')
+    expect(nativeAudioCompiled.systemPrompt).toMatch(/NEVER vocalize/i)
+
+    const textOnlyCompiled = composeAshyTurnPrompt({
+      userMessage: 'Me responde em texto normal',
+      omniOutputMode: 'text-only',
+    })
+
+    expect(textOnlyCompiled.systemPrompt).not.toContain('[NATIVE OMNI AUDIO OUTPUT DIRECTIVE]')
   })
 })

@@ -20,6 +20,13 @@ export interface HybridSpeculativeRephraseOptions {
 
 export type SpeculativeRephraseFn = (rawText: string, signal?: AbortSignal) => Promise<string>
 
+export interface OpenAiCompatibleTurnLlmOptions {
+  baseUrl: string
+  apiKey?: string
+  modelId: string
+  fetchImpl?: typeof fetch
+}
+
 export interface WakeWordDetectionResult {
   detected: boolean
   matchedPhrase: string | null
@@ -114,6 +121,211 @@ const TRAILING_HESITATION_TOKEN_SET = new Set([
   'uhm',
   'erm',
 ])
+
+const WHISPER_SILENCE_EXACT_TOKENS = new Set([
+  '[blank_audio]',
+  '(blank_audio)',
+  '[silêncio]',
+  '(silêncio)',
+  '[silencio]',
+  '(silencio)',
+  '[silence]',
+  '(silence)',
+  '[música]',
+  '(música)',
+  '[musica]',
+  '(musica)',
+  '[music]',
+  '(music)',
+  '[inaudível]',
+  '(inaudível)',
+  '[inaudible]',
+  '(inaudible)',
+])
+
+const WHISPER_SILENCE_SUBSTRINGS = [
+  'obrigado por assistir',
+  'obrigada por assistir',
+  'legendas pela comunidade',
+  'subtitles by',
+  'thank you for watching',
+  'thanks for watching',
+] as const
+
+export function isWhisperSilenceHallucination(text: string): boolean {
+  if (typeof text !== 'string') {
+    return true
+  }
+
+  const trimmed = text.trim()
+  if (trimmed.length === 0) {
+    return true
+  }
+
+  // Only punctuation / ellipsis / dashes / whitespace
+  if (/^[.,?!;:\-—…'"()[\]\s]+$/u.test(trimmed)) {
+    return true
+  }
+
+  const lower = trimmed.toLowerCase()
+  if (WHISPER_SILENCE_EXACT_TOKENS.has(lower)) {
+    return true
+  }
+
+  const strippedPunct = lower.replace(/[.,?!;:\-—…!'"]+$/gu, '').trim()
+  if (WHISPER_SILENCE_EXACT_TOKENS.has(strippedPunct)) {
+    return true
+  }
+
+  for (const marker of WHISPER_SILENCE_SUBSTRINGS) {
+    if (strippedPunct.includes(marker)) {
+      return true
+    }
+  }
+
+  return false
+}
+
+function normalizeLlmBaseUrl(baseUrl: string): string {
+  return baseUrl.trim().replace(/\/+$/, '')
+}
+
+async function postChatCompletionWithReasoningFallback(
+  options: OpenAiCompatibleTurnLlmOptions,
+  payload: {
+    model: string
+    temperature: number
+    max_tokens: number
+    messages: Array<{ role: 'system' | 'user'; content: string }>
+  },
+  signal?: AbortSignal,
+): Promise<string> {
+  const fetchFn = options.fetchImpl ?? globalThis.fetch
+  if (typeof fetchFn !== 'function') {
+    throw new Error('Fetch implementation is unavailable for TurnIntelligence LLM call')
+  }
+
+  const endpoint = `${normalizeLlmBaseUrl(options.baseUrl)}/chat/completions`
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  }
+  if (options.apiKey && options.apiKey.trim().length > 0) {
+    headers.Authorization = `Bearer ${options.apiKey.trim()}`
+  }
+
+  const sendRequest = async (includeReasoningEffort: boolean): Promise<Response> => {
+    const bodyObj: Record<string, unknown> = {
+      ...payload,
+      ...(includeReasoningEffort ? { reasoning_effort: 'none' } : {}),
+    }
+    return await fetchFn(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(bodyObj),
+      signal,
+    })
+  }
+
+  let response = await sendRequest(true)
+  if (response.status === 400 || response.status === 422) {
+    // Retry cleanly without reasoning_effort for OpenAI-compatible servers that reject unknown fields
+    response = await sendRequest(false)
+  }
+
+  if (!response.ok) {
+    throw new Error(`TurnIntelligence LLM HTTP ${response.status}`)
+  }
+
+  const data = (await response.json()) as {
+    choices?: Array<{
+      message?: {
+        content?: string | null
+      }
+    }>
+  }
+
+  const content = data?.choices?.[0]?.message?.content
+  return typeof content === 'string' ? content.trim() : ''
+}
+
+export function createOpenAiCompatibleVoiceEndJudgeFn(
+  options: OpenAiCompatibleTurnLlmOptions,
+): (transcript: string, signal: AbortSignal) => Promise<EndJudgeDecision> {
+  return async (transcript: string, signal?: AbortSignal): Promise<EndJudgeDecision> => {
+    const content = await postChatCompletionWithReasoningFallback(
+      options,
+      {
+        model: options.modelId,
+        temperature: 0,
+        max_tokens: 40,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a real-time turn-taking boundary classifier for spoken Portuguese (PT-BR) and English. Reply ONLY with a JSON object {"complete": boolean, "reason": string} indicating whether the user utterance is semantically complete or cut off mid-thought.',
+          },
+          {
+            role: 'user',
+            content: transcript,
+          },
+        ],
+      },
+      signal,
+    )
+
+    const unfenced = content
+      .replace(/^```(?:json)?\s*/iu, '')
+      .replace(/\s*```$/u, '')
+      .trim()
+
+    const jsonMatch = /\{[\s\S]*\}/u.exec(unfenced)
+    const rawJson = jsonMatch ? jsonMatch[0] : unfenced
+    const parsed = JSON.parse(rawJson) as { complete?: unknown; reason?: unknown }
+
+    if (typeof parsed.complete !== 'boolean') {
+      throw new Error('Invalid JSON structure from VoiceEndJudge LLM')
+    }
+
+    const reason =
+      typeof parsed.reason === 'string' && parsed.reason.trim().length > 0
+        ? parsed.reason.trim()
+        : 'llm-judge'
+
+    return {
+      complete: parsed.complete,
+      reason,
+    }
+  }
+}
+
+export function createOpenAiCompatibleSpeculativeRephraseFn(
+  options: OpenAiCompatibleTurnLlmOptions,
+): (cleanedText: string, signal: AbortSignal) => Promise<string> {
+  return async (cleanedText: string, signal?: AbortSignal): Promise<string> => {
+    const content = await postChatCompletionWithReasoningFallback(
+      options,
+      {
+        model: options.modelId,
+        temperature: 0,
+        max_tokens: 200,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'Remove spoken disfluencies, stutters, and vocalized pauses from the user transcript while keeping the exact meaning and language (PT-BR). Do NOT answer the user question; return only the cleaned utterance.',
+          },
+          {
+            role: 'user',
+            content: cleanedText,
+          },
+        ],
+      },
+      signal,
+    )
+
+    return content.length > 0 ? content : cleanedText
+  }
+}
 
 export function evaluateHeuristicVoiceEnd(
   rawTranscript: string,

@@ -58,6 +58,7 @@ export interface ComposeTurnPromptInput {
   stageControlsPromptBlock?: string
   agencyToolsContext?: AgencyToolsPromptContext
   conversationHistory?: readonly ConversationMessage[]
+  omniOutputMode?: 'text-only' | 'native-audio'
 }
 
 export type SoulComposerInput = ComposeTurnPromptInput
@@ -489,6 +490,17 @@ export function buildVolatileTurnContext(input: ComposeTurnPromptInput): string 
   sections.push(
     ['[RECALLED MEMORIES & FACTS]', ...factsLines].join('\n'),
   )
+
+  if (input.omniOutputMode === 'native-audio') {
+    sections.push(
+      [
+        '[NATIVE OMNI AUDIO OUTPUT DIRECTIVE]',
+        '- You are generating native speech audio directly in real time (`modalities: ["text", "audio"]`).',
+        '- CRITICAL VOICE HYGIENE: NEVER vocalize or pronounce control tags like `<|ACT ...|>`, `<|DELAY ...|>`, or `<|CALLBACK ...|>` aloud in the spoken audio stream (never say "less than pipe ACT" or read JSON brackets out loud).',
+        '- Emit stage emotion/motion signals silently via the `ashy_stage_signal` tool or as silent text-only prefix markers, keeping your spoken audio 100% natural conversational Portuguese.',
+      ].join('\n'),
+    )
+  }
 
   return sections.join('\n\n')
 }

@@ -26,6 +26,9 @@ export function ModelsSettingsPanel(): React.ReactElement {
   const setActiveProvider = useAshyStore((s) => s.setActiveProvider)
   const testProviderConnection = useAshyStore((s) => s.testProviderConnection)
   const listProviderModels = useAshyStore((s) => s.listProviderModels)
+  const unifiedOmniMode = useAshyStore((s) => s.unifiedOmniMode)
+  const setUnifiedOmniMode = useAshyStore((s) => s.setUnifiedOmniMode)
+  const applyOmniModelPreset = useAshyStore((s) => s.applyOmniModelPreset)
 
   const [selectedProvider, setSelectedProvider] = useState<LlmProviderId>(
     providers.activeProviderId ?? 'openrouter',
@@ -207,6 +210,101 @@ export function ModelsSettingsPanel(): React.ReactElement {
         >
           Vault: {providers.diagnostics.status}
         </span>
+      </div>
+
+      {/* Phase 8.7 Unified Omni Model Card (LFM3-Omni-2B Local & Cloud) */}
+      <div
+        className="ashy-setting-box"
+        data-testid="unified-omni-settings-card"
+        style={{
+          flexDirection: 'column',
+          alignItems: 'stretch',
+          gap: '10px',
+          borderColor: unifiedOmniMode ? 'var(--accent-peach)' : 'var(--border-subtle)',
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: '12px',
+          }}
+        >
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span className="ashy-setting-title">
+                Modelo Omni Unificado (Voz, Texto, Imagem e Vídeo)
+              </span>
+              <span className={`ashy-badge ${unifiedOmniMode ? 'peach' : 'neutral'}`}>
+                {unifiedOmniMode ? 'Omni Nativo Ativo' : 'Pipeline Separado'}
+              </span>
+            </div>
+            <p className="ashy-setting-desc" style={{ margin: '2px 0 0 0' }}>
+              Um único modelo processa voz 16kHz, texto, imagens e frames de vídeo 2fps, gerando
+              fala 24kHz e tags de atuação diretamente.
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={unifiedOmniMode}
+            data-testid="toggle-unified-omni-mode"
+            className={`ashy-switch ${unifiedOmniMode ? 'checked' : ''}`}
+            onClick={() => setUnifiedOmniMode(!unifiedOmniMode)}
+          />
+        </div>
+
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            className="ashy-outline-btn"
+            data-testid="preset-omni-lfm3-local"
+            onClick={() => {
+              applyOmniModelPreset('lfm3-omni-2b')
+              setSelectedProvider('ollama')
+              setModelId('lfm3-omni:2b')
+            }}
+          >
+            ⚡ LFM3-Omni-2B (Local Ollama)
+          </button>
+          <button
+            type="button"
+            className="ashy-outline-btn"
+            data-testid="preset-omni-gpt4o"
+            onClick={() => {
+              applyOmniModelPreset('gpt-4o-audio')
+              setSelectedProvider('openai')
+              setModelId('gpt-4o-audio-preview')
+            }}
+          >
+            ☁️ GPT-4o Audio (OpenAI)
+          </button>
+          <button
+            type="button"
+            className="ashy-outline-btn"
+            data-testid="preset-omni-qwen"
+            onClick={() => {
+              applyOmniModelPreset('qwen2.5-omni')
+              setSelectedProvider('openrouter')
+              setModelId('qwen/qwen2.5-omni-7b')
+            }}
+          >
+             🌐 Qwen 2.5 Omni 7B (OpenRouter)
+          </button>
+          <button
+            type="button"
+            className="ashy-outline-btn"
+            data-testid="preset-omni-gemini"
+            onClick={() => {
+              applyOmniModelPreset('gemini-2.5-flash')
+              setSelectedProvider('openrouter')
+              setModelId('google/gemini-2.5-flash')
+            }}
+          >
+            ✨ Gemini 2.5 Flash (Google)
+          </button>
+        </div>
       </div>
 
       {/* 5 Provider Tabs */}

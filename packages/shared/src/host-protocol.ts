@@ -42,9 +42,23 @@ export const REASONING_EFFORT_LEVELS = [
 export type ReasoningEffort = (typeof REASONING_EFFORT_LEVELS)[number]
 export const ReasoningEffortSchema = v.picklist(REASONING_EFFORT_LEVELS)
 
+export const OMNI_EXECUTION_MODES = [
+  'modular',
+  'hybrid-omni-in',
+  'native-omni',
+] as const
+export type OmniExecutionMode = (typeof OMNI_EXECUTION_MODES)[number]
+export const OmniExecutionModeSchema = v.picklist(OMNI_EXECUTION_MODES)
+
+export const OMNI_MODALITY_KINDS = ['text', 'audio', 'image', 'video'] as const
+export type OmniModalityKind = (typeof OMNI_MODALITY_KINDS)[number]
+export const OmniModalityKindSchema = v.picklist(OMNI_MODALITY_KINDS)
+
 export const STT_PROVIDER_IDS = [
   'openai-whisper',
+  'groq-whisper',
   'local-whisper-http',
+  'web-speech-stt',
   'deterministic-wav-stt',
 ] as const
 
@@ -55,6 +69,7 @@ export const TTS_PROVIDER_IDS = [
   'elevenlabs',
   'openai-tts',
   'local-kokoro-http',
+  'web-speech-tts',
   'local-synth-fallback',
 ] as const
 
@@ -325,7 +340,64 @@ export interface VoiceRuntimeSettings {
   ttsVoiceId: string
   wakeWordEnabled: boolean
   wakeWordPhrases: string[]
+  groqSttModelId?: string
+  openaiSttModelId?: string
+  openaiTtsModelId?: string
+  openaiTtsVoiceId?: string
+  elevenLabsModelId?: string
+  localKokoroModelId?: string
+  localKokoroVoiceId?: string
+  webSpeechLang?: string
+  webSpeechVoiceURI?: string
+  selectedMicDeviceId?: string
+  autoSpeakReplies?: boolean
+  unifiedOmniMode?: boolean
+  directOmniAudio?: boolean
+  hasOpenAiApiKey?: boolean
+  hasGroqApiKey?: boolean
+  hasElevenLabsApiKey?: boolean
+  hasLocalSttApiKey?: boolean
+  hasLocalTtsApiKey?: boolean
+  maskedOpenAiApiKey?: string | null
+  maskedGroqApiKey?: string | null
+  maskedElevenLabsApiKey?: string | null
 }
+
+export const VoiceRuntimeSettingsSchema = v.object({
+  activeSttProviderId: SttProviderIdSchema,
+  activeTtsProviderId: TtsProviderIdSchema,
+  sttBaseUrl: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(512)),
+  sttModelId: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256)),
+  ttsBaseUrl: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(512)),
+  ttsModelId: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256)),
+  ttsVoiceId: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256)),
+  wakeWordEnabled: v.boolean(),
+  wakeWordPhrases: v.pipe(
+    v.array(v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(80))),
+    v.maxLength(16),
+  ),
+  groqSttModelId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  openaiSttModelId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  openaiTtsModelId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  openaiTtsVoiceId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  elevenLabsModelId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  localKokoroModelId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  localKokoroVoiceId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  webSpeechLang: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(64))),
+  webSpeechVoiceURI: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  selectedMicDeviceId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  autoSpeakReplies: v.optional(v.boolean()),
+  unifiedOmniMode: v.optional(v.boolean()),
+  directOmniAudio: v.optional(v.boolean()),
+  hasOpenAiApiKey: v.optional(v.boolean()),
+  hasGroqApiKey: v.optional(v.boolean()),
+  hasElevenLabsApiKey: v.optional(v.boolean()),
+  hasLocalSttApiKey: v.optional(v.boolean()),
+  hasLocalTtsApiKey: v.optional(v.boolean()),
+  maskedOpenAiApiKey: v.optional(v.nullable(v.string())),
+  maskedGroqApiKey: v.optional(v.nullable(v.string())),
+  maskedElevenLabsApiKey: v.optional(v.nullable(v.string())),
+})
 
 export const DEFAULT_VOICE_RUNTIME_SETTINGS: VoiceRuntimeSettings = {
   activeSttProviderId: 'deterministic-wav-stt',
@@ -337,6 +409,136 @@ export const DEFAULT_VOICE_RUNTIME_SETTINGS: VoiceRuntimeSettings = {
   ttsVoiceId: 'ashy-pt-br',
   wakeWordEnabled: true,
   wakeWordPhrases: ['ashy', 'ei ashy', 'oi ashy'],
+}
+
+export const SaveVoiceRuntimeSettingsInputSchema = v.object({
+  activeSttProviderId: v.optional(SttProviderIdSchema),
+  activeTtsProviderId: v.optional(TtsProviderIdSchema),
+  sttBaseUrl: v.optional(v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(512))),
+  sttModelId: v.optional(v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256))),
+  ttsBaseUrl: v.optional(v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(512))),
+  ttsModelId: v.optional(v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256))),
+  ttsVoiceId: v.optional(v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256))),
+  wakeWordEnabled: v.optional(v.boolean()),
+  wakeWordPhrases: v.optional(
+    v.pipe(
+      v.array(v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(80))),
+      v.maxLength(16),
+    ),
+  ),
+  groqSttModelId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  openaiSttModelId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  openaiTtsModelId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  openaiTtsVoiceId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  elevenLabsModelId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  localKokoroModelId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  localKokoroVoiceId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  webSpeechLang: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(64))),
+  webSpeechVoiceURI: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  selectedMicDeviceId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  autoSpeakReplies: v.optional(v.boolean()),
+  unifiedOmniMode: v.optional(v.boolean()),
+  directOmniAudio: v.optional(v.boolean()),
+  openaiApiKey: v.optional(v.pipe(v.string(), v.maxLength(512))),
+  groqApiKey: v.optional(v.pipe(v.string(), v.maxLength(512))),
+  elevenLabsApiKey: v.optional(v.pipe(v.string(), v.maxLength(512))),
+  localSttApiKey: v.optional(v.pipe(v.string(), v.maxLength(512))),
+  localTtsApiKey: v.optional(v.pipe(v.string(), v.maxLength(512))),
+  clearOpenAiApiKey: v.optional(v.boolean()),
+  clearGroqApiKey: v.optional(v.boolean()),
+  clearElevenLabsApiKey: v.optional(v.boolean()),
+  clearLocalSttApiKey: v.optional(v.boolean()),
+  clearLocalTtsApiKey: v.optional(v.boolean()),
+})
+export type SaveVoiceRuntimeSettingsInput = v.InferOutput<
+  typeof SaveVoiceRuntimeSettingsInputSchema
+>
+
+export const ListVoiceProviderModelsInputSchema = v.object({
+  kind: v.picklist(['stt', 'tts'] as const),
+  providerId: v.union([SttProviderIdSchema, TtsProviderIdSchema]),
+  baseUrl: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(512))),
+  apiKey: v.optional(v.pipe(v.string(), v.maxLength(512))),
+})
+export type ListVoiceProviderModelsInput = v.InferOutput<
+  typeof ListVoiceProviderModelsInputSchema
+>
+
+export interface VoiceProviderModelOption {
+  id: string
+  label: string
+}
+
+export interface VoiceProviderModelsCatalog {
+  kind: 'stt' | 'tts'
+  providerId: string
+  models: VoiceProviderModelOption[]
+  voices?: VoiceProviderModelOption[]
+  source: 'remote' | 'fallback'
+  error?: string
+}
+
+export const TranscribeVoiceAudioInputSchema = v.object({
+  audioBase64: v.pipe(v.string(), v.minLength(1), v.maxLength(8_000_000)),
+  mimeType: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(128))),
+  providerId: v.optional(SttProviderIdSchema),
+  baseUrl: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(512))),
+  modelId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  language: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(32))),
+})
+export type TranscribeVoiceAudioInput = v.InferOutput<
+  typeof TranscribeVoiceAudioInputSchema
+>
+
+export interface VoiceTranscribeAudioResult {
+  providerId: SttProviderId
+  text: string
+  latencyMs: number
+  confidence: number
+}
+
+export const SynthesizeVoiceSpeechInputSchema = v.object({
+  text: v.pipe(v.string(), v.minLength(1), v.maxLength(4096)),
+  providerId: v.optional(TtsProviderIdSchema),
+  baseUrl: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(512))),
+  modelId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  voiceId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+})
+export type SynthesizeVoiceSpeechInput = v.InferOutput<
+  typeof SynthesizeVoiceSpeechInputSchema
+>
+
+export const VoiceSynthesizedVowelFrameSchema = v.object({
+  timeSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
+  durationSec: v.pipe(v.number(), v.finite(), v.minValue(0)),
+  A: v.pipe(v.number(), v.finite(), v.minValue(0), v.maxValue(1)),
+  E: v.pipe(v.number(), v.finite(), v.minValue(0), v.maxValue(1)),
+  I: v.pipe(v.number(), v.finite(), v.minValue(0), v.maxValue(1)),
+  O: v.pipe(v.number(), v.finite(), v.minValue(0), v.maxValue(1)),
+  U: v.pipe(v.number(), v.finite(), v.minValue(0), v.maxValue(1)),
+  dominantVowel: v.picklist(['A', 'E', 'I', 'O', 'U', 'closed'] as const),
+})
+
+export interface VoiceSynthesizedVowelFrame {
+  timeSec: number
+  durationSec: number
+  A: number
+  E: number
+  I: number
+  O: number
+  U: number
+  dominantVowel: 'A' | 'E' | 'I' | 'O' | 'U' | 'closed'
+}
+
+export interface VoiceSynthesizeSpeechResult {
+  providerId: TtsProviderId
+  audioBase64: string
+  mimeType: string
+  sampleRate: number
+  durationMs: number
+  durationSec: number
+  synthesisLatencyMs: number
+  vowelFrames: VoiceSynthesizedVowelFrame[]
 }
 
 export const DELETABLE_MEMORY_KINDS = [
@@ -415,7 +617,36 @@ export interface PublicProviderConfig {
   maskedApiKey: string | null
   lastVerifiedAt: number | null
   lastError: string | null
+  isOmniModel?: boolean
+  inputModalities?: OmniModalityKind[]
+  outputModalities?: OmniModalityKind[]
+  supportsOmniAudioIn?: boolean
+  supportsOmniAudioOut?: boolean
+  supportsOmniVideoIn?: boolean
+  omniExecutionMode?: OmniExecutionMode
+  omniVoiceId?: string
 }
+
+export const PublicProviderConfigSchema = v.object({
+  providerId: LlmProviderIdSchema,
+  label: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(128)),
+  baseUrl: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(512)),
+  modelId: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256)),
+  reasoningEffort: v.optional(ReasoningEffortSchema),
+  requiresApiKey: v.boolean(),
+  hasApiKey: v.boolean(),
+  maskedApiKey: v.nullable(v.string()),
+  lastVerifiedAt: v.nullable(v.pipe(v.number(), v.finite())),
+  lastError: v.nullable(v.string()),
+  isOmniModel: v.optional(v.boolean()),
+  inputModalities: v.optional(v.array(OmniModalityKindSchema)),
+  outputModalities: v.optional(v.array(OmniModalityKindSchema)),
+  supportsOmniAudioIn: v.optional(v.boolean()),
+  supportsOmniAudioOut: v.optional(v.boolean()),
+  supportsOmniVideoIn: v.optional(v.boolean()),
+  omniExecutionMode: v.optional(OmniExecutionModeSchema),
+  omniVoiceId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(128))),
+})
 
 export interface ProviderHealthResult {
   ok: boolean
@@ -1059,6 +1290,7 @@ export interface AshyBootstrapSnapshot {
   lastEvalReport?: CoreExperimentEvalReport | null
   agency?: AgencySnapshot
   stagePreferences?: PersistedStagePreferences
+  voiceSettings?: VoiceRuntimeSettings
 }
 
 export const CompleteOnboardingInputSchema = v.object({
@@ -1071,6 +1303,14 @@ export const CompleteOnboardingInputSchema = v.object({
       modelId: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(256)),
       reasoningEffort: v.optional(ReasoningEffortSchema),
       apiKey: v.optional(v.string()),
+      isOmniModel: v.optional(v.boolean()),
+      inputModalities: v.optional(v.array(OmniModalityKindSchema)),
+      outputModalities: v.optional(v.array(OmniModalityKindSchema)),
+      supportsOmniAudioIn: v.optional(v.boolean()),
+      supportsOmniAudioOut: v.optional(v.boolean()),
+      supportsOmniVideoIn: v.optional(v.boolean()),
+      omniExecutionMode: v.optional(OmniExecutionModeSchema),
+      omniVoiceId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(128))),
     }),
   ),
 })
@@ -1084,6 +1324,14 @@ export const SaveProviderConfigInputSchema = v.object({
   reasoningEffort: v.optional(ReasoningEffortSchema),
   apiKey: v.optional(v.string()),
   clearApiKey: v.optional(v.boolean()),
+  isOmniModel: v.optional(v.boolean()),
+  inputModalities: v.optional(v.array(OmniModalityKindSchema)),
+  outputModalities: v.optional(v.array(OmniModalityKindSchema)),
+  supportsOmniAudioIn: v.optional(v.boolean()),
+  supportsOmniAudioOut: v.optional(v.boolean()),
+  supportsOmniVideoIn: v.optional(v.boolean()),
+  omniExecutionMode: v.optional(OmniExecutionModeSchema),
+  omniVoiceId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(128))),
 })
 
 export type SaveProviderConfigInput = v.InferOutput<typeof SaveProviderConfigInputSchema>
@@ -1105,6 +1353,14 @@ export const ProviderModelCatalogItemSchema = v.object({
   contextLength: v.optional(v.nullable(v.pipe(v.number(), v.integer(), v.minValue(0)))),
   supportsTools: v.optional(v.boolean()),
   supportsReasoning: v.optional(v.boolean()),
+  isOmniModel: v.optional(v.boolean()),
+  inputModalities: v.optional(v.array(OmniModalityKindSchema)),
+  outputModalities: v.optional(v.array(OmniModalityKindSchema)),
+  supportsOmniAudioIn: v.optional(v.boolean()),
+  supportsOmniAudioOut: v.optional(v.boolean()),
+  supportsOmniVideoIn: v.optional(v.boolean()),
+  omniExecutionMode: v.optional(OmniExecutionModeSchema),
+  omniVoiceId: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(128))),
 })
 
 export type ProviderModelCatalogItem = v.InferOutput<typeof ProviderModelCatalogItemSchema>
@@ -1168,18 +1424,98 @@ export const ASHY_HOST_RPC_METHODS = [
   'updateInitiativePolicy',
   'evaluateAttentionInitiative',
   'updateStagePreferences',
+  'getVoiceRuntimeSettings',
+  'saveVoiceRuntimeSettings',
+  'listVoiceProviderModels',
+  'transcribeVoiceAudio',
+  'synthesizeVoiceSpeech',
 ] as const
 
 export type AshyHostRpcMethod = (typeof ASHY_HOST_RPC_METHODS)[number]
 
-export const SendTurnInputSchema = v.object({
-  sessionId: v.pipe(v.string(), v.trim(), v.nonEmpty()),
-  text: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(16000)),
-  screenContext: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(512))),
-  interruptionControlNote: v.optional(
-    v.pipe(v.string(), v.trim(), v.maxLength(1024)),
+export const TurnInputAudioSchema = v.object({
+  dataBase64: v.pipe(
+    v.string(),
+    v.trim(),
+    v.nonEmpty(),
+    v.maxLength(8_000_000),
+    v.check(
+      (val) =>
+        /^(?:data:audio\/(?:wav|x-wav|pcm|mp3|mpeg);base64,)?[A-Za-z0-9+/=_-]+$/.test(val),
+      'Invalid audio base64 payload',
+    ),
   ),
+  format: v.picklist(['wav', 'pcm16'] as const),
+  sampleRate: v.optional(v.pipe(v.number(), v.finite(), v.minValue(8000), v.maxValue(96000))),
+  durationMs: v.optional(v.pipe(v.number(), v.finite(), v.minValue(0))),
+  transcriptHint: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(4000))),
 })
+export type TurnInputAudio = v.InferOutput<typeof TurnInputAudioSchema>
+
+export const TurnVideoFrameSchema = v.object({
+  dataUrl: v.pipe(
+    v.string(),
+    v.trim(),
+    v.nonEmpty(),
+    v.maxLength(1_500_000),
+    v.check(
+      (val) => /^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(val),
+      'Video frame must be a base64 image data URL',
+    ),
+  ),
+  timestampMs: v.pipe(v.number(), v.finite(), v.minValue(0)),
+  width: v.optional(v.pipe(v.number(), v.finite(), v.minValue(1), v.maxValue(8192))),
+  height: v.optional(v.pipe(v.number(), v.finite(), v.minValue(1), v.maxValue(8192))),
+  source: v.optional(v.picklist(['screen', 'camera', 'clip'] as const)),
+  dHashHex: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(64))),
+})
+export type TurnVideoFrame = v.InferOutput<typeof TurnVideoFrameSchema>
+
+export const TurnAttachmentSchema = v.object({
+  id: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(128))),
+  kind: v.picklist(['image', 'audio', 'video'] as const),
+  mimeType: v.pipe(v.string(), v.trim(), v.nonEmpty(), v.maxLength(128)),
+  dataUrlOrBase64: v.pipe(
+    v.string(),
+    v.trim(),
+    v.nonEmpty(),
+    v.maxLength(8_000_000),
+    v.check(
+      (val) =>
+        !/^(?:https?|file|ftp|javascript|ws|wss):/i.test(val) &&
+        /^(?:data:(?:image|audio|video)\/[a-z0-9.+-]+;base64,)?[A-Za-z0-9+/=_-]+$/.test(val),
+      'Attachment must be base64 or data URL; external/file URLs are forbidden',
+    ),
+  ),
+  name: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(256))),
+  width: v.optional(v.pipe(v.number(), v.finite(), v.minValue(1), v.maxValue(8192))),
+  height: v.optional(v.pipe(v.number(), v.finite(), v.minValue(1), v.maxValue(8192))),
+  durationMs: v.optional(v.pipe(v.number(), v.finite(), v.minValue(0))),
+})
+export type TurnAttachment = v.InferOutput<typeof TurnAttachmentSchema>
+
+export const SendTurnInputSchema = v.pipe(
+  v.object({
+    sessionId: v.pipe(v.string(), v.trim(), v.nonEmpty()),
+    text: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(16000)), ''),
+    screenContext: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(512))),
+    interruptionControlNote: v.optional(
+      v.pipe(v.string(), v.trim(), v.maxLength(1024)),
+    ),
+    inputAudio: v.optional(TurnInputAudioSchema),
+    videoFrames: v.optional(v.pipe(v.array(TurnVideoFrameSchema), v.maxLength(16))),
+    attachments: v.optional(v.pipe(v.array(TurnAttachmentSchema), v.maxLength(8))),
+    omniExecutionModeOverride: v.optional(OmniExecutionModeSchema),
+  }),
+  v.check(
+    (input) =>
+      (input.text?.trim().length ?? 0) > 0 ||
+      input.inputAudio !== undefined ||
+      (input.videoFrames !== undefined && input.videoFrames.length > 0) ||
+      (input.attachments !== undefined && input.attachments.length > 0),
+    'SendTurnInput requires non-empty text, inputAudio, videoFrames, or attachments',
+  ),
+)
 
 export type SendTurnInput = v.InferOutput<typeof SendTurnInputSchema>
 
@@ -1191,6 +1527,104 @@ export interface UpsertFactInput {
   object: string
   confidence?: number
 }
+
+export const TurnInputTranscriptEventSchema = v.object({
+  type: v.literal('turn:input-transcript'),
+  turnId: NonEmptyStringSchema,
+  sessionId: NonEmptyStringSchema,
+  userMessageId: NonEmptyStringSchema,
+  transcript: v.string(),
+  isFinal: v.boolean(),
+  source: v.picklist(['omni-native', 'stt-preflight', 'wav-metadata'] as const),
+})
+
+export const TurnAudioDeltaEventSchema = v.object({
+  type: v.literal('turn:audio-delta'),
+  turnId: NonEmptyStringSchema,
+  sessionId: NonEmptyStringSchema,
+  seq: NonNegativeIntSchema,
+  audioBase64: NonEmptyStringSchema,
+  format: v.picklist(['pcm16', 'wav'] as const),
+  sampleRate: v.pipe(v.number(), v.finite(), v.minValue(8000)),
+  durationMs: v.pipe(v.number(), v.finite(), v.minValue(0)),
+  transcriptDelta: v.optional(v.string()),
+  vowelFrames: v.optional(v.array(VoiceSynthesizedVowelFrameSchema)),
+})
+
+export const AshyHostStreamEventSchema = v.union([
+  v.object({
+    type: v.literal('turn:started'),
+    turnId: NonEmptyStringSchema,
+    sessionId: NonEmptyStringSchema,
+    startedAt: TimestampSchema,
+  }),
+  v.object({
+    type: v.literal('turn:delta'),
+    turnId: NonEmptyStringSchema,
+    sessionId: NonEmptyStringSchema,
+    textDelta: v.string(),
+  }),
+  TurnInputTranscriptEventSchema,
+  TurnAudioDeltaEventSchema,
+  v.object({
+    type: v.literal('turn:marker'),
+    turnId: NonEmptyStringSchema,
+    sessionId: NonEmptyStringSchema,
+    marker: v.union([
+      v.object({
+        type: v.literal('act'),
+        emotion: v.optional(AshyEmotionSchema),
+        intensity: v.optional(v.number()),
+        motion: v.optional(v.string()),
+        durationSec: v.optional(v.number()),
+      }),
+      v.object({
+        type: v.literal('delay'),
+        seconds: v.number(),
+      }),
+      v.object({
+        type: v.literal('callback'),
+        motifId: NonEmptyStringSchema,
+      }),
+    ]),
+  }),
+  v.object({
+    type: v.literal('turn:keepalive'),
+    turnId: NonEmptyStringSchema,
+    sessionId: NonEmptyStringSchema,
+    elapsedMs: v.number(),
+  }),
+  v.object({
+    type: v.literal('turn:completed'),
+    turnId: NonEmptyStringSchema,
+    sessionId: NonEmptyStringSchema,
+    assistantMessage: v.any(),
+    snapshot: v.any(),
+    persistenceWarning: v.nullable(v.string()),
+  }),
+  v.object({
+    type: v.literal('turn:aborted'),
+    turnId: NonEmptyStringSchema,
+    sessionId: NonEmptyStringSchema,
+    partialText: v.string(),
+  }),
+  v.object({
+    type: v.literal('turn:error'),
+    turnId: NonEmptyStringSchema,
+    sessionId: NonEmptyStringSchema,
+    code: v.picklist(['PROVIDER_NOT_CONFIGURED', 'LLM_REQUEST_FAILED', 'INTERNAL_ERROR'] as const),
+    message: v.string(),
+    recoverable: v.boolean(),
+  }),
+  v.object({
+    type: v.literal('stage:updated'),
+    stagePreferences: PersistedStagePreferencesSchema,
+  }),
+  v.object({
+    type: v.literal('shortcut:triggered'),
+    action: v.picklist(['toggleMic', 'toggleEyes', 'toggleDnd', 'toggleHideStage'] as const),
+  }),
+])
 
 export type AshyHostStreamEvent =
   | {
@@ -1204,6 +1638,27 @@ export type AshyHostStreamEvent =
       turnId: string
       sessionId: string
       textDelta: string
+    }
+  | {
+      type: 'turn:input-transcript'
+      turnId: string
+      sessionId: string
+      userMessageId: string
+      transcript: string
+      isFinal: boolean
+      source: 'omni-native' | 'stt-preflight' | 'wav-metadata'
+    }
+  | {
+      type: 'turn:audio-delta'
+      turnId: string
+      sessionId: string
+      seq: number
+      audioBase64: string
+      format: 'pcm16' | 'wav'
+      sampleRate: number
+      durationMs: number
+      transcriptDelta?: string
+      vowelFrames?: VoiceSynthesizedVowelFrame[]
     }
   | {
       type: 'turn:marker'
@@ -1373,6 +1828,19 @@ export interface AshyHostBridge {
   updateInitiativePolicy?(input: UpdateInitiativePolicyInput): Promise<InitiativePolicy>
   evaluateAttentionInitiative?(input?: EvaluateInitiativeInput): Promise<ProactiveInitiativeRecord>
   updateStagePreferences?(input: UpdateStagePreferencesInput): Promise<PersistedStagePreferences>
+  getVoiceRuntimeSettings?(): Promise<VoiceRuntimeSettings>
+  saveVoiceRuntimeSettings?(
+    input: SaveVoiceRuntimeSettingsInput,
+  ): Promise<VoiceRuntimeSettings>
+  listVoiceProviderModels?(
+    input: ListVoiceProviderModelsInput,
+  ): Promise<VoiceProviderModelsCatalog>
+  transcribeVoiceAudio?(
+    input: TranscribeVoiceAudioInput,
+  ): Promise<VoiceTranscribeAudioResult>
+  synthesizeVoiceSpeech?(
+    input: SynthesizeVoiceSpeechInput,
+  ): Promise<VoiceSynthesizeSpeechResult>
   onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
 
@@ -1439,6 +1907,71 @@ export const DEFAULT_PROVIDER_CONFIGS: Record<
   },
 }
 
+export interface ModelOmniCapabilities {
+  isOmniModel: boolean
+  supportsOmniAudioIn: boolean
+  supportsOmniAudioOut: boolean
+  supportsOmniVideoIn: boolean
+  inputModalities: OmniModalityKind[]
+  outputModalities: OmniModalityKind[]
+}
+
+export function inferModelOmniCapabilities(
+  _providerId: LlmProviderId,
+  modelId: string,
+): ModelOmniCapabilities {
+  const lower = (modelId ?? '').trim().toLowerCase()
+
+  // LFM3-Audio / LFM2-Audio (audio + text without video)
+  if (/lfm[23][-_]?audio/i.test(lower)) {
+    return {
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: true,
+      supportsOmniVideoIn: false,
+      inputModalities: ['text', 'audio'],
+      outputModalities: ['text', 'audio'],
+    }
+  }
+
+  // Full Native Omni models (LFM3-Omni, Qwen 2.5 Omni, GPT-4o Audio / Realtime)
+  if (
+    /lfm3[-_]?omni/i.test(lower) ||
+    /qwen(?:2\.5)?[-_]?omni/i.test(lower) ||
+    /gpt-4o(?:-\d{4}-\d{2}-\d{2})?-(?:mini-)?(?:audio|realtime)/i.test(lower)
+  ) {
+    return {
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: true,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text', 'audio'],
+    }
+  }
+
+  // Gemini 2.0 / 2.5 models (Multimodal Audio+Video+Image+Text In -> Text Out via REST)
+  if (/gemini-2\.[05]/i.test(lower)) {
+    return {
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: false,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text'],
+    }
+  }
+
+  return {
+    isOmniModel: false,
+    supportsOmniAudioIn: false,
+    supportsOmniAudioOut: false,
+    supportsOmniVideoIn: false,
+    inputModalities: ['text'],
+    outputModalities: ['text'],
+  }
+}
+
 export const FALLBACK_PROVIDER_MODELS: Record<LlmProviderId, ProviderModelCatalogItem[]> = {
   openrouter: [
     {
@@ -1472,6 +2005,13 @@ export const FALLBACK_PROVIDER_MODELS: Record<LlmProviderId, ProviderModelCatalo
       contextLength: 1048576,
       supportsTools: true,
       supportsReasoning: true,
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: false,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text'],
+      omniExecutionMode: 'hybrid-omni-in',
     },
     {
       id: 'openai/gpt-4.1',
@@ -1488,6 +2028,38 @@ export const FALLBACK_PROVIDER_MODELS: Record<LlmProviderId, ProviderModelCatalo
       contextLength: 131072,
       supportsTools: true,
       supportsReasoning: false,
+    },
+    {
+      id: 'qwen/qwen2.5-omni-7b',
+      name: 'Qwen 2.5 Omni 7B',
+      providerId: 'openrouter',
+      contextLength: 32768,
+      supportsTools: true,
+      supportsReasoning: false,
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: true,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text', 'audio'],
+      omniExecutionMode: 'native-omni',
+      omniVoiceId: 'Cherry',
+    },
+    {
+      id: 'openai/gpt-4o-audio-preview',
+      name: 'OpenAI: GPT-4o Audio Preview',
+      providerId: 'openrouter',
+      contextLength: 128000,
+      supportsTools: true,
+      supportsReasoning: false,
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: true,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text', 'audio'],
+      omniExecutionMode: 'native-omni',
+      omniVoiceId: 'coral',
     },
   ],
   anthropic: [
@@ -1557,6 +2129,38 @@ export const FALLBACK_PROVIDER_MODELS: Record<LlmProviderId, ProviderModelCatalo
       supportsTools: true,
       supportsReasoning: true,
     },
+    {
+      id: 'gpt-4o-audio-preview',
+      name: 'GPT-4o Audio Preview (Omni)',
+      providerId: 'openai',
+      contextLength: 128000,
+      supportsTools: true,
+      supportsReasoning: false,
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: true,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text', 'audio'],
+      omniExecutionMode: 'native-omni',
+      omniVoiceId: 'coral',
+    },
+    {
+      id: 'gpt-4o-mini-audio-preview',
+      name: 'GPT-4o Mini Audio Preview (Omni)',
+      providerId: 'openai',
+      contextLength: 128000,
+      supportsTools: true,
+      supportsReasoning: false,
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: true,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text', 'audio'],
+      omniExecutionMode: 'native-omni',
+      omniVoiceId: 'coral',
+    },
   ],
   'nvidia-nim': [
     {
@@ -1616,6 +2220,54 @@ export const FALLBACK_PROVIDER_MODELS: Record<LlmProviderId, ProviderModelCatalo
       contextLength: 65536,
       supportsTools: false,
       supportsReasoning: true,
+    },
+    {
+      id: 'lfm3-omni:2b',
+      name: 'Liquid AI LFM3-Omni 2B (Local Omni)',
+      providerId: 'ollama',
+      contextLength: 32768,
+      supportsTools: true,
+      supportsReasoning: false,
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: true,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text', 'audio'],
+      omniExecutionMode: 'native-omni',
+      omniVoiceId: 'female',
+    },
+    {
+      id: 'LiquidAI/LFM3-Omni-2B-GGUF',
+      name: 'LiquidAI/LFM3-Omni-2B-GGUF (llama-server)',
+      providerId: 'ollama',
+      contextLength: 32768,
+      supportsTools: true,
+      supportsReasoning: false,
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: true,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text', 'audio'],
+      omniExecutionMode: 'native-omni',
+      omniVoiceId: 'female',
+    },
+    {
+      id: 'qwen2.5-omni:7b',
+      name: 'Qwen 2.5 Omni 7B (Local Omni)',
+      providerId: 'ollama',
+      contextLength: 32768,
+      supportsTools: true,
+      supportsReasoning: false,
+      isOmniModel: true,
+      supportsOmniAudioIn: true,
+      supportsOmniAudioOut: true,
+      supportsOmniVideoIn: true,
+      inputModalities: ['text', 'audio', 'image', 'video'],
+      outputModalities: ['text', 'audio'],
+      omniExecutionMode: 'native-omni',
+      omniVoiceId: 'Cherry',
     },
   ],
 }

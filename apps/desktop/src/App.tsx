@@ -24,6 +24,7 @@ import {
 } from '@ashy/shared'
 import type { FsrsReviewRating } from '@ashy/cortex'
 import { AshyStageCanvas, DEFAULT_ASHY_LIVE2D_MODEL3_JSON } from '@ashy/stage'
+import { createSyntheticVideoFrameDataUrl } from './services/omni-media-sampler'
 import {
   BookOpen,
   Box,
@@ -199,9 +200,12 @@ export function App(): React.ReactElement {
   )
   const [live2dImportNotice, setLive2dImportNotice] = useState<string | null>(null)
   const [allowedPathDraft, setAllowedPathDraft] = useState('')
+  const [sttApiKeyDraft, setSttApiKeyDraft] = useState('')
+  const [ttsApiKeyDraft, setTtsApiKeyDraft] = useState('')
 
   useEffect(() => {
-    void useAshyStore.getState().bootstrapFromHost()
+    void useAshyStore.getState().bootstrapFromHost().catch(() => {})
+    void useAshyStore.getState().refreshMicDevices().catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -341,7 +345,7 @@ export function App(): React.ReactElement {
                 emotionIntensity={state.emotionIntensity}
                 isSpeaking={state.isSpeaking}
                 rawVowels={state.simulatedVowels}
-                rawVolume={state.isSpeaking ? 0.82 : 0}
+                rawVolume={state.isSpeaking ? Math.max(0.25, state.rawVolume || 0.82) : 0}
                 ambientLuminance={state.ambientLuminance}
                 bubbleText={state.bubbleText}
                 statusLabel={state.presenceStatus}
@@ -867,7 +871,7 @@ export function App(): React.ReactElement {
                   emotionIntensity={state.emotionIntensity}
                   isSpeaking={state.isSpeaking}
                   rawVowels={state.simulatedVowels}
-                  rawVolume={state.isSpeaking ? 0.85 : 0}
+                  rawVolume={state.isSpeaking ? Math.max(0.25, state.rawVolume || 0.85) : 0}
                   ambientLuminance={state.ambientLuminance}
                   bubbleText={state.bubbleText}
                   statusLabel={state.presenceStatus}
@@ -902,7 +906,7 @@ export function App(): React.ReactElement {
                   <button
                     type="button"
                     className="ashy-stage-pill active"
-                    onClick={() => state.toggleSimulatedSpeech()}
+                    onClick={() => void state.toggleVoiceConversation()}
                     title="Alternar voz local"
                   >
                     <Mic size={13} />
@@ -911,6 +915,17 @@ export function App(): React.ReactElement {
                       className="ashy-presence-dot"
                       style={{ width: '6px', height: '6px' }}
                     />
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="pill-toggle-omni-mode"
+                    className={`ashy-stage-pill ${state.unifiedOmniMode ? 'active' : 'muted'}`}
+                    onClick={() => state.setUnifiedOmniMode(!state.unifiedOmniMode)}
+                    title="Alternar modo Modelo Omni Unificado (Voz + Texto + Imagem + Vídeo)"
+                  >
+                    <span>
+                      {state.unifiedOmniMode ? '⚡ Omni Nativo' : 'Pipeline Separado'}
+                    </span>
                   </button>
                   <button
                     type="button"
@@ -965,16 +980,24 @@ export function App(): React.ReactElement {
 
                   {/* Left Waveform */}
                   <div className="ashy-waveform" aria-hidden="true">
-                    {WAVEFORM_BARS.map((h, i) => (
-                      <span
-                        key={`wf-l-${i}`}
-                        className="ashy-waveform-bar"
-                        style={{
-                          height: `${state.isSpeaking ? Math.min(32, Math.round(h * 1.15)) : h}px`,
-                          opacity: state.isSpeaking ? 0.95 : 0.65,
-                        }}
-                      />
-                    ))}
+                    {WAVEFORM_BARS.map((h, i) => {
+                      const energy = state.isVoiceListening
+                        ? Math.max(0.15, state.micInputLevel * 3)
+                        : state.isSpeaking
+                          ? Math.max(0.25, state.rawVolume || 0.85)
+                          : 0.15
+                      const isActive = state.isSpeaking || state.isVoiceListening
+                      return (
+                        <span
+                          key={`wf-l-${i}`}
+                          className="ashy-waveform-bar"
+                          style={{
+                            height: `${isActive ? Math.min(32, Math.max(6, Math.round(h * (0.85 + energy * 0.45)))) : h}px`,
+                            opacity: isActive ? 0.95 : 0.65,
+                          }}
+                        />
+                      )
+                    })}
                   </div>
 
                   {/* Center Warm Peach Mic Orb */}
@@ -982,8 +1005,8 @@ export function App(): React.ReactElement {
                     <button
                       type="button"
                       data-testid="btn-toggle-lipsync"
-                      className={`ashy-mic-hero-btn ${state.isSpeaking ? 'listening' : ''}`}
-                      onClick={() => state.toggleSimulatedSpeech()}
+                      className={`ashy-mic-hero-btn ${state.isSpeaking || state.isVoiceListening ? 'listening' : ''}`}
+                      onClick={() => void state.toggleVoiceConversation()}
                       title="Conversar por voz"
                     >
                       <Mic size={22} />
@@ -992,22 +1015,51 @@ export function App(): React.ReactElement {
                       className="ashy-dock-label"
                       style={{ color: 'var(--text-primary)', fontWeight: 500 }}
                     >
-                      {state.isSpeaking ? 'Falando com você...' : 'Conversar por voz'}
+                      {state.isSpeaking
+                        ? 'Falando com você...'
+                        : state.isVoiceListening
+                          ? 'Ouvindo... (Conversar por voz)'
+                          : 'Conversar por voz'}
                     </span>
                   </div>
 
                   {/* Right Waveform */}
                   <div className="ashy-waveform" aria-hidden="true">
-                    {[...WAVEFORM_BARS].reverse().map((h, i) => (
-                      <span
-                        key={`wf-r-${i}`}
-                        className="ashy-waveform-bar"
-                        style={{
-                          height: `${state.isSpeaking ? Math.min(32, Math.round(h * 1.15)) : h}px`,
-                          opacity: state.isSpeaking ? 0.95 : 0.65,
-                        }}
-                      />
-                    ))}
+                    {[...WAVEFORM_BARS].reverse().map((h, i) => {
+                      const energy = state.isVoiceListening
+                        ? Math.max(0.15, state.micInputLevel * 3)
+                        : state.isSpeaking
+                          ? Math.max(0.25, state.rawVolume || 0.85)
+                          : 0.15
+                      const isActive = state.isSpeaking || state.isVoiceListening
+                      return (
+                        <span
+                          key={`wf-r-${i}`}
+                          className="ashy-waveform-bar"
+                          style={{
+                            height: `${isActive ? Math.min(32, Math.max(6, Math.round(h * (0.85 + energy * 0.45)))) : h}px`,
+                            opacity: isActive ? 0.95 : 0.65,
+                          }}
+                        />
+                      )
+                    })}
+                  </div>
+
+                  <div className="ashy-dock-action">
+                    <button
+                      type="button"
+                      data-testid="btn-toggle-webcam"
+                      className={`ashy-dock-circle-btn ${
+                        state.isWebcamStreaming ? 'active' : ''
+                      }`}
+                      onClick={() => void state.toggleWebcamStream()}
+                      title="Compartilhar câmera ao vivo (2fps com dedup dHash)"
+                    >
+                      <Eye size={17} />
+                    </button>
+                    <span className="ashy-dock-label">
+                      {state.isWebcamStreaming ? 'Câmera 2fps' : 'Câmera'}
+                    </span>
                   </div>
 
                   <div className="ashy-dock-action">
@@ -1024,6 +1076,50 @@ export function App(): React.ReactElement {
                   </div>
                 </div>
               </div>
+
+              {state.isWebcamStreaming && (
+                <div
+                  data-testid="studio-webcam-pip"
+                  style={{
+                    position: 'absolute',
+                    right: '20px',
+                    bottom: '104px',
+                    width: '150px',
+                    padding: '6px',
+                    borderRadius: '12px',
+                    background: 'rgba(18, 15, 26, 0.88)',
+                    border: '1px solid var(--accent-peach)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '4px',
+                    zIndex: 12,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      fontSize: '10.5px',
+                      color: 'var(--accent-peach)',
+                    }}
+                  >
+                    <span>📹 Câmera (2 fps)</span>
+                    <span>{state.pendingVideoFrames.length} frames</span>
+                  </div>
+                  {state.webcamPreviewDataUrl && (
+                    <img
+                      src={state.webcamPreviewDataUrl}
+                      alt="Webcam preview"
+                      style={{
+                        width: '100%',
+                        height: '72px',
+                        objectFit: 'cover',
+                        borderRadius: '8px',
+                      }}
+                    />
+                  )}
+                </div>
+              )}
             </section>
 
             {/* Right Conversation Panel ("Nossa conversa") */}
@@ -1379,6 +1475,38 @@ export function App(): React.ReactElement {
               {/* Bottom Chat Composer */}
               <div className="ashy-chat-composer-wrap">
                 <form onSubmit={handleSendChat} className="ashy-chat-composer">
+                  {(state.pendingVideoFrames.length > 0 ||
+                    state.pendingTurnAttachments.length > 0) && (
+                    <div
+                      data-testid="composer-media-attachments"
+                      style={{
+                        display: 'flex',
+                        gap: '6px',
+                        flexWrap: 'wrap',
+                        padding: '6px 10px 0 10px',
+                        alignItems: 'center',
+                      }}
+                    >
+                      {state.pendingVideoFrames.length > 0 && (
+                        <span className="ashy-badge peach">
+                          🎬 {state.pendingVideoFrames.length} frames vídeo
+                        </span>
+                      )}
+                      {state.pendingTurnAttachments.map((att, idx) => (
+                        <span key={att.id ?? idx} className="ashy-badge violet">
+                          📎 {att.name ?? att.kind}
+                        </span>
+                      ))}
+                      <button
+                        type="button"
+                        className="ashy-outline-btn"
+                        style={{ padding: '2px 6px', fontSize: '10.5px' }}
+                        onClick={() => state.clearOmniStagedMedia()}
+                      >
+                        Limpar mídia
+                      </button>
+                    </div>
+                  )}
                   <textarea
                     data-testid="studio-chat-input"
                     className="ashy-composer-input"
@@ -1396,11 +1524,47 @@ export function App(): React.ReactElement {
                   <div className="ashy-composer-toolbar">
                     <button
                       type="button"
+                      data-testid="btn-attach-image"
                       className="ashy-icon-btn"
                       style={{ background: 'transparent', border: 'none' }}
                       title="Compartilhar imagem"
+                      onClick={() => {
+                        const synth = createSyntheticVideoFrameDataUrl(
+                          Date.now() & 0xff,
+                          0,
+                          'screen',
+                        )
+                        state.stageTurnAttachment({
+                          id: `img-${Date.now()}`,
+                          kind: 'image',
+                          mimeType: 'image/jpeg',
+                          dataUrlOrBase64: synth.dataUrl,
+                          name: 'captura-estudio.jpg',
+                          width: 640,
+                          height: 360,
+                        })
+                      }}
                     >
                       <Image size={18} />
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="btn-attach-video"
+                      className="ashy-icon-btn"
+                      style={{
+                        background: 'transparent',
+                        border: 'none',
+                        fontSize: '11px',
+                        color: 'var(--text-secondary)',
+                      }}
+                      title="Anexar clipe de vídeo (keyframes dHash)"
+                      onClick={() => {
+                        const f1 = createSyntheticVideoFrameDataUrl(11, 0, 'clip')
+                        const f2 = createSyntheticVideoFrameDataUrl(77, 500, 'clip')
+                        state.stageVideoFrames([f1, f2])
+                      }}
+                    >
+                      🎬
                     </button>
                     <button
                       type="submit"
@@ -3919,71 +4083,480 @@ export function App(): React.ReactElement {
                     </div>
                   </div>
 
-                  {/* STT & TTS Provider Selectors */}
+                  {/* STT & TTS Provider Selectors & Phase 8.6 Real Voice Endpoints */}
                   <div
                     style={{
                       display: 'grid',
-                      gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
                       gap: '12px',
                     }}
                   >
-                    <div>
-                      <label
-                        htmlFor="select-stt-provider"
-                        style={{
-                          display: 'block',
-                          fontSize: '12px',
-                          color: 'var(--text-secondary)',
-                          marginBottom: '4px',
-                        }}
-                      >
-                        Provedor STT (Transcrição):
-                      </label>
-                      <select
-                        id="select-stt-provider"
-                        data-testid="select-stt-provider"
-                        className="ashy-select"
-                        value={state.voiceSettings.activeSttProviderId}
-                        onChange={(e) =>
-                          state.setActiveSttProvider(e.target.value as SttProviderId)
-                        }
-                      >
-                        {STT_PROVIDER_IDS.map((id) => (
-                          <option key={id} value={id}>
-                            {id}
-                          </option>
-                        ))}
-                      </select>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <div>
+                        <label
+                          htmlFor="select-stt-provider"
+                          style={{
+                            display: 'block',
+                            fontSize: '12px',
+                            color: 'var(--text-secondary)',
+                            marginBottom: '4px',
+                          }}
+                        >
+                          Provedor STT (Transcrição):
+                        </label>
+                        <select
+                          id="select-stt-provider"
+                          data-testid="select-stt-provider"
+                          className="ashy-select"
+                          value={state.voiceSettings.activeSttProviderId}
+                          onChange={(e) =>
+                            state.setActiveSttProvider(e.target.value as SttProviderId)
+                          }
+                        >
+                          {STT_PROVIDER_IDS.map((id) => (
+                            <option key={id} value={id}>
+                              {id}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label
+                          htmlFor="input-stt-base-url"
+                          style={{
+                            display: 'block',
+                            fontSize: '11.5px',
+                            color: 'var(--text-secondary)',
+                            marginBottom: '4px',
+                          }}
+                        >
+                          Endpoint STT (Base URL):
+                        </label>
+                        <input
+                          id="input-stt-base-url"
+                          data-testid="input-stt-base-url"
+                          type="text"
+                          className="ashy-input"
+                          value={state.voiceSettings.sttBaseUrl ?? ''}
+                          placeholder="http://127.0.0.1:8080/v1"
+                          onChange={(e) =>
+                            state.updateVoiceSettingsDraft({ sttBaseUrl: e.target.value })
+                          }
+                        />
+                      </div>
+
+                      <div>
+                        <label
+                          htmlFor="input-stt-api-key"
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            fontSize: '11.5px',
+                            color: 'var(--text-secondary)',
+                            marginBottom: '4px',
+                          }}
+                        >
+                          <span>API Key STT (Cofre Seguro):</span>
+                          <span>
+                            {state.voiceSettings.activeSttProviderId === 'openai-whisper'
+                              ? state.voiceSettings.hasOpenAiApiKey
+                                ? state.voiceSettings.maskedOpenAiApiKey ?? 'Configurada'
+                                : 'Não configurada'
+                              : state.voiceSettings.activeSttProviderId === 'groq-whisper'
+                                ? state.voiceSettings.hasGroqApiKey
+                                  ? state.voiceSettings.maskedGroqApiKey ?? 'Configurada'
+                                  : 'Não configurada'
+                                : state.voiceSettings.hasLocalSttApiKey
+                                  ? 'Configurada'
+                                  : 'Opcional (Local)'}
+                          </span>
+                        </label>
+                        <input
+                          id="input-stt-api-key"
+                          data-testid="input-stt-api-key"
+                          type="password"
+                          className="ashy-input"
+                          value={sttApiKeyDraft}
+                          placeholder="sk-... / gsk_... (write-only)"
+                          onChange={(e) => setSttApiKeyDraft(e.target.value)}
+                        />
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '6px', alignItems: 'flex-end' }}>
+                        <div style={{ flex: 1 }}>
+                          <label
+                            htmlFor="select-stt-model"
+                            style={{
+                              display: 'block',
+                              fontSize: '11.5px',
+                              color: 'var(--text-secondary)',
+                              marginBottom: '4px',
+                            }}
+                          >
+                            Modelo STT:
+                          </label>
+                          <select
+                            id="select-stt-model"
+                            data-testid="select-stt-model"
+                            className="ashy-select"
+                            value={state.voiceSettings.sttModelId ?? 'whisper-large-v3-turbo'}
+                            onChange={(e) =>
+                              state.updateVoiceSettingsDraft({ sttModelId: e.target.value })
+                            }
+                          >
+                            {Array.from(
+                              new Set([
+                                state.voiceSettings.sttModelId ?? 'whisper-large-v3-turbo',
+                                ...state.sttCatalogModels.map((m) => m.id),
+                                'whisper-large-v3-turbo',
+                                'whisper-1',
+                                'ggml-base.bin',
+                              ]),
+                            ).map((modelId) => (
+                              <option key={modelId} value={modelId}>
+                                {modelId}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <button
+                          type="button"
+                          className="ashy-outline-btn"
+                          data-testid="btn-refresh-stt-models"
+                          onClick={() =>
+                            void state.refreshVoiceProviderCatalog(
+                              'stt',
+                              sttApiKeyDraft.trim() || undefined,
+                            )
+                          }
+                        >
+                          Listar Modelos
+                        </button>
+                      </div>
                     </div>
 
-                    <div>
-                      <label
-                        htmlFor="select-tts-provider"
-                        style={{
-                          display: 'block',
-                          fontSize: '12px',
-                          color: 'var(--text-secondary)',
-                          marginBottom: '4px',
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <div>
+                        <label
+                          htmlFor="select-tts-provider"
+                          style={{
+                            display: 'block',
+                            fontSize: '12px',
+                            color: 'var(--text-secondary)',
+                            marginBottom: '4px',
+                          }}
+                        >
+                          Provedor TTS (Síntese de Voz):
+                        </label>
+                        <select
+                          id="select-tts-provider"
+                          data-testid="select-tts-provider"
+                          className="ashy-select"
+                          value={state.voiceSettings.activeTtsProviderId}
+                          onChange={(e) =>
+                            state.setActiveTtsProvider(e.target.value as TtsProviderId)
+                          }
+                        >
+                          {TTS_PROVIDER_IDS.map((id) => (
+                            <option key={id} value={id}>
+                              {id}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label
+                          htmlFor="input-tts-base-url"
+                          style={{
+                            display: 'block',
+                            fontSize: '11.5px',
+                            color: 'var(--text-secondary)',
+                            marginBottom: '4px',
+                          }}
+                        >
+                          Endpoint TTS (Base URL):
+                        </label>
+                        <input
+                          id="input-tts-base-url"
+                          data-testid="input-tts-base-url"
+                          type="text"
+                          className="ashy-input"
+                          value={state.voiceSettings.ttsBaseUrl ?? ''}
+                          placeholder="http://127.0.0.1:8880/v1"
+                          onChange={(e) =>
+                            state.updateVoiceSettingsDraft({ ttsBaseUrl: e.target.value })
+                          }
+                        />
+                      </div>
+
+                      <div>
+                        <label
+                          htmlFor="input-tts-api-key"
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            fontSize: '11.5px',
+                            color: 'var(--text-secondary)',
+                            marginBottom: '4px',
+                          }}
+                        >
+                          <span>API Key TTS (Cofre Seguro):</span>
+                          <span>
+                            {state.voiceSettings.activeTtsProviderId === 'elevenlabs'
+                              ? state.voiceSettings.hasElevenLabsApiKey
+                                ? state.voiceSettings.maskedElevenLabsApiKey ?? 'Configurada'
+                                : 'Não configurada'
+                              : state.voiceSettings.activeTtsProviderId === 'openai-tts'
+                                ? state.voiceSettings.hasOpenAiApiKey
+                                  ? state.voiceSettings.maskedOpenAiApiKey ?? 'Configurada'
+                                  : 'Não configurada'
+                                : state.voiceSettings.hasLocalTtsApiKey
+                                  ? 'Configurada'
+                                  : 'Opcional (Local)'}
+                          </span>
+                        </label>
+                        <input
+                          id="input-tts-api-key"
+                          data-testid="input-tts-api-key"
+                          type="password"
+                          className="ashy-input"
+                          value={ttsApiKeyDraft}
+                          placeholder="xi-... / sk-... (write-only)"
+                          onChange={(e) => setTtsApiKeyDraft(e.target.value)}
+                        />
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '6px', alignItems: 'flex-end' }}>
+                        <div style={{ flex: 1 }}>
+                          <label
+                            htmlFor="select-tts-model"
+                            style={{
+                              display: 'block',
+                              fontSize: '11.5px',
+                              color: 'var(--text-secondary)',
+                              marginBottom: '4px',
+                            }}
+                          >
+                            Modelo TTS:
+                          </label>
+                          <select
+                            id="select-tts-model"
+                            data-testid="select-tts-model"
+                            className="ashy-select"
+                            value={state.voiceSettings.ttsModelId ?? 'kokoro-v1'}
+                            onChange={(e) =>
+                              state.updateVoiceSettingsDraft({ ttsModelId: e.target.value })
+                            }
+                          >
+                            {Array.from(
+                              new Set([
+                                state.voiceSettings.ttsModelId ?? 'kokoro-v1',
+                                ...state.ttsCatalogModels.map((m) => m.id),
+                                'kokoro-v1',
+                                'eleven_turbo_v2_5',
+                                'tts-1-hd',
+                                'pt_BR-faber-medium',
+                              ]),
+                            ).map((modelId) => (
+                              <option key={modelId} value={modelId}>
+                                {modelId}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div style={{ flex: 1 }}>
+                          <label
+                            htmlFor="select-tts-voice"
+                            style={{
+                              display: 'block',
+                              fontSize: '11.5px',
+                              color: 'var(--text-secondary)',
+                              marginBottom: '4px',
+                            }}
+                          >
+                            Voz TTS:
+                          </label>
+                          <select
+                            id="select-tts-voice"
+                            data-testid="select-tts-voice"
+                            className="ashy-select"
+                            value={state.voiceSettings.ttsVoiceId ?? 'pf_dora'}
+                            onChange={(e) =>
+                              state.updateVoiceSettingsDraft({ ttsVoiceId: e.target.value })
+                            }
+                          >
+                            {Array.from(
+                              new Set([
+                                state.voiceSettings.ttsVoiceId ?? 'pf_dora',
+                                ...state.ttsCatalogVoices.map((v) => v.id),
+                                'pf_dora',
+                                'pm_alex',
+                                'ashy-ptbr-warm',
+                                'nova',
+                                'alloy',
+                              ]),
+                            ).map((voiceId) => (
+                              <option key={voiceId} value={voiceId}>
+                                {voiceId}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <button
+                          type="button"
+                          className="ashy-outline-btn"
+                          data-testid="btn-refresh-tts-models"
+                          onClick={() =>
+                            void state.refreshVoiceProviderCatalog(
+                              'tts',
+                              ttsApiKeyDraft.trim() || undefined,
+                            )
+                          }
+                        >
+                          Listar Vozes
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Microphone Hardware Selector, Auto-Speak & Live Diagnostics */}
+                  <div
+                    className="ashy-setting-box"
+                    style={{ flexDirection: 'column', alignItems: 'stretch', gap: '10px' }}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        gap: '12px',
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      <div style={{ flex: 1, minWidth: '200px' }}>
+                        <label
+                          htmlFor="select-mic-device"
+                          style={{
+                            display: 'block',
+                            fontSize: '12px',
+                            color: 'var(--text-secondary)',
+                            marginBottom: '4px',
+                          }}
+                        >
+                          Dispositivo de Microfone:
+                        </label>
+                        <select
+                          id="select-mic-device"
+                          data-testid="select-mic-device"
+                          className="ashy-select"
+                          value={state.selectedMicDeviceId}
+                          onChange={(e) => state.setSelectedMicDeviceId(e.target.value)}
+                        >
+                          <option value="default">Padrão do Sistema (default)</option>
+                          {state.availableMicDevices
+                            .filter((d) => d.deviceId !== 'default')
+                            .map((d) => (
+                              <option key={d.deviceId} value={d.deviceId}>
+                                {d.label}
+                              </option>
+                            ))}
+                          {state.selectedMicDeviceId !== 'default' &&
+                            !state.availableMicDevices.some(
+                              (d) => d.deviceId === state.selectedMicDeviceId,
+                            ) && (
+                              <option value={state.selectedMicDeviceId}>
+                                {state.selectedMicDeviceId}
+                              </option>
+                            )}
+                        </select>
+                      </div>
+
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                        <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                          Falar respostas automaticamente
+                        </span>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={state.autoSpeakReplies}
+                          data-testid="toggle-auto-speak-replies"
+                          className={`ashy-switch ${state.autoSpeakReplies ? 'checked' : ''}`}
+                          onClick={() => state.setAutoSpeakReplies(!state.autoSpeakReplies)}
+                        />
+                      </div>
+                    </div>
+
+                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                      <button
+                        type="button"
+                        className="ashy-outline-btn"
+                        data-testid="btn-test-mic"
+                        disabled={state.isTestingMic}
+                        onClick={() => void state.testMicrophone()}
+                      >
+                        {state.isTestingMic ? 'Ouvindo 3s...' : 'Testar Microfone'}
+                      </button>
+                      <button
+                        type="button"
+                        className="ashy-outline-btn"
+                        data-testid="btn-test-tts-voice"
+                        disabled={state.isTestingTts}
+                        onClick={() => void state.testTtsVoice()}
+                      >
+                        {state.isTestingTts ? 'Sintetizando...' : 'Testar Voz'}
+                      </button>
+                      <button
+                        type="button"
+                        className="ashy-peach-btn"
+                        data-testid="btn-save-voice-settings"
+                        disabled={state.isSavingVoiceSettings}
+                        onClick={() => {
+                          const sttKey = sttApiKeyDraft.trim()
+                          const ttsKey = ttsApiKeyDraft.trim()
+                          const activeStt = state.voiceSettings.activeSttProviderId
+                          const activeTts = state.voiceSettings.activeTtsProviderId
+                          void state.saveVoiceSettings({
+                            ...(sttKey
+                              ? activeStt === 'openai-whisper'
+                                ? { openaiApiKey: sttKey }
+                                : activeStt === 'groq-whisper'
+                                  ? { groqApiKey: sttKey }
+                                  : { localSttApiKey: sttKey }
+                              : {}),
+                            ...(ttsKey
+                              ? activeTts === 'elevenlabs'
+                                ? { elevenLabsApiKey: ttsKey }
+                                : activeTts === 'openai-tts'
+                                  ? { openaiApiKey: ttsKey }
+                                  : { localTtsApiKey: ttsKey }
+                              : {}),
+                          })
+                          if (sttKey) setSttApiKeyDraft('')
+                          if (ttsKey) setTtsApiKeyDraft('')
                         }}
                       >
-                        Provedor TTS (Síntese de Voz):
-                      </label>
-                      <select
-                        id="select-tts-provider"
-                        data-testid="select-tts-provider"
-                        className="ashy-select"
-                        value={state.voiceSettings.activeTtsProviderId}
-                        onChange={(e) =>
-                          state.setActiveTtsProvider(e.target.value as TtsProviderId)
-                        }
-                      >
-                        {TTS_PROVIDER_IDS.map((id) => (
-                          <option key={id} value={id}>
-                            {id}
-                          </option>
-                        ))}
-                      </select>
+                        {state.isSavingVoiceSettings
+                          ? 'Salvando...'
+                          : 'Salvar configurações de voz'}
+                      </button>
                     </div>
+
+                    {(state.voiceTestStatus || state.voiceRuntimeError) && (
+                      <div
+                        style={{
+                          fontSize: '11.5px',
+                          color: state.voiceRuntimeError
+                            ? 'var(--status-danger)'
+                            : 'var(--accent-peach)',
+                        }}
+                      >
+                        {state.voiceRuntimeError ?? state.voiceTestStatus}
+                      </div>
+                    )}
                   </div>
 
                   {/* Wake Word ("Ei Ashy" / "Oi Ashy") Toggle + PTT Hold Button */}
@@ -4025,6 +4598,28 @@ export function App(): React.ReactElement {
                         }
                       />
                     </div>
+                  </div>
+
+                  {/* Direct Omni Audio Toggle (Phase 8.7) */}
+                  <div className="ashy-setting-box">
+                    <div>
+                      <div className="ashy-setting-title">
+                        Áudio Omni Direto (16kHz PCM In / 24kHz PCM Out)
+                      </div>
+                      <p className="ashy-setting-desc">
+                        Quando o Modelo Omni Unificado está ativo, envia o áudio capturado pelo
+                        VAD diretamente ao modelo (ex: LFM3-Omni-2B ou GPT-4o Audio) sem passar
+                        por STT/TTS separados.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={state.directOmniAudio}
+                      data-testid="toggle-direct-omni-audio"
+                      className={`ashy-switch ${state.directOmniAudio ? 'checked' : ''}`}
+                      onClick={() => state.setDirectOmniAudio(!state.directOmniAudio)}
+                    />
                   </div>
 
                   {/* Last Barge-In PlaybackReceipt Inspector */}

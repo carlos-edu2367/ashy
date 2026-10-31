@@ -422,3 +422,72 @@ export function buildVoiceFixtureWavBytes(fixtureId: VoiceFixtureId): Uint8Array
     }
   }
 }
+
+
+export function uint8ArrayToBase64(bytes: Uint8Array): string {
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64')
+  }
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const slice = bytes.subarray(i, i + chunkSize)
+    binary += String.fromCharCode(...slice)
+  }
+  return btoa(binary)
+}
+
+export function base64ToUint8Array(base64: string): Uint8Array {
+  const clean = base64
+    .trim()
+    .replace(/^data:audio\/[a-z0-9.+-]+;base64,/i, '')
+    .replace(/\s+/g, '')
+    .replace(/-/g, '+')
+    .replace(/_/g, '/')
+  if (!clean) {
+    return new Uint8Array(0)
+  }
+  if (typeof Buffer !== 'undefined') {
+    return new Uint8Array(Buffer.from(clean, 'base64'))
+  }
+  const padded = clean.padEnd(clean.length + ((4 - (clean.length % 4)) % 4), '=')
+  const binary = atob(padded)
+  const out = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) {
+    out[i] = binary.charCodeAt(i)
+  }
+  return out
+}
+
+export function decodeOmniAudioDeltaToPcm(
+  audioBase64: string,
+  format: 'pcm16' | 'wav',
+  sampleRate = 24000,
+): { samples: Float32Array; sampleRate: number; durationMs: number } {
+  const bytes = base64ToUint8Array(audioBase64)
+  if (bytes.byteLength === 0) {
+    return {
+      samples: new Float32Array(0),
+      sampleRate,
+      durationMs: 0,
+    }
+  }
+  if (format === 'wav' || (bytes.length >= 12 && readAscii4(bytes, 0) === 'RIFF')) {
+    const decoded = decodeWavToPcmBlocks(bytes, 20)
+    return {
+      samples: decoded.samples,
+      sampleRate: decoded.sampleRate,
+      durationMs: decoded.totalDurationMs,
+    }
+  }
+  const sampleCount = Math.floor(bytes.byteLength / 2)
+  const samples = new Float32Array(sampleCount)
+  const view = new DataView(bytes.buffer, bytes.byteOffset, sampleCount * 2)
+  for (let i = 0; i < sampleCount; i++) {
+    const int16 = view.getInt16(i * 2, true)
+    samples[i] = int16 < 0 ? int16 / 32768 : int16 / 32767
+  }
+  const safeSampleRate = sampleRate > 0 ? sampleRate : 24000
+  const durationMs = Math.round((sampleCount / safeSampleRate) * 1000)
+  return { samples, sampleRate: safeSampleRate, durationMs }
+}
