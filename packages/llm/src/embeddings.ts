@@ -898,9 +898,13 @@ export function createOpenAICompatibleEmbeddingProvider(
   const modelId = options.modelId ?? 'text-embedding-3-small'
   const timeoutMs = options.timeoutMs ?? 4000
   const fetchFn = options.fetchImpl ?? globalThis.fetch
+  let cachedNotFoundError: string | null = null
 
   async function requestEmbeddings(inputs: readonly string[]): Promise<EmbeddingResult[]> {
     if (inputs.length === 0) return []
+    if (cachedNotFoundError !== null) {
+      throw new Error(cachedNotFoundError)
+    }
 
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -928,7 +932,11 @@ export function createOpenAICompatibleEmbeddingProvider(
 
       if (!response.ok) {
         const errText = await response.text().catch(() => response.statusText)
-        throw new Error(`OpenAI-compatible embeddings HTTP ${response.status}: ${errText}`)
+        const errMessage = `OpenAI-compatible embeddings HTTP ${response.status}: ${errText}`
+        if (response.status === 404) {
+          cachedNotFoundError = errMessage
+        }
+        throw new Error(errMessage)
       }
 
       const payload = (await response.json()) as {

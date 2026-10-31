@@ -59,7 +59,21 @@ function stripOuterDelimiters(input: string): string {
   if (trimmed.startsWith(OPEN_ESC) && trimmed.endsWith(CLOSE_ESC)) {
     return trimmed.slice(OPEN_ESC.length, -CLOSE_ESC.length).trim()
   }
+  if (trimmed.startsWith(OPEN_STD) && trimmed.endsWith('>')) {
+    return trimmed.slice(OPEN_STD.length, -1).trim()
+  }
+  if (trimmed.startsWith(OPEN_ESC) && trimmed.endsWith('>')) {
+    return trimmed.slice(OPEN_ESC.length, -1).trim()
+  }
   return trimmed
+}
+
+export function stripResidualStageMarkers(raw: string): string {
+  if (typeof raw !== 'string' || raw.length === 0) return ''
+  return raw
+    .replace(/<\|[\s\S]*?(?:\|>|\}>|>)/g, '')
+    .replace(/<\{'\|'\}[\s\S]*?(?:\{'\|'\}>|\}>|>)/g, '')
+    .trim()
 }
 
 /**
@@ -154,12 +168,25 @@ export function parseStageSignal(rawTagContent: string): AshyStageSignal {
       }
     }
 
+    const EMOTION_SYNONYM_MAP: Readonly<Record<string, AshyEmotion>> = {
+      warm: 'happy',
+      joy: 'happy',
+      smile: 'happy',
+      thinking: 'think',
+      thoughtful: 'think',
+      playful: 'tease',
+      teasing: 'tease',
+      calm: 'neutral',
+    }
+
     let validEmotion: AshyEmotion | undefined
     if (typeof rawEmotion === 'string') {
       const candidate = rawEmotion.trim().toLowerCase()
       const parsedEmotion = v.safeParse(AshyEmotionSchema, candidate)
       if (parsedEmotion.success) {
         validEmotion = parsedEmotion.output
+      } else if (EMOTION_SYNONYM_MAP[candidate]) {
+        validEmotion = EMOTION_SYNONYM_MAP[candidate]
       }
     }
 
@@ -265,6 +292,105 @@ function findNextOpener(buffer: string): { index: number; opener: typeof OPEN_ST
   return { index: escIdx, opener: OPEN_ESC }
 }
 
+function findLenientTagCloserIndex(buffer: string, bodyStart: number): number {
+  const body = buffer.slice(bodyStart)
+  const cmdMatch = /^\s*(ACT|DELAY|CALLBACK)(?:[\s:]+|$)/i.exec(body)
+  if (!cmdMatch) {
+    return -1
+  }
+
+  const command = cmdMatch[1]!.toUpperCase()
+  const argStartInBuffer = bodyStart + cmdMatch[0].length
+
+  if (command === 'ACT' || buffer.slice(argStartInBuffer).trimStart().startsWith('{')) {
+    const firstBraceIdx = buffer.indexOf('{', argStartInBuffer)
+    if (firstBraceIdx === -1) {
+      return -1
+    }
+
+    let depth = 0
+    let inSingleQuote = false
+    let inDoubleQuote = false
+    let escaped = false
+    let balancedEndIdx = -1
+
+    for (let i = firstBraceIdx; i < buffer.length; i++) {
+      const ch = buffer[i]!
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\' && (inSingleQuote || inDoubleQuote)) {
+        escaped = true
+        continue
+      }
+      if (ch === "'" && !inDoubleQuote) {
+        inSingleQuote = !inSingleQuote
+        continue
+      }
+      if (ch === '"' && !inSingleQuote) {
+        inDoubleQuote = !inDoubleQuote
+        continue
+      }
+      if (inSingleQuote || inDoubleQuote) {
+        continue
+      }
+      if (ch === '{') {
+        depth += 1
+      } else if (ch === '}') {
+        depth -= 1
+        if (depth === 0) {
+          balancedEndIdx = i
+          break
+        }
+      }
+    }
+
+    if (balancedEndIdx === -1) {
+      return -1
+    }
+
+    let afterIdx = balancedEndIdx + 1
+    while (afterIdx < buffer.length && (buffer[afterIdx] === ' ' || buffer[afterIdx] === '\t')) {
+      afterIdx += 1
+    }
+
+    if (afterIdx < buffer.length && buffer[afterIdx] === '>') {
+      return afterIdx
+    }
+    return -1
+  }
+
+  if (argStartInBuffer >= buffer.length) {
+    return -1
+  }
+  const gtIdx = buffer.indexOf('>', argStartInBuffer)
+  if (gtIdx === -1) {
+    return -1
+  }
+  if (buffer[gtIdx - 1] === '|' || buffer.slice(0, gtIdx + 1).endsWith(CLOSE_ESC)) {
+    return -1
+  }
+  return gtIdx
+}
+
+function findTagCloser(
+  buffer: string,
+  activeOpener: typeof OPEN_STD | typeof OPEN_ESC,
+): { index: number; length: number } | null {
+  const expectedCloser = activeOpener === OPEN_STD ? CLOSE_STD : CLOSE_ESC
+  const stdCloseIdx = buffer.indexOf(expectedCloser, activeOpener.length)
+  let bestMatch: { index: number; length: number } | null =
+    stdCloseIdx !== -1 ? { index: stdCloseIdx, length: expectedCloser.length } : null
+
+  const lenientIdx = findLenientTagCloserIndex(buffer, activeOpener.length)
+  if (lenientIdx !== -1 && (bestMatch === null || lenientIdx < bestMatch.index)) {
+    bestMatch = { index: lenientIdx, length: 1 }
+  }
+
+  return bestMatch
+}
+
 /**
  * Tail-safe streaming marker parser for `<|...|>` and `<{'|'}...{'|'}>`.
  * Always retains `tailHold = MAX_OPEN_LEN - 1` characters when outside a marker tag
@@ -313,14 +439,13 @@ export function createTailSafeMarkerParser(
         buffer = buffer.slice(emitEnd)
         return
       } else {
-        const expectedCloser = activeOpener === OPEN_STD ? CLOSE_STD : CLOSE_ESC
-        const closeIdx = buffer.indexOf(expectedCloser, activeOpener.length)
+        const closeMatch = findTagCloser(buffer, activeOpener)
 
         // Check if another opener appears inside the buffer before the closer (meaning the previous opener was stray literal text)
         const nextOpenerAfterActive = findNextOpener(buffer.slice(activeOpener.length))
         if (
           nextOpenerAfterActive !== null &&
-          (closeIdx === -1 || activeOpener.length + nextOpenerAfterActive.index < closeIdx)
+          (closeMatch === null || activeOpener.length + nextOpenerAfterActive.index < closeMatch.index)
         ) {
           const strayLiteralEnd = activeOpener.length + nextOpenerAfterActive.index
           emitLiteralSafe(buffer.slice(0, strayLiteralEnd))
@@ -329,17 +454,25 @@ export function createTailSafeMarkerParser(
           continue
         }
 
-        if (closeIdx === -1) {
+        if (closeMatch === null) {
           // Guard against unbounded memory growth on adversarial streams with a runaway opener
           if (buffer.length > 512) {
+            const fallbackGtIdx = buffer.indexOf('>', activeOpener.length)
+            if (fallbackGtIdx !== -1) {
+              const fullTag = buffer.slice(0, fallbackGtIdx + 1)
+              buffer = buffer.slice(fallbackGtIdx + 1)
+              activeOpener = null
+              callbacks.onSpecial(parseStageSignal(fullTag))
+              continue
+            }
             buffer = ''
             activeOpener = null
           }
           return
         }
 
-        const fullTag = buffer.slice(0, closeIdx + expectedCloser.length)
-        buffer = buffer.slice(closeIdx + expectedCloser.length)
+        const fullTag = buffer.slice(0, closeMatch.index + closeMatch.length)
+        buffer = buffer.slice(closeMatch.index + closeMatch.length)
         activeOpener = null
 
         const signal = parseStageSignal(fullTag)
@@ -360,6 +493,20 @@ export function createTailSafeMarkerParser(
     drain()
 
     if (activeOpener !== null) {
+      const fallbackGtIdx = buffer.indexOf('>', activeOpener.length)
+      if (fallbackGtIdx !== -1) {
+        const fullTag = buffer.slice(0, fallbackGtIdx + 1)
+        const remainder = buffer.slice(fallbackGtIdx + 1)
+        buffer = ''
+        activeOpener = null
+        const signal = parseStageSignal(fullTag)
+        callbacks.onSpecial(signal)
+        if (remainder.length > 0) {
+          write(remainder)
+          flush()
+        }
+        return
+      }
       // Truncated tag at end of stream: discard without leaking to TTS
       buffer = ''
       activeOpener = null

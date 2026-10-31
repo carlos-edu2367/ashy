@@ -1,6 +1,7 @@
 export const PACKAGE_NAME = '@ashy/llm'
 
 export * from './marker-parser'
+export { stripResidualStageMarkers } from './marker-parser'
 export * from './categorizer'
 export * from './anti-slop'
 export {
