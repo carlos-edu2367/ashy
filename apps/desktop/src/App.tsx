@@ -202,11 +202,19 @@ export function App(): React.ReactElement {
   const [allowedPathDraft, setAllowedPathDraft] = useState('')
   const [sttApiKeyDraft, setSttApiKeyDraft] = useState('')
   const [ttsApiKeyDraft, setTtsApiKeyDraft] = useState('')
+  const [soulArchiveJsonDraft, setSoulArchiveJsonDraft] = useState('')
+  const [showWipeConfirm, setShowWipeConfirm] = useState(false)
 
   useEffect(() => {
     void useAshyStore.getState().bootstrapFromHost().catch(() => {})
     void useAshyStore.getState().refreshMicDevices().catch(() => {})
   }, [])
+
+  useEffect(() => {
+    if (state.lastExportedSoulArchive) {
+      setSoulArchiveJsonDraft(JSON.stringify(state.lastExportedSoulArchive, null, 2))
+    }
+  }, [state.lastExportedSoulArchive])
 
   useEffect(() => {
     setVoiceDraft(state.voiceIdentity.content)
@@ -4925,7 +4933,6 @@ export function App(): React.ReactElement {
                       value={state.quietHoursRange}
                       onChange={(e) => {
                         state.setQuietHoursRange(e.target.value)
-                        state.setDndMode(e.target.value !== 'Desativado')
                       }}
                     >
                       {![
@@ -4934,7 +4941,9 @@ export function App(): React.ReactElement {
                         '23:00 - 07:00',
                         '21:00 - 06:00',
                         '22:00 — 08:00',
+                        '23:00 — 08:00',
                         '23:00 — 07:00',
+                        '00:00 — 06:00',
                         'Desativado',
                       ].includes(state.quietHoursRange) && (
                         <option value={state.quietHoursRange}>{state.quietHoursRange}</option>
@@ -4944,7 +4953,9 @@ export function App(): React.ReactElement {
                       <option value="23:00 - 07:00">23:00 - 07:00</option>
                       <option value="21:00 - 06:00">21:00 - 06:00</option>
                       <option value="22:00 — 08:00">22:00 — 08:00</option>
+                      <option value="23:00 — 08:00">23:00 — 08:00</option>
                       <option value="23:00 — 07:00">23:00 — 07:00</option>
+                      <option value="00:00 — 06:00">00:00 — 06:00</option>
                       <option value="Desativado">Desativado</option>
                     </select>
                   </div>
@@ -4983,6 +4994,248 @@ export function App(): React.ReactElement {
                     </button>
                   </div>
                 </section>
+                )}
+
+                {/* Card 2.1: Portabilidade da Alma (.ashy-soul) & Factory Reset */}
+                {(state.settingsSubTab === 'todas' ||
+                  state.settingsSubTab === 'geral' ||
+                  state.settingsSubTab === 'privacidade') && (
+                  <section className="ashy-settings-card" data-testid="panel-soul-portability">
+                    <div className="ashy-settings-section-head">
+                      <div className="ashy-settings-section-icon">
+                        <Database size={20} />
+                      </div>
+                      <div>
+                        <h3 className="ashy-setting-title">
+                          Portabilidade da Alma (.ashy-soul) &amp; Reset de Fábrica
+                        </h3>
+                        <p className="ashy-setting-desc">
+                          Exporte ou restaure sua alma completa com verificação SHA-256 ou apague
+                          todos os dados locais com 1 clique.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div
+                      style={{
+                        display: 'flex',
+                        flexWrap: 'wrap',
+                        alignItems: 'center',
+                        gap: '10px',
+                        marginTop: '12px',
+                      }}
+                    >
+                      <button
+                        type="button"
+                        className="ashy-outline-btn"
+                        data-testid="btn-export-soul"
+                        onClick={async () => {
+                          const archive = await state.exportSoulArchive()
+                          setSoulArchiveJsonDraft(JSON.stringify(archive, null, 2))
+                        }}
+                      >
+                        Exportar Alma (.ashy-soul)
+                      </button>
+
+                      <span
+                        className="ashy-badge violet"
+                        data-testid="soul-export-checksum-badge"
+                      >
+                        {state.lastExportedSoulArchive
+                          ? `SHA-256: ${state.lastExportedSoulArchive.checksumSha256}`
+                          : 'Nenhuma exportação recente'}
+                      </span>
+
+                      <label className="ashy-outline-btn" style={{ cursor: 'pointer' }}>
+                        <span>Carregar arquivo .ashy-soul</span>
+                        <input
+                          type="file"
+                          accept=".ashy-soul,.json"
+                          data-testid="input-import-soul-file"
+                          style={{ display: 'none' }}
+                          onChange={async (e) => {
+                            const file = e.target.files?.[0]
+                            if (!file) return
+                            const text = await file.text()
+                            setSoulArchiveJsonDraft(text)
+                          }}
+                        />
+                      </label>
+
+                      <button
+                        type="button"
+                        className="ashy-primary-btn"
+                        data-testid="btn-import-soul"
+                        onClick={() => void state.importSoulArchive(soulArchiveJsonDraft)}
+                      >
+                        Importar Alma (.ashy-soul)
+                      </button>
+                    </div>
+
+                    <div style={{ marginTop: '12px' }}>
+                      <textarea
+                        data-testid="soul-archive-json-textarea"
+                        className="ashy-input"
+                        rows={4}
+                        style={{
+                          width: '100%',
+                          fontFamily: 'var(--font-mono)',
+                          fontSize: '0.78rem',
+                        }}
+                        placeholder="Cole aqui o conteúdo JSON de um arquivo .ashy-soul ou clique em Exportar Alma..."
+                        value={soulArchiveJsonDraft}
+                        onChange={(e) => setSoulArchiveJsonDraft(e.target.value)}
+                      />
+                    </div>
+
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        flexWrap: 'wrap',
+                        gap: '10px',
+                        marginTop: '12px',
+                      }}
+                    >
+                      <span
+                        className={`ashy-badge ${
+                          state.soulPortabilityStatus.kind === 'error'
+                            ? 'danger'
+                            : state.soulPortabilityStatus.kind === 'exported' ||
+                                state.soulPortabilityStatus.kind === 'imported' ||
+                                state.soulPortabilityStatus.kind === 'wiped'
+                              ? 'mint'
+                              : 'peach'
+                        }`}
+                        data-testid="soul-import-status-badge"
+                      >
+                        {state.soulPortabilityStatus.message ??
+                          'Pronto para exportar ou importar (.ashy-soul)'}
+                      </span>
+
+                      {!showWipeConfirm ? (
+                        <button
+                          type="button"
+                          className="ashy-danger-outline-btn"
+                          data-testid="btn-wipe-all-trigger"
+                          onClick={() => setShowWipeConfirm(true)}
+                        >
+                          Apagar Tudo com 1 Clique (Factory Reset)
+                        </button>
+                      ) : (
+                        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                          <button
+                            type="button"
+                            className="ashy-danger-outline-btn"
+                            data-testid="btn-wipe-all-confirm"
+                            onClick={async () => {
+                              await state.wipeAllSoulData()
+                              setShowWipeConfirm(false)
+                              setSoulArchiveJsonDraft('')
+                            }}
+                          >
+                            Confirmar Exclusão Total
+                          </button>
+                          <button
+                            type="button"
+                            className="ashy-outline-btn"
+                            data-testid="btn-wipe-all-cancel"
+                            onClick={() => setShowWipeConfirm(false)}
+                          >
+                            Cancelar
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </section>
+                )}
+
+                {/* Card 2.2: Criptografia em Repouso (Encryption at Rest) */}
+                {(state.settingsSubTab === 'todas' ||
+                  state.settingsSubTab === 'privacidade') && (
+                  <section className="ashy-settings-card" data-testid="panel-encryption-at-rest">
+                    <div className="ashy-setting-row">
+                      <div className="ashy-settings-section-head">
+                        <div className="ashy-settings-section-icon">
+                          <Shield size={20} />
+                        </div>
+                        <div>
+                          <h3 className="ashy-setting-title">
+                            Criptografia em Repouso (AES-256-GCM)
+                          </h3>
+                          <p className="ashy-setting-desc">
+                            Protege memórias, diários e configurações no disco usando chave do
+                            sistema operacional ({state.encryptionAtRestStatus.algorithm}).
+                          </p>
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                        <span
+                          className={`ashy-badge ${
+                            state.encryptionAtRestStatus.enabled ? 'mint' : 'peach'
+                          }`}
+                          data-testid="encryption-at-rest-status"
+                        >
+                          {state.encryptionAtRestStatus.enabled
+                            ? 'AES-256-GCM Ativo'
+                            : 'Desativado (Texto Puro Local)'}{' '}
+                          • {state.encryptionAtRestStatus.keyBackend}
+                        </span>
+                        <button
+                          type="button"
+                          aria-label="Ativar criptografia em repouso"
+                          aria-pressed={state.encryptionAtRestStatus.enabled}
+                          data-testid="toggle-encryption-at-rest"
+                          className={`ashy-switch ${
+                            state.encryptionAtRestStatus.enabled ? 'on' : ''
+                          }`}
+                          onClick={() =>
+                            void state.setEncryptionAtRest(!state.encryptionAtRestStatus.enabled)
+                          }
+                        />
+                      </div>
+                    </div>
+                  </section>
+                )}
+
+                {/* Card 2.3: Atualizações do Aplicativo (Auto-Updater) */}
+                {(state.settingsSubTab === 'todas' || state.settingsSubTab === 'geral') && (
+                  <section className="ashy-settings-card" data-testid="panel-auto-updater">
+                    <div className="ashy-setting-row">
+                      <div className="ashy-settings-section-head">
+                        <div className="ashy-settings-section-icon">
+                          <Sparkles size={20} />
+                        </div>
+                        <div>
+                          <h3 className="ashy-setting-title">Atualizações do Aplicativo</h3>
+                          <p className="ashy-setting-desc">
+                            Versão instalada: {state.updaterState.currentVersion} • Canal GitHub
+                            Releases
+                          </p>
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                        <span
+                          className="ashy-badge violet"
+                          data-testid="updater-status-badge"
+                        >
+                          Status: {state.updaterState.status} • v{state.updaterState.currentVersion}
+                          {state.updaterState.availableVersion
+                            ? ` → v${state.updaterState.availableVersion}`
+                            : ''}
+                        </span>
+                        <button
+                          type="button"
+                          className="ashy-outline-btn"
+                          data-testid="btn-check-updates"
+                          onClick={() => void state.checkForAppUpdates()}
+                        >
+                          Verificar Atualizações
+                        </button>
+                      </div>
+                    </div>
+                  </section>
                 )}
 
                 {/* Card 3: Modelos, Aprovação de Ações (MCP) & Lembranças do Estúdio */}
