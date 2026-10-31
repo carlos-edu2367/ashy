@@ -349,8 +349,12 @@ export function App(): React.ReactElement {
       <div
         data-testid="floating-stage-overlay"
         onMouseEnter={() => setIsHoveringOverlay(true)}
-        onMouseMove={() => {
-          if (!isHoveringOverlay) setIsHoveringOverlay(true)
+        onMouseMove={(e) => {
+          const targetEl = e.target as HTMLElement | null
+          const overIsland = Boolean(targetEl?.closest?.('[data-ui-island="true"]'))
+          if ((!useAshyStore.getState().ignoringMouseEvents || overIsland) && !isHoveringOverlay) {
+            setIsHoveringOverlay(true)
+          }
         }}
         onMouseLeave={() => setIsHoveringOverlay(false)}
         onMouseDown={handleOverlayMouseDown}
@@ -473,13 +477,14 @@ export function App(): React.ReactElement {
                 ambientLuminance={state.ambientLuminance}
                 bubbleText={state.bubbleText}
                 statusLabel={state.presenceStatus}
-                mode={state.stageMode}
+                mode={state.isTransparentOverlayWindow ? 'live2d' : state.stageMode}
                 motionPreset={state.activeMotion}
                 live2dControls={state.live2dModelControls}
                 live2dModelUrl={state.live2dModelUrl}
                 transparentBackground={state.isTransparentOverlayWindow}
                 lockInteractiveMouse={isDraggingOverlay}
                 onIgnoreMouseChange={(ignore) => {
+                  setIsHoveringOverlay(!ignore)
                   if (
                     state.ignoringMouseEvents === ignore &&
                     state.ignoreMouseTransitionCount === 0

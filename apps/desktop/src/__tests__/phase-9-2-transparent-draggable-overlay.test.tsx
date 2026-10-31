@@ -149,10 +149,9 @@ describe('Phase 9.2 — 100% Transparent Overlay & Free Pointer Dragging', () =>
     expect(focusHubWindow).toHaveBeenCalledTimes(1)
     expect(useAshyStore.getState().viewMode).toBe('stage')
 
-    // Live2D parameter HUD must not render when transparentBackground is true
-    await act(async () => {
-      useAshyStore.getState().setStageMode('live2d')
-    })
+    // Live2D mode is forced in transparent overlay so it never renders opaque tachie JPEG backgrounds, and HUD is hidden
+    const canvas = getByTestId('ashy-stage-canvas')
+    expect(canvas.getAttribute('data-mode')).toBe('live2d')
     expect(container?.querySelector('[data-testid="live2d-parameter-hud"]')).toBeNull()
 
     // Idle empty/... bubble must be hidden on transparent background
@@ -162,7 +161,6 @@ describe('Phase 9.2 — 100% Transparent Overlay & Free Pointer Dragging', () =>
     expect(container?.querySelector('[data-testid="ashy-presence-bubble"]')).toBeNull()
 
     // Pointer dragging on stage canvas updates overlay position via IPC
-    const canvas = getByTestId('ashy-stage-canvas')
     vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
       left: 0,
       top: 0,
@@ -174,6 +172,15 @@ describe('Phase 9.2 — 100% Transparent Overlay & Free Pointer Dragging', () =>
       y: 0,
       toJSON: () => ({}),
     })
+
+    // Moving cursor into transparent click-through corner (80, 80) hides quick controls (opacity: 0)
+    await act(async () => {
+      canvas.dispatchEvent(
+        new MouseEvent('mousemove', { bubbles: true, clientX: 80, clientY: 80 }),
+      )
+    })
+    expect(useAshyStore.getState().ignoringMouseEvents).toBe(true)
+    expect(quickControls.style.opacity).toBe('0')
 
     await act(async () => {
       canvas.dispatchEvent(
