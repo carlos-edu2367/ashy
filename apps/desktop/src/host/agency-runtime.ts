@@ -14,6 +14,7 @@ import {
   createStdioMcpClient,
   detectBlastRadiusWarning,
   isPathWithinAllowed,
+  isSensitiveHostPath,
   type ApprovalScope,
   type AuthorizedVisionSensor,
   type CapturedScreenFrame,
@@ -32,6 +33,8 @@ import {
   type VisionObservationResult,
 } from '@ashy/shared'
 import type { ProviderVault } from './provider-vault'
+
+export { isSensitiveHostPath }
 
 export interface HostAgencyRuntimeOptions {
   readonly cortex: AshyCortex
@@ -98,11 +101,92 @@ const SYNTHETIC_FIXTURE_IDS: ReadonlySet<string> = new Set([
 
 const MAX_CLEANUP_OUTPUT_CHARS = 16_384
 
+const FORBIDDEN_NODE_EXPR_RE =
+  /child_process|\bspawn(?:Sync)?\b|\bexec(?:Sync|File|FileSync)?\b|\bfork\b|\.master\.key|secrets\.json|ashy\.db|voice-settings|providers\.json|stage-preferences\.json|fs\s*\.\s*(?:read|rm|unlink|writeFileSync|writeFile|appendFile|cp|copyFile|rename|rmdir|open|promises)/i
+
 export interface ResolveWorkspacePathOptions {
   readonly userDataDir?: string
   readonly workspaceCwd?: string
   readonly allowedPaths?: readonly string[]
   readonly forWrite?: boolean
+}
+
+function assertRealpathAndSymlinkSafe(
+  candidatePath: string,
+  rawPath: string,
+  allowedDirs: readonly string[],
+): void {
+  if (isSensitiveHostPath(rawPath) || isSensitiveHostPath(candidatePath)) {
+    throw new Error(`Access denied: sensitive host file is protected (${rawPath})`)
+  }
+
+  const realAllowedDirs: string[] = []
+  for (const dir of allowedDirs) {
+    const norm = dir.replace(/\\/g, '/')
+    realAllowedDirs.push(norm)
+    try {
+      if (fs.existsSync(dir)) {
+        realAllowedDirs.push(fs.realpathSync(dir).replace(/\\/g, '/'))
+      }
+    } catch {
+      // Ignore non-existent allowed dir
+    }
+  }
+
+  let current = path.resolve(candidatePath)
+  while (true) {
+    let lstat: fs.Stats | null = null
+    try {
+      lstat = fs.lstatSync(current)
+    } catch {
+      lstat = null
+    }
+
+    if (lstat) {
+      if (lstat.isSymbolicLink()) {
+        let realTarget: string
+        try {
+          realTarget = fs.realpathSync(current).replace(/\\/g, '/')
+        } catch {
+          const linkTarget = fs.readlinkSync(current)
+          realTarget = path.resolve(path.dirname(current), linkTarget).replace(/\\/g, '/')
+        }
+        if (
+          isSensitiveHostPath(realTarget) ||
+          !isPathWithinAllowed(realTarget, realAllowedDirs)
+        ) {
+          throw new Error(`Symlink escape blocked for path: ${rawPath}`)
+        }
+      } else {
+        try {
+          const realCurrent = fs.realpathSync(current).replace(/\\/g, '/')
+          if (isSensitiveHostPath(realCurrent)) {
+            throw new Error(`Access denied: sensitive host file is protected (${rawPath})`)
+          }
+          if (!isPathWithinAllowed(realCurrent, realAllowedDirs)) {
+            throw new Error(`Symlink escape blocked for path: ${rawPath}`)
+          }
+        } catch (err) {
+          if (
+            err instanceof Error &&
+            (err.message.startsWith('Symlink escape blocked') ||
+              err.message.startsWith('Access denied: sensitive host file'))
+          ) {
+            throw err
+          }
+        }
+      }
+    }
+
+    const parent = path.dirname(current)
+    if (!parent || parent === current) {
+      break
+    }
+    if (!isPathWithinAllowed(parent.replace(/\\/g, '/'), realAllowedDirs)) {
+      break
+    }
+    current = parent
+  }
 }
 
 export function resolveWorkspacePath(
@@ -124,6 +208,10 @@ export function resolveWorkspacePath(
   const normalized = trimmed.replace(/\\/g, '/')
   if (/(?:^|\/)\.{2,}(?:\/|$)/.test(normalized)) {
     throw new Error(`Path traversal segment (..) blocked in resolveWorkspacePath: ${candidatePath}`)
+  }
+
+  if (isSensitiveHostPath(candidatePath) || isSensitiveHostPath(normalized)) {
+    throw new Error(`Access denied: sensitive host file is protected (${candidatePath})`)
   }
 
   const normalizedUserDataDir = path
@@ -166,9 +254,11 @@ export function resolveWorkspacePath(
     }
 
     if (opts?.forWrite) {
+      assertRealpathAndSymlinkSafe(userWorkspaceCandidate, candidatePath, workspaceBaseDirs)
       return userWorkspaceCandidate
     }
     if (rel && fs.existsSync(userWorkspaceCandidate)) {
+      assertRealpathAndSymlinkSafe(userWorkspaceCandidate, candidatePath, workspaceBaseDirs)
       return userWorkspaceCandidate
     }
     if (rel) {
@@ -177,6 +267,7 @@ export function resolveWorkspacePath(
         isPathWithinAllowed(cwdCandidate, [normalizedWorkspaceCwd]) &&
         fs.existsSync(cwdCandidate)
       ) {
+        assertRealpathAndSymlinkSafe(cwdCandidate, candidatePath, workspaceBaseDirs)
         return cwdCandidate
       }
       if (hasMonorepoRoot) {
@@ -185,10 +276,12 @@ export function resolveWorkspacePath(
           isPathWithinAllowed(monorepoCandidate, [candidateMonorepoRoot]) &&
           fs.existsSync(monorepoCandidate)
         ) {
+          assertRealpathAndSymlinkSafe(monorepoCandidate, candidatePath, workspaceBaseDirs)
           return monorepoCandidate
         }
       }
     }
+    assertRealpathAndSymlinkSafe(userWorkspaceCandidate, candidatePath, workspaceBaseDirs)
     return userWorkspaceCandidate
   }
 
@@ -204,10 +297,16 @@ export function resolveWorkspacePath(
   }
 
   const resolvedDisk = path.resolve(candidatePath).replace(/\\/g, '/')
+  if (isSensitiveHostPath(resolvedDisk)) {
+    throw new Error(`Access denied: sensitive host file is protected (${candidatePath})`)
+  }
   if (!isPathWithinAllowed(resolvedDisk, workspaceBaseDirs)) {
-    throw new Error(`Unauthorized path outside allowed workspace directories: ${candidatePath}`)
+    throw new Error(
+      `Unauthorized path outside sandbox and allowed workspace directories: ${candidatePath}`,
+    )
   }
 
+  assertRealpathAndSymlinkSafe(resolvedDisk, candidatePath, workspaceBaseDirs)
   return resolvedDisk
 }
 
@@ -852,23 +951,37 @@ export function createHostAgencyRuntime(
         if (!cmd) {
           throw new Error('Invalid cleanup command: command must be non-empty')
         }
+        if (/[;&|><$`\r\n]/.test(cmd)) {
+          throw new Error(
+            'Cleanup command blocked by security policy: shell chaining, redirection, pipe, or command substitution characters are forbidden',
+          )
+        }
         if (/(?:^|[\s'"\\/])\.\.(?:[\\/]|['"\s]|$)/.test(cmd)) {
           throw new Error(`Unauthorized path traversal in cleanup command outside sandbox: ${cmd}`)
         }
+
+        const rawTokens = cmd
+          .split(/\s+/)
+          .map((t) => t.replace(/^['"]+|['"]+$/g, '').trim())
+          .filter(Boolean)
+        if (rawTokens.some((token) => isSensitiveHostPath(token))) {
+          throw new Error('Cleanup command blocked: references sensitive host file')
+        }
+
         const rawCwd =
           typeof args.cwd === 'string' && args.cwd.trim().length > 0
             ? resolveRuntimeWorkspacePath(args.cwd.trim())
             : normalizedUserDataDir
         const cwd = rawCwd.replace(/\\/g, '/')
-        if (!privacyController.isPathAllowed(cwd)) {
+        if (!privacyController.isPathAllowed(cwd) || isSensitiveHostPath(cwd)) {
           throw new Error(`Unauthorized cleanup working directory outside sandbox: ${cwd}`)
         }
         fs.mkdirSync(cwd, { recursive: true })
 
         const blastWarning = detectBlastRadiusWarning({ command: cmd })
 
-        // Cross-platform safe sandboxed handling for `rm -rf <target>`
-        const rmMatch = /^rm\s+(?:-[a-zA-Z]+\s+)+(.+)$/i.exec(cmd)
+        // Mode 1: Safe sandboxed workspace `rm` cleanup commands (`/^rm\s+(?:-[rfv]+\s+)*(.+)$/i`)
+        const rmMatch = /^rm\s+(?:-[rfv]+\s+)*(.+)$/i.exec(cmd)
         if (rmMatch) {
           const rawTarget = rmMatch[1]!.trim().replace(/^['"]|['"]$/g, '')
           if (
@@ -878,6 +991,10 @@ export function createHostAgencyRuntime(
           ) {
             throw new Error(`Unauthorized cleanup target path outside sandbox: ${rawTarget}`)
           }
+          if (isSensitiveHostPath(rawTarget)) {
+            throw new Error('Cleanup command blocked: references sensitive host file')
+          }
+
           const tmpSandboxRoot = path
             .resolve(os.tmpdir(), 'ashy-tmp-sandbox')
             .replace(/\\/g, '/')
@@ -889,16 +1006,25 @@ export function createHostAgencyRuntime(
             if (!relTmp || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(relTmp)) {
               throw new Error(`Unauthorized cleanup target path outside sandbox: ${rawTarget}`)
             }
+            if (isSensitiveHostPath(relTmp)) {
+              throw new Error('Cleanup command blocked: references sensitive host file')
+            }
             resolvedTarget = path.resolve(tmpSandboxRoot, relTmp)
           } else if (
             rawTarget === '/workspace/ashy' ||
             rawTarget.startsWith('/workspace/ashy/')
           ) {
             resolvedTarget = resolveRuntimeWorkspacePath(rawTarget, { forWrite: true })
-          } else if (path.isAbsolute(rawTarget) || rawTarget.startsWith('/')) {
-            resolvedTarget = path.resolve(rawTarget)
           } else {
-            resolvedTarget = path.resolve(cwd, rawTarget)
+            const candidateAbs =
+              path.isAbsolute(rawTarget) || rawTarget.startsWith('/')
+                ? path.resolve(rawTarget)
+                : path.resolve(cwd, rawTarget)
+            resolvedTarget = resolveRuntimeWorkspacePath(candidateAbs, { forWrite: true })
+          }
+
+          if (isSensitiveHostPath(resolvedTarget)) {
+            throw new Error('Cleanup command blocked: references sensitive host file')
           }
 
           const normalizedTarget = resolvedTarget.replace(/\\/g, '/').replace(/\/+$/, '')
@@ -916,6 +1042,11 @@ export function createHostAgencyRuntime(
           if ((!isInsideTmpSandbox && !isInsideAllowed) || isRootAllowedPath) {
             throw new Error(`Unauthorized cleanup target path outside sandbox: ${rawTarget}`)
           }
+
+          assertRealpathAndSymlinkSafe(resolvedTarget, rawTarget, [
+            ...privacyController.allowedPaths,
+            tmpSandboxRoot,
+          ])
 
           fs.rmSync(resolvedTarget, { recursive: true, force: true })
           const completedAt = new Date().toISOString()
@@ -935,74 +1066,87 @@ export function createHostAgencyRuntime(
           }
         }
 
-        const execResult = await new Promise<{
-          exitCode: number
-          stdout: string
-          stderr: string
-          truncated: boolean
-        }>((resolve) => {
-          const shellBin = process.platform === 'win32' ? 'powershell.exe' : '/bin/sh'
-          const shellArgs =
-            process.platform === 'win32'
-              ? ['-NoProfile', '-NonInteractive', '-Command', cmd]
-              : ['-c', cmd]
+        // Mode 2: Safe `node -e "<expr>"` commands (`shell: false` via process.execPath)
+        const nodeExprMatch = /^node\s+-e\s+(?:"([^"]+)"|'([^']+)')$/.exec(cmd)
+        if (nodeExprMatch) {
+          const expr = (nodeExprMatch[1] ?? nodeExprMatch[2] ?? '').trim()
+          if (!expr) {
+            throw new Error('Command rejected by security policy: empty node expression')
+          }
+          if (FORBIDDEN_NODE_EXPR_RE.test(expr) || isSensitiveHostPath(expr)) {
+            throw new Error(
+              'Command rejected by security policy: forbidden API or sensitive host file referenced in node expression',
+            )
+          }
 
-          execFile(
-            shellBin,
-            shellArgs,
-            { cwd, timeout: 10_000, windowsHide: true, maxBuffer: 256 * 1024 },
-            (err, stdout, stderr) => {
-              const rawOut = String(stdout ?? '').trim()
-              const rawErr = String(stderr ?? (err ? err.message : '')).trim()
-              const hitMaxBuffer =
-                Boolean(err) &&
-                ((err as { code?: unknown }).code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' ||
-                  /maxBuffer/i.test(err?.message ?? ''))
-              const truncated =
-                hitMaxBuffer ||
-                rawOut.length > MAX_CLEANUP_OUTPUT_CHARS ||
-                rawErr.length > MAX_CLEANUP_OUTPUT_CHARS
+          const execResult = await new Promise<{
+            exitCode: number
+            stdout: string
+            stderr: string
+            truncated: boolean
+          }>((resolve) => {
+            execFile(
+              process.execPath,
+              ['-e', expr],
+              { cwd, timeout: 5_000, maxBuffer: 64 * 1024, windowsHide: true },
+              (err, stdout, stderr) => {
+                const rawOut = String(stdout ?? '').trim()
+                const rawErr = String(stderr ?? (err ? err.message : '')).trim()
+                const hitMaxBuffer =
+                  Boolean(err) &&
+                  ((err as { code?: unknown }).code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' ||
+                    /maxBuffer/i.test(err?.message ?? ''))
+                const truncated =
+                  hitMaxBuffer ||
+                  rawOut.length > MAX_CLEANUP_OUTPUT_CHARS ||
+                  rawErr.length > MAX_CLEANUP_OUTPUT_CHARS
 
-              const cappedStdout =
-                rawOut.length > MAX_CLEANUP_OUTPUT_CHARS
-                  ? `${rawOut.slice(0, MAX_CLEANUP_OUTPUT_CHARS)}...[truncated]`
-                  : rawOut
-              const cappedStderr =
-                rawErr.length > MAX_CLEANUP_OUTPUT_CHARS
-                  ? `${rawErr.slice(0, MAX_CLEANUP_OUTPUT_CHARS)}...[truncated]`
-                  : rawErr
+                const cappedStdout =
+                  rawOut.length > MAX_CLEANUP_OUTPUT_CHARS
+                    ? `${rawOut.slice(0, MAX_CLEANUP_OUTPUT_CHARS)}...[truncated]`
+                    : rawOut
+                const cappedStderr =
+                  rawErr.length > MAX_CLEANUP_OUTPUT_CHARS
+                    ? `${rawErr.slice(0, MAX_CLEANUP_OUTPUT_CHARS)}...[truncated]`
+                    : rawErr
 
-              const exitCode = hitMaxBuffer
-                ? 0
-                : err && typeof (err as { code?: unknown }).code === 'number'
-                  ? (err as { code: number }).code
-                  : err
-                    ? 1
-                    : 0
-              resolve({
-                exitCode,
-                stdout: cappedStdout,
-                stderr: cappedStderr,
-                truncated,
-              })
-            },
-          )
-        })
+                const exitCode = hitMaxBuffer
+                  ? 0
+                  : err && typeof (err as { code?: unknown }).code === 'number'
+                    ? (err as { code: number }).code
+                    : err
+                      ? 1
+                      : 0
+                resolve({
+                  exitCode,
+                  stdout: cappedStdout,
+                  stderr: cappedStderr,
+                  truncated,
+                })
+              },
+            )
+          })
 
-        return {
-          executed: true,
-          command: cmd,
-          executedCommand: cmd,
-          cwd,
-          workingDirectory: cwd,
-          exitCode: execResult.exitCode,
-          stdout: execResult.stdout,
-          stderr: execResult.stderr,
-          truncated: execResult.truncated,
-          ...(blastWarning ? { blastRadiusWarning: blastWarning } : {}),
-          completedAt: new Date().toISOString(),
-          timestamp: Date.now(),
+          return {
+            executed: true,
+            command: cmd,
+            executedCommand: cmd,
+            cwd,
+            workingDirectory: cwd,
+            exitCode: execResult.exitCode,
+            stdout: execResult.stdout,
+            stderr: execResult.stderr,
+            truncated: execResult.truncated,
+            ...(blastWarning ? { blastRadiusWarning: blastWarning } : {}),
+            completedAt: new Date().toISOString(),
+            timestamp: Date.now(),
+          }
         }
+
+        // Mode 3: Reject all other commands
+        throw new Error(
+          'Command rejected by security policy: only workspace rm or safe node expressions are permitted',
+        )
       },
     },
   ])
@@ -1143,7 +1287,7 @@ export function createHostAgencyRuntime(
       if (typeof safeArgs.diffPreview !== 'string' && gatekeeper.getApprovalPolicy() !== 'off') {
         let previousContent: string | null = null
         try {
-          if (privacyController.isPathAllowed(resolvedPath)) {
+          if (privacyController.isPathAllowed(resolvedPath) && !isSensitiveHostPath(resolvedPath)) {
             const diskPath = resolveRuntimeWorkspacePath(resolvedPath)
             if (fs.existsSync(diskPath) && fs.statSync(diskPath).isFile()) {
               previousContent = fs.readFileSync(diskPath, 'utf8')

@@ -169,6 +169,56 @@ const PATH_ARG_KEYS: ReadonlySet<string> = new Set([
   'destPath',
 ])
 
+/**
+ * Checks whether a target path or filename refers to a sensitive host credential,
+ * database, configuration, or private key file that must never be accessed by MCP tools.
+ */
+export function isSensitiveHostPath(targetPath: string): boolean {
+  if (typeof targetPath !== 'string') return false
+  const normalized = targetPath
+    .replace(/\\/g, '/')
+    .trim()
+    .replace(/^['"]+|['"]+$/g, '')
+    .toLowerCase()
+  if (!normalized) return false
+
+  if (
+    normalized === '.git/config' ||
+    normalized.endsWith('/.git/config') ||
+    normalized.includes('/.git/config/')
+  ) {
+    return true
+  }
+
+  const segments = normalized.split('/').filter(Boolean)
+  const basename = segments[segments.length - 1] ?? normalized
+
+  const checkSegment = (seg: string): boolean => {
+    if (!seg) return false
+    if (seg === '.master.key' || seg.startsWith('.master.key')) return true
+    if (seg.includes('.secrets.json')) return true
+    if (seg === 'voice-settings.json' || seg.startsWith('voice-settings.json')) return true
+    if (seg === 'providers.json' || seg.startsWith('providers.json')) return true
+    if (seg === 'stage-preferences.json' || seg.startsWith('stage-preferences.json')) return true
+    if (seg === 'ashy.db' || seg.startsWith('ashy.db')) return true
+    if (seg.includes('.ashy-soul')) return true
+    if ((seg === '.env' || seg.startsWith('.env.')) && seg !== '.env.example') return true
+    if (seg.includes('id_rsa') || seg.includes('id_ed25519')) return true
+    if (seg.endsWith('.pem') || seg.endsWith('.key')) return true
+    return false
+  }
+
+  if (checkSegment(basename)) {
+    return true
+  }
+  for (const seg of segments) {
+    if (checkSegment(seg)) {
+      return true
+    }
+  }
+  return false
+}
+
 function serializeArgsPreview(args: Record<string, unknown>, maxLen = 240): string {
   try {
     const raw = JSON.stringify(args)
@@ -487,9 +537,21 @@ export class ActionGatekeeper {
     return Array.from(this.sessionApprovedTools)
   }
 
+  private getSessionApprovalKey(toolName: string, args: Record<string, unknown>): string {
+    if (toolName === 'run_cleanup_command') {
+      return `run_cleanup_command:${JSON.stringify(args)}`
+    }
+    return toolName
+  }
+
   revokeSessionApproval(toolName: string): void {
     const clean = toolName.trim()
     this.sessionApprovedTools.delete(clean)
+    for (const key of Array.from(this.sessionApprovedTools)) {
+      if (key.startsWith(`${clean}:`)) {
+        this.sessionApprovedTools.delete(key)
+      }
+    }
     const tool = this.tools.get(clean)
     this.recordAudit({
       toolName: clean || '*',
@@ -524,6 +586,11 @@ export class ActionGatekeeper {
   unregisterTool(toolName: string): void {
     this.tools.delete(toolName)
     this.sessionApprovedTools.delete(toolName)
+    for (const key of Array.from(this.sessionApprovedTools)) {
+      if (key.startsWith(`${toolName}:`)) {
+        this.sessionApprovedTools.delete(key)
+      }
+    }
   }
 
   getRegisteredTool(toolName: string): GatedToolDefinition | undefined {
@@ -540,7 +607,17 @@ export class ActionGatekeeper {
     return [...this.auditLog]
   }
 
+  isPathAllowed(candidatePath: string): boolean {
+    if (isSensitiveHostPath(candidatePath)) {
+      return false
+    }
+    return this.isPathAllowedWithSymlinkGuard(candidatePath)
+  }
+
   private isPathAllowedWithSymlinkGuard(candidatePath: string): boolean {
+    if (isSensitiveHostPath(candidatePath)) {
+      return false
+    }
     if (!this.privacyController.isPathAllowed(candidatePath)) {
       return false
     }
@@ -573,11 +650,17 @@ export class ActionGatekeeper {
       if (lstat) {
         try {
           const realCandidate = fs.realpathSync(candidatePath)
+          if (isSensitiveHostPath(realCandidate)) {
+            return false
+          }
           return isPathWithinAllowed(realCandidate, expandedAllowed)
         } catch {
           if (lstat.isSymbolicLink()) {
             const linkTarget = fs.readlinkSync(candidatePath)
             const resolvedTarget = pathMod.resolve(pathMod.dirname(candidatePath), linkTarget)
+            if (isSensitiveHostPath(resolvedTarget)) {
+              return false
+            }
             return isPathWithinAllowed(resolvedTarget, expandedAllowed)
           }
           return false
@@ -588,6 +671,9 @@ export class ActionGatekeeper {
       if (parentDir && parentDir !== candidatePath && fs.existsSync(parentDir)) {
         const realParent = fs.realpathSync(parentDir)
         const realCandidate = pathMod.join(realParent, pathMod.basename(candidatePath))
+        if (isSensitiveHostPath(realCandidate)) {
+          return false
+        }
         return isPathWithinAllowed(realCandidate, expandedAllowed)
       }
     } catch {
@@ -731,8 +817,11 @@ export class ActionGatekeeper {
 
     // 5. Staged-confirm flow ('ask' or 'session' mode)
     if (effectiveTier === 'staged-confirm') {
+      const sessionApprovalKey = this.getSessionApprovalKey(tool.toolName, safeArgs)
       const canAutoApproveFromSession =
-        !blastWarning && this.sessionApprovedTools.has(tool.toolName)
+        !blastWarning &&
+        (this.sessionApprovedTools.has(sessionApprovalKey) ||
+          (tool.toolName !== 'run_cleanup_command' && this.sessionApprovedTools.has(tool.toolName)))
 
       if (!canAutoApproveFromSession) {
         const cardId = this.nextId('action')
@@ -817,7 +906,9 @@ export class ActionGatekeeper {
     pending.card.status = 'approved'
 
     if (effectiveScope === 'session' && !pending.card.blastRadiusWarning) {
-      this.sessionApprovedTools.add(pending.tool.toolName)
+      this.sessionApprovedTools.add(
+        this.getSessionApprovalKey(pending.tool.toolName, pending.args)
+      )
     }
 
     this.recordAudit({

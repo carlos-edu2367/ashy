@@ -344,6 +344,7 @@ export function createHttpSseHostBridge(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'X-Ashy-Request': '1',
       },
       body: JSON.stringify({ method, payload }),
     })

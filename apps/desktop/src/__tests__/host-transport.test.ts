@@ -462,16 +462,23 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
       })
       expect(postEventsRes.status).toBe(405)
 
-      const malformedRes = await fetch(`${baseUrl}/__ashy_host/rpc`, {
+      const missingAntiCsrfRes = await fetch(`${baseUrl}/__ashy_host/rpc`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ method: 'getBootstrapSnapshot' }),
+      })
+      expect(missingAntiCsrfRes.status).toBe(403)
+
+      const malformedRes = await fetch(`${baseUrl}/__ashy_host/rpc`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Ashy-Request': '1' },
         body: '{bad-json',
       })
       expect(malformedRes.status).toBe(400)
 
       const protoRes = await fetch(`${baseUrl}/__ashy_host/rpc`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Ashy-Request': '1' },
         body: JSON.stringify({ method: '__proto__', payload: {} }),
       })
       expect(protoRes.status).toBe(400)
@@ -481,6 +488,7 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'X-Ashy-Request': '1',
           Origin: 'https://evil.attacker.example',
         },
         body: JSON.stringify({ method: 'getBootstrapSnapshot' }),
@@ -491,6 +499,7 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'X-Ashy-Request': '1',
           'Sec-Fetch-Site': 'cross-site',
         },
         body: JSON.stringify({ method: 'getBootstrapSnapshot' }),
@@ -525,6 +534,7 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
             headers: {
               Host: 'rebind.attacker.example:5173',
               'Content-Type': 'application/json',
+              'X-Ashy-Request': '1',
             },
           },
           (res) => {
@@ -911,7 +921,7 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
       // Invalid quietHours must be rejected with 400 Invalid RPC argument
       const badPolicyRes = await fetch(`${baseUrl}/__ashy_host/rpc`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Ashy-Request': '1' },
         body: JSON.stringify({
           method: 'updateInitiativePolicy',
           payload: { quietHoursStart: '25:99' },

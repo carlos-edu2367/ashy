@@ -691,6 +691,7 @@ function readJsonBody(req: IncomingMessage): Promise<{ method: string; payload?:
       totalBytes += buf.byteLength
       if (totalBytes > MAX_RPC_BODY_BYTES) {
         aborted = true
+        req.destroy()
         reject(new Error('RPC request payload exceeds maximum allowed size (10MB)'))
         return
       }
@@ -751,6 +752,19 @@ function parseHostHeaderHostname(rawHost: string): string {
   return colonIdx >= 0 ? trimmed.slice(0, colonIdx) : trimmed
 }
 
+function parseHostHeaderPort(rawHost: string): string {
+  const trimmed = rawHost.trim().toLowerCase()
+  if (trimmed.startsWith('[')) {
+    const closeIdx = trimmed.indexOf(']')
+    if (closeIdx >= 0 && trimmed[closeIdx + 1] === ':') {
+      return trimmed.slice(closeIdx + 2)
+    }
+    return ''
+  }
+  const colonIdx = trimmed.indexOf(':')
+  return colonIdx >= 0 ? trimmed.slice(colonIdx + 1) : ''
+}
+
 function isAllowedLoopbackRequest(req: IncomingMessage): { ok: true } | { ok: false; reason: string } {
   const hostHeader = req.headers.host
   if (typeof hostHeader === 'string' && hostHeader.trim().length > 0) {
@@ -775,6 +789,13 @@ function isAllowedLoopbackRequest(req: IncomingMessage): { ok: true } | { ok: fa
         !ALLOWED_LOOPBACK_HOSTS.has(originHost)
       ) {
         return { ok: false, reason: 'Forbidden: cross-origin request blocked' }
+      }
+      if (typeof hostHeader === 'string' && hostHeader.trim().length > 0) {
+        const hostPort = parseHostHeaderPort(hostHeader)
+        const originPort = parsedOrigin.port
+        if (hostPort && originPort && hostPort !== originPort) {
+          return { ok: false, reason: 'Cross-port origin rejected' }
+        }
       }
     } catch {
       return { ok: false, reason: 'Forbidden: invalid Origin header' }
@@ -860,6 +881,13 @@ export function createAshyHostHttpMiddleware(
         sendJson(res, 415, {
           ok: false,
           error: 'Unsupported Media Type: expected application/json',
+        })
+        return
+      }
+      if (req.headers['x-ashy-request'] !== '1') {
+        sendJson(res, 403, {
+          ok: false,
+          error: 'Forbidden: missing X-Ashy-Request anti-CSRF header',
         })
         return
       }

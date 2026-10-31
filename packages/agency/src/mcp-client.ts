@@ -120,6 +120,65 @@ const FORBIDDEN_TOOL_NAMES: ReadonlySet<string> = new Set([
 
 const SAFE_MCP_TOOL_NAME_RE = /^[a-zA-Z0-9_.:-]{1,128}$/
 
+const BLOCKED_SSRF_HOSTS: ReadonlySet<string> = new Set([
+  '0.0.0.0',
+  '169.254.169.254',
+  'metadata.google.internal',
+  'metadata.goog',
+  '100.100.100.200',
+  '[::]',
+  '::',
+])
+
+const SAFE_STDIO_ENV_KEYS: readonly string[] = [
+  'PATH',
+  'Path',
+  'SYSTEMROOT',
+  'SystemRoot',
+  'COMSPEC',
+  'ComSpec',
+  'HOME',
+  'USERPROFILE',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'TEMP',
+  'TMP',
+  'TMPDIR',
+  'LANG',
+  'LC_ALL',
+  'NODE_ENV',
+  'TERM',
+]
+
+function isBlockedSsrfHost(hostname: string): boolean {
+  const lower = hostname.trim().toLowerCase()
+  const bare = lower.startsWith('[') && lower.endsWith(']') ? lower.slice(1, -1) : lower
+  if (BLOCKED_SSRF_HOSTS.has(lower) || BLOCKED_SSRF_HOSTS.has(bare)) {
+    return true
+  }
+  if (bare.startsWith('169.254.') || bare.startsWith('fe80:')) {
+    return true
+  }
+  return false
+}
+
+function buildSanitizedStdioEnv(
+  customEnv?: Record<string, string | undefined>
+): Record<string, string | undefined> {
+  const baseEnv: Record<string, string | undefined> = {}
+  const hostEnv =
+    (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {}
+  for (const key of SAFE_STDIO_ENV_KEYS) {
+    if (hostEnv[key] !== undefined) {
+      baseEnv[key] = hostEnv[key]
+    }
+  }
+  return {
+    ...baseEnv,
+    ...(customEnv ?? {}),
+  }
+}
+
 function sanitizeToolDescription(raw: string): string {
   let cleaned = raw.replace(/[\r\n\0]+/g, ' ')
   let prev = ''
@@ -209,6 +268,9 @@ export function createHttpMcpClient(options: HttpMcpClientOptions): McpProtocolC
   }
   if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
     throw new Error(`Unsupported MCP HTTP protocol: ${parsedUrl.protocol}`)
+  }
+  if (isBlockedSsrfHost(parsedUrl.hostname)) {
+    throw new Error(`Blocked SSRF target host in MCP HTTP URL: ${parsedUrl.hostname}`)
   }
 
   const fetchFn = options.fetchImpl ?? globalThis.fetch
@@ -444,11 +506,13 @@ export function createStdioMcpClient(options: StdioMcpClientOptions): McpProtoco
       throw new Error('Stdio MCP transport is not available in this runtime environment')
     }
 
+    const sanitizedEnv = buildSanitizedStdioEnv(options.env)
+
     const proc = spawnFn(command, args, {
       shell: false,
       stdio: ['pipe', 'pipe', 'pipe'],
       ...(options.cwd ? { cwd: options.cwd } : {}),
-      ...(options.env ? { env: options.env } : {}),
+      env: sanitizedEnv,
     })
 
     if (!proc.stdin || !proc.stdout) {
