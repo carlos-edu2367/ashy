@@ -628,9 +628,15 @@ describe('Phase 9 — Native Electron Lifecycle (System Tray, Global Shortcuts P
 
     const pngBuf = fs.readFileSync(iconPngPath)
     expect(Array.from(pngBuf.subarray(0, 8))).toEqual([137, 80, 78, 71, 13, 10, 26, 10])
-    // Verify PNG IHDR width & height are 256x256
+    // Verify PNG IHDR width & height are 256x256 and match official Ashy app icon asset
     expect(pngBuf.readUInt32BE(16)).toBe(256)
     expect(pngBuf.readUInt32BE(20)).toBe(256)
+    const officialAppIconPath = path.join(desktopRoot, 'public/assets/ashy-app-icon.png')
+    const officialTrayIconPath = path.join(desktopRoot, 'public/assets/ashy-tray-icon.png')
+    expect(fs.existsSync(officialAppIconPath)).toBe(true)
+    expect(fs.existsSync(officialTrayIconPath)).toBe(true)
+    expect(pngBuf.equals(fs.readFileSync(officialAppIconPath))).toBe(true)
+    expect(fs.readFileSync(trayIconPath).equals(fs.readFileSync(officialTrayIconPath))).toBe(true)
 
     const icoBuf = fs.readFileSync(iconIcoPath)
     expect(Array.from(icoBuf.subarray(0, 4))).toEqual([0, 0, 1, 0])
@@ -685,6 +691,108 @@ describe('Phase 9 — Native Electron Lifecycle (System Tray, Global Shortcuts P
       expect(readmeContent).toContain(
         'curl -fsSL https://github.com/carlos-edu2367/ashy/releases/latest/download/install.sh | bash',
       )
+    }
+  })
+
+  it('6. starts embedded loopback static + RPC HTTP server when staticDistDir is provided without rendererUrl, serves index.html and /__ashy_host/rpc, blocks /main/ and path traversal, and enables overlay click-through on boot', async () => {
+    const dir = makeTempDir()
+    const fakeDistDir = path.join(dir, 'dist')
+    fs.mkdirSync(path.join(fakeDistDir, 'assets'), { recursive: true })
+    fs.mkdirSync(path.join(fakeDistDir, 'main'), { recursive: true })
+    fs.writeFileSync(
+      path.join(fakeDistDir, 'index.html'),
+      '<!DOCTYPE html><html><body>Ashy Packaged</body></html>',
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(fakeDistDir, 'assets/app.js'),
+      'console.log("ashy packaged asset");',
+      'utf8',
+    )
+    fs.writeFileSync(
+      path.join(fakeDistDir, 'main/index.mjs'),
+      '// internal main bundle',
+      'utf8',
+    )
+
+    const loadedUrls: string[] = []
+    const ignoreMouseCalls: Array<[boolean, { forward?: boolean } | undefined]> = []
+
+    class PackagedFakeBrowserWindow {
+      webContents = {
+        isDestroyed: () => false,
+        send: vi.fn(),
+        on: vi.fn(),
+        setWindowOpenHandler: vi.fn(),
+      }
+      loadURL = vi.fn(async (url: string) => {
+        loadedUrls.push(url)
+      })
+      setAlwaysOnTop = vi.fn()
+      setIgnoreMouseEvents = vi.fn((ignore: boolean, opts?: { forward?: boolean }) => {
+        ignoreMouseCalls.push([ignore, opts])
+      })
+      show = vi.fn()
+      focus = vi.fn()
+      hide = vi.fn()
+    }
+
+    const booted = await bootAshyElectronMain({
+      app: {
+        getPath: () => dir,
+        on: vi.fn(),
+      },
+      BrowserWindow: PackagedFakeBrowserWindow as unknown as never,
+      ipcMain: {
+        handle: vi.fn(),
+        removeHandler: vi.fn(),
+      },
+      staticDistDir: fakeDistDir,
+      isPackaged: true,
+    })
+
+    try {
+      expect(loadedUrls).toHaveLength(2)
+      const baseUrl = loadedUrls[0]!
+      expect(baseUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
+      expect(loadedUrls[1]).toBe(`${baseUrl}?view=stage-overlay`)
+
+      // Overlay window must default to click-through on boot so it never blocks clicks on hubWindow
+      expect(ignoreMouseCalls).toContainEqual([true, { forward: true }])
+
+      // 1. Serves index.html and static JS assets with proper Content-Type
+      const htmlRes = await fetch(`${baseUrl}/`)
+      expect(htmlRes.status).toBe(200)
+      expect(htmlRes.headers.get('content-type')).toContain('text/html')
+      expect(await htmlRes.text()).toContain('Ashy Packaged')
+
+      const jsRes = await fetch(`${baseUrl}/assets/app.js`)
+      expect(jsRes.status).toBe(200)
+      expect(jsRes.headers.get('content-type')).toContain('javascript')
+      expect(await jsRes.text()).toContain('ashy packaged asset')
+
+      // 2. Serves /__ashy_host/rpc on the same loopback server
+      const rpcRes = await fetch(`${baseUrl}/__ashy_host/rpc`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Ashy-Request': '1',
+        },
+        body: JSON.stringify({ method: 'getBootstrapSnapshot' }),
+      })
+      expect(rpcRes.status).toBe(200)
+      const rpcJson = (await rpcRes.json()) as { ok: boolean; result?: { sessions?: unknown[] } }
+      expect(rpcJson.ok).toBe(true)
+      expect(Array.isArray(rpcJson.result?.sessions)).toBe(true)
+
+      // 3. Adversarial: blocks access to /main/* internal Electron bundle and path traversal
+      const mainBundleRes = await fetch(`${baseUrl}/main/index.mjs`)
+      expect(mainBundleRes.status).toBe(403)
+
+      const traversalRes = await fetch(`${baseUrl}/..%2f..%2fpackage.json`)
+      expect([403, 404]).toContain(traversalRes.status)
+    } finally {
+      await booted.shutdown()
     }
   })
 })

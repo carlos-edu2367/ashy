@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="apps/desktop/public/assets/ashy-hero.jpg" alt="Ashy — Companheira Virtual" width="220" style="border-radius: 28px; box-shadow: 0 20px 50px rgba(16, 185, 129, 0.35); border: 2px solid #10b981;" />
+<img src="apps/desktop/public/assets/ashy-app-icon.png" alt="Ashy — Ícone Oficial" width="128" />
 
 # ✨ ASHY 1.0 — Edição em Português (BR) ✨
 ### **Companheira Virtual Local-First com História Compartilhada, Afeto em 4 Camadas, Voz Omni em Tempo Real e Palco 2D Universal**

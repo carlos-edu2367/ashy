@@ -40,6 +40,8 @@ if ($Uninstall) {
         Write-Warning "Ashy uninstaller was not found in '$env:LOCALAPPDATA\Programs\Ashy' or '$env:ProgramFiles\Ashy'."
         return
     }
+    Get-Process -Name 'Ashy' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
     Write-Host "[Ashy] Running silent uninstall: $uninstaller /S" -ForegroundColor Yellow
     $proc = Start-Process -FilePath $uninstaller -ArgumentList @('/S') -Wait -NoNewWindow -PassThru
     if ($proc.ExitCode -ne 0) {
@@ -102,6 +104,8 @@ try {
         throw "Installer file was not found at '$setup'."
     }
 
+    Get-Process -Name 'Ashy' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
     Write-Host "[Ashy] Installing Ashy silently (/S)..." -ForegroundColor Cyan
     $process = Start-Process -FilePath $setup -ArgumentList @('/S') -Wait -NoNewWindow -PassThru
     if ($process.ExitCode -ne 0) {

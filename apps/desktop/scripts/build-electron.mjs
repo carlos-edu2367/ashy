@@ -115,12 +115,19 @@ function ensureBuildIcons() {
   const iconIcoPath = path.join(buildResourcesDir, 'icon.ico')
   const trayIconPngPath = path.join(buildResourcesDir, 'tray-icon.png')
 
-  const icon256Png = generateAshyPngBuffer(256, 256)
-  const tray24Png = generateAshyPngBuffer(24, 24)
+  const officialAppIconPath = path.join(desktopDir, 'public/assets/ashy-app-icon.png')
+  const officialTrayIconPath = path.join(desktopDir, 'public/assets/ashy-tray-icon.png')
+
+  const icon256Png = fs.existsSync(officialAppIconPath)
+    ? fs.readFileSync(officialAppIconPath)
+    : generateAshyPngBuffer(256, 256)
+  const trayPng = fs.existsSync(officialTrayIconPath)
+    ? fs.readFileSync(officialTrayIconPath)
+    : generateAshyPngBuffer(32, 32)
 
   fs.writeFileSync(iconPngPath, icon256Png)
   fs.writeFileSync(iconIcoPath, wrapPngAsIco(icon256Png, 256, 256))
-  fs.writeFileSync(trayIconPngPath, tray24Png)
+  fs.writeFileSync(trayIconPngPath, trayPng)
 }
 
 const workspaceAliases = {

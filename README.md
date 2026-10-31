@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="apps/desktop/public/assets/ashy-hero.jpg" alt="Ashy — Virtual Companion Cozy Night Studio" width="240" style="border-radius: 28px; box-shadow: 0 20px 50px rgba(99, 102, 241, 0.35); border: 2px solid #818cf8;" />
+<img src="apps/desktop/public/assets/ashy-app-icon.png" alt="Ashy Official App Icon" width="128" />
 
 # ✨ ASHY 1.0 ✨
 ### **Local-First Virtual Companion with Shared History, Persistent 4-Tier Affect, Realtime Omni Voice & Universal 2D Stage**

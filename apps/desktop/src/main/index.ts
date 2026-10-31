@@ -1,4 +1,7 @@
+import fs from 'node:fs'
+import http from 'node:http'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import * as v from 'valibot'
 import {
   DEFAULT_STAGE_SHORTCUTS,
@@ -13,7 +16,10 @@ import {
 } from '../electron/main'
 import { createAshyHostKernel, type AshyHostKernel } from '../host/kernel'
 import { createElectronSafeStorageProtector } from '../host/secret-protector'
-import { dispatchHostRpc } from '../host/vite-host-plugin'
+import {
+  createAshyHostHttpMiddleware,
+  dispatchHostRpc,
+} from '../host/vite-host-plugin'
 import {
   createSafeAutoUpdater,
   type ElectronAutoUpdaterDriverLike,
@@ -25,6 +31,121 @@ import {
   type ElectronMenuLike,
   type ElectronTrayConstructorLike,
 } from './tray-manager'
+
+const STATIC_MIME_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.cjs': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.wasm': 'application/wasm',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.wav': 'audio/wav',
+  '.mp3': 'audio/mpeg',
+  '.ogg': 'audio/ogg',
+  '.moc3': 'application/octet-stream',
+  '.bin': 'application/octet-stream',
+}
+
+async function startEmbeddedStaticAndHostServer(
+  distDir: string,
+  kernel: AshyHostKernel,
+): Promise<{ baseUrl: string; close: () => Promise<void> }> {
+  const distRoot = path.resolve(distDir)
+  const hostMiddleware = createAshyHostHttpMiddleware(async () => kernel)
+
+  const server = http.createServer((req, res) => {
+    hostMiddleware(req, res, () => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.statusCode = 405
+        res.end('Method Not Allowed')
+        return
+      }
+
+      const rawUrl = req.url ?? '/'
+      let pathname = '/'
+      try {
+        pathname = decodeURIComponent(rawUrl.split('?')[0] || '/')
+      } catch {
+        res.statusCode = 400
+        res.end('Bad Request')
+        return
+      }
+
+      if (
+        pathname.includes('\0') ||
+        pathname.startsWith('/main/') ||
+        pathname === '/main' ||
+        pathname.startsWith('/preload/') ||
+        pathname === '/preload'
+      ) {
+        res.statusCode = 403
+        res.end('Forbidden')
+        return
+      }
+
+      const relPath = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '')
+      const candidatePath = path.resolve(distRoot, relPath)
+      if (
+        candidatePath !== distRoot &&
+        !candidatePath.startsWith(distRoot + path.sep)
+      ) {
+        res.statusCode = 403
+        res.end('Forbidden')
+        return
+      }
+
+      let targetFile = candidatePath
+      if (!fs.existsSync(targetFile) || !fs.statSync(targetFile).isFile()) {
+        if (!path.extname(relPath)) {
+          targetFile = path.join(distRoot, 'index.html')
+        } else {
+          res.statusCode = 404
+          res.end('Not Found')
+          return
+        }
+      }
+
+      try {
+        const ext = path.extname(targetFile).toLowerCase()
+        const contentType = STATIC_MIME_TYPES[ext] ?? 'application/octet-stream'
+        const buf = fs.readFileSync(targetFile)
+        res.statusCode = 200
+        res.setHeader('Content-Type', contentType)
+        res.setHeader('Cache-Control', ext === '.html' ? 'no-cache' : 'public, max-age=3600')
+        if (req.method === 'HEAD') {
+          res.end()
+        } else {
+          res.end(buf)
+        }
+      } catch {
+        res.statusCode = 500
+        res.end('Internal Server Error')
+      }
+    })
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => resolve())
+  })
+
+  const addr = server.address()
+  const port = typeof addr === 'object' && addr ? addr.port : 0
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve())
+      }),
+  }
+}
 
 export interface ElectronWebContentsNavigationEventLike {
   preventDefault(): void
@@ -177,6 +298,7 @@ export interface BootAshyElectronMainDeps {
   kernel?: AshyHostKernel
   preloadPath?: string
   rendererUrl?: string
+  staticDistDir?: string
   processRef?: Pick<NodeJS.Process, 'once' | 'removeListener'>
 }
 
@@ -435,19 +557,45 @@ export async function bootAshyElectronMain(
     },
   )
 
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url))
+  const defaultPreloadCandidate = path.resolve(moduleDir, '../preload/index.cjs')
   const preloadPath =
-    deps.preloadPath ?? path.resolve(process.cwd(), 'dist/preload/index.cjs')
+    deps.preloadPath ??
+    (fs.existsSync(defaultPreloadCandidate)
+      ? defaultPreloadCandidate
+      : path.resolve(process.cwd(), 'dist/preload/index.cjs'))
+
+  let embeddedServer: { baseUrl: string; close: () => Promise<void> } | null = null
+  if (
+    !deps.rendererUrl &&
+    !process.env.ASHY_ELECTRON_RENDERER_URL &&
+    deps.staticDistDir &&
+    fs.existsSync(path.join(deps.staticDistDir, 'index.html'))
+  ) {
+    embeddedServer = await startEmbeddedStaticAndHostServer(deps.staticDistDir, kernel)
+  }
+
   const baseRendererUrl =
-    deps.rendererUrl ?? process.env.ASHY_ELECTRON_RENDERER_URL ?? 'http://localhost:5173'
+    deps.rendererUrl ??
+    process.env.ASHY_ELECTRON_RENDERER_URL ??
+    embeddedServer?.baseUrl ??
+    'http://localhost:5173'
   const overlayUrl = baseRendererUrl.includes('?')
     ? `${baseRendererUrl}&view=stage-overlay`
     : `${baseRendererUrl}?view=stage-overlay`
+
+  const defaultIconCandidate = path.resolve(moduleDir, '../../build/icon.png')
+  const hubIconPath = fs.existsSync(defaultIconCandidate)
+    ? defaultIconCandidate
+    : path.resolve(process.cwd(), 'build/icon.png')
 
   const hubWindow = new deps.BrowserWindow({
     width: 1280,
     height: 820,
     backgroundColor: '#13111C',
     show: true,
+    autoHideMenuBar: true,
+    ...(fs.existsSync(hubIconPath) ? { icon: hubIconPath } : {}),
     webPreferences: {
       preload: preloadPath,
       contextIsolation: true,
@@ -472,11 +620,18 @@ export async function bootAshyElectronMain(
   })
   overlayWindowRef = overlayWindow
   overlayWindow.setAlwaysOnTop?.(true, 'screen-saver')
+  if (embeddedServer) {
+    overlayWindow.setIgnoreMouseEvents?.(true, { forward: true })
+  }
   attachWindowSecurityGuards(overlayWindow)
 
   activeWindows.push(hubWindow, overlayWindow)
 
   await hubWindow.loadURL(baseRendererUrl)
+  if (embeddedServer) {
+    hubWindow.show?.()
+    hubWindow.focus?.()
+  }
   await overlayWindow.loadURL(overlayUrl)
 
   const activatePrivacyShieldAndBroadcast = async (): Promise<void> => {
@@ -589,8 +744,12 @@ export async function bootAshyElectronMain(
 
   let trayController: AshySystemTrayController | null = null
   if (deps.Tray && deps.Menu) {
+    const defaultTrayCandidate = path.resolve(moduleDir, '../../build/tray-icon.png')
     const trayIconPath =
-      deps.trayIconPath ?? path.resolve(process.cwd(), 'build/tray-icon.png')
+      deps.trayIconPath ??
+      (fs.existsSync(defaultTrayCandidate)
+        ? defaultTrayCandidate
+        : path.resolve(process.cwd(), 'build/tray-icon.png'))
     trayController = createAshySystemTray({
       Tray: deps.Tray,
       Menu: deps.Menu,
@@ -617,6 +776,10 @@ export async function bootAshyElectronMain(
     trayController?.destroy()
     deps.globalShortcut?.unregisterAll()
     cleanupIpc()
+    if (embeddedServer) {
+      await embeddedServer.close().catch(() => undefined)
+      embeddedServer = null
+    }
     await kernel.stop()
   }
 
@@ -638,4 +801,86 @@ export async function bootAshyElectronMain(
     trayController,
     shutdown,
   }
+}
+
+if (
+  typeof process !== 'undefined' &&
+  Boolean(process.versions?.electron) &&
+  !process.env.VITEST &&
+  !process.env.ELECTRON_RUN_AS_NODE
+) {
+  const electronSpecifier = 'electron'
+  void (
+    import(/* @vite-ignore */ electronSpecifier) as Promise<{
+      app: ElectronAppLike & {
+        requestSingleInstanceLock?: () => boolean
+        whenReady: () => Promise<void>
+        on: (event: string, listener: () => void) => void
+        getVersion: () => string
+      }
+      BrowserWindow: unknown
+      ipcMain: unknown
+      safeStorage: unknown
+      globalShortcut: unknown
+      Tray: unknown
+      Menu: unknown
+    }>
+  )
+    .then(async (electronMod) => {
+      const {
+        app,
+        BrowserWindow,
+        ipcMain,
+        safeStorage,
+        globalShortcut,
+        Tray,
+        Menu,
+      } = electronMod
+
+      if (
+        typeof app.requestSingleInstanceLock === 'function' &&
+        !app.requestSingleInstanceLock()
+      ) {
+        app.quit?.()
+        return
+      }
+
+      const __dirname = path.dirname(fileURLToPath(import.meta.url))
+      const distDir = path.resolve(__dirname, '..')
+      const preloadPath = path.resolve(__dirname, '../preload/index.cjs')
+      const trayIconCandidate = path.resolve(__dirname, '../../build/tray-icon.png')
+      const trayIconFallback = path.resolve(distDir, 'assets/ashy-tray-icon.png')
+      const trayIconPath = fs.existsSync(trayIconCandidate)
+        ? trayIconCandidate
+        : trayIconFallback
+
+      await app.whenReady()
+      const runtime = await bootAshyElectronMain({
+        app,
+        BrowserWindow: BrowserWindow as unknown as ElectronBrowserWindowConstructorLike,
+        ipcMain: ipcMain as unknown as ElectronIpcMainLike,
+        safeStorage: safeStorage as unknown as ElectronSafeStorageLike,
+        globalShortcut: globalShortcut as unknown as ElectronGlobalShortcutLike,
+        Tray: Tray as unknown as ElectronTrayConstructorLike,
+        Menu: Menu as unknown as ElectronMenuLike,
+        preloadPath,
+        trayIconPath,
+        staticDistDir: distDir,
+        isPackaged: app.isPackaged,
+        appVersion: app.getVersion(),
+      })
+
+      app.on('second-instance', () => {
+        runtime.hubWindow.show?.()
+        runtime.hubWindow.focus?.()
+      })
+
+      app.on('activate', () => {
+        runtime.hubWindow.show?.()
+        runtime.hubWindow.focus?.()
+      })
+    })
+    .catch((err) => {
+      console.error('[Ashy Main] Fatal startup error:', err)
+    })
 }

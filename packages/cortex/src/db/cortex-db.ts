@@ -386,6 +386,7 @@ export class CortexDatabase {
   private encryptionCodec: CortexEncryptionCodec | null
   private encryptionAtRestEnabled = false
   private encryptionUpdatedAt: string | null = null
+  private isFts5Available = true
   public readonly isNativeSqlite: boolean
   public readonly isPersistent: boolean
   public readonly filePath: string
@@ -605,13 +606,6 @@ export class CortexDatabase {
         approval_status TEXT NOT NULL DEFAULT 'approved'
       );
 
-      CREATE VIRTUAL TABLE IF NOT EXISTS episodic_fts USING fts5(
-        memory_id UNINDEXED,
-        title,
-        summary,
-        content
-      );
-
       CREATE TABLE IF NOT EXISTS semantic_facts (
         id TEXT PRIMARY KEY,
         category TEXT NOT NULL,
@@ -818,6 +812,28 @@ export class CortexDatabase {
         updated_at TEXT NOT NULL
       );
     `)
+
+    try {
+      this.sqlite.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS episodic_fts USING fts5(
+          memory_id UNINDEXED,
+          title,
+          summary,
+          content
+        );
+      `)
+      this.isFts5Available = true
+    } catch {
+      this.isFts5Available = false
+      this.sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS episodic_fts (
+          memory_id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          content TEXT NOT NULL
+        );
+      `)
+    }
 
     // Idempotent column upgrades for pre-existing v1/v2 database files
     this.ensureColumnExists('episodic_memories', 'approval_status', "TEXT NOT NULL DEFAULT 'approved'")
@@ -1151,7 +1167,7 @@ export class CortexDatabase {
 
     const bm25ScoresById = new Map<string, number>()
 
-    if (this.sqlite && !this.encryptionAtRestEnabled) {
+    if (this.sqlite && this.isFts5Available && !this.encryptionAtRestEnabled) {
       const tokens = tokenizeForSearch(queryText)
       if (tokens.length > 0) {
         const ftsMatchQuery = tokens.map((t) => `"${t.replace(/"/g, '')}"*`).join(' OR ')
@@ -3064,7 +3080,9 @@ export class CortexDatabase {
           insertFtsStmt.run(ep.id, ep.title, ep.summary, ep.content)
         }
       }
-      this.sqlite.exec("INSERT INTO episodic_fts(episodic_fts) VALUES('rebuild');")
+      if (this.isFts5Available) {
+        this.sqlite.exec("INSERT INTO episodic_fts(episodic_fts) VALUES('rebuild');")
+      }
 
       // 2. semantic_facts
       const updateFactStmt = this.sqlite.prepare(
@@ -3900,7 +3918,9 @@ export class CortexDatabase {
     for (const table of tablesInFkOrder) {
       this.sqlite.prepare(`DELETE FROM ${table}`).run()
     }
-    this.sqlite.exec("INSERT INTO episodic_fts(episodic_fts) VALUES('rebuild');")
+    if (this.isFts5Available) {
+      this.sqlite.exec("INSERT INTO episodic_fts(episodic_fts) VALUES('rebuild');")
+    }
   }
 
   public wipeAll(): void {
