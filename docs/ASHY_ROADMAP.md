@@ -77,7 +77,7 @@ flowchart LR
 | 8.5 | Tools/MCP no Chat, Permissões Unificadas & Visão/Desktop Reais | §10 | ✅ Concluída |
 | 8.6 | Pipeline 100% Real de Voz (STT/TTS Local + Nuvem, Mic, Lip-Sync) | §7, §8 | **M4.5 — Zero Mocks em Produção** (✅ Concluída) |
 | 8.7 | Modelo Omni Unificado (Voz, Texto, Imagem e Vídeo Local `LFM3-Omni-2B` & Cloud) | §7, §8, §9, §10 | **M4.7 — Omni Unificado** (✅ Concluída) |
-| 9 | Protótipo público | §15 | **M5 — Release 1.0** |
+| 9 | Protótipo público | §15 | **M5 — Release 1.0** (✅ Concluída) |
 | 10 | 3D e XR | §8 (futuro) | |
 
 ---
@@ -324,7 +324,7 @@ flowchart LR
 
 ---
 
-## Fase 9 — Protótipo público (**Marco M5 — Release 1.0**)
+## Fase 9 — Protótipo público (**Marco M5 — Release 1.0** — ✅ Concluída)
 
 **Objetivo:** tornar a Ashy instalável, segura e compreensível para outras pessoas.
 
