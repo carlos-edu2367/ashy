@@ -28,7 +28,19 @@
 
 - `@ashy/shared` · `@ashy/bus` · `@ashy/llm` · `@ashy/cortex` · `@ashy/voice` · `@ashy/stage` · `@ashy/agency` · `@ashy/evals` · `apps/desktop` (`@ashy/desktop`)
 
-## ⚡ Quickstart
+## 🚀 Instalação em 1 Comando
+
+**Windows (PowerShell):**
+```powershell
+irm https://github.com/carlos-edu2367/ashy/releases/latest/download/install.ps1 | iex
+```
+
+**Linux (Bash):**
+```bash
+curl -fsSL https://github.com/carlos-edu2367/ashy/releases/latest/download/install.sh | bash
+```
+
+## ⚡ Quickstart (Desenvolvimento)
 
 ```bash
 pnpm install

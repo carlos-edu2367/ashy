@@ -180,6 +180,22 @@ O repositório utiliza `pnpm` workspaces com **8 pacotes modulares** e **1 aplic
 
 ---
 
+## 🚀 Instalação em 1 Comando / *One-Command Install*
+
+Instale ou atualize a **Ashy** diretamente sem precisar clonar o repositório:
+
+**Windows (PowerShell):**
+```powershell
+irm https://github.com/carlos-edu2367/ashy/releases/latest/download/install.ps1 | iex
+```
+
+**Linux (Bash):**
+```bash
+curl -fsSL https://github.com/carlos-edu2367/ashy/releases/latest/download/install.sh | bash
+```
+
+---
+
 ## ⚡ Quickstart & Comandos Principais
 
 ### Pré-requisitos
@@ -302,13 +318,26 @@ Instead of tying her identity to a single cloud vendor's ephemeral context windo
 - **`@ashy/evals`** (`packages/evals`): Automated **Milestone M2 Validation Harness** testing multi-day shared history, mid-journey model swaps (Model A &rarr; Model B), recall precision, inside-joke cooldowns, zero hallucinated memories, and `SeriousnessGate` compliance.
 - **`apps/desktop`** (`@ashy/desktop`): **Electron + React 19 + Vite + Zustand + Tailwind/OKLCH** desktop application featuring `AshyHostKernel`, `ProviderVault` (`safeStorage`), `FirstMeetingWizard`, transparent **Floating Stage Overlay**, **System Tray**, **Auto-Updater**, and the 5-tab **Companion Hub**.
 
-## 🚀 Quickstart Commands (English)
+## 🚀 One-Command Install & Quickstart Commands (English)
+
+**Windows (PowerShell):**
+```powershell
+irm https://github.com/carlos-edu2367/ashy/releases/latest/download/install.ps1 | iex
+```
+
+**Linux (Bash):**
+```bash
+curl -fsSL https://github.com/carlos-edu2367/ashy/releases/latest/download/install.sh | bash
+```
+
+**Developer Workspace Commands:**
 
 ```bash
 pnpm install                          # Install all workspace dependencies
 pnpm dev                              # Launch Host Kernel + React Studio UI (http://localhost:5173)
 pnpm build                            # Build production web & Electron main/preload bundles
 pnpm --filter @ashy/desktop pack:dir  # Package unpacked desktop app via electron-builder
+pnpm --filter @ashy/desktop dist:win  # Build AshySetup.exe & AshyPortable.exe on Windows
 pnpm test                             # Run full unit & integration test suite (Vitest)
 pnpm typecheck                        # Run strict TypeScript typechecking across all packages
 pnpm eval:m2                          # Run Milestone M2 Soul Portability evaluation suite

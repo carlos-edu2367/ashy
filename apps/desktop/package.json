@@ -1,6 +1,9 @@
 {
   "name": "@ashy/desktop",
   "version": "0.1.0",
+  "description": "Ashy — Local-first virtual companion with shared history and 2D stage",
+  "author": "Carlos Eduardo <carlos-edu2367>",
+  "homepage": "https://github.com/carlos-edu2367/ashy",
   "private": true,
   "type": "module",
   "main": "./src/index.ts",
@@ -28,7 +31,9 @@
     "dev:web": "vite --port 5173",
     "build": "vite build",
     "build:electron": "node scripts/build-electron.mjs",
+    "electron:start": "pnpm build:electron && npx --yes electron ./dist/main/index.mjs",
     "pack:dir": "pnpm build && pnpm build:electron",
+    "dist:win": "pnpm build && pnpm build:electron && npx --yes electron-builder --win",
     "preview": "vite preview --port 4173",
     "test": "vitest run --root ../.. --exclude \"packages/**\"",
     "typecheck": "tsc --noEmit -p ../../tsconfig.json"

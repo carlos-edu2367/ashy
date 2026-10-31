@@ -570,8 +570,9 @@ describe('Phase 9 — Native Electron Lifecycle (System Tray, Global Shortcuts P
     }
   })
 
-  it('5. verifies electron-builder.yml, macOS entitlements.mac.plist, and package.json build:electron / pack:dir scripts', () => {
+  it('5. verifies electron-builder.yml (valid v26 schema, github publish, AshySetup.exe), 256x256 icon.ico, macOS entitlements, package.json metadata/scripts, and Orin-style install.ps1 / install.sh / release.yml', () => {
     const desktopRoot = path.resolve(__dirname, '../..')
+    const repoRoot = path.resolve(desktopRoot, '../..')
     const builderYmlPath = path.join(desktopRoot, 'electron-builder.yml')
     const entitlementsPath = path.join(desktopRoot, 'build/entitlements.mac.plist')
     const buildScriptPath = path.join(desktopRoot, 'scripts/build-electron.mjs')
@@ -581,8 +582,15 @@ describe('Phase 9 — Native Electron Lifecycle (System Tray, Global Shortcuts P
     const builderYml = fs.readFileSync(builderYmlPath, 'utf8')
     expect(builderYml).toContain('appId: com.ashy.desktop')
     expect(builderYml).toContain('productName: Ashy')
+    expect(builderYml).toContain('npmRebuild: false')
     expect(builderYml).toContain('hardenedRuntime: true')
     expect(builderYml).toContain('build/entitlements.mac.plist')
+    expect(builderYml).toContain('provider: github')
+    expect(builderYml).toContain('owner: carlos-edu2367')
+    expect(builderYml).toContain('repo: ashy')
+    expect(builderYml).not.toContain('autoUpdate:')
+    expect(builderYml).toContain('artifactName: AshySetup.exe')
+    expect(builderYml).toContain('artifactName: AshyPortable.exe')
 
     expect(fs.existsSync(entitlementsPath)).toBe(true)
     const entitlements = fs.readFileSync(entitlementsPath, 'utf8')
@@ -593,10 +601,18 @@ describe('Phase 9 — Native Electron Lifecycle (System Tray, Global Shortcuts P
     expect(fs.existsSync(buildScriptPath)).toBe(true)
 
     const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8')) as {
+      description?: string
+      author?: string
+      homepage?: string
       scripts?: Record<string, string>
     }
+    expect(pkgJson.description).toBeTruthy()
+    expect(pkgJson.author).toBeTruthy()
+    expect(pkgJson.homepage).toBe('https://github.com/carlos-edu2367/ashy')
     expect(pkgJson.scripts?.['build:electron']).toBe('node scripts/build-electron.mjs')
     expect(pkgJson.scripts?.['pack:dir']).toBe('pnpm build && pnpm build:electron')
+    expect(pkgJson.scripts?.['electron:start']).toContain('electron ./dist/main/index.mjs')
+    expect(pkgJson.scripts?.['dist:win']).toContain('electron-builder --win')
 
     const iconPngPath = path.join(desktopRoot, 'build/icon.png')
     const iconIcoPath = path.join(desktopRoot, 'build/icon.ico')
@@ -610,10 +626,49 @@ describe('Phase 9 — Native Electron Lifecycle (System Tray, Global Shortcuts P
     expect(fs.existsSync(mainBundlePath)).toBe(true)
     expect(fs.existsSync(preloadBundlePath)).toBe(true)
 
-    const pngHeader = fs.readFileSync(iconPngPath).subarray(0, 8)
-    expect(Array.from(pngHeader)).toEqual([137, 80, 78, 71, 13, 10, 26, 10])
+    const pngBuf = fs.readFileSync(iconPngPath)
+    expect(Array.from(pngBuf.subarray(0, 8))).toEqual([137, 80, 78, 71, 13, 10, 26, 10])
+    // Verify PNG IHDR width & height are 256x256
+    expect(pngBuf.readUInt32BE(16)).toBe(256)
+    expect(pngBuf.readUInt32BE(20)).toBe(256)
 
-    const icoHeader = fs.readFileSync(iconIcoPath).subarray(0, 4)
-    expect(Array.from(icoHeader)).toEqual([0, 0, 1, 0])
+    const icoBuf = fs.readFileSync(iconIcoPath)
+    expect(Array.from(icoBuf.subarray(0, 4))).toEqual([0, 0, 1, 0])
+    // Verify ICO directory entry width & height bytes (0 = 256px in Windows ICO specification)
+    expect(icoBuf[6]).toBe(0)
+    expect(icoBuf[7]).toBe(0)
+
+    const installPs1Path = path.join(repoRoot, 'install.ps1')
+    const installShPath = path.join(repoRoot, 'install.sh')
+    const releaseWorkflowPath = path.join(repoRoot, '.github/workflows/release.yml')
+
+    expect(fs.existsSync(installPs1Path)).toBe(true)
+    expect(fs.existsSync(installShPath)).toBe(true)
+    expect(fs.existsSync(releaseWorkflowPath)).toBe(true)
+
+    const installPs1 = fs.readFileSync(installPs1Path, 'utf8')
+    expect(installPs1).toContain('carlos-edu2367/ashy')
+    expect(installPs1).toContain('AshySetup.exe')
+    expect(installPs1).toContain('-Uninstall')
+
+    const installSh = fs.readFileSync(installShPath, 'utf8')
+    expect(installSh).toContain('carlos-edu2367/ashy')
+    expect(installSh).toContain('Ashy-linux-x86_64.AppImage')
+    expect(installSh).toContain('--uninstall')
+
+    const releaseYml = fs.readFileSync(releaseWorkflowPath, 'utf8')
+    expect(releaseYml).toContain('AshySetup.exe')
+    expect(releaseYml).toContain('install.ps1')
+    expect(releaseYml).toContain('install.sh')
+
+    for (const readmeFile of ['README.md', 'README.pt-BR.md', 'README.en.md']) {
+      const readmeContent = fs.readFileSync(path.join(repoRoot, readmeFile), 'utf8')
+      expect(readmeContent).toContain(
+        'irm https://github.com/carlos-edu2367/ashy/releases/latest/download/install.ps1 | iex',
+      )
+      expect(readmeContent).toContain(
+        'curl -fsSL https://github.com/carlos-edu2367/ashy/releases/latest/download/install.sh | bash',
+      )
+    }
   })
 })
