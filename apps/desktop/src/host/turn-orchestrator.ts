@@ -1155,12 +1155,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
           let samples: Float32Array
           let sampleRate = synthesized.sampleRate > 0 ? synthesized.sampleRate : 24000
           try {
-            const decoded = decodeWavToPcmBlocks(
-              synthesized.wavBytes.buffer.slice(
-                synthesized.wavBytes.byteOffset,
-                synthesized.wavBytes.byteOffset + synthesized.wavBytes.byteLength,
-              ),
-            )
+            const decoded = decodeWavToPcmBlocks(synthesized.wavBytes)
             samples = decoded.samples
             if (decoded.sampleRate > 0) {
               sampleRate = decoded.sampleRate

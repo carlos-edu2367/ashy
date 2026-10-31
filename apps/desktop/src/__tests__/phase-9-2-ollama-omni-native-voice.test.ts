@@ -110,7 +110,7 @@ describe('Phase 9.2 — Ollama Native LFM3-Omni-2B 24kHz Voice Bridge & Compact 
           init?.body instanceof Uint8Array
             ? Buffer.from(init.body).toString('utf8')
             : String(init?.body ?? '')
-        return new Response(wavBuf, {
+        return new Response(Buffer.from(wavBuf), {
           status: 200,
           headers: { 'Content-Type': 'audio/wav' },
         })
@@ -180,7 +180,7 @@ describe('Phase 9.2 — Ollama Native LFM3-Omni-2B 24kHz Voice Bridge & Compact 
       }
       if (url === 'http://127.0.0.1:64599/tts') {
         ttsCalled = true
-        return new Response(ttsWavBytes, {
+        return new Response(Buffer.from(ttsWavBytes), {
           status: 200,
           headers: { 'Content-Type': 'audio/wav' },
         })
@@ -224,7 +224,6 @@ describe('Phase 9.2 — Ollama Native LFM3-Omni-2B 24kHz Voice Bridge & Compact 
     const agencyRuntime = createHostAgencyRuntime({
       cortex,
       userDataDir: dir,
-      workspaceRoot: dir,
     })
 
     const orchestrator = createTurnOrchestrator({
