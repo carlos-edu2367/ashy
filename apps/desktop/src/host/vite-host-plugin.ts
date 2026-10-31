@@ -122,6 +122,16 @@ const ALLOWED_RPC_METHODS = new Set<string>([
   'checkForUpdates',
   'downloadUpdate',
   'quitAndInstallUpdate',
+  'localRuntime:getStatus',
+  'localRuntime:ensureRunning',
+  'localRuntime:installEngine',
+  'localRuntime:pullModel',
+  'localRuntime:deleteModel',
+  'getLocalRuntimeStatus',
+  'ensureLocalEngineRunning',
+  'installLocalEngine',
+  'pullLocalModel',
+  'deleteLocalModel',
 ])
 
 export class DisallowedRpcMethodError extends Error {
@@ -763,6 +773,48 @@ export async function dispatchHostRpc(
       return kernel.quitAndInstallUpdate()
     }
 
+    case 'localRuntime:getStatus':
+    case 'getLocalRuntimeStatus': {
+      if (!kernel.getLocalRuntimeStatus) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      return kernel.getLocalRuntimeStatus()
+    }
+
+    case 'localRuntime:ensureRunning':
+    case 'ensureLocalEngineRunning': {
+      if (!kernel.ensureLocalEngineRunning) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      return kernel.ensureLocalEngineRunning()
+    }
+
+    case 'localRuntime:installEngine':
+    case 'installLocalEngine': {
+      if (!kernel.installLocalEngine) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      return kernel.installLocalEngine()
+    }
+
+    case 'localRuntime:pullModel':
+    case 'pullLocalModel': {
+      if (!kernel.pullLocalModel) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const model = extractStringArg(payload, 'model')
+      return kernel.pullLocalModel({ model })
+    }
+
+    case 'localRuntime:deleteModel':
+    case 'deleteLocalModel': {
+      if (!kernel.deleteLocalModel) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const model = extractStringArg(payload, 'model')
+      return kernel.deleteLocalModel({ model })
+    }
+
     default:
       throw new DisallowedRpcMethodError(method)
   }
@@ -992,6 +1044,7 @@ export function createAshyHostHttpMiddleware(
           const isClientError =
             err instanceof DisallowedRpcMethodError ||
             message.startsWith('Invalid RPC') ||
+            message.includes('INVALID_LOCAL_MODEL_NAME') ||
             message.includes('maximum allowed size')
           sendJson(res, isClientError ? 400 : 500, {
             ok: false,

@@ -1736,6 +1736,10 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       return
     }
 
+    if (event.type === 'local-runtime:status') {
+      return
+    }
+
     const assistantMsgId =
       get().activeStreamingTurnId === event.turnId && get().activeStreamingMessageId
         ? get().activeStreamingMessageId!

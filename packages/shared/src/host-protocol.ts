@@ -1399,6 +1399,152 @@ export const AutoUpdaterStateSchema = v.object({
 })
 export type AutoUpdaterState = v.InferOutput<typeof AutoUpdaterStateSchema>
 
+export interface LocalRuntimeModelInfo {
+  name: string
+  sizeBytes: number
+  family?: string
+  parameterSize?: string
+  quantizationLevel?: string
+  modifiedAt?: string
+}
+
+export const LocalRuntimeModelInfoSchema = v.object({
+  name: v.string(),
+  sizeBytes: v.number(),
+  family: v.optional(v.string()),
+  parameterSize: v.optional(v.string()),
+  quantizationLevel: v.optional(v.string()),
+  modifiedAt: v.optional(v.string()),
+})
+
+export interface LocalRuntimePullProgress {
+  model: string
+  status: 'starting' | 'pulling' | 'verifying' | 'completed' | 'error'
+  phaseText: string
+  completedBytes: number
+  totalBytes: number
+  percent: number
+  error?: string
+}
+
+export const LocalRuntimePullProgressSchema = v.object({
+  model: v.string(),
+  status: v.picklist(['starting', 'pulling', 'verifying', 'completed', 'error'] as const),
+  phaseText: v.string(),
+  completedBytes: v.number(),
+  totalBytes: v.number(),
+  percent: v.number(),
+  error: v.optional(v.string()),
+})
+
+export interface LocalRuntimeRecommendedModel {
+  id: string
+  label: string
+  sizeLabel: string
+  vramHint: string
+  description: string
+  isMultimodal: boolean
+}
+
+export const LocalRuntimeRecommendedModelSchema = v.object({
+  id: v.string(),
+  label: v.string(),
+  sizeLabel: v.string(),
+  vramHint: v.string(),
+  description: v.string(),
+  isMultimodal: v.boolean(),
+})
+
+export interface LocalRuntimeStatus {
+  engineInstalled: boolean
+  engineBinaryPath: string | null
+  engineRunning: boolean
+  managedByAshy: boolean
+  baseUrl: string
+  installedModels: LocalRuntimeModelInfo[]
+  recommendedModels: LocalRuntimeRecommendedModel[]
+  activePull: LocalRuntimePullProgress | null
+  installingEngine: boolean
+  lastError?: string | null
+}
+
+export const LocalRuntimeStatusSchema = v.object({
+  engineInstalled: v.boolean(),
+  engineBinaryPath: v.nullable(v.string()),
+  engineRunning: v.boolean(),
+  managedByAshy: v.boolean(),
+  baseUrl: v.string(),
+  installedModels: v.array(LocalRuntimeModelInfoSchema),
+  recommendedModels: v.array(LocalRuntimeRecommendedModelSchema),
+  activePull: v.nullable(LocalRuntimePullProgressSchema),
+  installingEngine: v.boolean(),
+  lastError: v.optional(v.nullable(v.string())),
+})
+
+export const RECOMMENDED_LOCAL_MODELS: readonly LocalRuntimeRecommendedModel[] = [
+  {
+    id: 'qwen2.5:3b',
+    label: 'Qwen 2.5 3B (Recomendado • Leve & Rápido)',
+    sizeLabel: '1.9 GB',
+    vramHint: '4 GB+ RAM/VRAM',
+    description: 'Excelente português, baixa latência e roda liso em notebooks e PCs a partir de 8 GB RAM.',
+    isMultimodal: false,
+  },
+  {
+    id: 'llama3.2:3b',
+    label: 'Llama 3.2 3B (Equilibrado & Ágil)',
+    sizeLabel: '2.0 GB',
+    vramHint: '4 GB+ RAM/VRAM',
+    description: 'Ótimo raciocínio rápido para conversas cotidianas e chamadas de ferramentas.',
+    isMultimodal: false,
+  },
+  {
+    id: 'gemma3:4b',
+    label: 'Gemma 3 4B (Multimodal: Texto + Visão)',
+    sizeLabel: '3.3 GB',
+    vramHint: '6 GB+ RAM/VRAM',
+    description: 'Enxerga imagens e janelas do computador localmente além de conversar em português.',
+    isMultimodal: true,
+  },
+  {
+    id: 'qwen2.5:7b',
+    label: 'Qwen 2.5 7B (Alta Qualidade Conversacional)',
+    sizeLabel: '4.7 GB',
+    vramHint: '8 GB+ VRAM',
+    description: 'Personalidade mais rica, humor mais afiado e alta fidelidade ao voice.md.',
+    isMultimodal: false,
+  },
+] as const
+
+export const LocalModelNameSchema = v.pipe(
+  v.string(),
+  v.trim(),
+  v.nonEmpty(),
+  v.maxLength(128),
+  v.regex(/^[a-zA-Z0-9._:/-]+$/),
+)
+
+export function validateLocalModelName(model: string): string {
+  const parsed = v.safeParse(LocalModelNameSchema, model)
+  if (!parsed.success) {
+    throw new Error('INVALID_LOCAL_MODEL_NAME')
+  }
+  if (parsed.output.includes('..')) {
+    throw new Error('INVALID_LOCAL_MODEL_NAME')
+  }
+  return parsed.output
+}
+
+export const PullLocalModelInputSchema = v.object({
+  model: LocalModelNameSchema,
+})
+export type PullLocalModelInput = v.InferOutput<typeof PullLocalModelInputSchema>
+
+export const DeleteLocalModelInputSchema = v.object({
+  model: LocalModelNameSchema,
+})
+export type DeleteLocalModelInput = v.InferOutput<typeof DeleteLocalModelInputSchema>
+
 export interface AshyBootstrapSnapshot {
   needsOnboarding: boolean
   userProfile: {
@@ -1456,6 +1602,7 @@ export interface AshyBootstrapSnapshot {
   voiceSettings?: VoiceRuntimeSettings
   encryptionAtRest?: EncryptionAtRestStatus
   updaterState?: AutoUpdaterState
+  localRuntime?: LocalRuntimeStatus
 }
 
 export type HostBootstrapSnapshot = AshyBootstrapSnapshot
@@ -1483,6 +1630,7 @@ export const HostBootstrapSnapshotSchema = v.object({
   voiceSettings: v.optional(VoiceRuntimeSettingsSchema),
   encryptionAtRest: v.optional(EncryptionAtRestStatusSchema),
   updaterState: v.optional(AutoUpdaterStateSchema),
+  localRuntime: v.optional(LocalRuntimeStatusSchema),
 })
 
 export const AshyBootstrapSnapshotSchema = HostBootstrapSnapshotSchema
@@ -1643,10 +1791,26 @@ export const ASHY_HOST_RPC_METHODS = [
   'checkForUpdates',
   'downloadUpdate',
   'quitAndInstallUpdate',
+  'localRuntime:getStatus',
+  'localRuntime:ensureRunning',
+  'localRuntime:installEngine',
+  'localRuntime:pullModel',
+  'localRuntime:deleteModel',
+  'getLocalRuntimeStatus',
+  'ensureLocalEngineRunning',
+  'installLocalEngine',
+  'pullLocalModel',
+  'deleteLocalModel',
 ] as const
 
 export type AshyHostRpcMethod = (typeof ASHY_HOST_RPC_METHODS)[number]
 export const AshyHostRpcMethodSchema = v.picklist(ASHY_HOST_RPC_METHODS)
+
+export const HostRpcRequestSchema = v.object({
+  method: AshyHostRpcMethodSchema,
+  payload: v.optional(v.unknown()),
+})
+export type HostRpcRequest = v.InferOutput<typeof HostRpcRequestSchema>
 
 export const TurnInputAudioSchema = v.object({
   dataBase64: v.pipe(
@@ -1850,6 +2014,10 @@ export const AshyHostStreamEventSchema = v.union([
     type: v.literal('updater:status'),
     state: AutoUpdaterStateSchema,
   }),
+  v.object({
+    type: v.literal('local-runtime:status'),
+    status: LocalRuntimeStatusSchema,
+  }),
 ])
 
 export type AshyHostStreamEvent =
@@ -1952,6 +2120,10 @@ export type AshyHostStreamEvent =
   | {
       type: 'updater:status'
       state: AutoUpdaterState
+    }
+  | {
+      type: 'local-runtime:status'
+      status: LocalRuntimeStatus
     }
 
 export interface AshyHostBridge {
@@ -2087,8 +2259,15 @@ export interface AshyHostBridge {
   checkForUpdates?(): Promise<AutoUpdaterState>
   downloadUpdate?(): Promise<AutoUpdaterState>
   quitAndInstallUpdate?(): Promise<{ ok: boolean }>
+  getLocalRuntimeStatus?(): Promise<LocalRuntimeStatus>
+  ensureLocalEngineRunning?(): Promise<LocalRuntimeStatus>
+  installLocalEngine?(): Promise<LocalRuntimeStatus>
+  pullLocalModel?(input: PullLocalModelInput): Promise<LocalRuntimeStatus>
+  deleteLocalModel?(input: DeleteLocalModelInput): Promise<LocalRuntimeStatus>
   onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
+
+export type AshyHostKernelApi = AshyHostBridge
 
 export function maskApiKey(rawKey: string | null | undefined): string | null {
   if (typeof rawKey !== 'string') return null

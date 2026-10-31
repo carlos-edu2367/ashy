@@ -45,6 +45,7 @@ import {
   type CompleteOnboardingInput,
   type CoreExperimentEvalReport,
   type DeletableMemoryKind,
+  type DeleteLocalModelInput,
   type DreamReflectionCycleResult,
   type EncryptionAtRestStatus,
   type EpisodicMemory,
@@ -57,6 +58,7 @@ import {
   type ListProviderModelsResult,
   type ListVoiceProviderModelsInput,
   type LlmProviderId,
+  type LocalRuntimeStatus,
   type MemoryGovernanceCategory,
   type MemoryGovernancePolicy,
   type PersistedStagePreferences,
@@ -66,6 +68,7 @@ import {
   type ProspectiveIntent,
   type ProviderHealthResult,
   type PublicProviderConfig,
+  type PullLocalModelInput,
   type RelationalMotif,
   type RelationshipStage,
   type RunCoreExperimentInput,
@@ -108,6 +111,11 @@ import {
 import { seedAshyDemoFixtures } from '../test/fixtures/demo-seed'
 import { createHostAgencyRuntime, type HostAgencyRuntime } from './agency-runtime'
 import { removeFileAtomicWithBackups, writeAtomicWithBackup } from './atomic-file'
+import {
+  createLocalRuntimeManager,
+  type LocalRuntimeManager,
+  type LocalRuntimeManagerOptions,
+} from './local-runtime-manager'
 import { createProviderVault, type ProviderVault } from './provider-vault'
 import { createNodeAesSecretProtector, type SecretProtector } from './secret-protector'
 import { createTurnOrchestrator, type TurnOrchestrator } from './turn-orchestrator'
@@ -278,6 +286,7 @@ export interface AshyHostKernelOptions {
   fetchImpl?: typeof fetch
   keepaliveIntervalMs?: number
   dreamIdleTimeoutMs?: number
+  localRuntimeOptions?: Partial<LocalRuntimeManagerOptions>
 }
 
 export interface AshyHostKernel extends AshyHostBridge {
@@ -288,9 +297,11 @@ export interface AshyHostKernel extends AshyHostBridge {
   readonly providerVault: ProviderVault
   readonly agencyRuntime: HostAgencyRuntime
   readonly turnOrchestrator: TurnOrchestrator
+  readonly localRuntimeManager: LocalRuntimeManager
   emitHostEvent?(event: AshyHostStreamEvent): void
   start(): Promise<void>
   stop(): Promise<void>
+  dispose?(): Promise<void>
   exportSoul(input?: ExportSoulInput): Promise<AshySoulArchive>
   importSoul(input: ImportSoulInput): Promise<AshyBootstrapSnapshot>
   wipeAllData(): Promise<AshyBootstrapSnapshot>
@@ -301,6 +312,11 @@ export interface AshyHostKernel extends AshyHostBridge {
   checkForUpdates(): Promise<AutoUpdaterState>
   downloadUpdate(): Promise<AutoUpdaterState>
   quitAndInstallUpdate(): Promise<{ ok: boolean }>
+  getLocalRuntimeStatus(): Promise<LocalRuntimeStatus>
+  ensureLocalEngineRunning(): Promise<LocalRuntimeStatus>
+  installLocalEngine(): Promise<LocalRuntimeStatus>
+  pullLocalModel(input: PullLocalModelInput): Promise<LocalRuntimeStatus>
+  deleteLocalModel(input: DeleteLocalModelInput): Promise<LocalRuntimeStatus>
 }
 
 function deriveRelationshipMetrics(params: {
@@ -930,6 +946,7 @@ export async function createAshyHostKernel(
         updatedAt: encryptionUpdatedAt ?? cortex.db.getEncryptionUpdatedAt(),
       },
       updaterState: currentUpdaterState,
+      localRuntime: localRuntimeManager.getCachedStatus(),
     }
   }
 
@@ -940,6 +957,30 @@ export async function createAshyHostKernel(
   let turnOrchestratorInstance!: TurnOrchestrator
   let dreamIdleTimer: ReturnType<typeof setTimeout> | null = null
   let turnOrchestratorUnsub: (() => void) | null = null
+
+  const localRuntimeManager = createLocalRuntimeManager({
+    ...options.localRuntimeOptions,
+    fetchImpl: options.localRuntimeOptions?.fetchImpl ?? options.fetchImpl,
+    onStatusChange: (status) => {
+      options.localRuntimeOptions?.onStatusChange?.(status)
+      emitHostEvent({
+        type: 'local-runtime:status',
+        status,
+      })
+    },
+    onModelReady: (modelName, openaiBaseUrl) => {
+      options.localRuntimeOptions?.onModelReady?.(modelName, openaiBaseUrl)
+      if (providerVaultInstance) {
+        providerVaultInstance.saveProviderConfig({
+          providerId: 'ollama',
+          baseUrl: openaiBaseUrl,
+          modelId: modelName,
+          reasoningEffort: 'none',
+        })
+        providerVaultInstance.setActiveProvider('ollama')
+      }
+    },
+  })
 
   function clearDreamIdleTimer(): void {
     if (dreamIdleTimer !== null) {
@@ -1217,6 +1258,7 @@ export async function createAshyHostKernel(
   }
 
   async function stop(): Promise<void> {
+    localRuntimeManager.dispose()
     if (!started) return
     clearDreamIdleTimer()
     turnOrchestratorUnsub?.()
@@ -1255,9 +1297,13 @@ export async function createAshyHostKernel(
     get turnOrchestrator() {
       return turnOrchestratorInstance
     },
+    get localRuntimeManager() {
+      return localRuntimeManager
+    },
     emitHostEvent,
     start,
     stop,
+    dispose: stop,
 
     async getBootstrapSnapshot(): Promise<AshyBootstrapSnapshot> {
       return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)
@@ -2618,6 +2664,38 @@ export async function createAshyHostKernel(
 
     async quitAndInstallUpdate(): Promise<{ ok: boolean }> {
       return { ok: true }
+    },
+
+    async getLocalRuntimeStatus(): Promise<LocalRuntimeStatus> {
+      return localRuntimeManager.getStatus()
+    },
+
+    async ensureLocalEngineRunning(): Promise<LocalRuntimeStatus> {
+      return localRuntimeManager.ensureEngineRunning()
+    },
+
+    async installLocalEngine(): Promise<LocalRuntimeStatus> {
+      return localRuntimeManager.installEngine()
+    },
+
+    async pullLocalModel(input: PullLocalModelInput): Promise<LocalRuntimeStatus> {
+      const model =
+        typeof input === 'string'
+          ? input
+          : input && typeof input === 'object' && typeof input.model === 'string'
+            ? input.model
+            : ''
+      return localRuntimeManager.pullModel(model)
+    },
+
+    async deleteLocalModel(input: DeleteLocalModelInput): Promise<LocalRuntimeStatus> {
+      const model =
+        typeof input === 'string'
+          ? input
+          : input && typeof input === 'object' && typeof input.model === 'string'
+            ? input.model
+            : ''
+      return localRuntimeManager.deleteModel(model)
     },
 
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {

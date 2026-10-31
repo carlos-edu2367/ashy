@@ -14,6 +14,7 @@ import type {
   CompleteOnboardingInput,
   CoreExperimentEvalReport,
   DeletableMemoryKind,
+  DeleteLocalModelInput,
   DreamReflectionCycleResult,
   EncryptionAtRestStatus,
   EpisodicMemory,
@@ -25,6 +26,7 @@ import type {
   ListProviderModelsInput,
   ListProviderModelsResult,
   LlmProviderId,
+  LocalRuntimeStatus,
   MemoryGovernanceCategory,
   MemoryGovernancePolicy,
   PersistedStagePreferences,
@@ -34,6 +36,7 @@ import type {
   ProspectiveIntent,
   ProviderHealthResult,
   PublicProviderConfig,
+  PullLocalModelInput,
   RelationalMotif,
   RunCoreExperimentInput,
   SaveProviderConfigInput,
@@ -346,6 +349,21 @@ export function createPreloadHostBridge(
     },
     quitAndInstallUpdate(): Promise<{ ok: boolean }> {
       return invoke<{ ok: boolean }>('quitAndInstallUpdate')
+    },
+    getLocalRuntimeStatus(): Promise<LocalRuntimeStatus> {
+      return invoke<LocalRuntimeStatus>('localRuntime:getStatus')
+    },
+    ensureLocalEngineRunning(): Promise<LocalRuntimeStatus> {
+      return invoke<LocalRuntimeStatus>('localRuntime:ensureRunning')
+    },
+    installLocalEngine(): Promise<LocalRuntimeStatus> {
+      return invoke<LocalRuntimeStatus>('localRuntime:installEngine')
+    },
+    pullLocalModel(input: PullLocalModelInput): Promise<LocalRuntimeStatus> {
+      return invoke<LocalRuntimeStatus>('localRuntime:pullModel', input)
+    },
+    deleteLocalModel(input: DeleteLocalModelInput): Promise<LocalRuntimeStatus> {
+      return invoke<LocalRuntimeStatus>('localRuntime:deleteModel', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       return preloadApi.onEvent(listener)
@@ -693,6 +711,21 @@ export function createHttpSseHostBridge(
     },
     quitAndInstallUpdate(): Promise<{ ok: boolean }> {
       return rpc<{ ok: boolean }>('quitAndInstallUpdate')
+    },
+    getLocalRuntimeStatus(): Promise<LocalRuntimeStatus> {
+      return rpc<LocalRuntimeStatus>('localRuntime:getStatus')
+    },
+    ensureLocalEngineRunning(): Promise<LocalRuntimeStatus> {
+      return rpc<LocalRuntimeStatus>('localRuntime:ensureRunning')
+    },
+    installLocalEngine(): Promise<LocalRuntimeStatus> {
+      return rpc<LocalRuntimeStatus>('localRuntime:installEngine')
+    },
+    pullLocalModel(input: PullLocalModelInput): Promise<LocalRuntimeStatus> {
+      return rpc<LocalRuntimeStatus>('localRuntime:pullModel', input)
+    },
+    deleteLocalModel(input: DeleteLocalModelInput): Promise<LocalRuntimeStatus> {
+      return rpc<LocalRuntimeStatus>('localRuntime:deleteModel', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       listeners.add(listener)

@@ -295,6 +295,31 @@ export function registerAshyElectronIpc(
     return { closed: true }
   })
 
+  ipcMain.handle('localRuntime:getStatus', async (event) => {
+    validateIpcSender(event)
+    return dispatchHostRpc(kernel, 'localRuntime:getStatus', undefined)
+  })
+
+  ipcMain.handle('localRuntime:ensureRunning', async (event) => {
+    validateIpcSender(event)
+    return dispatchHostRpc(kernel, 'localRuntime:ensureRunning', undefined)
+  })
+
+  ipcMain.handle('localRuntime:installEngine', async (event) => {
+    validateIpcSender(event)
+    return dispatchHostRpc(kernel, 'localRuntime:installEngine', undefined)
+  })
+
+  ipcMain.handle('localRuntime:pullModel', async (event, payload) => {
+    validateIpcSender(event)
+    return dispatchHostRpc(kernel, 'localRuntime:pullModel', payload)
+  })
+
+  ipcMain.handle('localRuntime:deleteModel', async (event, payload) => {
+    validateIpcSender(event)
+    return dispatchHostRpc(kernel, 'localRuntime:deleteModel', payload)
+  })
+
   const unsubscribe = kernel.onHostEvent((event) => {
     const targets = getWebContents()
     for (const target of targets) {
@@ -323,6 +348,11 @@ export function registerAshyElectronIpc(
     ipcMain.removeHandler('ashy:windowMinimize')
     ipcMain.removeHandler('ashy:windowMaximize')
     ipcMain.removeHandler('ashy:windowClose')
+    ipcMain.removeHandler('localRuntime:getStatus')
+    ipcMain.removeHandler('localRuntime:ensureRunning')
+    ipcMain.removeHandler('localRuntime:installEngine')
+    ipcMain.removeHandler('localRuntime:pullModel')
+    ipcMain.removeHandler('localRuntime:deleteModel')
   }
 }
 

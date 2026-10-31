@@ -2,8 +2,11 @@ import type {
   AshyBootstrapSnapshot,
   AshyHostStreamEvent,
   AutoUpdaterState,
+  DeleteLocalModelInput,
   ListProviderModelsInput,
   ListProviderModelsResult,
+  LocalRuntimeStatus,
+  PullLocalModelInput,
   StageOverlayRuntimeState,
 } from '@ashy/shared'
 
@@ -46,6 +49,11 @@ export interface AshyPreloadApi {
   checkForUpdates?(): Promise<AutoUpdaterState>
   downloadUpdate?(): Promise<AutoUpdaterState>
   quitAndInstallUpdate?(): Promise<{ ok: boolean }>
+  getLocalRuntimeStatus?(): Promise<LocalRuntimeStatus>
+  ensureLocalEngineRunning?(): Promise<LocalRuntimeStatus>
+  installLocalEngine?(): Promise<LocalRuntimeStatus>
+  pullLocalModel?(input: PullLocalModelInput): Promise<LocalRuntimeStatus>
+  deleteLocalModel?(input: DeleteLocalModelInput): Promise<LocalRuntimeStatus>
   onEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
 
@@ -129,6 +137,33 @@ export function createAshyPreloadApi(
       return ipcRenderer.invoke('ashy:rpc', {
         method: 'quitAndInstallUpdate',
       }) as Promise<{ ok: boolean }>
+    },
+    getLocalRuntimeStatus(): Promise<LocalRuntimeStatus> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'localRuntime:getStatus',
+      }) as Promise<LocalRuntimeStatus>
+    },
+    ensureLocalEngineRunning(): Promise<LocalRuntimeStatus> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'localRuntime:ensureRunning',
+      }) as Promise<LocalRuntimeStatus>
+    },
+    installLocalEngine(): Promise<LocalRuntimeStatus> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'localRuntime:installEngine',
+      }) as Promise<LocalRuntimeStatus>
+    },
+    pullLocalModel(input: PullLocalModelInput): Promise<LocalRuntimeStatus> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'localRuntime:pullModel',
+        payload: input,
+      }) as Promise<LocalRuntimeStatus>
+    },
+    deleteLocalModel(input: DeleteLocalModelInput): Promise<LocalRuntimeStatus> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'localRuntime:deleteModel',
+        payload: input,
+      }) as Promise<LocalRuntimeStatus>
     },
     onEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       const wrapped = (_event: unknown, payload: AshyHostStreamEvent) => {
