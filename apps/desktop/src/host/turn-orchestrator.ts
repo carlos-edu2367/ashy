@@ -12,6 +12,7 @@ import {
   streamText,
   stripBondManipulation,
   stripLeadingAssistantSlop,
+  stripResidualStageMarkers,
   type ChatMessage,
   type ChatMessageContentPart,
   type ToolDefinition,
@@ -33,6 +34,12 @@ import {
 } from '@ashy/shared'
 import { decodeWavToPcmBlocks, extractPcmFrameVowelWeights } from '@ashy/voice'
 import type { HostAgencyRuntime } from './agency-runtime'
+import {
+  buildCompactLocalOmniSystemPrompt,
+  synthesizeNativeOllamaOmniSpeech,
+  transcribeNativeOllamaOmniAudio,
+  type DiscoverOllamaLlamaServerOptions,
+} from './ollama-native-audio-bridge'
 import type { ProviderVault } from './provider-vault'
 import type { VoiceIdentityStore } from './voice-identity-store'
 
@@ -60,6 +67,7 @@ export interface TurnOrchestratorOptions {
   onDominantEmotionChange?: (emotion: AshyEmotion) => void
   keepaliveIntervalMs?: number
   getKernelEpoch?: () => number
+  ollamaLlamaServerOptions?: DiscoverOllamaLlamaServerOptions & { llamaServerBaseUrl?: string }
 }
 
 export interface TurnOrchestrator {
@@ -641,6 +649,44 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
 
       const voiceIdentityMarkdown = voiceStore.read().content
       const activeConfig = providerState.configs[providerState.activeProviderId]
+      if (
+        providerState.activeProviderId === 'ollama' &&
+        input.inputAudio &&
+        inputTranscriptSource === null &&
+        (options.ollamaLlamaServerOptions || !process.env.VITEST)
+      ) {
+        const asrTranscript = await transcribeNativeOllamaOmniAudio({
+          audioWavBase64: input.inputAudio.dataBase64,
+          language: 'pt',
+          llamaServerBaseUrl: options.ollamaLlamaServerOptions?.llamaServerBaseUrl,
+          ollamaLogPath: options.ollamaLlamaServerOptions?.ollamaLogPath,
+          ollamaBaseUrl: activeConfig?.baseUrl,
+          modelId: activeConfig?.modelId,
+          signal: controller.signal,
+          fetchImpl: options.ollamaLlamaServerOptions?.fetchImpl,
+        })
+        if (asrTranscript && !controller.signal.aborted && !entry.abortedEmitted && !isStaleEpoch()) {
+          currentEffectiveUserText = asrTranscript
+          try {
+            cortex.appendChatMessage({
+              ...userMessage,
+              content: asrTranscript,
+              rawContent: asrTranscript,
+            })
+          } catch {
+            // Fault-isolated
+          }
+          emit({
+            type: 'turn:input-transcript',
+            turnId,
+            sessionId,
+            userMessageId: userMessage.id,
+            transcript: asrTranscript,
+            isFinal: true,
+            source: 'omni-native',
+          })
+        }
+      }
       const effectiveScreenContext =
         input.screenContext && input.screenContext.trim().length > 0
           ? input.screenContext
@@ -691,12 +737,19 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
       const nativeDirectiveMatch = omniPromptOverlay.match(
         /\[NATIVE OMNI AUDIO OUTPUT DIRECTIVE\][\s\S]*?(?=\n\n\[|$)/,
       )
-      const finalSystemPrompt =
+      const rawFinalSystemPrompt =
         effectiveOmniMode === 'native-omni' &&
         nativeDirectiveMatch &&
         !compiled.systemPrompt.includes('[NATIVE OMNI AUDIO OUTPUT DIRECTIVE]')
           ? `${compiled.systemPrompt}\n\n${nativeDirectiveMatch[0]}`
           : compiled.systemPrompt
+      const finalSystemPrompt =
+        providerState.activeProviderId === 'ollama'
+          ? buildCompactLocalOmniSystemPrompt({
+              fullSystemPrompt: rawFinalSystemPrompt,
+              userMessage: currentEffectiveUserText,
+            })
+          : rawFinalSystemPrompt
 
       const hasMultimodalInputs =
         Boolean(input.inputAudio) ||
@@ -763,9 +816,15 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
             },
           })
         }
+        const effectiveUserTurnText =
+          providerState.activeProviderId === 'ollama' &&
+          input.inputAudio &&
+          currentEffectiveUserText === '[Mensagem de voz Omni]'
+            ? 'Responda diretamente em português ao áudio falado pelo usuário.'
+            : compiled.userTurnContent
         userParts.push({
           type: 'text',
-          text: compiled.userTurnContent,
+          text: effectiveUserTurnText,
         })
       }
 
@@ -1067,10 +1126,102 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
 
       const completedAt = Date.now()
       const latencyMs = Math.max(0, completedAt - startedAt)
-      const rawClean = getCleanText().trim()
+      const rawClean = getCleanText().trim() || stripResidualStageMarkers(rawAccum).trim()
       const afterSlop = stripLeadingAssistantSlop(rawClean).trim()
       const afterBond = stripBondManipulation(afterSlop || rawClean).trim()
       const finalCleanContent = afterBond || afterSlop || rawClean || '...'
+
+      if (
+        audioChunkSeq === 0 &&
+        finalCleanContent !== '...' &&
+        providerState.activeProviderId === 'ollama' &&
+        activeConfig?.isOmniModel
+      ) {
+        const synthesized = await synthesizeNativeOllamaOmniSpeech({
+          text: finalCleanContent,
+          voice: activeConfig?.omniVoiceId,
+          language: 'pt',
+          llamaServerBaseUrl: options.ollamaLlamaServerOptions?.llamaServerBaseUrl,
+          ollamaLogPath: options.ollamaLlamaServerOptions?.ollamaLogPath,
+          fetchImpl: options.ollamaLlamaServerOptions?.fetchImpl,
+          signal: controller.signal,
+        })
+        if (
+          synthesized &&
+          !controller.signal.aborted &&
+          !entry.abortedEmitted &&
+          !isStaleEpoch()
+        ) {
+          let samples: Float32Array
+          let sampleRate = synthesized.sampleRate > 0 ? synthesized.sampleRate : 24000
+          try {
+            const decoded = decodeWavToPcmBlocks(
+              synthesized.wavBytes.buffer.slice(
+                synthesized.wavBytes.byteOffset,
+                synthesized.wavBytes.byteOffset + synthesized.wavBytes.byteLength,
+              ),
+            )
+            samples = decoded.samples
+            if (decoded.sampleRate > 0) {
+              sampleRate = decoded.sampleRate
+            }
+          } catch {
+            samples = new Float32Array(0)
+          }
+
+          const samplesPerFrame = Math.max(1, Math.round(sampleRate * 0.02))
+          const frameDurationSec = Number((samplesPerFrame / sampleRate).toFixed(4))
+          const vowelFrames: VoiceSynthesizedVowelFrame[] = []
+          let frameIdx = 0
+          for (let offset = 0; offset < samples.length; offset += samplesPerFrame) {
+            const slice = samples.subarray(
+              offset,
+              Math.min(samples.length, offset + samplesPerFrame),
+            )
+            const weights = extractPcmFrameVowelWeights(slice, sampleRate)
+            const entries: Array<['A' | 'E' | 'I' | 'O' | 'U', number]> = [
+              ['A', weights.A],
+              ['E', weights.E],
+              ['I', weights.I],
+              ['O', weights.O],
+              ['U', weights.U],
+            ]
+            entries.sort((a, b) => b[1] - a[1])
+            const dominantVowel =
+              weights.rmsVolume > 0.01 && entries[0]![1] > 0.02 ? entries[0]![0] : 'closed'
+            vowelFrames.push({
+              timeSec: Number((frameIdx * frameDurationSec).toFixed(4)),
+              durationSec: frameDurationSec,
+              A: weights.A,
+              E: weights.E,
+              I: weights.I,
+              O: weights.O,
+              U: weights.U,
+              dominantVowel,
+            })
+            frameIdx += 1
+          }
+          const durationMs =
+            samples.length > 0
+              ? Math.max(1, Math.round((samples.length / sampleRate) * 1000))
+              : 20
+
+          const seq = audioChunkSeq
+          audioChunkSeq += 1
+          emit({
+            type: 'turn:audio-delta',
+            turnId,
+            sessionId,
+            seq,
+            audioBase64: Buffer.from(synthesized.wavBytes).toString('base64'),
+            format: 'wav',
+            sampleRate,
+            durationMs,
+            vowelFrames,
+            transcriptDelta: finalCleanContent,
+          })
+        }
+      }
 
       const assistantMessage: ChatMessageRecord = {
         id: `msg-assistant-${turnId}`,
