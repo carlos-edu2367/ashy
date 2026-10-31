@@ -1,7 +1,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import type { ConfigDiagnostics } from '@ashy/shared'
-import { readWithAutoHeal, writeAtomicWithBackup } from './atomic-file'
+import {
+  readWithAutoHeal,
+  removeFileAtomicWithBackups,
+  writeAtomicWithBackup,
+} from './atomic-file'
 
 export const DEFAULT_ASHY_VOICE_MD = `# Ashy — Voz & Identidade Viva (Cozy Night Studio)
 
@@ -21,17 +25,32 @@ Quando o usuário demonstrar dor emocional real, luto, pânico, exaustão severa
 - Adote uma presença calma, direta, acolhedora e humana, sem clichês terapêuticos robóticos.
 `
 
+export const DEFAULT_VOICE_IDENTITY_MARKDOWN = DEFAULT_ASHY_VOICE_MD
+
+const VOICE_IDENTITY_AAD = 'voice_identity.markdown'
+
+export interface VoiceIdentityEncryptionCodec {
+  isEnabled(): boolean
+  encrypt(plain: string, aad: string): string
+  decrypt(cipher: string, aad: string): string
+}
+
 export interface VoiceIdentitySnapshot {
   content: string
+  markdown: string
   diagnostics: ConfigDiagnostics
   updatedAt: number
 }
 
+export type VoiceIdentityState = VoiceIdentitySnapshot
+
 export interface VoiceIdentityStore {
   readonly filePath: string
   read(): VoiceIdentitySnapshot
+  get(): VoiceIdentitySnapshot
   save(content: string): VoiceIdentitySnapshot
   reset(): VoiceIdentitySnapshot
+  rewrapForEncryptionState(): void
 }
 
 function validateVoiceMarkdown(raw: string): string {
@@ -45,14 +64,34 @@ function validateVoiceMarkdown(raw: string): string {
   return raw
 }
 
-export function createVoiceIdentityStore(options: { userDataDir: string }): VoiceIdentityStore {
+export function createVoiceIdentityStore(options: {
+  userDataDir: string
+  encryptionCodec?: VoiceIdentityEncryptionCodec
+}): VoiceIdentityStore {
   const filePath = path.join(options.userDataDir, 'voice.md')
+  const codec = options.encryptionCodec
+
+  function serializeForDisk(markdown: string): string {
+    if (codec?.isEnabled()) {
+      return codec.encrypt(markdown, VOICE_IDENTITY_AAD)
+    }
+    return markdown
+  }
+
+  function parseAndValidateFromDisk(raw: string): string {
+    const trimmed = raw.trim()
+    if (trimmed.startsWith('enc:v1:') && codec) {
+      const decrypted = codec.decrypt(trimmed, VOICE_IDENTITY_AAD)
+      return validateVoiceMarkdown(decrypted)
+    }
+    return validateVoiceMarkdown(raw)
+  }
 
   function read(): VoiceIdentitySnapshot {
     const result = readWithAutoHeal({
       filePath,
-      defaultContent: DEFAULT_ASHY_VOICE_MD,
-      parseAndValidate: validateVoiceMarkdown,
+      defaultContent: serializeForDisk(DEFAULT_ASHY_VOICE_MD),
+      parseAndValidate: parseAndValidateFromDisk,
     })
     let updatedAt = result.diagnostics.updatedAt
     try {
@@ -62,6 +101,7 @@ export function createVoiceIdentityStore(options: { userDataDir: string }): Voic
     }
     return {
       content: result.value,
+      markdown: result.value,
       diagnostics: result.diagnostics,
       updatedAt,
     }
@@ -69,10 +109,11 @@ export function createVoiceIdentityStore(options: { userDataDir: string }): Voic
 
   function save(content: string): VoiceIdentitySnapshot {
     const validated = validateVoiceMarkdown(content)
-    writeAtomicWithBackup(filePath, validated)
+    writeAtomicWithBackup(filePath, serializeForDisk(validated))
     const now = Date.now()
     return {
       content: validated,
+      markdown: validated,
       diagnostics: {
         status: 'ok',
         updatedAt: now,
@@ -82,10 +123,18 @@ export function createVoiceIdentityStore(options: { userDataDir: string }): Voic
   }
 
   function reset(): VoiceIdentitySnapshot {
-    writeAtomicWithBackup(filePath, DEFAULT_ASHY_VOICE_MD)
+    if (codec) {
+      removeFileAtomicWithBackups(filePath, 3)
+      writeAtomicWithBackup(filePath, serializeForDisk(DEFAULT_ASHY_VOICE_MD), {
+        rotateBackup: false,
+      })
+    } else {
+      writeAtomicWithBackup(filePath, DEFAULT_ASHY_VOICE_MD)
+    }
     const now = Date.now()
     return {
       content: DEFAULT_ASHY_VOICE_MD,
+      markdown: DEFAULT_ASHY_VOICE_MD,
       diagnostics: {
         status: 'ok',
         message: 'Identidade de voz restaurada para o padrão Cozy Night Studio.',
@@ -95,10 +144,20 @@ export function createVoiceIdentityStore(options: { userDataDir: string }): Voic
     }
   }
 
+  function rewrapForEncryptionState(): void {
+    const current = read().content
+    removeFileAtomicWithBackups(filePath, 3)
+    writeAtomicWithBackup(filePath, serializeForDisk(current), {
+      rotateBackup: false,
+    })
+  }
+
   return {
     filePath,
     read,
+    get: read,
     save,
     reset,
+    rewrapForEncryptionState,
   }
 }

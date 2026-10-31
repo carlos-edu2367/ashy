@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import * as v from 'valibot'
@@ -6,15 +7,23 @@ import { createAshyCortex, type AshyCortex } from '@ashy/cortex'
 import { runCoreExperimentM2 } from '@ashy/evals'
 import { generateText } from '@ashy/llm'
 import {
+  AshySoulArchiveSchema,
+  canonicalizeJson,
   CompleteOnboardingInputSchema,
+  CURRENT_SOUL_SCHEMA_VERSION,
+  DEFAULT_PERSISTED_AGENCY_CONSENT_STATE,
   DEFAULT_PERSISTED_STAGE_PREFERENCES,
   DEFAULT_VOICE_RUNTIME_SETTINGS,
   EvaluateInitiativeInputSchema,
+  ExportSoulInputSchema,
+  ImportSoulInputSchema,
   ListVoiceProviderModelsInputSchema,
   maskApiKey,
   PersistedStagePreferencesSchema,
   RunCoreExperimentInputSchema,
+  safeJsonParseWithoutProto,
   SaveVoiceRuntimeSettingsInputSchema,
+  SetEncryptionAtRestInputSchema,
   SynthesizeVoiceSpeechInputSchema,
   TranscribeVoiceAudioInputSchema,
   UpdateInitiativePolicyInputSchema,
@@ -27,16 +36,22 @@ import {
   type AshyEmotion,
   type AshyHostBridge,
   type AshyHostStreamEvent,
+  type AshySoulArchive,
+  type AshySoulBundlePayload,
   type AutobiographicalMilestone,
+  type AutoUpdaterState,
   type ChatMessageRecord,
   type ChatSessionRecord,
   type CompleteOnboardingInput,
   type CoreExperimentEvalReport,
   type DeletableMemoryKind,
   type DreamReflectionCycleResult,
+  type EncryptionAtRestStatus,
   type EpisodicMemory,
   type EvaluateInitiativeInput,
+  type ExportSoulInput,
   type ExternalMcpServerConfig,
+  type ImportSoulInput,
   type InitiativePolicy,
   type ListProviderModelsInput,
   type ListProviderModelsResult,
@@ -58,6 +73,7 @@ import {
   type SaveVoiceRuntimeSettingsInput,
   type SemanticFact,
   type SendTurnInput,
+  type SetEncryptionAtRestInput,
   type SharedPendingActionCard,
   type SttProviderId,
   type SynthesizeVoiceSpeechInput,
@@ -91,7 +107,7 @@ import {
 } from '@ashy/voice'
 import { seedAshyDemoFixtures } from '../test/fixtures/demo-seed'
 import { createHostAgencyRuntime, type HostAgencyRuntime } from './agency-runtime'
-import { writeAtomicWithBackup } from './atomic-file'
+import { removeFileAtomicWithBackups, writeAtomicWithBackup } from './atomic-file'
 import { createProviderVault, type ProviderVault } from './provider-vault'
 import { createNodeAesSecretProtector, type SecretProtector } from './secret-protector'
 import { createTurnOrchestrator, type TurnOrchestrator } from './turn-orchestrator'
@@ -275,6 +291,16 @@ export interface AshyHostKernel extends AshyHostBridge {
   emitHostEvent?(event: AshyHostStreamEvent): void
   start(): Promise<void>
   stop(): Promise<void>
+  exportSoul(input?: ExportSoulInput): Promise<AshySoulArchive>
+  importSoul(input: ImportSoulInput): Promise<AshyBootstrapSnapshot>
+  wipeAllData(): Promise<AshyBootstrapSnapshot>
+  setEncryptionAtRest(input: SetEncryptionAtRestInput): Promise<AshyBootstrapSnapshot>
+  getEncryptionAtRestStatus(): Promise<EncryptionAtRestStatus>
+  activatePrivacyShield(): Promise<AshyBootstrapSnapshot>
+  getUpdateState(): Promise<AutoUpdaterState>
+  checkForUpdates(): Promise<AutoUpdaterState>
+  downloadUpdate(): Promise<AutoUpdaterState>
+  quitAndInstallUpdate(): Promise<{ ok: boolean }>
 }
 
 function deriveRelationshipMetrics(params: {
@@ -684,12 +710,30 @@ export async function createAshyHostKernel(
     }
   }
 
+  let kernelEpoch = 0
+  let encryptionUpdatedAt: string | null = null
+  let currentUpdaterState: AutoUpdaterState = {
+    status: 'idle',
+    currentVersion: '1.0.0',
+    availableVersion: null,
+    progressPercent: null,
+    errorMessage: null,
+    checkedAt: null,
+    autoDownload: true,
+  }
+
+  const cortexEncryptionCodec = {
+    encrypt: (plain: string, aad: string) => voiceSecretProtector.encryptEnvelope(plain, aad),
+    decrypt: (cipher: string, aad: string) => voiceSecretProtector.decryptEnvelope(cipher, aad),
+  }
+
   const container = createContainer()
 
   const cortexToken = container.provide('cortex', {
     build: () =>
       createAshyCortex({
         filePath: path.join(options.userDataDir, 'ashy.db'),
+        encryptionCodec: cortexEncryptionCodec,
       }),
     onStop: (instance) => {
       instance.close()
@@ -697,7 +741,15 @@ export async function createAshyHostKernel(
   })
 
   const voiceStoreToken = container.provide('voiceStore', {
-    build: () => createVoiceIdentityStore({ userDataDir: options.userDataDir }),
+    build: () =>
+      createVoiceIdentityStore({
+        userDataDir: options.userDataDir,
+        encryptionCodec: {
+          isEnabled: () => (cortexInstance ? cortexInstance.isEncryptionAtRestEnabled() : false),
+          encrypt: (plain, aad) => voiceSecretProtector.encryptEnvelope(plain, aad),
+          decrypt: (cipher, aad) => voiceSecretProtector.decryptEnvelope(cipher, aad),
+        },
+      }),
   })
 
   const providerVaultToken = container.provide('providerVault', {
@@ -749,6 +801,7 @@ export async function createAshyHostKernel(
           dominantEmotion = emotion
         },
         keepaliveIntervalMs: options.keepaliveIntervalMs,
+        getKernelEpoch: () => kernelEpoch,
       }),
     onStop: (instance) => {
       instance.abortAll()
@@ -870,6 +923,13 @@ export async function createAshyHostKernel(
       agency: (agencyRuntime ?? agencyRuntimeInstance)?.getSnapshot(),
       stagePreferences: currentStagePreferences,
       voiceSettings: buildSanitizedVoiceRuntimeSettings(providerVault),
+      encryptionAtRest: {
+        enabled: cortex.isEncryptionAtRestEnabled(),
+        algorithm: 'AES-256-GCM',
+        keyBackend: voiceSecretProtector.getBackendKind(),
+        updatedAt: encryptionUpdatedAt ?? cortex.db.getEncryptionUpdatedAt(),
+      },
+      updaterState: currentUpdaterState,
     }
   }
 
@@ -886,6 +946,192 @@ export async function createAshyHostKernel(
       clearTimeout(dreamIdleTimer)
       dreamIdleTimer = null
     }
+  }
+
+  function applyStagePreferencesUpdate(
+    rawInput: UpdateStagePreferencesInput,
+  ): PersistedStagePreferences {
+    let parsed: UpdateStagePreferencesInput
+    try {
+      parsed = v.parse(UpdateStagePreferencesInputSchema, rawInput)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      throw new Error(`Invalid RPC argument: ${message}`)
+    }
+
+    currentStagePreferences = {
+      ...currentStagePreferences,
+      ...(parsed.stageMode !== undefined ? { stageMode: parsed.stageMode } : {}),
+      ...(parsed.live2dPresetId !== undefined ? { live2dPresetId: parsed.live2dPresetId } : {}),
+      ...(parsed.live2dModelUrl !== undefined ? { live2dModelUrl: parsed.live2dModelUrl } : {}),
+      ...(parsed.loadedLive2DModelName !== undefined
+        ? { loadedLive2DModelName: parsed.loadedLive2DModelName }
+        : {}),
+      ...(parsed.live2dModelControls !== undefined
+        ? { live2dModelControls: parsed.live2dModelControls }
+        : {}),
+      ...(parsed.ambientLuminance !== undefined
+        ? { ambientLuminance: parsed.ambientLuminance }
+        : {}),
+      ...(parsed.showDesktopAvatar !== undefined
+        ? { showDesktopAvatar: parsed.showDesktopAvatar }
+        : {}),
+      ...(parsed.isStageHidden !== undefined ? { isStageHidden: parsed.isStageHidden } : {}),
+      updatedAt: Date.now(),
+    }
+
+    writeAtomicWithBackup(stagePreferencesPath, JSON.stringify(currentStagePreferences, null, 2))
+    emitHostEvent({
+      type: 'stage:updated',
+      stagePreferences: currentStagePreferences,
+    })
+    return currentStagePreferences
+  }
+
+  function applyVoiceRuntimeSettingsUpdate(
+    rawInput: SaveVoiceRuntimeSettingsInput,
+  ): VoiceRuntimeSettings {
+    let parsed: SaveVoiceRuntimeSettingsInput
+    try {
+      parsed = v.parse(SaveVoiceRuntimeSettingsInputSchema, rawInput)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      throw new Error(`Invalid RPC argument: ${message}`)
+    }
+
+    const nextSttProvider =
+      parsed.activeSttProviderId ?? currentVoiceSettings.activeSttProviderId
+    const nextTtsProvider =
+      parsed.activeTtsProviderId ?? currentVoiceSettings.activeTtsProviderId
+
+    if (parsed.sttBaseUrl !== undefined) {
+      const checkProvider =
+        nextSttProvider === 'openai-whisper' || nextSttProvider === 'groq-whisper'
+          ? extractUrlOrigin(parsed.sttBaseUrl) === 'https://api.openai.com' ||
+            extractUrlOrigin(parsed.sttBaseUrl) === 'https://api.groq.com'
+            ? nextSttProvider
+            : 'local-whisper-http'
+          : 'local-whisper-http'
+      validateVoiceEndpointUrl(parsed.sttBaseUrl, checkProvider)
+    }
+
+    if (parsed.ttsBaseUrl !== undefined) {
+      const checkProvider =
+        nextTtsProvider === 'openai-tts' || nextTtsProvider === 'elevenlabs'
+          ? extractUrlOrigin(parsed.ttsBaseUrl) === 'https://api.openai.com' ||
+            extractUrlOrigin(parsed.ttsBaseUrl) === 'https://api.elevenlabs.io'
+            ? nextTtsProvider
+            : 'local-kokoro-http'
+          : 'local-kokoro-http'
+      validateVoiceEndpointUrl(parsed.ttsBaseUrl, checkProvider)
+    }
+
+    const nextSettings: StoredVoiceSettingsDocument = {
+      ...currentVoiceSettings,
+      ...(parsed.activeSttProviderId !== undefined
+        ? { activeSttProviderId: parsed.activeSttProviderId }
+        : {}),
+      ...(parsed.activeTtsProviderId !== undefined
+        ? { activeTtsProviderId: parsed.activeTtsProviderId }
+        : {}),
+      ...(parsed.sttBaseUrl !== undefined ? { sttBaseUrl: parsed.sttBaseUrl } : {}),
+      ...(parsed.sttModelId !== undefined ? { sttModelId: parsed.sttModelId } : {}),
+      ...(parsed.ttsBaseUrl !== undefined ? { ttsBaseUrl: parsed.ttsBaseUrl } : {}),
+      ...(parsed.ttsModelId !== undefined ? { ttsModelId: parsed.ttsModelId } : {}),
+      ...(parsed.ttsVoiceId !== undefined ? { ttsVoiceId: parsed.ttsVoiceId } : {}),
+      ...(parsed.wakeWordEnabled !== undefined
+        ? { wakeWordEnabled: parsed.wakeWordEnabled }
+        : {}),
+      ...(parsed.wakeWordPhrases !== undefined
+        ? { wakeWordPhrases: [...parsed.wakeWordPhrases] }
+        : {}),
+      ...(parsed.groqSttModelId !== undefined ? { groqSttModelId: parsed.groqSttModelId } : {}),
+      ...(parsed.openaiSttModelId !== undefined
+        ? { openaiSttModelId: parsed.openaiSttModelId }
+        : {}),
+      ...(parsed.openaiTtsModelId !== undefined
+        ? { openaiTtsModelId: parsed.openaiTtsModelId }
+        : {}),
+      ...(parsed.openaiTtsVoiceId !== undefined
+        ? { openaiTtsVoiceId: parsed.openaiTtsVoiceId }
+        : {}),
+      ...(parsed.elevenLabsModelId !== undefined
+        ? { elevenLabsModelId: parsed.elevenLabsModelId }
+        : {}),
+      ...(parsed.localKokoroModelId !== undefined
+        ? { localKokoroModelId: parsed.localKokoroModelId }
+        : {}),
+      ...(parsed.localKokoroVoiceId !== undefined
+        ? { localKokoroVoiceId: parsed.localKokoroVoiceId }
+        : {}),
+      ...(parsed.webSpeechLang !== undefined ? { webSpeechLang: parsed.webSpeechLang } : {}),
+      ...(parsed.webSpeechVoiceURI !== undefined
+        ? { webSpeechVoiceURI: parsed.webSpeechVoiceURI }
+        : {}),
+      ...(parsed.selectedMicDeviceId !== undefined
+        ? { selectedMicDeviceId: parsed.selectedMicDeviceId }
+        : {}),
+      ...(parsed.unifiedOmniMode !== undefined
+        ? { unifiedOmniMode: parsed.unifiedOmniMode }
+        : {}),
+      ...(parsed.directOmniAudio !== undefined
+        ? { directOmniAudio: parsed.directOmniAudio }
+        : {}),
+      ...(parsed.autoSpeakReplies !== undefined
+        ? { autoSpeakReplies: parsed.autoSpeakReplies }
+        : {}),
+    }
+
+    if (parsed.clearOpenAiApiKey === true) {
+      delete nextSettings.encryptedOpenAiApiKey
+    } else if (typeof parsed.openaiApiKey === 'string' && parsed.openaiApiKey.trim().length > 0) {
+      nextSettings.encryptedOpenAiApiKey = voiceSecretProtector.encrypt(
+        parsed.openaiApiKey.trim(),
+      )
+    }
+
+    if (parsed.clearGroqApiKey === true) {
+      delete nextSettings.encryptedGroqApiKey
+    } else if (typeof parsed.groqApiKey === 'string' && parsed.groqApiKey.trim().length > 0) {
+      nextSettings.encryptedGroqApiKey = voiceSecretProtector.encrypt(parsed.groqApiKey.trim())
+    }
+
+    if (parsed.clearElevenLabsApiKey === true) {
+      delete nextSettings.encryptedElevenLabsApiKey
+    } else if (
+      typeof parsed.elevenLabsApiKey === 'string' &&
+      parsed.elevenLabsApiKey.trim().length > 0
+    ) {
+      nextSettings.encryptedElevenLabsApiKey = voiceSecretProtector.encrypt(
+        parsed.elevenLabsApiKey.trim(),
+      )
+    }
+
+    if (parsed.clearLocalSttApiKey === true) {
+      delete nextSettings.encryptedLocalSttApiKey
+    } else if (
+      typeof parsed.localSttApiKey === 'string' &&
+      parsed.localSttApiKey.trim().length > 0
+    ) {
+      nextSettings.encryptedLocalSttApiKey = voiceSecretProtector.encrypt(
+        parsed.localSttApiKey.trim(),
+      )
+    }
+
+    if (parsed.clearLocalTtsApiKey === true) {
+      delete nextSettings.encryptedLocalTtsApiKey
+    } else if (
+      typeof parsed.localTtsApiKey === 'string' &&
+      parsed.localTtsApiKey.trim().length > 0
+    ) {
+      nextSettings.encryptedLocalTtsApiKey = voiceSecretProtector.encrypt(
+        parsed.localTtsApiKey.trim(),
+      )
+    }
+
+    currentVoiceSettings = nextSettings
+    writeAtomicWithBackup(voiceSettingsPath, JSON.stringify(currentVoiceSettings, null, 2))
+    return buildSanitizedVoiceRuntimeSettings(providerVaultInstance)
   }
 
   function resolveDreamJsonGenerator(): ((prompt: string) => Promise<string>) | undefined {
@@ -955,6 +1201,9 @@ export async function createAshyHostKernel(
     if (started) return
     await container.start()
     cortexInstance = await container.resolve(cortexToken)
+    if (encryptionUpdatedAt === null) {
+      encryptionUpdatedAt = cortexInstance.db.getEncryptionUpdatedAt()
+    }
     voiceStoreInstance = await container.resolve(voiceStoreToken)
     providerVaultInstance = await container.resolve(providerVaultToken)
     agencyRuntimeInstance = await container.resolve(agencyRuntimeToken)
@@ -1049,6 +1298,22 @@ export async function createAshyHostKernel(
         providerVaultInstance.setActiveProvider(input.providerConfig.providerId)
       }
 
+      if (input.voiceSettings) {
+        applyVoiceRuntimeSettingsUpdate(input.voiceSettings)
+      }
+
+      if (input.agencyConsent) {
+        await agencyRuntimeInstance.updateConsent(input.agencyConsent)
+      }
+
+      if (input.initiativePolicy) {
+        cortexInstance.saveInitiativePolicy(input.initiativePolicy)
+      }
+
+      if (input.stagePreferences) {
+        applyStagePreferencesUpdate(input.stagePreferences)
+      }
+
       cortexInstance.db.upsertMilestone({
         id: 'milestone-first-meeting',
         title: 'Primeiro Encontro no Estúdio',
@@ -1057,6 +1322,28 @@ export async function createAshyHostKernel(
         roomTrophyId: 'trophy-first-boot-mug',
         createdAt: now,
       })
+
+      if (input.seedFirstGreeting === true) {
+        if (!cortexInstance.getChatSession('session-initial')) {
+          cortexInstance.createChatSession({
+            id: 'session-initial',
+            title: 'Primeiro Encontro',
+          })
+        }
+        activeSessionId = 'session-initial'
+        const greetingContent = `Oi, ${input.userName}! Que bom te conhecer de verdade aqui no estúdio. Já deixei uma caneca de café pra gente na estante — me conta: no que você tá trabalhando ou pensando hoje?`
+        cortexInstance.appendChatMessage({
+          id: 'msg-onboarding-greeting',
+          sessionId: 'session-initial',
+          role: 'assistant',
+          content: greetingContent,
+          rawContent: greetingContent,
+          emotion: 'happy',
+          markersJson: '[]',
+          consolidatedEpisodeId: 'milestone-first-meeting',
+          createdAt: now,
+        })
+      }
 
       return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)
     },
@@ -2111,6 +2398,226 @@ export async function createAshyHostKernel(
       })
       const synth = await provider.synthesize({ text: input.text, modelId, voiceId })
       return formatResult('local-kokoro-http', synth)
+    },
+
+    async exportSoul(rawInput?: ExportSoulInput): Promise<AshySoulArchive> {
+      let parsed: ExportSoulInput
+      try {
+        parsed = v.parse(ExportSoulInputSchema, rawInput)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        throw new Error(`Invalid RPC argument: ${message}`)
+      }
+
+      const cortexSnapshot = cortexInstance.exportSoulSnapshot()
+      if (parsed?.includeChatHistory === false) {
+        cortexSnapshot.chatSessions = []
+        cortexSnapshot.chatMessages = []
+      }
+      if (parsed?.includeAuditLog === false) {
+        cortexSnapshot.actionAuditLog = []
+      }
+
+      const voiceIdentityMarkdown = voiceStoreInstance.get().markdown
+      const stagePreferences: PersistedStagePreferences = { ...currentStagePreferences }
+      const voicePreferences: VoiceRuntimeSettings = {
+        ...buildSanitizedVoiceRuntimeSettings(providerVaultInstance),
+        hasOpenAiApiKey: false,
+        hasGroqApiKey: false,
+        hasElevenLabsApiKey: false,
+        hasLocalSttApiKey: false,
+        hasLocalTtsApiKey: false,
+        maskedOpenAiApiKey: null,
+        maskedGroqApiKey: null,
+        maskedElevenLabsApiKey: null,
+      }
+
+      const payload: AshySoulBundlePayload = {
+        formatVersion: 1,
+        schemaVersion: CURRENT_SOUL_SCHEMA_VERSION,
+        exportedAt: new Date().toISOString(),
+        appVersion: '1.0.0',
+        cortex: cortexSnapshot,
+        voiceIdentityMarkdown,
+        stagePreferences,
+        voicePreferences,
+      }
+
+      const checksumSha256 = crypto
+        .createHash('sha256')
+        .update(canonicalizeJson(payload), 'utf8')
+        .digest('hex')
+
+      return {
+        magic: 'ASHY_SOUL_V1',
+        checksumSha256,
+        payload,
+      }
+    },
+
+    async importSoul(rawInput: ImportSoulInput): Promise<AshyBootstrapSnapshot> {
+      if (!rawInput || typeof rawInput !== 'object') {
+        throw new Error('Invalid RPC argument: importSoul requires an object input')
+      }
+      canonicalizeJson(rawInput)
+      const parsedInput = v.parse(ImportSoulInputSchema, rawInput)
+
+      const rawArchiveObj =
+        typeof parsedInput.archive === 'string'
+          ? safeJsonParseWithoutProto(parsedInput.archive)
+          : parsedInput.archive
+
+      canonicalizeJson(rawArchiveObj)
+      const archive = v.parse(AshySoulArchiveSchema, rawArchiveObj)
+
+      const expectedHex = crypto
+        .createHash('sha256')
+        .update(canonicalizeJson(archive.payload), 'utf8')
+        .digest('hex')
+      const expectedBuf = Buffer.from(expectedHex, 'hex')
+      const providedBuf = Buffer.from(archive.checksumSha256.toLowerCase(), 'hex')
+
+      if (
+        expectedBuf.length !== providedBuf.length ||
+        !crypto.timingSafeEqual(expectedBuf, providedBuf)
+      ) {
+        throw new Error('SOUL_CHECKSUM_MISMATCH: Soul archive checksum verification failed')
+      }
+
+      if (
+        typeof archive.payload.voiceIdentityMarkdown !== 'string' ||
+        archive.payload.voiceIdentityMarkdown.includes('\0') ||
+        archive.payload.voiceIdentityMarkdown.trim().length < 16
+      ) {
+        throw new Error(
+          'Invalid voiceIdentityMarkdown in Soul archive: must contain at least 16 non-whitespace characters and no null bytes',
+        )
+      }
+
+      if (archive.payload.stagePreferences) {
+        v.parse(UpdateStagePreferencesInputSchema, archive.payload.stagePreferences)
+      }
+
+      kernelEpoch += 1
+      clearDreamIdleTimer()
+      turnOrchestratorInstance.abortAll()
+
+      cortexInstance.importSoulSnapshot(archive.payload.cortex)
+      voiceStoreInstance.save(archive.payload.voiceIdentityMarkdown)
+
+      if (archive.payload.stagePreferences) {
+        applyStagePreferencesUpdate(archive.payload.stagePreferences)
+      }
+
+      const restoredConsent = cortexInstance.db.getAgencyConsentState()
+      await agencyRuntimeInstance.updateConsent({
+        eyesMode: restoredConsent.eyesMode,
+        micMode: restoredConsent.micMode,
+        dndMode: restoredConsent.dndMode,
+        approvalPolicy: restoredConsent.approvalPolicy,
+        allowedPaths: restoredConsent.allowedPaths,
+        allowedWindowTitles: restoredConsent.allowedWindowTitles,
+        toolRiskOverrides: restoredConsent.toolRiskOverrides,
+      })
+
+      const restoredSessions = cortexInstance.listChatSessions()
+      activeSessionId = restoredSessions[0]?.id ?? 'session-initial'
+
+      return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)
+    },
+
+    async wipeAllData(): Promise<AshyBootstrapSnapshot> {
+      kernelEpoch += 1
+      clearDreamIdleTimer()
+      turnOrchestratorInstance.abortAll()
+
+      dominantEmotion = 'neutral'
+      lastPersistenceWarning = null
+      lastEvalReport = null
+      activeSessionId = 'session-initial'
+
+      cortexInstance.wipeAll()
+      providerVaultInstance.resetAll()
+      voiceStoreInstance.reset()
+
+      removeFileAtomicWithBackups(voiceSettingsPath, 3)
+      currentVoiceSettings = createDefaultStoredVoiceSettings()
+
+      removeFileAtomicWithBackups(stagePreferencesPath, 3)
+      currentStagePreferences = { ...DEFAULT_PERSISTED_STAGE_PREFERENCES }
+
+      agencyRuntimeInstance.revokeSessionPermissions()
+      await agencyRuntimeInstance.updateConsent({
+        eyesMode: DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.eyesMode,
+        micMode: DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.micMode,
+        dndMode: DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.dndMode,
+        approvalPolicy: DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.approvalPolicy,
+        allowedPaths: [...DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.allowedPaths],
+        allowedWindowTitles: [...DEFAULT_PERSISTED_AGENCY_CONSENT_STATE.allowedWindowTitles],
+        toolRiskOverrides: {},
+      })
+
+      return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)
+    },
+
+    async setEncryptionAtRest(
+      rawInput: SetEncryptionAtRestInput,
+    ): Promise<AshyBootstrapSnapshot> {
+      const parsed = v.parse(SetEncryptionAtRestInputSchema, rawInput)
+      kernelEpoch += 1
+      cortexInstance.setEncryptionAtRest(parsed.enabled, cortexEncryptionCodec)
+      voiceStoreInstance.rewrapForEncryptionState()
+      encryptionUpdatedAt =
+        cortexInstance.db.getEncryptionUpdatedAt() ?? new Date().toISOString()
+      return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)
+    },
+
+    async getEncryptionAtRestStatus(): Promise<EncryptionAtRestStatus> {
+      return {
+        enabled: cortexInstance.isEncryptionAtRestEnabled(),
+        algorithm: 'AES-256-GCM',
+        keyBackend: voiceSecretProtector.getBackendKind(),
+        updatedAt: encryptionUpdatedAt ?? cortexInstance.db.getEncryptionUpdatedAt(),
+      }
+    },
+
+    async activatePrivacyShield(): Promise<AshyBootstrapSnapshot> {
+      kernelEpoch += 1
+      clearDreamIdleTimer()
+      turnOrchestratorInstance.abortAll()
+      agencyRuntimeInstance.revokeSessionPermissions()
+      await agencyRuntimeInstance.updateConsent({
+        micMode: 'muted',
+        eyesMode: 'off',
+        dndMode: true,
+      })
+      return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)
+    },
+
+    async getUpdateState(): Promise<AutoUpdaterState> {
+      return { ...currentUpdaterState }
+    },
+
+    async checkForUpdates(): Promise<AutoUpdaterState> {
+      currentUpdaterState = {
+        ...currentUpdaterState,
+        status: 'not-available',
+        checkedAt: new Date().toISOString(),
+        errorMessage: null,
+      }
+      emitHostEvent({
+        type: 'updater:status',
+        state: { ...currentUpdaterState },
+      })
+      return { ...currentUpdaterState }
+    },
+
+    async downloadUpdate(): Promise<AutoUpdaterState> {
+      return { ...currentUpdaterState }
+    },
+
+    async quitAndInstallUpdate(): Promise<{ ok: boolean }> {
+      return { ok: true }
     },
 
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {

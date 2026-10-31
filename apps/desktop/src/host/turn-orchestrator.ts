@@ -59,6 +59,7 @@ export interface TurnOrchestratorOptions {
   onPersistenceWarning?: (warning: string | null) => void
   onDominantEmotionChange?: (emotion: AshyEmotion) => void
   keepaliveIntervalMs?: number
+  getKernelEpoch?: () => number
 }
 
 export interface TurnOrchestrator {
@@ -457,8 +458,10 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     let currentEffectiveUserText = effectiveUserText
     const { turnId, controller } = entry
     const sessionId = input.sessionId
+    const epochAtStart = options.getKernelEpoch?.() ?? 0
+    const isStaleEpoch = () => (options.getKernelEpoch?.() ?? 0) !== epochAtStart
 
-    if (controller.signal.aborted || entry.abortedEmitted) {
+    if (controller.signal.aborted || entry.abortedEmitted || isStaleEpoch()) {
       finalizeAbortEntry(entry)
       return
     }
@@ -485,7 +488,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
 
     let literalEmittedSinceLastTick = false
     const keepaliveTimer = setInterval(() => {
-      if (controller.signal.aborted || entry.abortedEmitted) {
+      if (controller.signal.aborted || entry.abortedEmitted || isStaleEpoch()) {
         return
       }
       if (literalEmittedSinceLastTick) {
@@ -509,7 +512,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
 
     const parser = createTailSafeMarkerParser({
       onLiteral(text) {
-        if (controller.signal.aborted || entry.abortedEmitted || text.length === 0) {
+        if (controller.signal.aborted || entry.abortedEmitted || isStaleEpoch() || text.length === 0) {
           return
         }
         literalEmittedSinceLastTick = true
@@ -522,7 +525,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
         })
       },
       onSpecial(signal) {
-        if (controller.signal.aborted || entry.abortedEmitted) {
+        if (controller.signal.aborted || entry.abortedEmitted || isStaleEpoch()) {
           return
         }
 
@@ -764,6 +767,9 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
                 callbackMotifId: v.optional(v.string()),
               }),
               execute: async (args) => {
+                if (isStaleEpoch()) {
+                  return { ok: false }
+                }
                 const marker: TurnMarkerPayload = {
                   type: 'act',
                   emotion: args.emotion,
@@ -864,7 +870,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
       try {
         while (true) {
           const { done, value } = await Promise.race([reader.read(), abortPromise])
-          if (controller.signal.aborted || entry.abortedEmitted) {
+          if (controller.signal.aborted || entry.abortedEmitted || isStaleEpoch()) {
             finalizeAbortEntry(entry)
             return
           }
@@ -889,7 +895,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
           } else if (value.type === 'input-transcript') {
             lastActivityAt = Date.now()
             const cleanTranscript = value.transcript.trim()
-            if (cleanTranscript.length > 0) {
+            if (cleanTranscript.length > 0 && !isStaleEpoch()) {
               currentEffectiveUserText = cleanTranscript
               compiledSeriousness = evaluateSeriousnessGate(cleanTranscript)
               userReaction = analyzeUserAffectReaction(cleanTranscript, {
@@ -1011,7 +1017,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
               ...(value.transcriptDelta ? { transcriptDelta: value.transcriptDelta } : {}),
             })
           } else if (value.type === 'error') {
-            if (controller.signal.aborted || entry.abortedEmitted) {
+            if (controller.signal.aborted || entry.abortedEmitted || isStaleEpoch()) {
               finalizeAbortEntry(entry)
               return
             }
@@ -1027,7 +1033,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
         }
       }
 
-      if (controller.signal.aborted || entry.abortedEmitted) {
+      if (controller.signal.aborted || entry.abortedEmitted || isStaleEpoch()) {
         finalizeAbortEntry(entry)
         return
       }
@@ -1161,7 +1167,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
         persistenceWarning,
       })
     } catch (err) {
-      if (controller.signal.aborted || entry.abortedEmitted) {
+      if (controller.signal.aborted || entry.abortedEmitted || isStaleEpoch()) {
         finalizeAbortEntry(entry)
         return
       }

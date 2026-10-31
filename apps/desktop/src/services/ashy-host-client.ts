@@ -6,16 +6,21 @@ import type {
   AshyEmotion,
   AshyHostBridge,
   AshyHostStreamEvent,
+  AshySoulArchive,
   AutobiographicalMilestone,
+  AutoUpdaterState,
   ChatMessageRecord,
   ChatSessionRecord,
   CompleteOnboardingInput,
   CoreExperimentEvalReport,
   DeletableMemoryKind,
   DreamReflectionCycleResult,
+  EncryptionAtRestStatus,
   EpisodicMemory,
   EvaluateInitiativeInput,
+  ExportSoulInput,
   ExternalMcpServerConfig,
+  ImportSoulInput,
   InitiativePolicy,
   ListProviderModelsInput,
   ListProviderModelsResult,
@@ -34,6 +39,7 @@ import type {
   SaveProviderConfigInput,
   SemanticFact,
   SendTurnInput,
+  SetEncryptionAtRestInput,
   SharedPendingActionCard,
   TestProviderInput,
   UpdateAgencyConsentInput,
@@ -310,6 +316,36 @@ export function createPreloadHostBridge(
       input: SynthesizeVoiceSpeechInput,
     ): Promise<VoiceSynthesizeSpeechResult> {
       return invoke<VoiceSynthesizeSpeechResult>('synthesizeVoiceSpeech', input)
+    },
+    exportSoul(input?: ExportSoulInput): Promise<AshySoulArchive> {
+      return invoke<AshySoulArchive>('exportSoul', input)
+    },
+    importSoul(input: ImportSoulInput): Promise<AshyBootstrapSnapshot> {
+      return invoke<AshyBootstrapSnapshot>('importSoul', input)
+    },
+    wipeAllData(): Promise<AshyBootstrapSnapshot> {
+      return invoke<AshyBootstrapSnapshot>('wipeAllData')
+    },
+    setEncryptionAtRest(input: SetEncryptionAtRestInput): Promise<AshyBootstrapSnapshot> {
+      return invoke<AshyBootstrapSnapshot>('setEncryptionAtRest', input)
+    },
+    getEncryptionAtRestStatus(): Promise<EncryptionAtRestStatus> {
+      return invoke<EncryptionAtRestStatus>('getEncryptionAtRestStatus')
+    },
+    activatePrivacyShield(): Promise<AshyBootstrapSnapshot> {
+      return invoke<AshyBootstrapSnapshot>('activatePrivacyShield')
+    },
+    getUpdateState(): Promise<AutoUpdaterState> {
+      return invoke<AutoUpdaterState>('getUpdateState')
+    },
+    checkForUpdates(): Promise<AutoUpdaterState> {
+      return invoke<AutoUpdaterState>('checkForUpdates')
+    },
+    downloadUpdate(): Promise<AutoUpdaterState> {
+      return invoke<AutoUpdaterState>('downloadUpdate')
+    },
+    quitAndInstallUpdate(): Promise<{ ok: boolean }> {
+      return invoke<{ ok: boolean }>('quitAndInstallUpdate')
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       return preloadApi.onEvent(listener)
@@ -628,6 +664,36 @@ export function createHttpSseHostBridge(
     ): Promise<VoiceSynthesizeSpeechResult> {
       return rpc<VoiceSynthesizeSpeechResult>('synthesizeVoiceSpeech', input)
     },
+    exportSoul(input?: ExportSoulInput): Promise<AshySoulArchive> {
+      return rpc<AshySoulArchive>('exportSoul', input)
+    },
+    importSoul(input: ImportSoulInput): Promise<AshyBootstrapSnapshot> {
+      return rpc<AshyBootstrapSnapshot>('importSoul', input)
+    },
+    wipeAllData(): Promise<AshyBootstrapSnapshot> {
+      return rpc<AshyBootstrapSnapshot>('wipeAllData')
+    },
+    setEncryptionAtRest(input: SetEncryptionAtRestInput): Promise<AshyBootstrapSnapshot> {
+      return rpc<AshyBootstrapSnapshot>('setEncryptionAtRest', input)
+    },
+    getEncryptionAtRestStatus(): Promise<EncryptionAtRestStatus> {
+      return rpc<EncryptionAtRestStatus>('getEncryptionAtRestStatus')
+    },
+    activatePrivacyShield(): Promise<AshyBootstrapSnapshot> {
+      return rpc<AshyBootstrapSnapshot>('activatePrivacyShield')
+    },
+    getUpdateState(): Promise<AutoUpdaterState> {
+      return rpc<AutoUpdaterState>('getUpdateState')
+    },
+    checkForUpdates(): Promise<AutoUpdaterState> {
+      return rpc<AutoUpdaterState>('checkForUpdates')
+    },
+    downloadUpdate(): Promise<AutoUpdaterState> {
+      return rpc<AutoUpdaterState>('downloadUpdate')
+    },
+    quitAndInstallUpdate(): Promise<{ ok: boolean }> {
+      return rpc<{ ok: boolean }>('quitAndInstallUpdate')
+    },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       listeners.add(listener)
       ensureEventSource()
@@ -669,3 +735,4 @@ export function getAshyHostBridge(): AshyHostBridge {
 }
 
 export const getAshyHostClient = getAshyHostBridge
+export const createAshyHostClient = createHttpSseHostBridge

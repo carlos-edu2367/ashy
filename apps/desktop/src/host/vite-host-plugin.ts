@@ -11,7 +11,9 @@ import type {
   DeletableMemoryKind,
   EpisodicMemory,
   EvaluateInitiativeInput,
+  ExportSoulInput,
   ExternalMcpServerConfig,
+  ImportSoulInput,
   ListProviderModelsInput,
   ListVoiceProviderModelsInput,
   LlmProviderId,
@@ -24,6 +26,7 @@ import type {
   SaveProviderConfigInput,
   SaveVoiceRuntimeSettingsInput,
   SendTurnInput,
+  SetEncryptionAtRestInput,
   SynthesizeVoiceSpeechInput,
   TestProviderInput,
   TranscribeVoiceAudioInput,
@@ -109,6 +112,16 @@ const ALLOWED_RPC_METHODS = new Set<string>([
   'listVoiceProviderModels',
   'transcribeVoiceAudio',
   'synthesizeVoiceSpeech',
+  'exportSoul',
+  'importSoul',
+  'wipeAllData',
+  'setEncryptionAtRest',
+  'getEncryptionAtRestStatus',
+  'activatePrivacyShield',
+  'getUpdateState',
+  'checkForUpdates',
+  'downloadUpdate',
+  'quitAndInstallUpdate',
 ])
 
 export class DisallowedRpcMethodError extends Error {
@@ -672,6 +685,82 @@ export async function dispatchHostRpc(
       }
       const obj = assertObjectPayload<SynthesizeVoiceSpeechInput>(payload, method)
       return kernel.synthesizeVoiceSpeech(obj)
+    }
+
+    case 'exportSoul': {
+      if (!kernel.exportSoul) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      if (payload === undefined || payload === null) {
+        return kernel.exportSoul()
+      }
+      const obj = assertObjectPayload<NonNullable<ExportSoulInput>>(payload, method)
+      return kernel.exportSoul(obj)
+    }
+
+    case 'importSoul': {
+      if (!kernel.importSoul) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<ImportSoulInput>(payload, method)
+      return kernel.importSoul(obj)
+    }
+
+    case 'wipeAllData': {
+      if (!kernel.wipeAllData) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      return kernel.wipeAllData()
+    }
+
+    case 'setEncryptionAtRest': {
+      if (!kernel.setEncryptionAtRest) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<SetEncryptionAtRestInput>(payload, method)
+      return kernel.setEncryptionAtRest(obj)
+    }
+
+    case 'getEncryptionAtRestStatus': {
+      if (!kernel.getEncryptionAtRestStatus) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      return kernel.getEncryptionAtRestStatus()
+    }
+
+    case 'activatePrivacyShield': {
+      if (!kernel.activatePrivacyShield) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      return kernel.activatePrivacyShield()
+    }
+
+    case 'getUpdateState': {
+      if (!kernel.getUpdateState) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      return kernel.getUpdateState()
+    }
+
+    case 'checkForUpdates': {
+      if (!kernel.checkForUpdates) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      return kernel.checkForUpdates()
+    }
+
+    case 'downloadUpdate': {
+      if (!kernel.downloadUpdate) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      return kernel.downloadUpdate()
+    }
+
+    case 'quitAndInstallUpdate': {
+      if (!kernel.quitAndInstallUpdate) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      return kernel.quitAndInstallUpdate()
     }
 
     default:

@@ -31,7 +31,11 @@ import {
   streamText,
   type LanguageModel,
 } from '@ashy/llm'
-import { readWithAutoHeal, writeAtomicWithBackup } from './atomic-file'
+import {
+  readWithAutoHeal,
+  removeFileAtomicWithBackups,
+  writeAtomicWithBackup,
+} from './atomic-file'
 import { createNodeAesSecretProtector, type SecretProtector } from './secret-protector'
 
 interface StoredProviderEntry {
@@ -242,12 +246,15 @@ export interface ProviderModelOverrides {
   apiKey?: string
 }
 
+export type ProviderVaultPublicState = AshyBootstrapSnapshot['providers']
+
 export interface ProviderVault {
   readonly providersFilePath: string
   readonly secretsFilePath: string
   getPublicState(): AshyBootstrapSnapshot['providers']
   saveProviderConfig(input: SaveProviderConfigInput): PublicProviderConfig
   setActiveProvider(providerId: LlmProviderId): AshyBootstrapSnapshot['providers']
+  resetAll(): ProviderVaultPublicState
   getDecryptedApiKey(providerId: LlmProviderId): string | null
   createLanguageModel(
     providerId?: LlmProviderId,
@@ -910,12 +917,29 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
     return catalogPromise
   }
 
+  function resetAll(): ProviderVaultPublicState {
+    decryptedKeyCache.clear()
+    inFlightProbes.clear()
+    inFlightCatalogRequests.clear()
+    removeFileAtomicWithBackups(secretsFilePath, 3)
+    removeFileAtomicWithBackups(providersFilePath, 3)
+    writeAtomicWithBackup(providersFilePath, defaultProvidersJson, { rotateBackup: false })
+    writeAtomicWithBackup(secretsFilePath, defaultSecretsJson, { rotateBackup: false })
+    return getPublicState()
+  }
+
+  function _unusedPlaceholder() {
+    return null
+  
+  }
+
   return {
     providersFilePath,
     secretsFilePath,
     getPublicState,
     saveProviderConfig,
     setActiveProvider,
+    resetAll,
     getDecryptedApiKey,
     createLanguageModel,
     createActiveLanguageModel,
