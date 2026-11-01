@@ -300,12 +300,31 @@ test.describe.serial('Ashy Release 1.0 — Full E2E Suite', () => {
       { timeout: 15_000 },
     )
 
-    const omniRequests = aiServer.requests.filter((r) => {
-      if (!r.url.endsWith('/chat/completions')) return false
+    // Since Phase 10.0 the 'ollama' provider uses the native /api/chat adapter, which has no
+    // audio-out channel (`modalities` is intentionally dropped; the reply is voiced by host TTS).
+    // The multimodal Omni turn must still reach the model with the attached frames as `images`.
+    // An OpenAI-compatible omni server (e.g. llama-server) would instead get `modalities:["audio"]`.
+    const isOmniTurnRequest = (r: (typeof aiServer.requests)[number]): boolean => {
       const body = r.body as Record<string, unknown> | null
+      if (r.url === '/api/chat') {
+        const messages = Array.isArray(body?.messages)
+          ? (body.messages as Array<Record<string, unknown>>)
+          : []
+        return messages.some(
+          (m) =>
+            m.role === 'user' &&
+            typeof m.content === 'string' &&
+            m.content.includes('responde com voz nativa Omni') &&
+            Array.isArray(m.images) &&
+            m.images.length > 0,
+        )
+      }
+      if (!r.url.endsWith('/chat/completions')) return false
       return Array.isArray(body?.modalities) && body.modalities.includes('audio')
-    })
-    expect(omniRequests.length).toBeGreaterThanOrEqual(1)
+    }
+    await expect
+      .poll(() => aiServer.requests.filter(isOmniTurnRequest).length, { timeout: 15_000 })
+      .toBeGreaterThanOrEqual(1)
   })
 
   test('Flow 5: Live2D / Tachie Stage Controls & Floating Stage Overlay (?view=stage-overlay)', async ({
