@@ -140,3 +140,39 @@ describe('deterministic episode extraction hygiene', () => {
     expect(out.episode.summary).toContain('Ashy: Qual erro aparece')
   })
 })
+
+describe('poisoned legacy memories are skipped at retrieval (non-destructive)', () => {
+  it('isPoisonedTranscriptMemory', async () => {
+    const { isPoisonedTranscriptMemory } = await import('../index')
+    expect(isPoisonedTranscriptMemory({ summary: 'Usuário: Olá. | Ashy: Olá, Carlos! Tudo bem. Como posso te ajudar hoje?' })).toBe(true)
+    expect(isPoisonedTranscriptMemory({ summary: 'Usuário: O que você sabe fazer? | Ashy: O que você sabe fazer?' })).toBe(true)
+    expect(isPoisonedTranscriptMemory({ summary: 'Usuário: Meu gato se chama Biscoito. | Ashy: Que fofo! O Biscoito tem bom gosto.' })).toBe(false)
+    expect(isPoisonedTranscriptMemory({ summary: 'Usuário: Meu gato se chama Biscoito.' })).toBe(false)
+    expect(isPoisonedTranscriptMemory({ summary: 'Carlos adotou um gato.' })).toBe(false)
+  })
+
+  it('the text-chat prompt never shows them, and they stay in the store', () => {
+    const cortex = createAshyCortex({ dbPath: ':memory:' })
+    const base = { createdAt: 1, lastReviewedAt: 1, stability: 6, difficulty: 4.5, surprise: 0.4, isFlashbulb: false, approvalStatus: 'approved' as const }
+    cortex.db.upsertEpisodicMemory({
+      ...base,
+      id: 'ep-session-poison',
+      title: 'Me conta uma curiosidade sobre o espaço.',
+      summary: 'Usuário: Me conta uma curiosidade sobre o espaço. | Ashy: Me conta uma curiosidade sobre o espaço.',
+      content: 'Usuário: Me conta uma curiosidade sobre o espaço.\nAshy: Me conta uma curiosidade sobre o espaço.',
+      tags: ['espaco'],
+    })
+    cortex.db.upsertEpisodicMemory({
+      ...base,
+      id: 'ep-session-good',
+      title: 'Curiosidade sobre o espaço e Marte',
+      summary: 'Usuário: Eu adoro curiosidades sobre o espaço, principalmente Marte. | Ashy: Marte tem o maior vulcão do sistema solar.',
+      content: 'Usuário: Eu adoro curiosidades sobre o espaço, principalmente Marte.\nAshy: Marte tem o maior vulcão do sistema solar.',
+      tags: ['espaco', 'marte'],
+    })
+    const out = cortex.compileTurnPrompt({ userMessage: 'Me conta uma curiosidade sobre o espaço.', topKMemories: 4 }, { sideEffects: false })
+    const text = JSON.stringify(out)
+    expect(text).not.toContain('ep-session-poison')
+    expect(cortex.db.listEpisodicMemories().map((m) => m.id)).toContain('ep-session-poison')
+  })
+})

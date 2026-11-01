@@ -1,4 +1,5 @@
 import { computeCosineSimilarity128, embedTextSync128 } from '@ashy/llm'
+import { isPoisonedTranscriptMemory } from '../memory/conversation-hygiene'
 import {
   ASHY_BASELINE_MOOD,
   ASHY_DEFAULT_TRAITS,
@@ -521,8 +522,9 @@ export function composeAshyTurnPrompt(input: ComposeTurnPromptInput): ComposedTu
     maxPlayfulnessAllowed: 1.0,
   }
 
+  // 2026-11-01: legacy echo / greeting-loop pairings are never fed back to the model (non-destructive).
   const approvedMemories = (input.retrievedMemories ?? []).filter(
-    (item) => item.memory.approvalStatus !== 'pending_review',
+    (item) => item.memory.approvalStatus !== 'pending_review' && !isPoisonedTranscriptMemory(item.memory),
   )
   const approvedMotifs = seriousness.isSeriousOrDelicate
     ? []

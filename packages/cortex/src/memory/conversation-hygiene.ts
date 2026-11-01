@@ -207,3 +207,19 @@ export function hasMemorableContent(text: string): boolean {
   if (startsWithGreeting(t) && tokens.size <= 4) return false
   return tokens.size >= 3
 }
+
+/**
+ * A legacy transcript-style episode whose pairing is junk: "Usuário: X | Ashy: Y" where Y parrots X or is
+ * only a greeting / generic offer, or neither side says anything memorable. Such rows (written before the
+ * 2026-11-01 hygiene) are skipped at retrieval — never deleted.
+ */
+export function isPoisonedTranscriptMemory(memory: { summary?: string | null }): boolean {
+  const pair = /^(?:usu[aá]rio|user)\s*:\s*(.+?)\s*\|\s*(?:ashy|assistente|assistant)\s*:\s*(.*)$/is.exec(
+    (memory.summary ?? '').trim(),
+  )
+  if (!pair) return false
+  const user = pair[1] ?? ''
+  const reply = pair[2] ?? ''
+  if (reply.trim().length === 0) return !hasMemorableContent(user)
+  return isEchoReply(user, reply) || isGreetingOnlyReply(reply) || (!hasMemorableContent(user) && !hasMemorableContent(reply))
+}
