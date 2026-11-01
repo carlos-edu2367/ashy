@@ -458,7 +458,7 @@ describe('Phase 10.2 — hybrid backend start and buildContext mode line', () =>
     expect(cmd).toMatchObject({ backend: 'llamacpp-hybrid', callId: state.callId })
     expect(cmd).not.toHaveProperty('test')
     const cfg = await h.invoke<CallRuntimeConfig>('call:getRuntimeConfig', { callId: state.callId })
-    expect(cfg.llamacpp).toMatchObject({ baseUrl: 'http://127.0.0.1:39123', contextSize: 8192 })
+    expect(cfg.llamacpp).toMatchObject({ baseUrl: 'http://127.0.0.1:39123', contextSize: 16384 })
 
     const ctx = await h.invoke<CallContextResult>('call:buildContext', { callId: state.callId })
     expect(ctx.instructions.split('\n').at(-1)).toBe(CALL_INSTRUCTIONS_TEXT_MODE_LINE)

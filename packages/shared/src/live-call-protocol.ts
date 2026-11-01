@@ -21,7 +21,13 @@ export type LiveBackendId = (typeof LIVE_BACKEND_IDS)[number]
 export const LiveBackendIdSchema = v.picklist(LIVE_BACKEND_IDS)
 
 /** Phase 10.1 implements only these backends; others are rejected by `call:start`. */
-export const LIVE_BACKENDS_IMPLEMENTED: readonly LiveBackendId[] = ['llamacpp-realtime', 'llamacpp-hybrid']
+export const LIVE_BACKENDS_IMPLEMENTED: readonly LiveBackendId[] = [
+  'llamacpp-realtime',
+  'llamacpp-hybrid',
+  'openai-realtime',
+  'gemini-live',
+  'cascade',
+]
 
 export const LIVE_INPUT_MODES = ['transcribed', 'audio-direct'] as const
 export type LiveInputMode = (typeof LIVE_INPUT_MODES)[number]
@@ -57,8 +63,44 @@ export interface LiveModeSettings {
     maxParallelTts: number
   }
   session: {
-    /** Rotate the realtime session (seeded with a recap) after this many turns — curbs 2B-model repetition. */
+    /**
+     * Safety net: rotate the realtime session (seeded with a short recap) after this many turns.
+     * Default 40. A one-continuous-session call is what keeps LFM3-2B coherent — the 2026-11-01
+     * real report showed rotation-with-recap (then triggered on every near-repeat) locking Ashy
+     * into repeating the recap's greeting on every turn.
+     */
     rotateAfterTurns: number
+  }
+  /**
+   * Phase 10.4 — 'openai-realtime' backend = ANY OpenAI-Realtime-compatible speech-to-speech endpoint
+   * (OpenAI gpt-realtime*, Alibaba Qwen-Omni realtime via DashScope, Azure, or a custom URL).
+   * The API key lives in the host (`liveMode:setApiKey`) and is injected by the main process.
+   */
+  realtimeCloud: {
+    provider: CloudRealtimeProvider
+    /** Full wss URL (without query); empty = provider default. */
+    url: string
+    model: string
+    voice: string
+  }
+  /** Phase 10.4 — Google Gemini Live (native audio). */
+  gemini: {
+    model: string
+    voice: string
+  }
+  /** Phase 10.5 — classic pipeline: STT → any text LLM (full Ashy context + tools) → chunked TTS. */
+  cascade: {
+    /** One of the voice STT provider ids (e.g. 'ollama-transcriptions', 'local-whisper-http', 'openai-whisper', 'groq-whisper'). */
+    sttProviderId: string
+    /** 'chat-default' = the active chat provider/model of the app. */
+    llmProviderId: string
+    /** Optional model override for the LLM provider ('' = provider's configured model). */
+    llmModelId: string
+    ttsProviderId: CascadeTtsProviderId
+    /** Voice for the TTS provider ('female'/'male' for llama.cpp /tts, provider voice id otherwise). */
+    ttsVoice: string
+    /** Optional reference voice (llama.cpp /tts only). */
+    referenceVoiceId: string | null
   }
   devices: { inputDeviceId?: string; outputDeviceId?: string }
   features: {
@@ -68,6 +110,23 @@ export interface LiveModeSettings {
     idleNudgeSec: number
   }
 }
+
+export const CLOUD_REALTIME_PROVIDERS = ['openai', 'qwen', 'custom'] as const
+export type CloudRealtimeProvider = (typeof CLOUD_REALTIME_PROVIDERS)[number]
+/** Defaults per OpenAI-Realtime-compatible provider (URL is the WebSocket endpoint without query). */
+export const CLOUD_REALTIME_PRESETS: Record<CloudRealtimeProvider, { url: string; model: string; voice: string; label: string }> = {
+  openai: { url: 'wss://api.openai.com/v1/realtime', model: 'gpt-realtime-2.1-mini', voice: 'marin', label: 'OpenAI Realtime' },
+  qwen: { url: 'wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime', model: 'qwen3.5-omni-flash-realtime', voice: 'Tina', label: 'Qwen-Omni Realtime (DashScope)' },
+  custom: { url: '', model: '', voice: '', label: 'Personalizado (compatível com OpenAI Realtime)' },
+}
+export const GEMINI_LIVE_DEFAULTS = { model: 'gemini-3.8-live', voice: 'Kore' } as const
+
+export const CASCADE_TTS_PROVIDER_IDS = ['llamacpp-tts', 'local-kokoro-http', 'openai-tts', 'elevenlabs'] as const
+export type CascadeTtsProviderId = (typeof CASCADE_TTS_PROVIDER_IDS)[number]
+
+/** Providers whose API key is stored for Live Mode cloud backends. */
+export const LIVE_KEY_PROVIDERS = ['openai', 'qwen', 'custom', 'gemini'] as const
+export type LiveKeyProvider = (typeof LIVE_KEY_PROVIDERS)[number]
 
 export const DEFAULT_LIVE_MODE_SETTINGS: LiveModeSettings = {
   backend: 'llamacpp-realtime',
@@ -97,7 +156,25 @@ export const DEFAULT_LIVE_MODE_SETTINGS: LiveModeSettings = {
     maxParallelTts: 2,
   },
   session: {
-    rotateAfterTurns: 6,
+    rotateAfterTurns: 40,
+  },
+  realtimeCloud: {
+    provider: 'openai',
+    url: '',
+    model: 'gpt-realtime-2.1-mini',
+    voice: 'marin',
+  },
+  gemini: {
+    model: 'gemini-3.8-live',
+    voice: 'Kore',
+  },
+  cascade: {
+    sttProviderId: 'ollama-transcriptions',
+    llmProviderId: 'chat-default',
+    llmModelId: '',
+    ttsProviderId: 'llamacpp-tts',
+    ttsVoice: 'female',
+    referenceVoiceId: null,
   },
   devices: {},
   features: {
@@ -147,6 +224,30 @@ export const SaveLiveModeSettingsInputSchema = v.object({
     v.object({
       inputDeviceId: v.optional(v.pipe(v.string(), v.maxLength(256))),
       outputDeviceId: v.optional(v.pipe(v.string(), v.maxLength(256))),
+    }),
+  ),
+  realtimeCloud: v.optional(
+    v.object({
+      provider: v.optional(v.picklist(CLOUD_REALTIME_PROVIDERS)),
+      url: v.optional(v.union([v.literal(''), v.pipe(v.string(), v.trim(), v.regex(/^wss:\/\/[^\s]+$/), v.maxLength(512))])),
+      model: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(128))),
+      voice: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(64))),
+    }),
+  ),
+  gemini: v.optional(
+    v.object({
+      model: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(128))),
+      voice: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(64))),
+    }),
+  ),
+  cascade: v.optional(
+    v.object({
+      sttProviderId: v.optional(v.pipe(v.string(), v.maxLength(64))),
+      llmProviderId: v.optional(v.pipe(v.string(), v.maxLength(64))),
+      llmModelId: v.optional(v.pipe(v.string(), v.maxLength(256))),
+      ttsProviderId: v.optional(v.picklist(CASCADE_TTS_PROVIDER_IDS)),
+      ttsVoice: v.optional(v.pipe(v.string(), v.maxLength(128))),
+      referenceVoiceId: v.optional(v.nullable(v.pipe(v.string(), v.regex(/^[a-z0-9-]{1,64}$/)))),
     }),
   ),
   hybrid: v.optional(
@@ -254,7 +355,7 @@ export const LIVE_LOCAL_MODELS: LiveLocalModelSpec[] = [
       sizeBytes: 506842528,
       sha256: '8a25f9d1931244429de404fccacfb7fb933970a36aa5688d2f5069f29c6b27b1',
     },
-    contextSize: 8192,
+    contextSize: 16384,
     capabilities: { audioIn: true, audioOut: true, imageIn: true, tools: true },
   },
 ]
@@ -396,6 +497,11 @@ export interface CallRuntimeConfig {
   sessionId: string
   settings: LiveModeSettings
   llamacpp: { baseUrl: string; modelId: string; contextSize: number } | null
+  /**
+   * Phase 10.4 — resolved cloud endpoint for 'openai-realtime' / 'gemini-live'. The API key is NOT
+   * here: the main process injects it into the call window's WebSocket upgrade.
+   */
+  cloud?: { kind: 'openai-compatible' | 'gemini'; url: string; model: string; voice: string } | null
 }
 
 export interface CallContextResult {
@@ -482,6 +588,12 @@ export const LIVE_CALL_METHODS = [
   'call:checkInitiative',
   'agency:approve',
   'agency:deny',
+  // Phase 10.4 / 10.5
+  'liveMode:setApiKey',
+  'liveMode:getKeyStatus',
+  // Phase 10.5 — classic cascade (STT → text LLM through the turn orchestrator → chunked TTS)
+  'call:cascadeTurn',
+  'call:cascadeAbort',
 ] as const
 export type LiveCallMethod = (typeof LIVE_CALL_METHODS)[number]
 export const LiveCallMethodSchema = v.picklist(LIVE_CALL_METHODS)
@@ -722,6 +834,51 @@ export const AgencyResolveInputSchema = v.object({
   scope: v.optional(v.picklist(['once', 'session', 'always'] as const)),
 })
 
+// ───────────────────────────── Phase 10.4: cloud keys ─────────────────────────────
+
+export const LiveSetApiKeyInputSchema = v.object({
+  provider: v.picklist(LIVE_KEY_PROVIDERS),
+  /** '' clears the key. */
+  apiKey: v.pipe(v.string(), v.trim(), v.maxLength(512)),
+})
+export type LiveKeyStatus = Record<LiveKeyProvider, { hasKey: boolean; masked: string | null }>
+
+// ───────────────────────────── Phase 10.5: cascade pipeline ─────────────────────────────
+
+/**
+ * One cascade turn: the call engine already transcribed the user; the host runs the text LLM through
+ * the turn orchestrator (full Ashy persona, memory, tools) and streams `call:cascade` events back.
+ * `turnId` is chosen by the caller (so no event can arrive before it knows the id). Nothing is
+ * persisted by this turn: the engine's `call:recordTurn` stores only what was actually spoken.
+ */
+export const CallCascadeTurnInputSchema = v.object({
+  callId: v.string(),
+  turnId: v.pipe(v.string(), v.regex(/^[A-Za-z0-9_.:-]{1,96}$/)),
+  /** Transcribed user speech ('' for a proactive turn: approval result / initiative). */
+  text: v.pipe(v.string(), v.maxLength(4000)),
+  /** Per-turn call context from `call:buildContext` (approval line, screen, interruption, recap). */
+  context: v.optional(v.pipe(v.string(), v.maxLength(8000))),
+  /** Host tool policy for this turn (`CallContextResult.toolChoice`); tools only with 'auto'. */
+  toolChoice: v.optional(v.picklist(['auto', 'none'] as const)),
+  /** Set for proactive turns (no user speech). */
+  injectReason: v.optional(v.picklist(['approval', 'initiative'] as const)),
+})
+export type CallCascadeTurnInput = v.InferOutput<typeof CallCascadeTurnInputSchema>
+export const CallCascadeAbortInputSchema = v.object({
+  callId: v.string(),
+  turnId: v.pipe(v.string(), v.maxLength(96)),
+})
+
+/** Streamed result of a cascade turn (host → call-engine window). */
+export type CallCascadeEvent =
+  /** Clean speakable text (ACT markers re-emitted inline as `<|ACT {json}|>`). */
+  | { kind: 'delta'; delta: string }
+  /** A tool started (caption only). */
+  | { kind: 'tool'; name: string }
+  | { kind: 'done'; text: string; providerId: string; modelId: string | null; latencyMs: number }
+  | { kind: 'error'; message: string }
+  | { kind: 'aborted' }
+
 // ───────────────────────────── Host → renderer events ─────────────────────────────
 
 export type LiveCallHostEvent =
@@ -735,6 +892,7 @@ export type LiveCallHostEvent =
   | { type: 'agency:pending'; card: AgencyPendingCardView }
   | { type: 'agency:resolved'; cardId: string; status: 'approved' | 'denied' | 'failed'; output?: string }
   | { type: 'vision:capture'; active: boolean; source: 'screen' | 'window' }
+  | ({ type: 'call:cascade'; callId: string; turnId: string } & CallCascadeEvent)
 
 export const LIVE_CALL_EVENT_TYPES = [
   'call:state',
@@ -747,6 +905,7 @@ export const LIVE_CALL_EVENT_TYPES = [
   'agency:pending',
   'agency:resolved',
   'vision:capture',
+  'call:cascade',
 ] as const
 
 export function isLiveCallHostEvent(e: { type: string }): e is LiveCallHostEvent {
