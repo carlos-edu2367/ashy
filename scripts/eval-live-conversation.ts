@@ -119,6 +119,11 @@ function removeWorkDir(dir: string): void {
       }
     }
   }
+  // Never recurse while a junction is still there: it would delete the real engines/models.
+  if (['engines', 'models'].some((name) => fs.existsSync(path.join(dir, name)))) {
+    console.warn(`  (left ${dir} in place: could not remove its junctions)`)
+    return
+  }
   try {
     fs.rmSync(dir, { recursive: true, force: true })
   } catch {
