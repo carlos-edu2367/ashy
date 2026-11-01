@@ -1,6 +1,6 @@
 # ADR-0005: Voz em Tempo Real com Turn-Taking CAS, Barge-In com `PlaybackReceipt` e Arquitetura Multimodal Omni Unificada (`LFM3-Omni-2B`)
 
-- **Status:** Accepted
+- **Status:** Accepted — **Parcialmente substituído por [ADR-0008](./0008-live-call-engine-pluggable-voice-sessions.md)** (barge-in e modos omni da conversa por voz; ver ADR-0008 › "Relação com o ADR-0005")
 - **Date:** 2026-10-31
 - **Milestone:** Fase 5, Fase 8.6 & Fase 8.7 (M4.7 — Omni Unificado)
 
