@@ -940,6 +940,8 @@ export async function createAshyHostKernel(
     },
     // Same host STT path as Phase 10.0 (`ollama-transcriptions` + chat-style heuristic).
     transcribe: (input) => kernel.transcribeVoiceAudio!(input),
+    // Live calls on llama.cpp / cascade try the running llama-server first when this is the Ollama path.
+    getActiveSttProviderId: () => currentVoiceSettings.activeSttProviderId,
     getTurnOrchestrator: () => turnOrchestratorInstance ?? null, // Phase 10.5 cascade LLM turns
     synthesizeSpeech: (input) => kernel.synthesizeVoiceSpeech!(input), // Phase 10.5 cascade TTS
     // Phase 10.5: load the cascade LLM at call connect (same adapter as the turn; nothing persisted).

@@ -123,6 +123,10 @@ async function makeHarness(
     transcribe,
     now: () => clock.t,
     createCallId: () => `call-test-${++seq}`,
+    // No llama-server here: call:transcribe falls back to the host STT fake (llama route: phase-10-5-call-stt-llamacpp).
+    sttFetchImpl: async () => {
+      throw new Error('no llama-server in this test')
+    },
     ...opts.deps,
   })
   const invoke = <T = unknown>(method: string, payload?: unknown) =>

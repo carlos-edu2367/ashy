@@ -54,6 +54,7 @@ import {
 } from './context'
 import { createCallRecorder, type CallRecorderCortex } from './recorder'
 import { transcribeCallAudio, type HostTranscribeFn } from './transcribe'
+import { createLlamaFirstTranscribe, resolveLlamaSttTarget, shouldPreferLlamaStt, type SttFetchLike } from './llama-stt'
 import type { AshyCortex } from '@ashy/cortex'
 import { classifyCallAffect, normalizeStageSignal } from './affect'
 import { createCallSynthesizer, requestLlamaTts, resolveLlamaBaseUrl, type FetchLike } from './synthesize'
@@ -105,6 +106,16 @@ export interface CallHostDeps {
   resolveSessionId(): string | Promise<string>
   /** Host STT (kernel `transcribeVoiceAudio`). */
   transcribe: HostTranscribeFn
+  /**
+   * The voice settings' active STT provider (kernel). Live calls on llama.cpp backends / cascade send
+   * their audio to the running llama-server first only when the effective STT is the Ollama LFM3 path
+   * (`ollama-transcriptions` / `web-speech-stt`); absent = treated as that path.
+   */
+  getActiveSttProviderId?: () => SttProviderId | undefined
+  /** Host → llama-server `/v1/audio/transcriptions` (tests). */
+  sttFetchImpl?: SttFetchLike
+  /** Bound of the llama-server STT attempt before falling back (default `LLAMA_STT_TIMEOUT_MS`, 6 s). */
+  llamaSttTimeoutMs?: number
   /** Overrides cortex retrieval (tests / alternative stores). */
   retrieveMemories?: (userText: string) => Promise<CallMemoryRetrieval> | CallMemoryRetrieval
   memoryBudgetMs?: number
@@ -429,13 +440,32 @@ export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): 
       const cascadeStt = call.backend === 'cascade' ? deps.settings.get().cascade?.sttProviderId : undefined
       const sttProviderId =
         cascadeStt && (STT_PROVIDER_IDS as readonly string[]).includes(cascadeStt) ? (cascadeStt as SttProviderId) : undefined
+      // The call model already sits in llama-server: transcribe there instead of loading a second copy
+      // of LFM3-Omni in Ollama (8 GB GPUs); any failure falls back to the configured STT.
+      let effectiveStt: SttProviderId | undefined = sttProviderId
+      if (!effectiveStt) {
+        try {
+          effectiveStt = deps.getActiveSttProviderId?.()
+        } catch {
+          effectiveStt = undefined
+        }
+      }
+      const transcribe = shouldPreferLlamaStt(call.backend, effectiveStt)
+        ? createLlamaFirstTranscribe({
+            target: resolveLlamaSttTarget(deps.settings.get(), deps.engine),
+            fallback: deps.transcribe,
+            ...(deps.sttFetchImpl ? { fetchImpl: deps.sttFetchImpl } : {}),
+            ...(deps.llamaSttTimeoutMs !== undefined ? { timeoutMs: deps.llamaSttTimeoutMs } : {}),
+            ...(deps.onWarning ? { onWarning: deps.onWarning } : {}),
+          })
+        : deps.transcribe
       return transcribeCallAudio(
         {
           audioWavBase64: input.audioWavBase64,
           ...(input.language ? { language: input.language } : {}),
           ...(sttProviderId ? { providerId: sttProviderId } : {}),
         },
-        { transcribe: deps.transcribe },
+        { transcribe },
       )
     }),
     api.registry.register('call:recordTurn', async (payload) => {
