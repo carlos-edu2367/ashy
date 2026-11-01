@@ -13,6 +13,10 @@
  * Phase 10.3: `call:command inject` (active callId only) → `engine.inject`; the host adapter also
  * carries `call:executeTool` and `call:checkInitiative`.
  *
+ * Phase 10.4: `openai-realtime` / `gemini-live` drive a cloud speech-to-speech session through the
+ * host's loopback relay (`config.cloud`; the API key never reaches this window).
+ * Phase 10.5: `cascade` (host STT → text LLM via the turn orchestrator → chunked TTS), see `./cascade`.
+ *
  * Without the Electron preload (plain-browser dev over the HTTP bridge) the hub mounts this boot
  * inline instead (see `shouldMountCallEngineInline`).
  */
@@ -35,12 +39,15 @@ import type {
 } from '@ashy/shared'
 import {
   createCallEngine,
+  createCloudVoiceSession,
   createLlamaCppHybridSession,
   createLlamaCppRealtimeSession,
+  isCloudBackend,
   type CallEngineHost,
   type VoiceSession,
 } from '@ashy/voice'
 import { getAshyHostBridge } from '../services/ashy-host-client'
+import { createCascadeCallEngine, createCascadeSessionOverBridge } from './cascade'
 
 /** URL of the Silero VAD model served from `apps/desktop/public/models`. */
 export const SILERO_VAD_MODEL_URL = '/models/silero_vad.onnx'
@@ -101,10 +108,21 @@ function errorMessage(err: unknown): string {
 
 const TERMINAL: ReadonlySet<CallStatus> = new Set<CallStatus>(['idle', 'ended'])
 
-const SESSION_BACKENDS: ReadonlySet<string> = new Set(['llamacpp-realtime', 'llamacpp-hybrid'])
+const SESSION_BACKENDS: ReadonlySet<string> = new Set([
+  'llamacpp-realtime',
+  'llamacpp-hybrid',
+  'openai-realtime',
+  'gemini-live',
+  'cascade',
+])
 
-/** Backend session for a runtime config (`llamacpp-realtime` | `llamacpp-hybrid`). */
+/**
+ * Backend session for a runtime config: `llamacpp-realtime` | `llamacpp-hybrid`, the cloud
+ * `openai-realtime` / `gemini-live`, or `cascade`.
+ */
 export function createBackendSession(config: CallRuntimeConfig, host: CallEngineHost): VoiceSession {
+  if (isCloudBackend(config.backend)) return createCloudVoiceSession(config)
+  if (config.backend === 'cascade') return createCascadeSessionOverBridge({ config, host })
   const llamacpp = config.llamacpp
   if (!llamacpp) {
     throw new Error(`backend ${config.backend} has no llama.cpp endpoint`)
@@ -129,15 +147,29 @@ export function createBackendSession(config: CallRuntimeConfig, host: CallEngine
   throw new Error(`backend not implemented in the call engine: ${config.backend}`)
 }
 
-/** Default factory: CallEngine over the backend's llama.cpp session. */
+/** Default factory: CallEngine over the backend's session (cloud, cascade or llama.cpp). */
 export const createDefaultCallEngine: CallEngineFactory = ({ config, host, testInput }) => {
-  const llamacpp = config.llamacpp
-  if (!llamacpp) {
-    throw new Error(`backend ${config.backend} has no llama.cpp endpoint`)
-  }
   // Fail fast (before the mic opens) on a backend this window can't drive.
   if (!SESSION_BACKENDS.has(config.backend)) {
     throw new Error(`backend not implemented in the call engine: ${config.backend}`)
+  }
+  if (isCloudBackend(config.backend)) {
+    if (!config.cloud) throw new Error(`backend ${config.backend} has no cloud endpoint`)
+    return createCallEngine({
+      callId: config.callId,
+      settings: config.settings,
+      host,
+      vadModelUrl: SILERO_VAD_MODEL_URL,
+      ...(testInput ? { testInput } : {}),
+      createSession: () => createCloudVoiceSession(config),
+    })
+  }
+  if (config.backend === 'cascade') {
+    return createCascadeCallEngine({ config, host, ...(testInput ? { testInput } : {}) })
+  }
+  const llamacpp = config.llamacpp
+  if (!llamacpp) {
+    throw new Error(`backend ${config.backend} has no llama.cpp endpoint`)
   }
   return createCallEngine({
     callId: config.callId,

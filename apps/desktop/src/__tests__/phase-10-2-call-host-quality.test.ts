@@ -639,7 +639,8 @@ describe('Phase 10.2 — call-engine boot: session per backend, test input, new 
     expect(hybrid.caps.speakerReference).toBe(true)
     const realtime = createBackendSession(runtimeConfig('c1', 'llamacpp-realtime'), host)
     expect(realtime.caps.speakerReference).toBe(false)
-    expect(() => createBackendSession(runtimeConfig('c1', 'gemini-live'), host)).toThrow(/not implemented/)
+    // Phase 10.4: cloud backends route to the cloud session (which needs the host-resolved endpoint).
+    expect(() => createBackendSession(runtimeConfig('c1', 'gemini-live'), host)).toThrow(/no cloud endpoint/)
 
     await host.synthesize({ callId: 'c1', text: 'oi' })
     await host.classifyAffect({ callId: 'c1', text: 'uau' })

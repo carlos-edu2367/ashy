@@ -1,4 +1,16 @@
 import { describe, expect, it, vi } from 'vitest'
+
+// Routing tests (Phase 10.4/10.5): the real factories are swapped for spies; nothing connects.
+vi.mock('@ashy/voice', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@ashy/voice')>()
+  return {
+    ...actual,
+    createCallEngine: vi.fn((opts: unknown) => ({ __engineOpts: opts })),
+    createCloudVoiceSession: vi.fn((config: { backend: string }) => ({ __cloud: config.backend })),
+    createCascadeSession: vi.fn((opts: unknown) => ({ __cascade: opts })),
+    createLlamaCppRealtimeSession: vi.fn(() => ({ __llamacpp: 'realtime' })),
+  }
+})
 import {
   DEFAULT_LIVE_MODE_SETTINGS,
   type AshyHostBridge,
@@ -8,8 +20,11 @@ import {
   type CallStatus,
   type LiveCallInvokeInput,
 } from '@ashy/shared'
+import * as voice from '@ashy/voice'
 import {
   bootCallEngine,
+  createBackendSession,
+  createDefaultCallEngine,
   isCallEngineView,
   type CallEngineFactory,
   type CallEngineLike,
@@ -289,5 +304,100 @@ describe('Phase 10.1 — call-engine boot (command routing, guards, error report
     await flush()
     expect(f2.engines[0]!.inject).toHaveBeenCalledWith('[Contexto] (Iniciativa) gatos', 'initiative')
     boot2.dispose()
+  })
+})
+
+describe('Phase 10.4/10.5 — default call-engine factory routing (cloud + cascade)', () => {
+  const host = createCallEngineHostStub()
+
+  function createCallEngineHostStub() {
+    return {} as unknown as CreateCallEngineArgs['host']
+  }
+
+  function routedConfig(backend: CallRuntimeConfig['backend'], extra: Partial<CallRuntimeConfig> = {}): CallRuntimeConfig {
+    return {
+      callId: `call-${backend}`,
+      backend,
+      sessionId: 's1',
+      settings: { ...structuredClone(DEFAULT_LIVE_MODE_SETTINGS), backend },
+      llamacpp: null,
+      ...extra,
+    }
+  }
+
+  type EngineOpts = {
+    callId: string
+    settings: CallRuntimeConfig['settings']
+    vadModelUrl: string
+    contextSize?: number
+    testInput?: unknown
+    createSession: () => unknown
+  }
+  const lastEngineOpts = (): EngineOpts => {
+    const calls = vi.mocked(voice.createCallEngine).mock.calls
+    return calls[calls.length - 1]![0] as unknown as EngineOpts
+  }
+
+  it('8. openai-realtime: CallEngine over createCloudVoiceSession (no llama.cpp endpoint needed); test input passes through', () => {
+    vi.mocked(voice.createCallEngine).mockClear()
+    vi.mocked(voice.createCloudVoiceSession).mockClear()
+    const cfg = routedConfig('openai-realtime', {
+      cloud: { kind: 'openai-compatible', url: 'ws://127.0.0.1:4100/relay/abc', model: 'gpt-realtime-2.1-mini', voice: 'marin' },
+    })
+    const testInput = { wavBase64: 'UklGRg==', question: 'oi' } as unknown as NonNullable<CreateCallEngineArgs['testInput']>
+    createDefaultCallEngine({ config: cfg, host, testInput })
+    const opts = lastEngineOpts()
+    expect(opts.callId).toBe('call-openai-realtime')
+    expect(opts.vadModelUrl).toBe('/models/silero_vad.onnx')
+    expect(opts.testInput).toBe(testInput)
+    expect(opts.contextSize).toBeUndefined()
+    expect(voice.createCloudVoiceSession).not.toHaveBeenCalled()
+    expect(opts.createSession()).toEqual({ __cloud: 'openai-realtime' })
+    expect(voice.createCloudVoiceSession).toHaveBeenCalledWith(cfg)
+    // createBackendSession routes the same way.
+    expect(createBackendSession(cfg, host)).toEqual({ __cloud: 'openai-realtime' })
+  })
+
+  it('9. gemini-live: cloud session; a cloud backend without a resolved endpoint fails fast', () => {
+    vi.mocked(voice.createCloudVoiceSession).mockClear()
+    const cfg = routedConfig('gemini-live', {
+      cloud: { kind: 'gemini', url: 'ws://127.0.0.1:4100/relay/g', model: 'gemini-3.8-live', voice: 'Kore' },
+    })
+    createDefaultCallEngine({ config: cfg, host })
+    expect(lastEngineOpts().testInput).toBeUndefined()
+    expect(lastEngineOpts().createSession()).toEqual({ __cloud: 'gemini-live' })
+    expect(() => createDefaultCallEngine({ config: routedConfig('gemini-live', { cloud: null }), host })).toThrow(
+      /gemini-live has no cloud endpoint/,
+    )
+    expect(() => createDefaultCallEngine({ config: routedConfig('openai-realtime'), host })).toThrow(
+      /openai-realtime has no cloud endpoint/,
+    )
+  })
+
+  it('10. cascade: createCascadeCallEngine (transcribed input forced, no llama.cpp endpoint), session over the bridge', () => {
+    vi.mocked(voice.createCascadeSession).mockClear()
+    const cfg = routedConfig('cascade')
+    cfg.settings.llamacpp.inputMode = 'audio-direct'
+    createDefaultCallEngine({ config: cfg, host })
+    const opts = lastEngineOpts()
+    expect(opts.callId).toBe('call-cascade')
+    expect(opts.settings.llamacpp.inputMode).toBe('transcribed')
+    expect(voice.createCascadeSession).not.toHaveBeenCalled()
+    opts.createSession()
+    expect(voice.createCascadeSession).toHaveBeenCalledTimes(1)
+    expect(voice.createCloudVoiceSession).not.toHaveBeenCalledWith(cfg)
+  })
+
+  it('11. llama.cpp backends still need their endpoint; unknown backends fail fast', () => {
+    expect(() => createDefaultCallEngine({ config: routedConfig('llamacpp-realtime'), host })).toThrow(
+      /no llama.cpp endpoint/,
+    )
+    const ok = { ...routedConfig('llamacpp-realtime'), llamacpp: { baseUrl: 'http://127.0.0.1:5555', modelId: 'm', contextSize: 4096 } }
+    createDefaultCallEngine({ config: ok, host })
+    expect(lastEngineOpts().contextSize).toBe(4096)
+    expect(lastEngineOpts().createSession()).toEqual({ __llamacpp: 'realtime' })
+    expect(() =>
+      createDefaultCallEngine({ config: routedConfig('nope' as CallRuntimeConfig['backend']), host }),
+    ).toThrow(/not implemented in the call engine: nope/)
   })
 })
