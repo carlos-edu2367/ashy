@@ -72,7 +72,7 @@ describe('selectCallMemoryLines', () => {
       { summary: 'Usuário: Eu trabalho com desenvolvimento de jogos!', content: '' },
     ]
     expect(selectCallMemoryLines({ episodes, userText: 'Eu trabalho com desenvolvimento de jogos.' }).lines).toEqual([])
-    expect(selectCallMemoryLines({ episodes, userText: 'O que eu faço da vida?', userLabel: 'Carlos' }).lines).toHaveLength(1)
+    expect(selectCallMemoryLines({ episodes, userText: 'Com o que eu trabalho mesmo?', userLabel: 'Carlos' }).lines).toHaveLength(1)
   })
 
   it('injects user facts touched by the utterance (name/pronouns excluded) before episodes', () => {
@@ -219,5 +219,13 @@ describe('live-mode settings migration', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('selectCallMemoryLines relevance', () => {
+  it('never injects a statement that shares no word with the utterance', () => {
+    const episodes = [{ summary: 'Usuário: Hoje eu comecei a aprender violão.', content: '' }]
+    expect(selectCallMemoryLines({ episodes, userText: 'Me dá uma dica pra dormir melhor.', userLabel: 'Carlos' }).lines).toEqual([])
+    expect(selectCallMemoryLines({ episodes, userText: 'Como vai o violão?', userLabel: 'Carlos' }).lines).toHaveLength(1)
   })
 })

@@ -194,10 +194,15 @@ export function selectCallMemoryLines(input: SelectCallMemoriesInput): SelectedC
         candidates.push({ line: summary, text: summary })
       }
     }
-    // The most query-relevant statements of the episode first.
-    candidates.sort((a, b) => overlaps(queryStems, stems(b.text)) - overlaps(queryStems, stems(a.text)))
+    // The most query-relevant statements of the episode first; a statement sharing no word with the
+    // utterance is not injected (hybrid/vector retrieval always returns something, and an unrelated
+    // "memory" every turn makes the small model drag old topics into every reply).
+    const scored = candidates
+      .map((c) => ({ ...c, score: overlaps(queryStems, stems(c.text)) }))
+      .filter((c) => c.score > 0)
+      .sort((a, b) => b.score - a.score)
     let contributed = false
-    for (const c of candidates.slice(0, 2)) {
+    for (const c of scored.slice(0, 2)) {
       if (conversationSimilarity(c.text, userText) >= CURRENT_UTTERANCE_SIMILARITY) continue
       if (push(c.line, c.text)) contributed = true
     }
