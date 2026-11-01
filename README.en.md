@@ -20,7 +20,7 @@
 
 - **6-Layer Memory with Mandatory Provenance (`source_episode_ids`) + FSRS-6:** Episodic, Semantic (`Predict -> Calibrate`), Autobiographical (`Our Story`), Inside-Joke Motifs (`CooldownLock`), Prospective Intents, and User Habits stored in local SQLite (`ashy.db`).
 - **Soul Portability (`.ashy-soul`) & M2 Eval Gate:** KV-Cache-friendly prompt composer (`voice.md` + *Golden Dialogue Exemplars*), `SHA-256`-verified `.ashy-soul` export/import, and atomic **1-Click Factory Reset**.
-- **Unified Omni Mode (`LFM3-Omni-2B`) & Realtime Voice:** Run a single local multimodal model (`ollama run lfm3-omni:2b` or `llama-server` with direct 16kHz audio in &rarr; 24kHz `LiquidCodec` audio out + `2 fps` `dHash` video frames and `think: false`), or combine modular Cloud/Local STT, LLM, and TTS providers.
+- **Live Mode (voice call) & Omni chat:** Call Ashy (`Ctrl+Alt+L`) for a hands-free conversation with barge-in and lip-sync: locally with `LFM3-Omni-2B` on an Ashy-managed `llama-server` (hybrid with your reference voice by default), in the cloud (OpenAI Realtime / Qwen-Omni / Gemini Live), or through the classic STT &rarr; any LLM &rarr; TTS pipeline ([ADR-0008](./docs/adr/0008-live-call-engine-pluggable-voice-sessions.md)). In chat, `LFM3-Omni-2B` (Ollama or `llama-server`) takes images and `2 fps` `dHash` video, alongside modular Cloud/Local STT, LLM, and TTS providers.
 - **Dual-Mode 2D Stage & $O(1)$ Click-Through Overlay:** **Live2D Cubism 4 (`.model3.json`)** + **Layered Tachie**, formant lip-sync (`A, E, I, O, U, S`), and a transparent `alwaysOnTop` floating overlay with $O(1)$ CPU `64x64` silhouette hit-testing.
 - **3-Tier MCP Agency & Security Hardening:** Progressive MCP discovery via 3 meta-tools, `ActionGatekeeper` (`observe-only`, `read-safe`, `staged-confirm`), optional `AES-256-GCM` encryption at rest, and 6 global OS shortcuts (`Ctrl+Shift+M/E/D/H/Space/K`).
 
@@ -58,4 +58,4 @@ pnpm test:e2e
 - [Provider & Local AI Guide (`docs/PROVIDER_GUIDE.md`)](./docs/PROVIDER_GUIDE.md)
 - [Architecture Specification (`docs/ASHY_ARCHITECTURE_SPEC.md`)](./docs/ASHY_ARCHITECTURE_SPEC.md)
 - [Phased Roadmap (`docs/ASHY_ROADMAP.md`)](./docs/ASHY_ROADMAP.md)
-- [Architecture Decision Records (`docs/adr/0001..0007`)](./docs/adr/)
+- [Architecture Decision Records (`docs/adr/0001..0008`)](./docs/adr/)

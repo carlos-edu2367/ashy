@@ -33,7 +33,7 @@
 [![📘 Guia do Usuário](https://img.shields.io/badge/📘_Guia_do_Usuário-USER__GUIDE-3b82f6?style=for-the-badge)](./docs/USER_GUIDE.md)
 [![🤖 Guia de Provedores & IA Local](https://img.shields.io/badge/🤖_IA_Local_&_Cloud-PROVIDER__GUIDE-8b5cf6?style=for-the-badge)](./docs/PROVIDER_GUIDE.md)
 [![🏛️ Arquitetura](https://img.shields.io/badge/🏛️_Arquitetura-SPEC-06b6d4?style=for-the-badge)](./docs/ASHY_ARCHITECTURE_SPEC.md)
-[![📜 ADRs (0001..0007)](https://img.shields.io/badge/📜_Decisões-7_ADRs-10b981?style=for-the-badge)](./docs/adr/)
+[![📜 ADRs (0001..0008)](https://img.shields.io/badge/📜_Decisões-8_ADRs-10b981?style=for-the-badge)](./docs/adr/)
 [![🗺️ Roadmap M5](https://img.shields.io/badge/🗺️_Roadmap-Marco_M5_✅-eab308?style=for-the-badge)](./docs/ASHY_ROADMAP.md)
 
 </div>
@@ -113,7 +113,7 @@ Em vez de prender sua identidade à janela de contexto efêmera de uma única AP
 | :--- | :--- |
 | 🧠 **6 Memórias com Proveniência + FSRS-6** | Episódica, Semântica (`Predict -> Calibrate`), Autobiográfica (`Our Story`), Piadas Internas (`CooldownLock`), Prospectiva e Hábitos. Toda memória exige `source_episode_ids` reais (zero alucinações ou seeds). |
 | 🔮 **Portabilidade da Alma (`.ashy-soul`) & Gate M2** | Compositor de prompt amigável a KV-Cache (`voice.md` + *Golden Dialogue Exemplars*). Troque do modelo A para o modelo B mantendo a voz, as referências e o humor, ou exporte/importe toda a alma com verificação `SHA-256`. |
-| 🎙️ **Modo Omni Unificado (`LFM3-Omni-2B`) & Voz CAS** | Rode 1 único modelo local (`ollama run lfm3-omni:2b` ou `llama-server`) que recebe áudio `16kHz` direto + vídeo a `2 fps` (`dHash`) e responde com áudio `24kHz` (`LiquidCodec`) e `think: false`, ou use o modo modular (Whisper + LLM + Kokoro/ElevenLabs). |
+| 🎙️ **Modo ao vivo (chamada de voz) & Omni no chat** | Ligue para a Ashy (`Ctrl+Alt+L`) e converse mãos-livres com barge-in e lip-sync: local com o `LFM3-Omni-2B` num `llama-server` gerenciado pela Ashy (híbrido com a sua voz de referência por padrão), na nuvem (OpenAI Realtime / Qwen-Omni / Gemini Live) ou pela pipeline clássica STT → qualquer LLM → TTS ([ADR-0008](./docs/adr/0008-live-call-engine-pluggable-voice-sessions.md)). No chat, o `LFM3-Omni-2B` também recebe imagem e vídeo a `2 fps` (`dHash`). |
 | 🎭 **Palco Universal 2D & Click-Through $O(1)$** | Suporte nativo a **Live2D Cubism 4 (`.model3.json`)** e **Tachie em camadas**, lip-sync formante, mola a `120 Hz` e janela flutuante transparente (`alwaysOnTop`) com máscara de colisão `64x64` em CPU $O(1)$. |
 | 🛡️ **Agência MCP em 3 Níveis & Privacidade Radical** | Descoberta progressiva com 3 meta-tools, **Action Gatekeeper** (`observe-only`, `read-safe`, `staged-confirm` com diff visual), criptografia em repouso `AES-256-GCM`, 6 atalhos globais (`Ctrl+Shift+M/E/D/H/Space/K`) e **Factory Reset em 1 Clique**. |
 
@@ -201,7 +201,7 @@ curl -fsSL https://github.com/carlos-edu2367/ashy/releases/latest/download/insta
 ### Pré-requisitos
 - **Node.js** `>= 22.6.0` (inclui `node:sqlite` nativo)
 - **pnpm** `>= 10.x`
-- *(Opcional para IA 100% Local)* **Ollama** (`ollama run lfm3-omni:2b`) ou **`llama-server`** (`LiquidAI/LFM3-Omni-2B-GGUF`)
+- *(Opcional para IA 100% Local)* **Ollama** (`ollama run lfm3-omni:2b`) ou **`llama-server`** (`LiquidAI/LFM3-Omni-2B-GGUF`) para o chat. Para o **Modo ao vivo**, a Ashy baixa e gerencia o próprio `llama-server` (Configurações › Live Mode).
 
 ### Comandos Prontos para Copiar
 
@@ -271,6 +271,7 @@ pnpm test:e2e
   5. **[ADR-0005](./docs/adr/0005-realtime-voice-cas-turn-taking-and-unified-omni-lfm3.md):** Voz em Tempo Real com Turn-Taking CAS, Barge-In com `PlaybackReceipt` e Arquitetura Multimodal Omni Unificada (`LFM3-Omni-2B`)
   6. **[ADR-0006](./docs/adr/0006-dual-mode-2d-stage-and-o1-cpu-click-through.md):** Palco 2D Dual-Mode (Tachie + Cubism 4 Live2D), Lip-Sync Acústico, Iluminação Oklab e Click-Through Desktop em CPU $O(1)$
   7. **[ADR-0007](./docs/adr/0007-progressive-mcp-agency-3-tier-gatekeeper-and-security-hardening.md):** Agência Progressiva MCP (3 Meta-Tools), Gatekeeper em 3 Níveis, Visão Deduplicada por `dHash` e Endurecimento de Segurança
+  8. **[ADR-0008](./docs/adr/0008-live-call-engine-pluggable-voice-sessions.md):** Motor de Chamada ao Vivo com Janela Oculta Dona da Chamada, `VoiceSession` Plugável e Backends Local / Nuvem / Cascata (substitui parcialmente o ADR-0005)
 
 ---
 ---
@@ -302,7 +303,7 @@ Instead of tying her identity to a single cloud vendor's ephemeral context windo
 | :--- | :--- |
 | 🧠 **6-Layer Memory with Provenance + FSRS-6** | Episodic, Semantic (`Predict -> Calibrate`), Autobiographical (`Our Story`), Inside-Joke Motifs (`CooldownLock`), Prospective Intents, and User Habits. Every memory requires real `source_episode_ids` (zero hallucinated or seeded memories). |
 | 🔮 **Soul Portability (`.ashy-soul`) & M2 Gate** | KV-Cache-friendly prompt composer (`voice.md` + *Golden Dialogue Exemplars*). Swap from Model A to Model B mid-journey while keeping her voice, callbacks, and affect — or export/import her entire soul with `SHA-256` verification. |
-| 🎙️ **Unified Omni Mode (`LFM3-Omni-2B`) & CAS Voice** | Run a single local multimodal model (`ollama run lfm3-omni:2b` or `llama-server`) taking direct `16kHz` mic audio + `2 fps` `dHash`-deduplicated video frames and streaming `24kHz` `LiquidCodec` audio with `think: false` — or mix modular STT/LLM/TTS providers. |
+| 🎙️ **Live Mode (voice call) & Omni chat** | Call Ashy (`Ctrl+Alt+L`) for a hands-free conversation with barge-in and lip-sync: locally with `LFM3-Omni-2B` on an Ashy-managed `llama-server` (hybrid with your reference voice by default), in the cloud (OpenAI Realtime / Qwen-Omni / Gemini Live), or through the classic STT → any LLM → TTS pipeline ([ADR-0008](./docs/adr/0008-live-call-engine-pluggable-voice-sessions.md)). In chat, `LFM3-Omni-2B` also takes images and `2 fps` `dHash`-deduplicated video. |
 | 🎭 **Universal 2D Stage & $O(1)$ Click-Through** | Dual-mode **Live2D Cubism 4 (`.model3.json`)** and **Layered Tachie**, formant lip-sync (`A, E, I, O, U, S`), `120 Hz` spring physics, and a transparent `alwaysOnTop` floating overlay with $O(1)$ CPU `64x64` bitmask hit-testing. |
 | 🛡️ **3-Tier MCP Agency & Radical Privacy** | Progressive MCP discovery via 3 meta-tools, **Action Gatekeeper** (`observe-only`, `read-safe`, `staged-confirm` with visual diffs), optional `AES-256-GCM` encryption at rest, 6 global OS shortcuts (`Ctrl+Shift+M/E/D/H/Space/K`), and **1-Click Factory Reset**. |
 
@@ -349,4 +350,4 @@ pnpm test:e2e                         # Run the 6 real-browser Playwright E2E fl
 - 🤖 [Provider & Local AI Guide (`docs/PROVIDER_GUIDE.md`)](./docs/PROVIDER_GUIDE.md)
 - 🏛️ [Architecture Specification (`docs/ASHY_ARCHITECTURE_SPEC.md`)](./docs/ASHY_ARCHITECTURE_SPEC.md)
 - 🗺️ [Phased Roadmap (`docs/ASHY_ROADMAP.md`)](./docs/ASHY_ROADMAP.md)
-- 📜 [Architecture Decision Records (`docs/adr/0001..0007`)](./docs/adr/)
+- 📜 [Architecture Decision Records (`docs/adr/0001..0008`)](./docs/adr/)

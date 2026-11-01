@@ -6,6 +6,8 @@ A **Ashy 1.0** foi construída sobre uma arquitetura desacoplada em que a **alma
 2. **`hybrid-omni-in` (Modo Híbrido Omni-In):** O modelo recebe diretamente **áudio bruto (`16kHz`) + vídeo (`2 fps`) + texto** sem precisar de STT separado, e responde em texto ultrarrápido que é sintetizado pelo motor TTS escolhido.
 3. **`modular` (Modo Modular Clássico):** Pipeline especializado combinando **STT** (Local ou Nuvem) $\rightarrow$ **LLM** (Ollama, OpenRouter, Anthropic, OpenAI, NVIDIA NIM) $\rightarrow$ **TTS** (Kokoro, Piper, ElevenLabs, OpenAI TTS ou Web Speech API).
 
+> **Fase 10 — conversa por voz = Modo ao vivo.** Os três modos acima valem para o **chat** (texto, imagem e vídeo na mensagem, e falar respostas do chat em voz alta). A **chamada de voz contínua** é o Modo ao vivo, com backends próprios (llama.cpp gerenciado, OpenAI Realtime/Qwen/custom, Gemini Live ou pipeline clássica): ver a [§6](#6-modo-ao-vivo-chamada--backends-e-provedores) e o [ADR-0008](./adr/0008-live-call-engine-pluggable-voice-sessions.md). O "Omni Nativo" pelo **Ollama não é fala→fala**: o Ollama não gera áudio num turno de chat, então o áudio vem de ASR → texto → `/tts` no fim do turno.
+
 ---
 
 ## Sumário
@@ -15,6 +17,7 @@ A **Ashy 1.0** foi construída sobre uma arquitetura desacoplada em que a **alma
 3. [Provedores LLM Modulares (OpenRouter, Anthropic, OpenAI, NVIDIA NIM e Ollama Local)](#3-provedores-llm-modulares-openrouter-anthropic-openai-nvidia-nim-e-ollama-local)
 4. [Provedores de Voz Modulares — STT & TTS (Locais e em Nuvem)](#4-provedores-de-voz-modulares--stt--tts-locais-e-em-nuvem)
 5. [Segurança de Chaves (`safeStorage`) e Solução de Problemas](#5-segurança-de-chaves-safestorage-e-solução-de-problemas)
+6. [Modo ao vivo (chamada) — backends e provedores](#6-modo-ao-vivo-chamada--backends-e-provedores)
 
 ---
 
@@ -206,3 +209,51 @@ No modo modular, o pipeline da Ashy utiliza o **`MarkdownSegmenter`** + **`TTFA 
 - **O catálogo do Ollama aparece vazio:** Verifique se `ollama serve` está rodando em `http://127.0.0.1:11434` e se você já baixou ao menos um modelo (`ollama pull lfm3-omni:2b`).
 - **A latência até a primeira resposta está alta em modelos com raciocínio (Qwen3 / DeepSeek / Claude):** Em `Ajustes > Modelos`, altere **Esforço de Raciocínio (`reasoningEffort`)** para **`none`** — isso envia `think: false` / `reasoning: { enabled: false }` e reduz o TTFT para menos de `1.5s`.
 - **Quero testar se o microfone e o TTS estão funcionando antes de conversar:** Em `Ajustes > Voz`, selecione seu microfone físico real na lista de dispositivos, clique em **Testar Microfone** e depois em **Testar Voz**.
+
+---
+
+## 6. Modo ao vivo (chamada) — backends e provedores
+
+A chamada de voz contínua (botão **Ligar**, `Ctrl+Alt+L` ou o overlay) é configurada em **Configurações › Live Mode**. O uso no dia a dia (ligar, voz de referência, teste, recursos, aprovações) está no [Guia do Usuário §7](./USER_GUIDE.md#7-modo-ao-vivo-chamada). Aqui ficam os provedores de cada backend.
+
+| Backend (card) | Onde roda | Precisa de | Recomendação |
+|---|---|---|---|
+| `llamacpp-hybrid` — **Local omni + minha voz (híbrido)** *(padrão)* | Seu PC | Motor llama.cpp + LFM3-Omni-2B | **Recomendado no local.** O modelo responde em texto; o `/tts` do llama.cpp fala frase a frase (voz feminina/masculina ou de referência), com filtro de eco/repetição antes do áudio. |
+| `llamacpp-realtime` — **Local omni (LFM3 via llama.cpp)** | Seu PC | Motor llama.cpp + LFM3-Omni-2B | Texto e áudio intercalados do próprio modelo: um pouco mais rápido, menos controlável. |
+| `cascade` — **Pipeline clássica** | Depende dos provedores | Um STT, um LLM de texto e um TTS | **Melhor qualidade/ferramentas no local** com `qwen3:4b-instruct` no Ollama. Aceita qualquer LLM do vault. |
+| `openai-realtime` — **OpenAI Realtime / compatível** | Nuvem (ou servidor seu) | Chave do provedor | Fala→fala de baixa latência com modelo grande. |
+| `gemini-live` — **Gemini Live** | Nuvem | Chave do Google AI Studio | Fala→fala de baixa latência, pt-BR pedido nas instruções. |
+
+### 6.1 Motor local gerenciado (llama.cpp)
+- **Build fixado `b12024`** do `ggml-org/llama.cpp`, baixado só das URLs oficiais com **SHA256 conferido**. Variantes: **CUDA 12.4** (NVIDIA; motor + `cudart`, ~670 MB), **Vulkan** (AMD/Intel, ~38 MB) e **CPU** (~25 MB). A variante é recomendada pela GPU detectada (`nvidia-smi`) e pode ser trocada.
+- **Modelo:** `LiquidAI/LFM3-Omni-2B-GGUF` numa revisão fixada: `LFM3-Omni-2B-Q4_K_M.gguf` (1,10 GB) + `mmproj-LFM3-Omni-2B-Q8_0.gguf` (507 MB), com SHA256 conferido. **Reuso do Ollama:** se `%USERPROFILE%\.ollama\models\blobs` (ou `OLLAMA_MODELS`) tiver um blob com o mesmo SHA256, ele é reaproveitado em vez de baixado.
+- **Visual C++:** o llama-server precisa do *Microsoft Visual C++ 2015-2022 Redistributable (x64)*. Se faltar, o painel mostra o aviso e o botão **Instalar componente da Microsoft** (instalador oficial `vc_redist.x64.exe`; o Windows pede permissão de administrador).
+- **Processo:** `llama-server` em `127.0.0.1`, porta livre, health check `/health`, reinício automático (até 3 vezes). A cada início, uma chave aleatória é passada **por variável de ambiente** (nunca na linha de comando) e o processo principal a injeta só nas requisições da janela da chamada. É iniciado sozinho ao ligar uma chamada.
+- **Servidor próprio:** informe a URL (ex.: `http://127.0.0.1:8080`). Ele é só verificado (`/health`), não instalado nem iniciado pela Ashy.
+- **Log:** `%APPDATA%\@ashy\desktop\logs\llama-server.log`.
+
+### 6.2 Pipeline clássica (`cascade`)
+- **STT** (`cascade.sttProviderId`): `ollama-transcriptions` (padrão; LFM3-Omni no Ollama), `local-whisper-http`, `openai-whisper` ou `groq-whisper`. O ASR do LFM3 às vezes erra respostas curtas ("pode"); um Whisper local deixa a aprovação por voz mais confiável.
+- **LLM:** "Mesmo modelo do chat" ou qualquer provedor do vault (Ollama, OpenRouter, Anthropic, OpenAI, NVIDIA NIM) com um modelo opcional. Para uso local, `ollama pull qwen3:4b-instruct` (~2,5 GB) e escolha Ollama + `qwen3:4b-instruct`: foi o modelo pequeno que respondeu de forma variada, lembrou fatos e **chamou ferramentas** de verdade nos testes. O LFM3-2B como LLM de texto é mais rápido, mas não chama ferramentas.
+- **TTS:** `llamacpp-tts` (motor local, voz feminina/masculina ou de referência), `local-kokoro-http`, `openai-tts` ou `elevenlabs`. Os três últimos usam a URL, a chave e a voz de **Configurações › Voz**.
+
+### 6.3 Nuvem fala→fala
+| Provedor | Preset | Chave |
+|---|---|---|
+| **OpenAI** | `wss://api.openai.com/v1/realtime`, modelo `gpt-realtime-2.1-mini`, voz `marin` | Chave da OpenAI (se não houver uma própria do Live Mode, usa a do chat) |
+| **Qwen-Omni (DashScope)** | `wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime` (Singapura), modelo `qwen3.5-omni-flash-realtime`, voz `Tina` | Chave do Model Studio **da mesma região** do endpoint. Se o handshake falhar, use o endpoint do seu workspace ou o de Pequim com uma chave de Pequim. |
+| **Personalizado** | Qualquer servidor compatível com OpenAI Realtime: `wss://…` ou local `ws://127.0.0.1` / `ws://localhost` | Opcional |
+| **Gemini Live** | modelo `gemini-3.8-live`, voz `Kore` | Chave do Google AI Studio |
+
+- As chaves são coladas no painel do backend (campo só de escrita; a interface mostra apenas o status mascarado) e ficam cifradas em `%APPDATA%\@ashy\desktop\live-cloud-keys.json`.
+- A janela da chamada nunca recebe a chave: ela se conecta a um **relay local** do processo principal, que abre a conexão com o provedor adicionando a autenticação (`Authorization: Bearer` ou `?key=` no Gemini).
+- **O que vai para o provedor:** o áudio do microfone durante a chamada, as instruções da Ashy (persona, seu nome, últimas mensagens do chat e memórias relevantes de cada turno; ajustável em "Contexto da Ashy na nuvem") e os resultados das ferramentas. Há custo por minuto conforme o provedor.
+- **Erros comuns** (mostrados na faixa da chamada): "chave de API inválida (HTTP 401)", "limite de uso/cota excedido (HTTP 429)", "Chave de API do … não configurada".
+- **Validação:** os backends de nuvem foram implementados a partir da documentação oficial e testados contra servidores falsos; ainda não foram validados com uma chave real.
+
+### 6.4 Checklist do Modo ao vivo
+- **Eco com caixas de som:** use fone de ouvido.
+- **Primeira resposta lenta:** o modelo está carregando na VRAM; as próximas são mais rápidas.
+- **Chamada termina com "motor não instalado":** instale motor e modelo no painel, ou troque de backend.
+- **DLL ausente (`0xC0000135`):** instale o Visual C++ pelo botão do painel.
+- **Testar chamada** mostra ✓/✗ por etapa (microfone, VAD, backend, primeira resposta, playback) com os tempos.

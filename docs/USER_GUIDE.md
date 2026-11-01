@@ -12,6 +12,7 @@ Bem-vindo ao guia oficial de uso da **Ashy 1.0**. A Ashy é uma companheira virt
 4. [Nossa História, Piadas Internas (`CooldownLock`), Quarto da Ashy & *Dream & Reflection*](#4-nossa-história-piadas-internas-cooldownlock-quarto-da-ashy--dream--reflection)
 5. [Palco Universal 2D, Modo Overlay Transparente, Bandeja do Sistema e os 6 Atalhos Globais](#5-palco-universal-2d-modo-overlay-transparente-bandeja-do-sistema-e-os-6-atalhos-globais)
 6. [Portabilidade da Alma (`.ashy-soul`), Criptografia em Repouso (`AES-256-GCM`) & Apagar Tudo com 1 Clique (Factory Reset)](#6-portabilidade-da-alma-ashy-soul-criptografia-em-repouso-aes-256-gcm--apagar-tudo-com-1-clique-factory-reset)
+7. [Modo ao vivo (chamada)](#7-modo-ao-vivo-chamada)
 
 ---
 
@@ -26,6 +27,7 @@ Ao iniciar a Ashy pela primeira vez em uma instalação limpa (ou logo após um 
 
 2. **Escolha do Modo de Inteligência (Local Omni vs. Cloud / Modular):**
    - **Modo 1 — Local Omni Unificado (`LFM3-Omni-2B` Recomendado):** Configura com 1 clique o modelo multimodal local **`lfm3-omni:2b`** (`http://127.0.0.1:11434` via Ollama ou `http://127.0.0.1:8080/v1` via `llama-server`), capaz de ouvir sua voz diretamente em 16kHz, enxergar câmera/tela autorizada e responder com voz nativa em 24kHz (`LiquidCodec`) e texto simultaneamente, com `reasoningEffort: 'none'` (`think: false`) para latência instantânea.
+     *Isso configura o modelo do **chat**. A conversa por voz contínua é o Modo ao vivo, que usa o seu próprio motor local gerenciado pela Ashy (llama.cpp); pelo Ollama a voz é ASR → texto → TTS no fim do turno, não fala→fala. Ver [§7](#7-modo-ao-vivo-chamada).*
    - **Modo 2 — Nuvem ou Modular (`OpenRouter`, `OpenAI`, `Anthropic`, `NVIDIA NIM`, `Ollama`):** Permite escolher o provedor, informar a chave de API (armazenada com criptografia nativa do sistema operacional via `safeStorage`), pesquisar dinamicamente o catálogo de modelos (`GET /v1/models` ou `/api/tags`) e escolher o nível de raciocínio (`reasoningEffort`: `none`, `minimal`, `low`, `medium` ou `high`).
 
 3. **Permissões de Privacidade Explicadas Antes do Primeiro Turno:**
@@ -58,10 +60,10 @@ A aba **Estúdio** é o espaço principal de convivência diária com a Ashy, de
 - Cada sinal `<|ACT|>` atualiza imediatamente a expressão facial, o olhar e o gesto corporal da Ashy no palco 2D, além de alimentar o vetor afetivo da sessão.
 
 ### Conversa por Voz em Tempo Real e Barge-In
-- Clique em **Conversar por voz** (ou use o atalho global `Ctrl+Shift+M` / `Ctrl+Shift+Space`) para ativar a escuta:
-  - **Turn-Taking Humano (CAS):** A Ashy não corta você na primeira pausa para respirar. O detector Silero VAD + `VoiceEndJudge` aguarda de forma inteligente (`1200ms` com proteção *Compare-And-Swap* e até `3000ms` de *grace period* se sua frase ainda parecer incompleta, preparando uma reformulação especulativa aos `600ms`).
-  - **Modo Omni Direto (`native-omni`):** Se você estiver usando o preset `LFM3-Omni-2B` (ou `gpt-4o-audio-preview` / `Qwen 2.5 Omni`), o áudio 16kHz do microfone (incluindo `360ms` de pré-rolagem do Ring Buffer) é enviado diretamente ao modelo Omni sem STT intermediário, e a voz 24kHz da Ashy toca imediatamente com lip-sync formante (`A, E, I, O, U, S`).
-  - **Interrupção Natural (*Barge-In* com Recibo Exato):** Se você começar a falar enquanto a Ashy está falando, ela interrompe a fala com um fade-out suave de `120ms` e calcula exatamente o que você ouviu (`heardText`) e o que ficou por dizer (`unheardText`) via `PlaybackReceipt`. No turno seguinte, ela sabe exatamente em que palavra foi interrompida!
+- **Para conversar por voz, use o Modo ao vivo (chamada):** o botão **Ligar** no centro do dock ou `Ctrl+Alt+L`. Tudo sobre a chamada (backends, motor local, voz de referência, ferramentas, privacidade e solução de problemas) está na [§7](#7-modo-ao-vivo-chamada).
+- **Turn-Taking Humano:** A Ashy não corta você na primeira pausa para respirar. Na chamada, o Silero VAD (com pré-rolagem de `360ms`) espera o fim do turno (`700ms` de silêncio por padrão, com *grace period*) antes de responder.
+- **Interrupção Natural (*Barge-In*):** Se você começar a falar enquanto a Ashy fala, o volume dela abaixa na hora; se a fala se confirmar, ela para com um fade-out curto e o histórico guarda **só o que você ouviu**. No turno seguinte ela sabe em que ponto foi interrompida.
+- *Nota:* o antigo "Omni Nativo" do Ollama não era fala→fala (o Ollama não gera áudio num turno de chat); ele continua só para o chat de texto e para falar respostas do chat em voz alta. Ver [ADR-0008](./adr/0008-live-call-engine-pluggable-voice-sessions.md).
 
 ### Webcam, Visão de Tela (`2 fps`) e Cartões de Ação (`ActionGatekeeper`)
 - No Estúdio, você pode ativar a **Câmera / Vídeo Omni (`2 fps`)**, compartilhar a tela autorizada (`Eyes`) ou enviar um clipe `.mp4`/`.webm`. Um filtro perceptual **dHash de 64 bits** descarta quadros repetidos automaticamente para economizar largura de banda e contexto.
@@ -172,6 +174,8 @@ Mesmo quando a janela da Ashy está em segundo plano ou minimizada, você pode c
 
 *(No macOS, `CommandOrControl` corresponde a `Cmd+Shift+...`; no Windows e Linux, `Ctrl+Shift+...`.)*
 
+Além desses, **`Ctrl+Alt+L`** liga e desliga a **chamada do Modo ao vivo** (ver [§7](#7-modo-ao-vivo-chamada)).
+
 ---
 
 ## 6. Portabilidade da Alma (`.ashy-soul`), Criptografia em Repouso (`AES-256-GCM`) & Apagar Tudo com 1 Clique (Factory Reset)
@@ -203,3 +207,68 @@ Se você quiser recomeçar do zero absoluto ou limpar todos os dados locais da m
    - Todas as tabelas do `ashy.db` (episódios, fatos, marcos, piadas internas, intenções, hábitos, logs de evolução, auditoria MCP e histórico de mensagens), além do snapshot `ashy.db.enc` e configurações de sessão, são apagados atomicamente;
    - Os controles de privacidade retornam ao estado seguro padrão;
    - A interface volta instantaneamente para o **Wizard de Primeiro Encontro (`FirstMeetingWizard`)**, pronta para uma nova jornada limpa.
+
+---
+
+## 7. Modo ao vivo (chamada)
+
+O **Modo ao vivo** (Live Mode) é uma **chamada de voz contínua e mãos-livres** com a Ashy: você fala, ela responde com voz, pode ser interrompida no meio da frase, o avatar mexe a boca com o áudio que está tocando e as falas dos dois lados entram no chat (com o ícone 🎤) e na memória como mensagens de voz. Se você a interromper, o histórico guarda **só o trecho que você realmente ouviu**. A arquitetura está no [ADR-0008](./adr/0008-live-call-engine-pluggable-voice-sessions.md); detalhes de cada provedor estão no [Guia de Provedores](./PROVIDER_GUIDE.md#6-modo-ao-vivo-chamada--backends-e-provedores).
+
+### Como ligar
+- **Botão Ligar** no centro do dock da aba **Companhia**. O anel mostra o estado: ouvindo, você falando, pensando, falando, reconectando. Durante a chamada aparecem o botão de **mute**, a **legenda ao vivo** e o chip de **latência**. Clique de novo para **Desligar**.
+- **Atalho global `Ctrl+Alt+L`**: liga e desliga a chamada de qualquer lugar.
+- **Overlay (avatar flutuante):** os botões **Ligar/Desligar** e **Mic on/off** ficam na ilha de controles. O ponto de estado continua visível durante a chamada mesmo sem o mouse em cima. A chamada continua funcionando com a janela principal fechada.
+- Quando a chamada termina por erro, a faixa do dock mostra o motivo (motor não instalado, chave inválida, microfone negado etc.).
+
+### Escolhendo o backend (Configurações › Live Mode)
+Em **Configurações** › **Live Mode**, escolha um dos cards:
+
+| Card | O que é | Quando usar |
+|---|---|---|
+| **Local omni + minha voz (híbrido)** — *padrão* | O LFM3-Omni-2B local (llama.cpp) pensa em texto e o `/tts` do llama.cpp fala, frase a frase, com voz feminina/masculina ou com a **sua voz de referência**. | **Recomendado no computador local.** É o modo mais controlável com um modelo pequeno: ecos e repetições são cortados antes de virar áudio. |
+| **Local omni (LFM3 via llama.cpp)** | O mesmo modelo responde texto e áudio intercalados direto (`/v1/realtime`). | Um pouco mais rápido, mas o áudio sai junto com o texto e não dá para filtrar; tende a repetir a primeira forma de resposta. |
+| **Pipeline clássica (STT → modelo de texto → voz)** | Transcrição → **qualquer modelo de texto** (Ollama, OpenRouter, Anthropic, OpenAI, NVIDIA NIM ou "Mesmo modelo do chat") → voz (llama.cpp `/tts`, Kokoro, OpenAI TTS ou ElevenLabs). Usa a persona, a memória e as ferramentas completas da Ashy. | **Melhor qualidade e melhores ferramentas no local** com `qwen3:4b-instruct` no Ollama (`ollama pull qwen3:4b-instruct`, ~2,5 GB). Também é o jeito de conversar por voz com Claude, GPT etc. |
+| **OpenAI Realtime / compatível** | Fala→fala na nuvem: OpenAI (`gpt-realtime-2.1-mini`), Qwen-Omni (DashScope) ou um servidor próprio compatível. | Menor latência e um modelo grande. **Requer chave**, e o áudio vai para o provedor. |
+| **Gemini Live** | Fala→fala na nuvem do Google (`gemini-3.8-live`). | Mesma coisa: **requer chave** (Google AI Studio). |
+
+A troca de card é salva na hora. Os campos de cada painel são gravados com o botão **Salvar** no fim da página.
+
+### Instalando o motor local
+Vale para os dois backends locais e para a pipeline clássica com a voz do llama.cpp. No painel **Motor local (llama.cpp)**:
+1. Veja a **GPU detectada** e a variante recomendada: **CUDA 12.4 (NVIDIA)**, **Vulkan (AMD/Intel)** ou **CPU**. "Automática" usa a recomendada; você pode forçar outra.
+2. Clique em **Instalar motor**. A Ashy baixa só o build fixado do llama.cpp (`b12024`, releases oficiais no GitHub) e confere o SHA256. Tamanhos aproximados: CUDA ~670 MB (motor + runtime CUDA), Vulkan ~38 MB, CPU ~25 MB.
+3. Clique em **Baixar modelo**: LFM3-Omni 2B Q4_K_M + mmproj Q8_0, ~1,6 GB, do Hugging Face, com SHA256 conferido. **Se o Ollama já tiver o mesmo arquivo GGUF, ele é reaproveitado** em vez de baixado de novo (o mmproj vem sempre do Hugging Face).
+4. **Iniciar / Parar** liga e desliga o servidor local, que escuta só em `127.0.0.1`. Ao ligar uma chamada, ele é iniciado automaticamente.
+5. **Aviso do Visual C++:** se aparecer *"Falta um componente da Microsoft (Visual C++ Runtime)"*, clique em **Instalar componente da Microsoft**. O instalador oficial (`vc_redist.x64.exe`) é baixado do site da Microsoft, o Windows pede permissão de administrador e às vezes é preciso reiniciar.
+6. Em vez do servidor gerenciado, você pode informar a **URL de um llama-server seu** (ex.: `http://127.0.0.1:8080`).
+
+### Voz de referência (híbrido e pipeline com a voz do llama.cpp)
+- Em **Voz de referência**, clique em **Enviar amostra**: de 5 a 30 s de fala limpa (wav, mp3, flac, ogg ou m4a). O áudio é convertido no próprio PC para mono 24 kHz e fica só no seu computador.
+- **Ouvir** sintetiza uma frase de teste, **Usar** escolhe a voz e **Excluir** remove.
+- Use só vozes que você tem direito de usar.
+
+### Testar chamada
+**Testar chamada** faz uma chamada de um turno: uma pergunta sintetizada substitui o microfone, e cada etapa (microfone, VAD, backend, primeira resposta, playback) aparece com ✓/✗ e o tempo em ms. Nada do teste vai para a memória. Como a pergunta é falada pela voz local do llama.cpp, o teste precisa do motor local instalado mesmo nos backends de nuvem; a chamada normal não precisa.
+
+### Recursos na chamada
+Em **Recursos na chamada** (todos desligados por padrão e salvos na hora):
+- **Ferramentas:** ela pode ver a janela ativa, olhar a tela autorizada, ler um arquivo do workspace e escrever uma nota de projeto. Com o modelo local de 2B funciona melhor para pedidos simples; na nuvem, ou na pipeline clássica com um modelo maior, é mais confiável.
+- **Visão:** quando você pergunta algo como "o que tem na minha tela?", ela olha a tela **respeitando o modo Tela/Janela da privacidade** (`Eyes`). Enquanto captura, aparece **"👁 vendo a tela"**. A descrição da tela é feita pelo motor local.
+- **Iniciativa:** depois de um tempo em silêncio (padrão 90 s, ajustável em "Puxar assunto após"), ela pode puxar assunto **raramente e com contexto**: no máximo uma vez a cada 10 min e nunca com o mic mudo, com Não perturbe ou fora do horário permitido.
+
+**Aprovações:** quando uma ação precisa de permissão, aparece um card no dock e no balão do overlay com **Aprovar**, **Sempre permitir** (grava a permissão para aquela ferramenta) e **Negar**. Você também pode responder **por voz**, com a frase inteira: "pode", "pode fazer" ou "autorizo" aprovam; "pode sempre" aprova sempre; "não", "cancela" ou "deixa" negam. Frases maiores ("pode me contar uma piada") não aprovam nada. A Ashy nunca se aprova sozinha, e ações de alto impacto (com aviso de risco) só são aprovadas por clique.
+
+### Privacidade: o que sai do computador
+- **Backends locais (híbrido e local omni):** nada sai da máquina. O motor escuta só em `127.0.0.1` e exige uma chave aleatória por execução, que a interface nunca vê.
+- **OpenAI Realtime / Qwen / Gemini:** vão para o provedor escolhido o **áudio do microfone durante a chamada**, as instruções da Ashy (persona, seu nome, as últimas mensagens do chat e as memórias relevantes de cada turno) e os resultados das ferramentas. As chaves ficam cifradas no seu PC e só o processo principal as usa, por um relay local; a interface só grava a chave e mostra o status mascarado. Na OpenAI, se você não colar uma chave própria do Live Mode, a chave do chat é usada.
+- **Pipeline clássica:** o texto da conversa vai para o provedor de LLM escolhido (se for de nuvem), e o áudio vai para o STT/TTS escolhido (se for de nuvem).
+- A voz de referência e as capturas de tela ficam locais (a tela é descrita pelo motor local).
+
+### Solução de problemas
+- **Ela se ouve e responde a si mesma (eco):** com caixas de som, o cancelamento de eco nem sempre basta. **Use fone de ouvido.**
+- **A primeira resposta demora:** na primeira chamada (ou logo depois de iniciar o motor) o modelo ainda está sendo carregado na memória/VRAM. As respostas seguintes são mais rápidas. Com a GPU ocupada por outros programas, tudo fica mais lento.
+- **"Motor não instalado" ou a chamada termina logo:** instale o motor e o modelo em Configurações › Live Mode, ou escolha um backend de nuvem / a pipeline clássica.
+- **Erro de DLL / Visual C++:** use o botão **Instalar componente da Microsoft** e reinicie se for pedido.
+- **Nuvem:** "chave de API inválida (HTTP 401)", "limite de uso/cota excedido (HTTP 429)" ou "Chave de API do … não configurada" aparecem na faixa da chamada. Confira a chave no painel do backend.
+- **A aprovação por voz não funcionou:** a transcrição precisa ser exatamente uma das frases. Se o reconhecimento errar, use o botão.
+- **Logs:** o log do motor local fica em `%APPDATA%\@ashy\desktop\logs\llama-server.log`. Os dados da Ashy (banco, `live-mode.json`, vozes de referência) ficam em `%APPDATA%\@ashy\desktop\`.

@@ -20,7 +20,7 @@
 
 - **6 Memórias com Proveniência Obrigatória (`source_episode_ids`) + FSRS-6:** Episódica, Semântica (`Predict -> Calibrate`), Autobiográfica (`Nossa História`), Piadas Internas (`CooldownLock`), Prospectiva e Hábitos no SQLite local (`ashy.db`).
 - **Portabilidade da Alma (`.ashy-soul`) & Gate M2:** Prompt amigável a KV-Cache (`voice.md` + *Golden Dialogue Exemplars*), exportação/importação `.ashy-soul` verificada por `SHA-256` e **Apagar Tudo com 1 Clique (Factory Reset)**.
-- **Modo Omni Unificado (`LFM3-Omni-2B`) & Voz em Tempo Real:** Suporte a 1 único modelo local (`ollama run lfm3-omni:2b` ou `llama-server` com áudio 16kHz in &rarr; 24kHz `LiquidCodec` out + vídeo a `2 fps` `dHash` e `think: false`), além de modo Cloud/Modular (Whisper, Kokoro-FastAPI, Piper, ElevenLabs, OpenRouter, Anthropic, OpenAI, NVIDIA NIM).
+- **Modo ao vivo (chamada de voz) & Omni no chat:** Ligue para a Ashy (`Ctrl+Alt+L`) e converse mãos-livres com barge-in e lip-sync: local com o `LFM3-Omni-2B` num `llama-server` gerenciado pela Ashy (híbrido com a sua voz de referência por padrão), na nuvem (OpenAI Realtime / Qwen-Omni / Gemini Live) ou pela pipeline clássica STT &rarr; qualquer LLM &rarr; TTS ([ADR-0008](./docs/adr/0008-live-call-engine-pluggable-voice-sessions.md)). No chat, `LFM3-Omni-2B` (Ollama ou `llama-server`) com imagem e vídeo a `2 fps` `dHash`, além de provedores Cloud/Modular (Whisper, Kokoro-FastAPI, Piper, ElevenLabs, OpenRouter, Anthropic, OpenAI, NVIDIA NIM).
 - **Palco 2D Dual-Mode & Overlay $O(1)$ Click-Through:** **Live2D Cubism 4 (`.model3.json`)** + **Tachie em camadas**, lip-sync acústico formante (`A, E, I, O, U, S`) e janela transparente `alwaysOnTop` com máscara `64x64` em CPU $O(1)$.
 - **Agência MCP em 3 Níveis & Segurança:** 3 meta-tools progressivas, `ActionGatekeeper` (`observe-only`, `read-safe`, `staged-confirm`), criptografia em repouso `AES-256-GCM` e 6 atalhos globais (`Ctrl+Shift+M/E/D/H/Space/K`).
 
@@ -58,4 +58,4 @@ pnpm test:e2e
 - [Guia de Provedores e IA Local (`docs/PROVIDER_GUIDE.md`)](./docs/PROVIDER_GUIDE.md)
 - [Especificação de Arquitetura (`docs/ASHY_ARCHITECTURE_SPEC.md`)](./docs/ASHY_ARCHITECTURE_SPEC.md)
 - [Roadmap por Fases (`docs/ASHY_ROADMAP.md`)](./docs/ASHY_ROADMAP.md)
-- [Architecture Decision Records (`docs/adr/0001..0007`)](./docs/adr/)
+- [Architecture Decision Records (`docs/adr/0001..0008`)](./docs/adr/)
