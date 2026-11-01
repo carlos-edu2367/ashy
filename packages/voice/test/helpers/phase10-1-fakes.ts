@@ -3,6 +3,7 @@ import { vi } from 'vitest'
 import {
   DEFAULT_LIVE_MODE_SETTINGS,
   type CallContextResult,
+  type CallStageSignal,
   type CallVisemeFrame,
   type LiveModeSettings,
 } from '@ashy/shared'
@@ -12,7 +13,9 @@ import {
   synthesizeVoicedSpeechPcm,
   type CallEngineHost,
   type CallRecordTurnInput,
+  type CallReportStageInput,
   type CallReportStateInput,
+  type CallReportTestResultInput,
   type CaptureAudioContextLike,
   type WebAudioContextLike,
   type WebSocketFactory,
@@ -145,21 +148,26 @@ interface FakeSource {
 
 export function createFakePlaybackContext() {
   const sources: FakeSource[] = []
+  const gains: Array<{ gain: { value: number; setValueAtTime: ReturnType<typeof vi.fn>; linearRampToValueAtTime: ReturnType<typeof vi.fn>; cancelScheduledValues: ReturnType<typeof vi.fn> } }> = []
   const ctx = {
     currentTime: 0,
     sampleRate: 48000,
     state: 'running',
     destination: {},
-    createGain: () => ({
-      gain: {
-        value: 1,
-        setValueAtTime: vi.fn(),
-        linearRampToValueAtTime: vi.fn(),
-        cancelScheduledValues: vi.fn(),
-      },
-      connect: vi.fn(),
-      disconnect: vi.fn(),
-    }),
+    createGain: () => {
+      const node = {
+        gain: {
+          value: 1,
+          setValueAtTime: vi.fn(),
+          linearRampToValueAtTime: vi.fn(),
+          cancelScheduledValues: vi.fn(),
+        },
+        connect: vi.fn(),
+        disconnect: vi.fn(),
+      }
+      gains.push(node)
+      return node
+    },
     createBuffer: (_ch: number, length: number, sampleRate: number) => {
       const data = new Float32Array(length)
       return { duration: length / sampleRate, getChannelData: () => data }
@@ -193,7 +201,7 @@ export function createFakePlaybackContext() {
       }
     }
   }
-  return { ctx: ctx as unknown as WebAudioContextLike & typeof ctx, sources, advance }
+  return { ctx: ctx as unknown as WebAudioContextLike & typeof ctx, sources, gains, advance }
 }
 
 // ───────────────────────────── microphone ─────────────────────────────
@@ -249,8 +257,16 @@ export const TEST_INSTRUCTIONS =
   "You are Ashy.\nAlways respond in Brazilian Portuguese, briefly and naturally (1–3 sentences unless asked).\nRespond in interleaved text and audio."
 
 export function createFakeHost(
-  opts: { transcript?: string | (() => string); perTurnContext?: string; asrDelayMs?: number } = {},
+  opts: {
+    transcript?: string | (() => string)
+    perTurnContext?: string
+    asrDelayMs?: number
+    classifyAffect?: (text: string) => CallStageSignal | null
+  } = {},
 ) {
+  const affects: Array<{ callId: string; text: string }> = []
+  const stages: Array<CallReportStageInput & { at: number }> = []
+  const testResults: CallReportTestResultInput[] = []
   const states: CallReportStateInput[] = []
   const turns: CallRecordTurnInput[] = []
   const visemes: CallVisemeFrame[] = []
@@ -282,17 +298,33 @@ export function createFakeHost(
     reportViseme: vi.fn((frame) => {
       visemes.push(frame)
     }),
+    // Phase 10.2
+    classifyAffect: vi.fn(async (input) => {
+      affects.push(input)
+      return opts.classifyAffect ? opts.classifyAffect(input.text) : null
+    }),
+    reportStage: vi.fn(async (input) => {
+      stages.push({ ...input, at: Date.now() })
+      return { ok: true }
+    }),
+    reportTestResult: vi.fn(async (input) => {
+      testResults.push(input)
+      return { ok: true }
+    }),
+    synthesize: vi.fn(async () => ({ pcmBase64: '', sampleRate: 24000, durationMs: 0, latencyMs: 0 })),
   }
-  return { host, states, turns, visemes, contexts, transcribes }
+  return { host, states, turns, visemes, contexts, transcribes, affects, stages, testResults }
 }
 
 export function testSettings(patch: {
   turn?: Partial<LiveModeSettings['turn']>
   interrupt?: Partial<LiveModeSettings['interrupt']>
   llamacpp?: Partial<LiveModeSettings['llamacpp']>
+  session?: Partial<LiveModeSettings['session']>
 } = {}): LiveModeSettings {
   return {
     ...DEFAULT_LIVE_MODE_SETTINGS,
+    session: { ...DEFAULT_LIVE_MODE_SETTINGS.session, ...(patch.session ?? {}) },
     llamacpp: { ...DEFAULT_LIVE_MODE_SETTINGS.llamacpp, ...(patch.llamacpp ?? {}) },
     turn: { ...DEFAULT_LIVE_MODE_SETTINGS.turn, ...(patch.turn ?? {}) },
     interrupt: { ...DEFAULT_LIVE_MODE_SETTINGS.interrupt, ...(patch.interrupt ?? {}) },

@@ -10,7 +10,10 @@ import type {
   CallContextResult,
   CallEndReason,
   CallMetrics,
+  CallStageSignal,
   CallStatus,
+  CallSynthesizeResult,
+  CallTestStep,
   CallTranscribeResult,
   CallVisemeFrame,
 } from '@ashy/shared'
@@ -145,6 +148,33 @@ export interface CallTranscribeInput {
   language?: string
 }
 
+/** Mirrors `CallClassifyAffectInputSchema`. */
+export interface CallClassifyAffectInput {
+  callId: string
+  text: string
+}
+
+/** Mirrors `CallReportStageInputSchema`. */
+export interface CallReportStageInput extends CallStageSignal {
+  callId: string
+}
+
+/** Mirrors `CallSynthesizeInputSchema`. */
+export interface CallSynthesizeInput {
+  callId: string
+  text: string
+}
+
+/** Mirrors `CallReportTestResultInputSchema`. */
+export interface CallReportTestResultInput {
+  callId: string
+  ok: boolean
+  steps: Array<{ step: CallTestStep; ok: boolean; ms?: number; detail?: string }>
+  metrics?: CallMetrics | null
+  transcript?: string | null
+  reply?: string | null
+}
+
 /** Implemented by the call-engine window glue on top of `liveCall:invoke`. */
 export interface CallEngineHost {
   buildContext(input: CallBuildContextInput): Promise<CallContextResult>
@@ -152,6 +182,14 @@ export interface CallEngineHost {
   recordTurn(input: CallRecordTurnInput): Promise<unknown>
   reportState(input: CallReportStateInput): Promise<unknown> | void
   reportViseme(frame: CallVisemeFrame): Promise<unknown> | void
+  /** Phase 10.2 — fast host heuristic (no LLM) for a sentence without an ACT marker (`call:classifyAffect`). */
+  classifyAffect(input: CallClassifyAffectInput): Promise<CallStageSignal | null>
+  /** Phase 10.2 — emitted when the segment carrying the signal starts playing (`call:reportStage`). */
+  reportStage(input: CallReportStageInput): Promise<unknown>
+  /** Phase 10.2 — test call outcome (`call:reportTestResult`). */
+  reportTestResult(input: CallReportTestResultInput): Promise<unknown>
+  /** Phase 10.2 — hybrid mode: /tts of one text chunk (`call:synthesize`); used by the hybrid session. */
+  synthesize(input: CallSynthesizeInput): Promise<CallSynthesizeResult>
 }
 
 // ───────────────────────────── Timers / clock ─────────────────────────────

@@ -7,6 +7,8 @@
  * 4. runs the same post-turn memory trio as the turn orchestrator
  *    (`runPostTurnMemoryPipeline`).
  * Steps 3–4 are fault-isolated; an untranscribed turn never feeds memory.
+ * Phase 10.2: turns of a TEST call (`test: true`) are ignored entirely — nothing is persisted,
+ * no event, no affect, no memory.
  */
 import type { AshyCortex } from '@ashy/cortex'
 import { ASHY_EMOTIONS, type AshyEmotion, type ChatMessageRecord, type LiveCallHostEvent } from '@ashy/shared'
@@ -49,11 +51,20 @@ export interface RecordCallTurnInput {
   }
   /** Memories that were in context for this turn (from `call:buildContext`). */
   retrieval?: CallMemoryRetrieval | null
+  /** Phase 10.2: turn of a test call → skipped. */
+  test?: boolean
 }
 
 export interface RecordCallTurnResult {
   userMessage: ChatMessageRecord
   assistantMessage: ChatMessageRecord | null
+}
+
+/** Returned for test-call turns (nothing recorded). */
+export interface SkippedCallTurnResult {
+  skipped: 'test_call'
+  userMessage: null
+  assistantMessage: null
 }
 
 const VALID_EMOTIONS = new Set<string>(ASHY_EMOTIONS)
@@ -63,7 +74,10 @@ export function createCallRecorder(deps: CallRecorderDeps) {
   let sequence = 0
 
   return {
-    async recordTurn(input: RecordCallTurnInput): Promise<RecordCallTurnResult> {
+    async recordTurn(input: RecordCallTurnInput): Promise<RecordCallTurnResult | SkippedCallTurnResult> {
+      if (input.test === true) {
+        return { skipped: 'test_call', userMessage: null, assistantMessage: null }
+      }
       const cortex = deps.getCortex()
       const nowMs = now()
       sequence += 1

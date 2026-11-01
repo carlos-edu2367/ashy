@@ -181,9 +181,31 @@ export type ElectronPermissionCheckHandlerLike = (
   details?: ElectronPermissionCheckDetailsLike,
 ) => boolean
 
+/** Subset of Electron's `OnBeforeSendHeadersListenerDetails`. */
+export interface ElectronBeforeSendHeadersDetailsLike {
+  url: string
+  webContentsId?: number
+  resourceType?: string
+  requestHeaders: Record<string, string>
+  [key: string]: unknown
+}
+
+export type ElectronBeforeSendHeadersListenerLike = (
+  details: ElectronBeforeSendHeadersDetailsLike,
+  callback: (response: { cancel?: boolean; requestHeaders?: Record<string, string> }) => void,
+) => void
+
+export interface ElectronWebRequestLike {
+  onBeforeSendHeaders(
+    filterOrListener: { urls: string[] } | ElectronBeforeSendHeadersListenerLike | null,
+    listener?: ElectronBeforeSendHeadersListenerLike | null,
+  ): void
+}
+
 export interface ElectronSessionLike {
   setPermissionRequestHandler?(handler: ElectronPermissionRequestHandlerLike | null): void
   setPermissionCheckHandler?(handler: ElectronPermissionCheckHandlerLike | null): void
+  webRequest?: ElectronWebRequestLike
 }
 
 export interface ElectronWebContentsLike {
@@ -397,6 +419,131 @@ export function installScopedMediaPermission(
   }
 }
 
+// ───────────────────────────── Phase 10.2: llama-server auth header injection ─────────────────────────────
+
+/**
+ * One header-injection scope: the URL patterns it cares about plus a per-request decision.
+ * `headersFor` returns the headers to ADD, or null to leave the request untouched.
+ */
+export interface RequestHeaderScope {
+  urls(): string[]
+  headersFor(details: ElectronBeforeSendHeadersDetailsLike): Record<string, string> | null
+}
+
+export interface RequestHeaderScopeHandle {
+  /** Re-reads `urls()` and re-registers the session filter (call when the target port changes). */
+  refresh(): void
+  dispose(): void
+}
+
+interface SessionHeaderRouter {
+  scopes: Set<RequestHeaderScope>
+  listener: ElectronBeforeSendHeadersListenerLike
+  update(): void
+}
+
+const sessionHeaderRouters = new WeakMap<object, SessionHeaderRouter>()
+
+/**
+ * Electron keeps only ONE `webRequest.onBeforeSendHeaders` listener per session (the last one
+ * wins), so every header rewrite in Ashy must go through this per-session router instead of
+ * calling `onBeforeSendHeaders` directly. The router registers a single listener whose URL filter
+ * is the union of the scopes' patterns (or unsubscribes when there are none) and lets the first
+ * scope that answers add its headers.
+ *
+ * Verified for Electron 35.1.5 (electron-builder.yml): WebSocket handshakes go through
+ * `webRequest` too — `ElectronBrowserClient::WillInterceptWebSocket` routes them through
+ * `shell/browser/net/proxying_websocket.cc`, whose `OnBeforeRequestComplete` calls
+ * `web_request_api_->OnBeforeSendHeaders(&info_, request_, ..., &request_headers_)` and sends the
+ * (modified) `request_headers_` with the upgrade; filters are parsed with
+ * `URLPattern::SCHEME_ALL`, so `ws://` patterns match, and `details.webContentsId` is filled from
+ * the request's RenderFrameHost (`electron_api_web_request.cc`).
+ */
+export function installScopedRequestHeaders(
+  session: ElectronSessionLike | null | undefined,
+  scope: RequestHeaderScope,
+): RequestHeaderScopeHandle {
+  const webRequest = session?.webRequest
+  if (!session || !webRequest || typeof webRequest.onBeforeSendHeaders !== 'function') {
+    return { refresh: () => undefined, dispose: () => undefined }
+  }
+  let router = sessionHeaderRouters.get(session)
+  if (!router) {
+    const scopes = new Set<RequestHeaderScope>()
+    const listener: ElectronBeforeSendHeadersListenerLike = (details, callback) => {
+      for (const s of scopes) {
+        let add: Record<string, string> | null = null
+        try {
+          add = s.headersFor(details)
+        } catch {
+          add = null
+        }
+        if (add && Object.keys(add).length > 0) {
+          callback({ requestHeaders: { ...details.requestHeaders, ...add } })
+          return
+        }
+      }
+      callback({})
+    }
+    let lastKey: string | null = null
+    const created: SessionHeaderRouter = {
+      scopes,
+      listener,
+      update() {
+        const urls = [...new Set([...scopes].flatMap((s) => s.urls()))].sort()
+        const key = urls.join('\n')
+        if (key === lastKey) return
+        lastKey = key
+        if (urls.length === 0) webRequest.onBeforeSendHeaders(null)
+        else webRequest.onBeforeSendHeaders({ urls }, listener)
+      },
+    }
+    router = created
+    sessionHeaderRouters.set(session, created)
+  }
+  const ownRouter = router
+  ownRouter.scopes.add(scope)
+  ownRouter.update()
+  let disposed = false
+  return {
+    refresh() {
+      if (!disposed) ownRouter.update()
+    },
+    dispose() {
+      if (disposed) return
+      disposed = true
+      ownRouter.scopes.delete(scope)
+      ownRouter.update()
+    },
+  }
+}
+
+/** What the main process needs from the host to authenticate the call window to llama-server. */
+export interface EngineAuthLike {
+  origin: string
+  port: number
+  headers: Record<string, string>
+}
+
+/** URL patterns for the managed llama-server (plain HTTP + the `/v1/realtime` WebSocket). */
+export function engineAuthUrlPatterns(auth: EngineAuthLike | null): string[] {
+  if (!auth || !Number.isInteger(auth.port) || auth.port <= 0 || auth.port > 65535) return []
+  return [`http://127.0.0.1:${auth.port}/*`, `ws://127.0.0.1:${auth.port}/*`]
+}
+
+/** True when `rawUrl` targets exactly the engine's loopback port over http/ws. */
+export function isEngineRequestUrl(rawUrl: string, auth: EngineAuthLike | null): boolean {
+  if (!auth) return false
+  try {
+    const u = new URL(rawUrl)
+    if (u.protocol !== 'http:' && u.protocol !== 'ws:') return false
+    if (u.hostname !== '127.0.0.1') return false
+    return Number(u.port) === auth.port
+  } catch {
+    return false
+  }
+}
+
 export interface CallWindowTimers {
   setTimeout(fn: () => void, ms: number): unknown
   clearTimeout(handle: unknown): void
@@ -415,6 +562,12 @@ export interface CreateCallWindowControllerOptions {
   session?: ElectronSessionLike | null
   idleDestroyMs?: number
   timers?: CallWindowTimers
+  /**
+   * Phase 10.2: current managed llama-server auth (`kernel.liveCall.getEngineAuth()`). The headers
+   * are injected (main process only, never exposed to the renderer) into the call window's
+   * requests to that engine port.
+   */
+  getEngineAuth?: () => EngineAuthLike | null
 }
 
 export interface ElectronCallWindowController {
@@ -423,6 +576,8 @@ export interface ElectronCallWindowController {
   getWindow(): ElectronBrowserWindowInstanceLike | null
   /** Feed every `call:state`: arms the idle auto-destroy on idle/ended, cancels it otherwise. */
   handleCallState(status: string): void
+  /** Re-reads the engine auth (port/key) and refreshes the header-injection filter. */
+  refreshEngineAuth(): void
 }
 
 function sameWebContents(candidate: unknown, target: ElectronWebContentsLike): boolean {
@@ -445,6 +600,14 @@ export function createCallWindowController(
   let pending: Promise<void> | null = null
   let idleTimer: unknown = null
   let releasePermission: (() => void) | null = null
+  let headerScope: RequestHeaderScopeHandle | null = null
+  const readEngineAuth = (): EngineAuthLike | null => {
+    try {
+      return options.getEngineAuth?.() ?? null
+    } catch {
+      return null
+    }
+  }
 
   const cancelIdleTimer = (): void => {
     if (idleTimer !== null) {
@@ -460,6 +623,8 @@ export function createCallWindowController(
     pending = null
     releasePermission?.()
     releasePermission = null
+    headerScope?.dispose()
+    headerScope = null
     options.onWindowGone?.(target)
   }
 
@@ -486,6 +651,19 @@ export function createCallWindowController(
       wc.session ?? options.session ?? null,
       (candidate) => win === created && sameWebContents(candidate, wc),
     )
+    if (options.getEngineAuth) {
+      headerScope = installScopedRequestHeaders(wc.session ?? options.session ?? null, {
+        urls: () => (win === created ? engineAuthUrlPatterns(readEngineAuth()) : []),
+        headersFor: (details) => {
+          // Only the call-engine window, only the engine's current loopback port.
+          if (win !== created || typeof wc.id !== 'number' || details.webContentsId !== wc.id) {
+            return null
+          }
+          const auth = readEngineAuth()
+          return auth && isEngineRequestUrl(details.url, auth) ? auth.headers : null
+        },
+      })
+    }
     created.on?.('closed', () => forget(created))
     return created
   }
@@ -567,6 +745,10 @@ export function createCallWindowController(
         return
       }
       cancelIdleTimer()
+    },
+
+    refreshEngineAuth() {
+      headerScope?.refresh()
     },
   }
   return controller
@@ -1079,6 +1261,9 @@ export async function bootAshyElectronMain(
     preloadPath,
     url: callEngineUrl,
     session: deps.session ?? null,
+    // Phase 10.2: the llama-server API key stays in the main process; only the call window's
+    // requests to the engine port get `Authorization` injected (see installScopedRequestHeaders).
+    getEngineAuth: () => kernel.liveCall?.getEngineAuth?.() ?? null,
     ...(deps.callWindowIdleDestroyMs !== undefined
       ? { idleDestroyMs: deps.callWindowIdleDestroyMs }
       : {}),
@@ -1100,6 +1285,8 @@ export async function bootAshyElectronMain(
   const unsubscribeCallState = kernel.onHostEvent((evt) => {
     if (evt.type === 'call:state') {
       callWindowController.handleCallState(evt.state.status)
+    } else if (evt.type === 'engine:status') {
+      callWindowController.refreshEngineAuth()
     }
   })
 

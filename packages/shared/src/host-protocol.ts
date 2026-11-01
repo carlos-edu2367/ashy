@@ -2088,6 +2088,7 @@ export const CallCommandEventSchema = v.variant('command', [
     callId: NonEmptyStringSchema,
     backend: LiveBackendIdEventSchema,
     sessionId: NonEmptyStringSchema,
+    test: v.optional(v.boolean()),
   }),
   v.object({
     type: v.literal('call:command'),
@@ -2161,13 +2162,38 @@ export const ChatAppendedEventSchema = v.object({
   messageIds: v.array(NonEmptyStringSchema),
 })
 
-/** Validates any of the 5 Live Call host events (`LiveCallHostEvent`). */
+export const CallStageEventSchema = v.object({
+  type: v.literal('call:stage'),
+  callId: NonEmptyStringSchema,
+  emotion: v.string(),
+  intensity: v.number(),
+  motion: v.optional(v.string()),
+})
+
+export const CallTestResultEventSchema = v.object({
+  type: v.literal('call:testResult'),
+  result: v.object({
+    callId: NonEmptyStringSchema,
+    ok: v.boolean(),
+    steps: v.array(
+      v.object({ step: v.string(), ok: v.boolean(), ms: v.optional(v.number()), detail: v.optional(v.string()) }),
+    ),
+    metrics: v.nullable(v.record(v.string(), v.number())),
+    transcript: v.nullable(v.string()),
+    reply: v.nullable(v.string()),
+    finishedAt: v.number(),
+  }),
+})
+
+/** Validates any of the Live Call host events (`LiveCallHostEvent`). */
 export const LiveCallHostEventSchema = v.union([
   CallStateEventSchema,
   CallVisemeEventSchema,
   CallCommandEventSchema,
   EngineStatusEventSchema,
   ChatAppendedEventSchema,
+  CallStageEventSchema,
+  CallTestResultEventSchema,
 ])
 
 export const AshyHostStreamEventSchema = v.union([
@@ -2263,6 +2289,8 @@ export const AshyHostStreamEventSchema = v.union([
   CallCommandEventSchema,
   EngineStatusEventSchema,
   ChatAppendedEventSchema,
+  CallStageEventSchema,
+  CallTestResultEventSchema,
 ])
 
 export type AshyHostStreamEvent =

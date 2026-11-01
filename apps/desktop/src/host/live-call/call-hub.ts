@@ -30,6 +30,8 @@ export interface CallEngineSource {
   getStatus(): LlamaCppEngineStatus
   start(modelId?: string): Promise<LlamaCppEngineStatus>
   getModelSpec(modelId: string): LiveLocalModelSpec | undefined
+  /** Phase 10.2 (T3): auth headers for host → managed llama-server HTTP calls. */
+  getRequestHeaders?(): Record<string, string>
 }
 
 export interface CallWindowControllerLike {
@@ -54,6 +56,14 @@ export interface CallRecord {
   callId: string
   sessionId: string
   backend: LiveBackendId
+  /** Phase 10.2 test call: never persisted, no memory/affect side effects. */
+  test: boolean
+}
+
+export interface CallHubStartInput {
+  backend?: LiveBackendId
+  /** Internal only (`call:startTest`); `call:start` never sets it. */
+  test?: boolean
 }
 
 export interface CallHub {
@@ -62,7 +72,7 @@ export interface CallHub {
   getActiveCall(): CallRecord | null
   /** Any call started by this hub recently (active or just ended), e.g. a turn recorded after hang-up. */
   getKnownCall(callId: string): CallRecord | null
-  start(input: { backend?: LiveBackendId }): Promise<CallStateSnapshot>
+  start(input: CallHubStartInput): Promise<CallStateSnapshot>
   stop(input: { callId?: string }): CallStateSnapshot
   setMuted(input: { muted: boolean }): CallStateSnapshot
   getRuntimeConfig(input: { callId?: string }): CallRuntimeConfig
@@ -181,7 +191,7 @@ export function createCallHub(deps: CallHubDeps): CallHub {
     }
   }
 
-  async function doStart(input: { backend?: LiveBackendId }): Promise<CallStateSnapshot> {
+  async function doStart(input: CallHubStartInput): Promise<CallStateSnapshot> {
     const myGeneration = generation
     const settings = deps.settings.get()
     const backend = input.backend ?? settings.backend
@@ -216,9 +226,17 @@ export function createCallHub(deps: CallHubDeps): CallHub {
       if (generation !== myGeneration) return { ...state }
     }
 
-    active = { callId, sessionId, backend }
+    const test = input.test === true
+    active = { callId, sessionId, backend, test }
     remember(active)
-    deps.emit({ type: 'call:command', command: 'start', callId, backend, sessionId })
+    deps.emit({
+      type: 'call:command',
+      command: 'start',
+      callId,
+      backend,
+      sessionId,
+      ...(test ? { test: true } : {}),
+    })
     return publish({
       ...IDLE_CALL_STATE,
       callId,

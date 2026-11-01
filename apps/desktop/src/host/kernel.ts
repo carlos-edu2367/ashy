@@ -119,7 +119,11 @@ import { seedAshyDemoFixtures } from '../test/fixtures/demo-seed'
 import { createHostAgencyRuntime, type HostAgencyRuntime } from './agency-runtime'
 import { removeFileAtomicWithBackups, writeAtomicWithBackup } from './atomic-file'
 import { registerEngineHandlers } from './engines/handlers'
-import { createLlamaCppEngine, type CreateLlamaCppEngineOptions } from './engines/llamacpp-engine'
+import {
+  createLlamaCppEngine,
+  type CreateLlamaCppEngineOptions,
+  type LlamaCppEngineAuth,
+} from './engines/llamacpp-engine'
 import { registerCallHostHandlers } from './live-call/handlers'
 import { createLiveCallRegistry, type LiveCallRegistry } from './live-call/registry'
 import { createLiveModeSettingsStore } from './live-call/settings'
@@ -369,6 +373,8 @@ export interface AshyHostLiveCallApi {
   /** Emits a Live Call event to every host event subscriber (IPC + SSE; viseme is IPC-only). */
   emit(event: LiveCallHostEvent): void
   getCallWindowController(): CallWindowController | null
+  /** Phase 10.2: managed llama-server origin + auth headers (SECRET: Electron main/e2e only). */
+  getEngineAuth(): LlamaCppEngineAuth | null
 }
 
 export interface AshyHostKernel extends AshyHostBridge {
@@ -916,6 +922,7 @@ export async function createAshyHostKernel(
     getCallWindowController(): CallWindowController | null {
       return callWindowController
     },
+    getEngineAuth: () => llamaCppEngine.getAuth(),
   }
 
   const liveModeSettingsStore = createLiveModeSettingsStore({ userDataDir: options.userDataDir })
@@ -930,6 +937,7 @@ export async function createAshyHostKernel(
   })
   registerEngineHandlers(liveCallApi, { llamaCppEngine, liveModeSettingsStore })
   registerCallHostHandlers(liveCallApi, {
+    userDataDir: options.userDataDir,
     settings: liveModeSettingsStore,
     engine: llamaCppEngine,
     getCortex: () => cortexInstance,

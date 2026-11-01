@@ -194,10 +194,16 @@ class FakeChild extends EventEmitter implements LlamaCppChildProcess {
 }
 
 function createFakeSpawn(behavior?: (index: number, child: FakeChild) => void) {
-  const calls: Array<{ command: string; args: string[]; cwd: string; child: FakeChild }> = []
+  const calls: Array<{
+    command: string
+    args: string[]
+    cwd: string
+    env: Record<string, string> | undefined
+    child: FakeChild
+  }> = []
   const spawnImpl: LlamaCppSpawnImpl = (command, args, options) => {
     const child = new FakeChild(1000 + calls.length)
-    calls.push({ command, args, cwd: options.cwd, child })
+    calls.push({ command, args, cwd: options.cwd, env: options.env, child })
     behavior?.(calls.length - 1, child)
     return child
   }
@@ -534,6 +540,10 @@ describe('LlamaCppEngine — process lifecycle', () => {
       '-c', '4096',
       '--jinja', '--no-webui',
     ])
+    // Phase 10.2: the per-launch API key goes through the env, never argv.
+    expect(call.env?.LLAMA_API_KEY).toMatch(/^[0-9a-f]{64}$/)
+    expect(call.args.join(' ')).not.toContain(call.env!.LLAMA_API_KEY!)
+    expect(call.args).not.toContain('--api-key')
     expect(status).toMatchObject({
       running: true,
       managed: true,

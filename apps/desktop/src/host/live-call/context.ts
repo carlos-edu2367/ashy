@@ -12,6 +12,9 @@ import { decayMoodToBaseline } from '@ashy/cortex'
 import type { CallContextResult, MoodVector, ProspectiveIntent } from '@ashy/shared'
 
 export const CALL_INSTRUCTIONS_MODE_LINE = 'Respond in interleaved text and audio.'
+/** Phase 10.2 hybrid: the realtime session answers in text only (model-card text-mode line). */
+export const CALL_INSTRUCTIONS_TEXT_MODE_LINE = 'Respond in text.'
+export type CallInstructionsMode = 'audio' | 'text'
 export const CALL_INSTRUCTIONS_LANGUAGE_LINE =
   'Always respond in Brazilian Portuguese, briefly and naturally (1–3 sentences unless asked).'
 export const CALL_INSTRUCTIONS_MAX_CHARS = 1200
@@ -41,6 +44,8 @@ export interface CallContextDeps {
 
 export interface CallContextBuildInput {
   sessionId: string
+  /** 'text' for the hybrid backend (default 'audio'). */
+  mode?: CallInstructionsMode
   userText?: string
   interruptedAfterText?: string
 }
@@ -61,7 +66,9 @@ function oneLine(raw: string | null | undefined): string {
 }
 
 /** Session-level instructions for llama.cpp realtime (≤ ~1200 chars, mode line LAST). */
-export function buildCallInstructions(input: { userName?: string | null } = {}): string {
+export function buildCallInstructions(
+  input: { userName?: string | null; mode?: CallInstructionsMode } = {},
+): string {
   const userName = oneLine(input.userName)
     .replace(/[^\p{L}\p{N} .'-]/gu, '')
     .slice(0, 40)
@@ -80,7 +87,8 @@ export function buildCallInstructions(input: { userName?: string | null } = {}):
   const body = lines
     .join('\n')
     .replace(FORBIDDEN_INSTRUCTION_RE, '')
-  const tail = `${CALL_INSTRUCTIONS_LANGUAGE_LINE}\n${CALL_INSTRUCTIONS_MODE_LINE}`
+  const modeLine = input.mode === 'text' ? CALL_INSTRUCTIONS_TEXT_MODE_LINE : CALL_INSTRUCTIONS_MODE_LINE
+  const tail = `${CALL_INSTRUCTIONS_LANGUAGE_LINE}\n${modeLine}`
   const maxBody = Math.max(0, CALL_INSTRUCTIONS_MAX_CHARS - tail.length - 1)
   return `${body.slice(0, maxBody).trimEnd()}\n${tail}`
 }
@@ -187,7 +195,7 @@ export function createCallContextBuilder(deps: CallContextDeps) {
       } catch {
         userName = null
       }
-      const instructions = buildCallInstructions({ userName })
+      const instructions = buildCallInstructions({ userName, mode: input.mode ?? 'audio' })
 
       const userText = oneLine(input.userText)
       const interruptedAfterText = oneLine(input.interruptedAfterText)

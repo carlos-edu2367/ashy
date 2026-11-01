@@ -7,13 +7,19 @@
  * session deltas → GaplessAudioPlayer (+ viseme frames from the PCM actually played)
  * ledger (text + played ms per response) → host.recordTurn (only what was heard)
  *
+ * Phase 10.2: ducking in interrupt_pending, session rotation seeded with a deduped recap (curbs the 2B
+ * model repeating itself), emotion per sentence (ACT marker or host.classifyAffect) reported when that
+ * sentence starts playing, and a test mode where a WAV replaces the microphone.
+ *
  * The engine knows no backend: it only reads `session.caps`. Every browser API is injected.
  */
 import {
   type CallCaption,
   type CallEndReason,
   type CallMetrics,
+  type CallStageSignal,
   type CallStatus,
+  type CallTestInput,
   type CallVisemeFrame,
   type LiveModeSettings,
   formatTranscribedUserTurn,
@@ -28,7 +34,17 @@ import {
   type WebAudioContextLike,
   type WebAudioWorkletCapture,
 } from '../voice-session-runtime'
-import { encodePcmBlocksToWav, uint8ArrayToBase64 } from '../wav-codec'
+import { base64ToUint8Array, decodeWavToPcmBlocks, encodePcmBlocksToWav, uint8ArrayToBase64 } from '../wav-codec'
+import {
+  buildSessionRecap,
+  extractActMarkers,
+  isNearRepeat,
+  NEAR_REPEAT_WINDOW,
+  splitCompletedSentences,
+  stripCallMarkers,
+  textSimilarity,
+  type CallExchange,
+} from './call-quality'
 import {
   createInitialCallMachineState,
   transitionCall,
@@ -49,6 +65,7 @@ import {
   createDefaultCallTimers,
   defaultNow,
   type CallEngineHost,
+  type CallReportTestResultInput,
   type CallTimers,
   type VoiceSession,
   type VoiceSessionEventMap,
@@ -58,6 +75,18 @@ const CAPTURE_RATE = 16000
 const BARGE_IN_FADE_MS = 120
 const VISEME_INTERVAL_MS = 33
 const CAPTION_THROTTLE_MS = 100
+/** Phase 10.2 ducking while a possible barge-in is being confirmed. */
+export const CALL_DUCK_DB = -12
+const DUCK_RAMP_MS = 80
+const UNDUCK_RAMP_MS = 150
+/** Session rotation: ~4 chars per text token; rotate when the estimate passes 70 % of the context. */
+const CHARS_PER_TOKEN = 4
+const CONTEXT_ROTATE_RATIO = 0.7
+/** Stage timing before the response is complete: never assume speech faster than this. */
+const STAGE_MIN_MS_PER_CHAR = 1000 / 15
+const TEST_TRAILING_SILENCE_MS = 1500
+const TEST_TIMEOUT_MS = 45000
+const TEST_BLOCK_MS = 20
 
 export interface CallEngineOptions {
   callId: string
@@ -79,6 +108,18 @@ export interface CallEngineOptions {
   timers?: CallTimers
   maxReconnectAttempts?: number
   transcribeLanguage?: string
+  /** Context window of the backend model (CallRuntimeConfig.llamacpp.contextSize). Default 8192. */
+  contextSize?: number
+  /** Context tokens per second of audio (input/output) for the rotation estimate. Default 12.5. */
+  audioTokensPerSec?: number
+  /**
+   * Phase 10.2 test call: this WAV (mono PCM16, 16 kHz) replaces the microphone (fed in real time in
+   * 20 ms blocks, then 1.5 s of silence). After one turn (or the timeout) the engine calls
+   * host.reportTestResult and stops. Test turns are never recorded.
+   */
+  testInput?: CallTestInput
+  /** Test call overall timeout (default 45 s). */
+  testTimeoutMs?: number
   onSnapshot?: (snapshot: CallEngineSnapshot) => void
   onLog?: (message: string, data?: unknown) => void
 }
@@ -108,6 +149,22 @@ interface LedgerChunk {
   frames: CallVisemeFrame[]
 }
 
+interface PendingStage {
+  /** Offset in the clean (marker-free) response text where the signal applies. */
+  offset: number
+  signal: CallStageSignal | null
+  resolved: boolean
+  fired: boolean
+}
+
+interface StageTrack {
+  markersSeen: number
+  sentencesSeen: number
+  cleanLen: number
+  pending: PendingStage[]
+  cancelled: boolean
+}
+
 interface ResponseLedger {
   itemId: string | null
   userTranscript: string
@@ -122,6 +179,9 @@ interface ResponseLedger {
   responseRequestedAt: number
   firstAudioAt: number | null
   safetyTimer: unknown
+  stage: StageTrack
+  /** Recap bookkeeping done (once per ledger). */
+  noted: boolean
 }
 
 interface ActiveTurn {
@@ -130,9 +190,34 @@ interface ActiveTurn {
   lease: HistoryLease | null
 }
 
-const MARKER_RE = /<\|[^|>]*\|>/g
-function stripMarkers(text: string): string {
-  return text.replace(MARKER_RE, '').replace(/\s{2,}/g, ' ')
+/** Markers (`<|ACT …|>`, `<|ACT …}>`, control tokens) never reach the caption or the ledger. */
+const stripMarkers = stripCallMarkers
+
+interface TestTracker {
+  samples: Float32Array | null
+  startedAt: number
+  engineOk: boolean
+  engineMs?: number
+  engineDetail?: string
+  sessionOk: boolean
+  sessionMs?: number
+  sessionDetail?: string
+  feedStartedAt: number | null
+  speechStartAt: number | null
+  speechEndAt: number | null
+  committed: boolean
+  transcript: string | null
+  asrMs?: number
+  transcriptionDetail?: string
+  ttfbMs?: number
+  playbackOk: boolean
+  playbackMs?: number
+  playbackDetail?: string
+  reply: string | null
+  metrics: CallMetrics | null
+  feedTimer: unknown
+  timeoutTimer: unknown
+  reported: boolean
 }
 
 function classifyCaptureError(err: unknown): CallEndReason {
@@ -210,6 +295,42 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
   let lastCaptionReportAt = -Infinity
   let captionTimer: unknown = null
 
+  // ── session rotation (Phase 10.2) ──
+  const rotateAfterTurns = Math.max(1, settings.session?.rotateAfterTurns ?? 6)
+  const contextSize = options.contextSize && options.contextSize > 0 ? options.contextSize : 8192
+  const audioTokensPerSec = options.audioTokensPerSec ?? 12.5
+  let sessionTurns = 0
+  let sessionTokens = 0
+  const exchanges: CallExchange[] = []
+  const recentReplies: string[] = []
+  let rotationDue: string | null = null
+  let rotating: Promise<void> | null = null
+  /** Recap to send (inside the context part of the next user turn) to a freshly opened session. */
+  let pendingRecap = ''
+  let lastUserLabel: string | undefined
+
+  // ── test mode (Phase 10.2) ──
+  const testInput = options.testInput ?? null
+  const test: TestTracker | null = testInput
+    ? {
+        samples: null,
+        startedAt: 0,
+        engineOk: false,
+        sessionOk: false,
+        feedStartedAt: null,
+        speechStartAt: null,
+        speechEndAt: null,
+        committed: false,
+        transcript: null,
+        playbackOk: false,
+        reply: null,
+        metrics: null,
+        feedTimer: null,
+        timeoutTimer: null,
+        reported: false,
+      }
+    : null
+
   // ───────────────────────── state reporting ─────────────────────────
 
   function snapshot(): CallEngineSnapshot {
@@ -264,11 +385,28 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
   }
 
   function dispatch(event: CallMachineEvent): boolean {
+    const prev = machine.status
     const next = transitionCall(machine, event)
     if (next === machine) return false
     machine = next
+    onStatusChange(prev, machine.status)
     report()
     return true
+  }
+
+  function onStatusChange(prev: CallStatus, status: CallStatus): void {
+    if (status === 'interrupt_pending') {
+      player.setDuck(CALL_DUCK_DB, DUCK_RAMP_MS)
+    } else if (prev === 'interrupt_pending' && player.getDuckDb() !== 0) {
+      // False interruption → back to full volume; queue drained → nothing left to un-duck smoothly.
+      player.setDuck(0, status === 'speaking' ? UNDUCK_RAMP_MS : 0)
+    }
+    if (status === 'listening') {
+      if (rotationDue !== null && !rotating && !stopped) void startRotation()
+      if (test && test.committed && !test.reported) {
+        void Promise.resolve().then(() => finishTest())
+      }
+    }
   }
 
   // ───────────────────────── visemes ─────────────────────────
@@ -305,7 +443,95 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     visemeTimer = timers.setInterval(() => {
       if (stopped) return
       sendViseme(currentVisemeFrame())
+      tickStage()
     }, VISEME_INTERVAL_MS)
+  }
+
+  // ───────────────────────── emotion (Phase 10.2, spec §6.5) ─────────────────────────
+
+  function newStageTrack(): StageTrack {
+    return { markersSeen: 0, sentencesSeen: 0, cleanLen: 0, pending: [], cancelled: false }
+  }
+
+  function cancelStage(l: ResponseLedger): void {
+    l.stage.cancelled = true
+    l.stage.pending.length = 0
+  }
+
+  /** ACT markers → immediate signals; every complete sentence without a marker → host.classifyAffect. */
+  function processStage(l: ResponseLedger, final: boolean): void {
+    const st = l.stage
+    if (st.cancelled) return
+    const { clean, markers } = extractActMarkers(l.text)
+    st.cleanLen = clean.length
+    for (let i = st.markersSeen; i < markers.length; i++) {
+      st.pending.push({ offset: markers[i]!.offset, signal: markers[i]!.signal, resolved: true, fired: false })
+    }
+    st.markersSeen = markers.length
+    const spans = splitCompletedSentences(clean, final)
+    for (let i = st.sentencesSeen; i < spans.length; i++) {
+      const span = spans[i]!
+      const prevEnd = i > 0 ? spans[i - 1]!.end : 0
+      if (markers.some((m) => m.offset >= prevEnd && m.offset < span.end)) continue
+      const pending: PendingStage = { offset: span.start, signal: null, resolved: false, fired: false }
+      st.pending.push(pending)
+      classifySentence(span.text).then(
+        (signal) => {
+          pending.signal = st.cancelled ? null : signal
+          pending.resolved = true
+        },
+        () => {
+          pending.resolved = true
+        },
+      )
+    }
+    st.sentencesSeen = spans.length
+  }
+
+  async function classifySentence(text: string): Promise<CallStageSignal | null> {
+    if (typeof host.classifyAffect !== 'function') return null
+    try {
+      const res = await host.classifyAffect({ callId, text: text.slice(0, 2000) })
+      return res && typeof res.emotion === 'string' && res.emotion ? res : null
+    } catch (err) {
+      log('classifyAffect failed', err)
+      return null
+    }
+  }
+
+  /** Fires each resolved signal when its text offset starts playing (proportional text → audio map). */
+  function tickStage(): void {
+    const l = ledger
+    if (!l || l.stage.cancelled || l.chunks.length === 0 || l.stage.pending.length === 0) return
+    const st = l.stage
+    const startSec = l.chunks[0]!.startSec
+    const ratio = st.cleanLen > 0 ? l.totalAudioMs / st.cleanLen : 0
+    const msPerChar = l.done ? ratio : Math.max(ratio, STAGE_MIN_MS_PER_CHAR)
+    const t = player.getCurrentTimeSec()
+    for (const p of st.pending) {
+      if (p.fired || !p.resolved) continue
+      const atSec = startSec + (p.offset * msPerChar) / 1000
+      if (t + 1e-6 < atSec) continue
+      p.fired = true
+      if (p.signal) sendStage(p.signal)
+    }
+    st.pending = st.pending.filter((p) => !p.fired)
+  }
+
+  function sendStage(signal: CallStageSignal): void {
+    if (typeof host.reportStage !== 'function') return
+    const intensity = Number.isFinite(signal.intensity) ? Math.max(0, Math.min(1, signal.intensity)) : 0.6
+    try {
+      const res = host.reportStage({
+        callId,
+        emotion: String(signal.emotion).slice(0, 32),
+        intensity,
+        ...(signal.motion ? { motion: String(signal.motion).slice(0, 48) } : {}),
+      })
+      if (res && typeof (res as Promise<unknown>).catch === 'function') (res as Promise<unknown>).catch(() => {})
+    } catch {
+      // ignore
+    }
   }
 
   function stopVisemeTicker(): void {
@@ -341,13 +567,21 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     if (l.finalized) return
     l.finalized = true
     clearLedgerTimers(l)
+    cancelStage(l)
     const fullText = stripMarkers(l.text).trim()
     const spoken =
       outcome.spokenOverride ??
       (outcome.playedMs >= l.totalAudioMs - 1 && l.totalAudioMs > 0
         ? fullText
         : sliceSpokenText(fullText, outcome.playedMs, l.totalAudioMs))
+    const exchange = noteReply(l, fullText, spoken)
     const userTranscript = l.userTranscriptPromise ? await l.userTranscriptPromise.catch(() => '') : l.userTranscript
+    if (exchange && !exchange.user) exchange.user = userTranscript
+    if (test) {
+      // Test turns never reach the memory / chat history.
+      if (test.reply === null) test.reply = fullText
+      return
+    }
     try {
       await host.recordTurn({
         callId,
@@ -363,6 +597,90 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     }
   }
 
+  // ───────────────────────── session rotation (Phase 10.2) ─────────────────────────
+
+  function tokensOf(text: string): number {
+    return Math.ceil(text.length / CHARS_PER_TOKEN)
+  }
+
+  function audioTokens(ms: number): number {
+    return Math.ceil((Math.max(0, ms) / 1000) * audioTokensPerSec)
+  }
+
+  /**
+   * Recap bookkeeping + rotation triggers, once per finished response (completed, interrupted or cut).
+   * Returns the exchange so the caller can fill an audio-direct transcript later.
+   */
+  function noteReply(l: ResponseLedger, fullText: string, spoken: string): CallExchange | null {
+    if (l.noted) return null
+    l.noted = true
+    sessionTokens += tokensOf(l.text) + audioTokens(l.totalAudioMs)
+    let exchange: CallExchange | null = null
+    if (fullText || l.userTranscript) {
+      exchange = { user: l.userTranscript, assistant: spoken }
+      exchanges.push(exchange)
+      if (exchanges.length > 12) exchanges.splice(0, exchanges.length - 12)
+    }
+    if (rotationDue === null && fullText && isNearRepeat(fullText, recentReplies)) {
+      rotationDue = 'repetition'
+      log('near-repeat reply detected: rotating the session', { reply: fullText.slice(0, 120) })
+    }
+    if (fullText) {
+      recentReplies.push(fullText)
+      if (recentReplies.length > NEAR_REPEAT_WINDOW) recentReplies.splice(0, recentReplies.length - NEAR_REPEAT_WINDOW)
+    }
+    if (rotationDue === null && sessionTurns >= rotateAfterTurns) rotationDue = 'turns'
+    if (rotationDue === null && sessionTokens >= contextSize * CONTEXT_ROTATE_RATIO) rotationDue = 'context'
+    return exchange
+  }
+
+  function startRotation(): Promise<void> {
+    if (!rotating) {
+      const reason = rotationDue ?? 'manual'
+      rotating = rotateSession(reason).finally(() => {
+        rotating = null
+      })
+    }
+    return rotating
+  }
+
+  /**
+   * Opens a fresh session with the same instructions, swaps it in quietly (no state change) and queues
+   * the recap for the next user turn. On failure the current session is kept (retried after next turn).
+   */
+  async function rotateSession(reason: string): Promise<void> {
+    const old = session
+    if (stopped || !old) return
+    log(`rotating session (${reason})`, { turns: sessionTurns, tokens: sessionTokens })
+    let next: VoiceSession
+    try {
+      next = options.createSession()
+      await next.connect({ instructions, voice: settings.llamacpp.voice })
+    } catch (err) {
+      log('session rotation failed; keeping the current session', err)
+      return
+    }
+    const busy = ledger !== null || (inputMode === 'audio-direct' && streamingAudioDirect)
+    if (stopped || session !== old || busy) {
+      void next.close().catch(() => {})
+      return
+    }
+    session = next
+    attachSession(next)
+    void old.close().catch(() => {})
+    rotationDue = null
+    pendingRecap = buildSessionRecap(exchanges, lastUserLabel ? { userLabel: lastUserLabel } : {})
+    sessionTurns = 0
+    sessionTokens = tokensOf(instructions) + tokensOf(pendingRecap)
+  }
+
+  /** Context text for the next user turn: the pending recap (if any) + the host's per-turn context. */
+  function takeTurnContext(context: string): string {
+    const recap = pendingRecap
+    pendingRecap = ''
+    return [recap.trim(), context.trim()].filter((t) => t.length > 0).join('\n')
+  }
+
   function onPlayerEnded(): void {
     const l = ledger
     if (!l || !l.done || l.finalized) return
@@ -371,6 +689,10 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
 
   function completeNaturally(l: ResponseLedger): void {
     if (l.finalized) return
+    if (test && !test.playbackOk) {
+      test.playbackOk = true
+      test.playbackMs = Math.round(l.totalAudioMs)
+    }
     void finalizeLedger(l, { interrupted: false, playedMs: l.totalAudioMs })
     if (ledger === l) ledger = null
     stopVisemeTicker()
@@ -448,6 +770,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     ledger = null
     if (l) {
       clearLedgerTimers(l)
+      cancelStage(l)
       l.finalized = true // nothing played → nothing saved
     }
     session?.cancelResponse('client')
@@ -470,6 +793,8 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       responseRequestedAt: now(),
       firstAudioAt: null,
       safetyTimer: null,
+      stage: newStageTrack(),
+      noted: false,
     }
   }
 
@@ -507,6 +832,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     metrics = { ...turnMetrics }
     caption = null
     dispatch({ type: 'turn_end' })
+    if (test) test.committed = true
     const superseded = () => stopped || turnSeq !== seq || machine.status !== 'thinking'
 
     if (inputMode === 'audio-direct') {
@@ -514,17 +840,25 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       const blocks = turnBlocks(t.onsetFrame, ev.endFrame)
       releaseTurnLease()
       session?.commitUserTurn()
+      const userAudioMs = blocks.reduce((acc, b) => acc + b.durationMs, 0)
       const transcriptPromise = transcribeBlocks(blocks)
         .then((r) => {
           turnMetrics.asrMs = r.asrMs
+          if (test && turnSeq === seq) {
+            test.transcript = r.text || null
+            test.asrMs = r.asrMs
+          }
           return r.text
         })
         .catch(() => '')
-      const { context: contextText } = await buildTurnContext()
+      const { context } = await buildTurnContext()
       if (superseded()) return
       interruptedAfterText = undefined
       const l = newLedger('', speechEndAt, turnMetrics)
       l.userTranscriptPromise = transcriptPromise
+      const contextText = takeTurnContext(context)
+      sessionTurns += 1
+      sessionTokens += tokensOf(contextText) + audioTokens(userAudioMs)
       // Send first, then install the ledger: synchronous events of an older response
       // (e.g. an implicit cancel) must never be adopted by the new ledger.
       session?.respond({ contextText })
@@ -539,6 +873,8 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     }
 
     // transcribed
+    // A due rotation (e.g. after a barge-in) overlaps the ASR; the turn waits for it before submitting.
+    if (rotationDue !== null && !rotating) void startRotation()
     const blocks = turnBlocks(t.onsetFrame, ev.endFrame + Math.round(0.2 * CAPTURE_RATE))
     let text = ''
     try {
@@ -548,12 +884,17 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     } catch (err) {
       if (superseded()) return
       detail = `transcription failed: ${String((err as Error)?.message ?? err)}`
+      if (test) test.transcriptionDetail = detail
       abandonTurn()
       dispatch({ type: 'response_failed' })
       return
     }
     if (superseded()) return
     metrics = { ...turnMetrics }
+    if (test) {
+      test.transcript = text || null
+      test.asrMs = turnMetrics.asrMs
+    }
     if (!text) {
       detail = 'empty transcription'
       abandonTurn()
@@ -564,6 +905,11 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     report()
     const turnContext = await buildTurnContext(text)
     if (superseded()) return
+    if (rotating) {
+      await rotating
+      if (superseded()) return
+    }
+    if (turnContext.userLabel) lastUserLabel = turnContext.userLabel
     interruptedAfterText = undefined
     const s = session
     if (!s?.submitUserText) {
@@ -574,7 +920,12 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     }
     const l = newLedger(text, speechEndAt, turnMetrics)
     // One input_text item: "[Contexto] …\n\n<Nome>: <fala>" — avoids LFM3 role confusion (spec §8.1).
-    s.submitUserText(formatTranscribedUserTurn(text, turnContext.context, turnContext.userLabel))
+    // After a rotation the recap rides in the context part of that same item (llama.cpp realtime
+    // only accepts user input_text items, and instructions only before the first input).
+    const item = formatTranscribedUserTurn(text, takeTurnContext(turnContext.context), turnContext.userLabel)
+    sessionTurns += 1
+    sessionTokens += tokensOf(item)
+    s.submitUserText(item)
     ledger = l
   }
 
@@ -628,6 +979,10 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
 
   function handleDetectorEvent(ev: TurnDetectorEvent): void {
     const status = machine.status
+    if (test && !test.committed) {
+      if (ev.type === 'speech_start' && test.speechStartAt === null) test.speechStartAt = now()
+      if (ev.type === 'speech_end' && status === 'user_speaking') test.speechEndAt = now()
+    }
     switch (ev.type) {
       case 'speech_start': {
         if (status === 'listening') {
@@ -715,6 +1070,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     l.text = e.text
     caption = { role: 'assistant', text: stripMarkers(l.text).trim().slice(0, 4000), final: false }
     reportCaptionThrottled()
+    processStage(l, false)
   }
 
   function onResponseAudio(e: VoiceSessionEventMap['response_audio']): void {
@@ -727,6 +1083,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     if (first) {
       l.firstAudioAt = tNow
       l.metrics.ttfbMs = Math.round(tNow - l.responseRequestedAt)
+      if (test && test.ttfbMs === undefined) test.ttfbMs = l.metrics.ttfbMs
       // Free the previous responses' buffers unless the gain is still at 0 from a fade
       // (reset() would leave the GainNode muted; scheduleChunk restores it instead).
       if (player.getGainValue() !== 0) player.reset()
@@ -754,6 +1111,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       turn = null
       if (!dispatch({ type: 'first_audio_played' })) report()
       startVisemeTicker()
+      tickStage()
     }
   }
 
@@ -765,6 +1123,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     if (e.cancelled && e.cancelReason === 'watchdog') {
       // Runaway speech: cut playback now, keep only what was actually heard.
       detail = `watchdog: ${e.detail ?? 'runaway audio'}`
+      if (test) test.playbackDetail = detail
       const playedMs = playedMsOf(l)
       player.stopWithFade(BARGE_IN_FADE_MS)
       void finalizeLedger(l, { interrupted: false, playedMs })
@@ -778,6 +1137,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     }
     if (l.chunks.length === 0) {
       // No audio at all: nothing was heard.
+      if (test) test.playbackDetail = 'response had no audio'
       void finalizeLedger(l, { interrupted: false, playedMs: 0, spokenOverride: '' })
       ledger = null
       releaseTurnLease()
@@ -787,6 +1147,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       return
     }
     caption = { role: 'assistant', text: stripMarkers(l.text).trim().slice(0, 4000), final: false }
+    processStage(l, true)
     player.markStreamComplete(true)
     if (!l.finalized) {
       // Safety net if the AudioContext never fires `onended`.
@@ -825,6 +1186,9 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     session = s
     attachSession(s)
     await s.connect({ instructions, voice: settings.llamacpp.voice })
+    sessionTurns = 0
+    sessionTokens = tokensOf(instructions)
+    rotationDue = null
   }
 
   async function handleBackendFailure(why: string): Promise<void> {
@@ -862,6 +1226,9 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
         try {
           await openSession()
           if (stopped) return
+          // The new session knows nothing of the call so far: seed it like a rotation.
+          pendingRecap = buildSessionRecap(exchanges, lastUserLabel ? { userLabel: lastUserLabel } : {})
+          sessionTokens += tokensOf(pendingRecap)
           detector.reset()
           detail = null
           dispatch({ type: 'reconnected' })
@@ -889,6 +1256,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
   async function teardown(): Promise<void> {
     stopped = true
     clearFalseInterruptTimer()
+    clearTestTimers()
     if (reconnectTimer !== null) {
       timers.clearTimeout(reconnectTimer)
       reconnectTimer = null
@@ -934,6 +1302,140 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     report()
   }
 
+  // ───────────────────────── test mode (Phase 10.2) ─────────────────────────
+
+  function clearTestTimers(): void {
+    if (!test) return
+    if (test.feedTimer !== null) {
+      timers.clearInterval(test.feedTimer)
+      test.feedTimer = null
+    }
+    if (test.timeoutTimer !== null) {
+      timers.clearTimeout(test.timeoutTimer)
+      test.timeoutTimer = null
+    }
+  }
+
+  /** Decodes the test WAV to mono 16 kHz float samples (throws on a malformed file). */
+  async function prepareTestInput(): Promise<void> {
+    if (!test || !testInput) return
+    const decoded = decodeWavToPcmBlocks(base64ToUint8Array(testInput.wavBase64), TEST_BLOCK_MS)
+    if (decoded.samples.length === 0) throw new Error('test input: empty audio')
+    test.samples =
+      decoded.sampleRate === CAPTURE_RATE ? decoded.samples : resampleFloat32(decoded.samples, decoded.sampleRate, CAPTURE_RATE)
+  }
+
+  /** Feeds the WAV through the capture → detector pipeline in real time (20 ms blocks), then silence. */
+  function startTestFeed(): void {
+    const t = test
+    if (!t || !t.samples) return
+    const samples = t.samples
+    const blockSamples = Math.round((CAPTURE_RATE * TEST_BLOCK_MS) / 1000)
+    const silenceMs = Math.max(TEST_TRAILING_SILENCE_MS, turnCfg.endpointMs + 500)
+    const totalSamples = samples.length + Math.round((silenceMs / 1000) * CAPTURE_RATE)
+    const totalBlocks = Math.ceil(totalSamples / blockSamples)
+    const t0 = now()
+    t.feedStartedAt = t0
+    let pushed = 0
+    const pushDue = () => {
+      if (stopped) return
+      const due = Math.min(totalBlocks, Math.floor((now() - t0) / TEST_BLOCK_MS) + 1)
+      while (pushed < due) {
+        const from = pushed * blockSamples
+        const chunk = new Float32Array(blockSamples)
+        if (from < samples.length) chunk.set(samples.subarray(from, Math.min(samples.length, from + blockSamples)))
+        pushed += 1
+        onCaptureBlock(capture.pushAecFrame(chunk))
+      }
+      if (pushed >= totalBlocks && t.feedTimer !== null) {
+        timers.clearInterval(t.feedTimer)
+        t.feedTimer = null
+      }
+    }
+    t.feedTimer = timers.setInterval(pushDue, TEST_BLOCK_MS)
+    pushDue()
+  }
+
+  function buildTestResult(why?: string): CallReportTestResultInput {
+    const t = test!
+    const failDetail = (fallback: string) => (why ? `${fallback} (${why})` : fallback)
+    const vadOk = t.speechStartAt !== null && t.speechEndAt !== null
+    const similarity = t.transcript && testInput ? textSimilarity(t.transcript, testInput.expectedText) : 0
+    const steps: CallReportTestResultInput['steps'] = [
+      {
+        step: 'engine',
+        ok: t.engineOk,
+        ...(t.engineMs !== undefined ? { ms: t.engineMs } : {}),
+        ...(!t.engineOk ? { detail: failDetail(t.engineDetail ?? 'engine did not start') } : {}),
+      },
+      {
+        step: 'session',
+        ok: t.sessionOk,
+        ...(t.sessionMs !== undefined ? { ms: t.sessionMs } : {}),
+        ...(!t.sessionOk ? { detail: failDetail(t.sessionDetail ?? 'no session handshake') } : {}),
+      },
+      {
+        step: 'vad',
+        ok: vadOk,
+        ...(vadOk && t.feedStartedAt !== null ? { ms: Math.round(t.speechEndAt! - t.feedStartedAt) } : {}),
+        ...(!vadOk
+          ? { detail: failDetail(t.speechStartAt === null ? 'speech not detected' : 'end of speech not detected') }
+          : {}),
+      },
+      {
+        step: 'transcription',
+        ok: Boolean(t.transcript),
+        ...(t.asrMs !== undefined ? { ms: t.asrMs } : {}),
+        detail: t.transcript
+          ? `similarity ${similarity.toFixed(2)} with the expected text`
+          : failDetail(t.transcriptionDetail ?? (t.asrMs !== undefined ? 'empty transcription' : 'not reached')),
+      },
+      {
+        step: 'first_audio',
+        ok: t.ttfbMs !== undefined,
+        ...(t.ttfbMs !== undefined ? { ms: t.ttfbMs } : { detail: failDetail('no audio received') }),
+      },
+      {
+        step: 'playback',
+        ok: t.playbackOk,
+        ...(t.playbackMs !== undefined ? { ms: t.playbackMs } : {}),
+        ...(!t.playbackOk ? { detail: failDetail(t.playbackDetail ?? 'playback did not finish') } : {}),
+      },
+    ]
+    for (const st of steps) if (st.detail) st.detail = st.detail.slice(0, 500)
+    return {
+      callId,
+      ok: steps.every((st) => st.ok),
+      steps,
+      metrics: t.metrics ?? metrics,
+      transcript: t.transcript ? t.transcript.slice(0, 4000) : null,
+      reply: t.reply ? t.reply.slice(0, 4000) : null,
+    }
+  }
+
+  async function reportTest(why?: string): Promise<void> {
+    if (!test || test.reported) return
+    test.reported = true
+    clearTestTimers()
+    if (!test.metrics && metrics) test.metrics = { ...metrics }
+    if (test.reply === null && ledger) test.reply = stripMarkers(ledger.text).trim() || null
+    const result = buildTestResult(why)
+    log('test call result', result)
+    if (typeof host.reportTestResult !== 'function') return
+    try {
+      await host.reportTestResult(result)
+    } catch (err) {
+      log('reportTestResult failed', err)
+    }
+  }
+
+  /** One test turn is over (or timed out): report, then hang up. */
+  async function finishTest(why?: string): Promise<void> {
+    if (!test || test.reported) return
+    await reportTest(why)
+    if (!stopped) await stop('user_hangup')
+  }
+
   async function start(): Promise<CallStatus> {
     if (!dispatch({ type: 'start' })) return machine.status
     try {
@@ -946,17 +1448,24 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       log('playback context unavailable', err)
     }
 
+    const startedAt = now()
+    if (test) test.startedAt = startedAt
     const sessionPromise = (async () => {
       const ctx = await host.buildContext({ callId })
       instructions = ctx?.instructions ?? ''
+      const t0 = now()
       await openSession()
+      if (test) test.sessionMs = Math.round(now() - t0)
     })()
-    const capturePromise = capture.startMicrophoneCapture({
-      ...(settings.devices.inputDeviceId ? { deviceId: settings.devices.inputDeviceId } : {}),
-      ...(options.mediaDevices ? { mediaDevices: options.mediaDevices } : {}),
-      ...(options.captureAudioContextFactory ? { audioContextFactory: options.captureAudioContextFactory } : {}),
-      onPcmBlock: (aecBlock) => onCaptureBlock(aecBlock),
-    })
+    // Test call: the WAV replaces the microphone (no getUserMedia at all).
+    const capturePromise = test
+      ? prepareTestInput()
+      : capture.startMicrophoneCapture({
+          ...(settings.devices.inputDeviceId ? { deviceId: settings.devices.inputDeviceId } : {}),
+          ...(options.mediaDevices ? { mediaDevices: options.mediaDevices } : {}),
+          ...(options.captureAudioContextFactory ? { audioContextFactory: options.captureAudioContextFactory } : {}),
+          onPcmBlock: (aecBlock) => onCaptureBlock(aecBlock),
+        })
     const [sessionRes, captureRes, detectorRes] = await Promise.allSettled([
       sessionPromise,
       capturePromise,
@@ -970,21 +1479,41 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     } else if (sessionRes.status === 'rejected') {
       failure = { reason: 'backend_unavailable', detail: String((sessionRes.reason as Error)?.message ?? sessionRes.reason) }
     }
+    if (test) {
+      test.sessionOk = sessionRes.status === 'fulfilled'
+      if (sessionRes.status === 'rejected') test.sessionDetail = String((sessionRes.reason as Error)?.message ?? sessionRes.reason)
+    }
     if (failure) {
       detail = failure.detail
       await teardown()
       machine = transitionCall(machine, { type: 'fatal', reason: failure.reason, detail: failure.detail })
       report()
       finishToIdle()
+      if (test) {
+        test.engineDetail = failure.detail
+        await reportTest()
+      }
       return 'ended'
     }
     if (detectorRes.status === 'fulfilled') log(`vad engine: ${detectorRes.value}`)
     dispatch({ type: 'connected' })
+    if (test && machine.status === 'listening') {
+      const t = test
+      const timeoutMs = options.testTimeoutMs ?? TEST_TIMEOUT_MS
+      t.engineOk = true
+      t.engineMs = Math.round(now() - startedAt)
+      t.timeoutTimer = timers.setTimeout(() => {
+        t.timeoutTimer = null
+        void finishTest(`timeout after ${Math.round(timeoutMs / 1000)} s`)
+      }, timeoutMs)
+      startTestFeed()
+    }
     return machine.status
   }
 
   async function stop(reason: CallEndReason = 'user_hangup', stopDetail?: string): Promise<void> {
     if (stopped && (machine.status === 'idle' || machine.status === 'ended')) return
+    if (test && !test.reported) await reportTest('call stopped before the test finished')
     const l = ledger
     ledger = null
     if (l && l.chunks.length > 0 && !l.finalized) {

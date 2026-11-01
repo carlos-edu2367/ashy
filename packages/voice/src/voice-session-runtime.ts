@@ -712,7 +712,16 @@ export interface GaplessAudioPlayer {
     gainValueAfterFade: number
   }
   isPlaying(): boolean
+  /** Effective output gain (fade gain × duck factor, the duck ramp evaluated on the player clock). */
   getGainValue(): number
+  /**
+   * Phase 10.2 — ducks the output by `db` (≤ 0, clamped to −60) with a linear GainNode ramp of
+   * `rampMs`; `setDuck(0, rampMs)` restores. Works on the virtual clock when no AudioContext is
+   * attached. `stopWithFade`, `reset` and `attachAudioContext` clear the duck.
+   */
+  setDuck(db: number, rampMs?: number): void
+  /** Current duck target in dB (0 = not ducked). */
+  getDuckDb(): number
   getScheduledItems(): readonly ScheduledPlaybackItem[]
   reset(): void
 }
@@ -781,10 +790,55 @@ export function createGaplessAudioPlayer(
   let queueDrained = false
   let playbackEndedFired = false
   let nextFallbackSeq = 0
+  // Phase 10.2 ducking: a factor applied on top of `gainValue`, ramped linearly on the player clock.
+  let duckDb = 0
+  let duckRamp: { from: number; to: number; startSec: number; endSec: number } | null = null
 
   function getCurrentTimeSec(): number {
     const ctxTime = ctx && Number.isFinite(ctx.currentTime) ? ctx.currentTime : 0
     return Math.max(virtualClockSec, ctxTime)
+  }
+
+  function duckFactorAt(timeSec: number): number {
+    const r = duckRamp
+    if (!r) return 1
+    if (timeSec >= r.endSec || r.endSec <= r.startSec) return r.to
+    if (timeSec <= r.startSec) return r.from
+    return r.from + (r.to - r.from) * ((timeSec - r.startSec) / (r.endSec - r.startSec))
+  }
+
+  function effectiveGainAt(timeSec = getCurrentTimeSec()): number {
+    return gainValue * duckFactorAt(timeSec)
+  }
+
+  function clearDuck(): void {
+    duckDb = 0
+    duckRamp = null
+  }
+
+  function setDuck(db: number, rampMs = 80): void {
+    const target = Number.isFinite(db) ? Math.max(-60, Math.min(0, db)) : 0
+    const nowSec = getCurrentTimeSec()
+    const fromFactor = duckFactorAt(nowSec)
+    const toFactor = target === 0 ? 1 : Math.pow(10, target / 20)
+    const rampSec = Math.max(0, Number.isFinite(rampMs) ? rampMs : 0) / 1000
+    duckDb = target
+    duckRamp = target === 0 && rampSec === 0 ? null : { from: fromFactor, to: toFactor, startSec: nowSec, endSec: nowSec + rampSec }
+    if (!gainNode) return
+    const param = gainNode.gain
+    const ctxNow = ctx && Number.isFinite(ctx.currentTime) ? ctx.currentTime : 0
+    const fromGain = gainValue * fromFactor
+    const toGain = gainValue * toFactor
+    if (param.linearRampToValueAtTime && param.setValueAtTime && rampSec > 0) {
+      param.cancelScheduledValues?.(ctxNow)
+      param.setValueAtTime(fromGain, ctxNow)
+      param.linearRampToValueAtTime(toGain, ctxNow + rampSec)
+    } else if (param.setValueAtTime) {
+      param.cancelScheduledValues?.(ctxNow)
+      param.setValueAtTime(toGain, ctxNow)
+    } else {
+      param.value = toGain
+    }
   }
 
   function handleQueueDrained(): void {
@@ -905,9 +959,10 @@ export function createGaplessAudioPlayer(
     if (gainNode && gainValue === 0) {
       gainValue = 1
       const nowSec = ctx && Number.isFinite(ctx.currentTime) ? ctx.currentTime : 0
+      const restored = effectiveGainAt()
       gainNode.gain.cancelScheduledValues?.(nowSec)
-      gainNode.gain.setValueAtTime?.(1, nowSec)
-      gainNode.gain.value = 1
+      gainNode.gain.setValueAtTime?.(restored, nowSec)
+      gainNode.gain.value = restored
     } else if (gainValue === 0) {
       gainValue = 1
     }
@@ -992,9 +1047,12 @@ export function createGaplessAudioPlayer(
     const effectiveFadeMs = Math.max(0, Number.isFinite(fadeMs) ? fadeMs : defaultFadeOutMs)
     const stoppedAtSec = getCurrentTimeSec()
     const fadeEndTimeSec = stoppedAtSec + effectiveFadeMs / 1000
+    const fadeFromGain = effectiveGainAt(stoppedAtSec)
+    clearDuck()
 
     if (gainNode) {
-      gainNode.gain.setValueAtTime?.(gainValue, stoppedAtSec)
+      gainNode.gain.cancelScheduledValues?.(stoppedAtSec)
+      gainNode.gain.setValueAtTime?.(fadeFromGain, stoppedAtSec)
       gainNode.gain.linearRampToValueAtTime?.(0, fadeEndTimeSec)
       gainNode.gain.value = 0
     }
@@ -1028,6 +1086,14 @@ export function createGaplessAudioPlayer(
 
   function reset(): void {
     stopLipSyncTicker()
+    if (duckRamp && gainNode && gainValue !== 0) {
+      // Un-duck the node (a fade-muted node is restored by the next scheduleChunk instead).
+      const nowSec = ctx && Number.isFinite(ctx.currentTime) ? ctx.currentTime : 0
+      gainNode.gain.cancelScheduledValues?.(nowSec)
+      gainNode.gain.setValueAtTime?.(1, nowSec)
+      if (!gainNode.gain.setValueAtTime) gainNode.gain.value = 1
+    }
+    clearDuck()
     for (const src of activeSourceNodes) {
       try {
         src.onended = null
@@ -1069,6 +1135,7 @@ export function createGaplessAudioPlayer(
     ctx = normalized
     bindGainNode()
     gainValue = 1
+    clearDuck()
     // The new context has its own clock: realign the virtual timeline so the next
     // chunk starts "now" on the real context instead of far in the future.
     virtualClockSec = 0
@@ -1098,7 +1165,9 @@ export function createGaplessAudioPlayer(
     getActiveVowelFrame,
     stopWithFade,
     isPlaying: () => playing,
-    getGainValue: () => gainValue,
+    getGainValue: () => effectiveGainAt(),
+    setDuck,
+    getDuckDb: () => duckDb,
     getScheduledItems: () => scheduledItems.slice(),
     reset,
   }

@@ -6,6 +6,10 @@
  * the generic `liveCall:invoke` RPC (`call:getRuntimeConfig|buildContext|transcribe|recordTurn|
  * reportState|reportViseme`).
  *
+ * Phase 10.2: the session is chosen by backend (`llamacpp-realtime`, or `llamacpp-hybrid` whose text
+ * answer is spoken through `call:synthesize`); a `start {test:true}` command fetches
+ * `call:getTestInput` and runs the engine on that WAV instead of the mic.
+ *
  * Without the Electron preload (plain-browser dev over the HTTP bridge) the hub mounts this boot
  * inline instead (see `shouldMountCallEngineInline`).
  */
@@ -17,14 +21,19 @@ import type {
   CallEndReason,
   CallRuntimeConfig,
   CallStateSnapshot,
+  CallStageSignal,
   CallStatus,
+  CallSynthesizeResult,
+  CallTestInput,
   CallTranscribeResult,
   LiveCallMethod,
 } from '@ashy/shared'
 import {
   createCallEngine,
+  createLlamaCppHybridSession,
   createLlamaCppRealtimeSession,
   type CallEngineHost,
+  type VoiceSession,
 } from '@ashy/voice'
 import { getAshyHostBridge } from '../services/ashy-host-client'
 
@@ -42,6 +51,8 @@ export interface CallEngineLike {
 export interface CreateCallEngineArgs {
   config: CallRuntimeConfig
   host: CallEngineHost
+  /** Phase 10.2 test call: synthetic question that replaces the microphone. */
+  testInput?: CallTestInput
 }
 
 export type CallEngineFactory = (args: CreateCallEngineArgs) => CallEngineLike
@@ -83,24 +94,52 @@ function errorMessage(err: unknown): string {
 
 const TERMINAL: ReadonlySet<CallStatus> = new Set<CallStatus>(['idle', 'ended'])
 
-/** Default factory: CallEngine over a llama.cpp `/v1/realtime` session. */
-export const createDefaultCallEngine: CallEngineFactory = ({ config, host }) => {
+const SESSION_BACKENDS: ReadonlySet<string> = new Set(['llamacpp-realtime', 'llamacpp-hybrid'])
+
+/** Backend session for a runtime config (`llamacpp-realtime` | `llamacpp-hybrid`). */
+export function createBackendSession(config: CallRuntimeConfig, host: CallEngineHost): VoiceSession {
   const llamacpp = config.llamacpp
   if (!llamacpp) {
     throw new Error(`backend ${config.backend} has no llama.cpp endpoint`)
+  }
+  if (config.backend === 'llamacpp-hybrid') {
+    return createLlamaCppHybridSession({
+      baseUrl: llamacpp.baseUrl,
+      modelId: llamacpp.modelId,
+      maxOutputTokens: config.settings.llamacpp.maxOutputTokens,
+      maxParallelTts: config.settings.hybrid?.maxParallelTts ?? 2,
+      synthesize: (text) => host.synthesize({ callId: config.callId, text }),
+    })
+  }
+  if (config.backend === 'llamacpp-realtime') {
+    return createLlamaCppRealtimeSession({
+      baseUrl: llamacpp.baseUrl,
+      modelId: llamacpp.modelId,
+      inputMode: config.settings.llamacpp.inputMode,
+      maxOutputTokens: config.settings.llamacpp.maxOutputTokens,
+    })
+  }
+  throw new Error(`backend not implemented in the call engine: ${config.backend}`)
+}
+
+/** Default factory: CallEngine over the backend's llama.cpp session. */
+export const createDefaultCallEngine: CallEngineFactory = ({ config, host, testInput }) => {
+  const llamacpp = config.llamacpp
+  if (!llamacpp) {
+    throw new Error(`backend ${config.backend} has no llama.cpp endpoint`)
+  }
+  // Fail fast (before the mic opens) on a backend this window can't drive.
+  if (!SESSION_BACKENDS.has(config.backend)) {
+    throw new Error(`backend not implemented in the call engine: ${config.backend}`)
   }
   return createCallEngine({
     callId: config.callId,
     settings: config.settings,
     host,
     vadModelUrl: SILERO_VAD_MODEL_URL,
-    createSession: () =>
-      createLlamaCppRealtimeSession({
-        baseUrl: llamacpp.baseUrl,
-        modelId: llamacpp.modelId,
-        inputMode: config.settings.llamacpp.inputMode,
-        maxOutputTokens: config.settings.llamacpp.maxOutputTokens,
-      }),
+    contextSize: llamacpp.contextSize,
+    ...(testInput ? { testInput } : {}),
+    createSession: () => createBackendSession(config, host),
   })
 }
 
@@ -117,6 +156,10 @@ export function createCallEngineHostOverBridge(bridge: AshyHostBridge): CallEngi
     recordTurn: (input) => invoke<unknown>('call:recordTurn', input),
     reportState: (input) => invoke<unknown>('call:reportState', input),
     reportViseme: (frame) => invoke<unknown>('call:reportViseme', frame),
+    classifyAffect: (input) => invoke<CallStageSignal | null>('call:classifyAffect', input),
+    reportStage: (input) => invoke<unknown>('call:reportStage', input),
+    reportTestResult: (input) => invoke<unknown>('call:reportTestResult', input),
+    synthesize: (input) => invoke<CallSynthesizeResult>('call:synthesize', input),
   }
 }
 
@@ -159,7 +202,7 @@ export function bootCallEngine(options: CallEngineBootOptions = {}): CallEngineB
     }
   }
 
-  const start = async (callId: string): Promise<void> => {
+  const start = async (callId: string, test: boolean | 'probe' = false): Promise<void> => {
     if (current && current.callId === callId) {
       log('ignoring duplicate start', callId)
       return
@@ -191,9 +234,30 @@ export function bootCallEngine(options: CallEngineBootOptions = {}): CallEngineB
       }
       if (call.stopRequested || disposed || current !== call) return
 
+      // Phase 10.2 test call: the synthetic question replaces the microphone.
+      let testInput: CallTestInput | undefined
+      if (test) {
+        try {
+          const raw = (await invokeRaw('call:getTestInput', { callId })) as CallTestInput | null
+          if (!raw || typeof raw.wavBase64 !== 'string' || raw.wavBase64.length === 0) {
+            throw new Error('empty test input')
+          }
+          testInput = raw
+        } catch (err) {
+          if (test === true) {
+            if (!call.stopRequested && !disposed) {
+              await reportEnded(callId, 'backend_error', `test input: ${errorMessage(err)}`)
+            }
+            return
+          }
+          // 'probe' (recovered start without the flag): not a test call.
+        }
+        if (call.stopRequested || disposed || current !== call) return
+      }
+
       let engine: CallEngineLike
       try {
-        engine = createEngine({ config, host })
+        engine = createEngine({ config, host, ...(testInput ? { testInput } : {}) })
       } catch (err) {
         await reportEnded(callId, 'backend_unavailable', errorMessage(err))
         return
@@ -219,17 +283,19 @@ export function bootCallEngine(options: CallEngineBootOptions = {}): CallEngineB
     }
   }
 
-  const host_getRuntimeConfig = (callId: string): Promise<unknown> => {
+  const invokeRaw = (method: LiveCallMethod, payload: unknown): Promise<unknown> => {
     if (typeof bridge.invokeLiveCall !== 'function') {
       return Promise.reject(new Error('LIVE_CALL_UNAVAILABLE: bridge has no invokeLiveCall'))
     }
-    return bridge.invokeLiveCall({ method: 'call:getRuntimeConfig', payload: { callId } })
+    return bridge.invokeLiveCall({ method, payload })
   }
+  const host_getRuntimeConfig = (callId: string): Promise<unknown> =>
+    invokeRaw('call:getRuntimeConfig', { callId })
 
   const handleCommand = async (command: CallCommand): Promise<void> => {
     if (disposed) return
     if (command.command === 'start') {
-      await start(command.callId)
+      await start(command.callId, command.test === true)
       return
     }
     const call = current
@@ -267,12 +333,8 @@ export function bootCallEngine(options: CallEngineBootOptions = {}): CallEngineB
         const state = raw as CallStateSnapshot | null | undefined
         if (disposed || current || !state?.callId || state.status !== 'connecting') return
         log('recovering pending start', state.callId)
-        return handleCommand({
-          command: 'start',
-          callId: state.callId,
-          backend: state.backend ?? 'llamacpp-realtime',
-          sessionId: state.sessionId ?? '',
-        })
+        // The snapshot doesn't carry the test flag: probe `call:getTestInput` (unknown → normal call).
+        return start(state.callId, 'probe')
       })
       .catch(() => undefined)
   }

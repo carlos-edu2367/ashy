@@ -1852,7 +1852,7 @@ export function resolveInitialWindowMode(): {
   return { viewMode: 'hub', isTransparentOverlayWindow: false }
 }
 
-function resolveMotionPreset(rawMotion?: string): AshyMotionPreset | null {
+export function resolveMotionPreset(rawMotion?: string): AshyMotionPreset | null {
   if (typeof rawMotion !== 'string') return null
   const normalized = rawMotion.trim().toLowerCase()
   if ((ASHY_MOTION_PRESETS as readonly string[]).includes(normalized)) {

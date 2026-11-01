@@ -5,25 +5,41 @@
  *
  * While a call is active, `call:viseme` drives the stage mouth by writing the existing
  * `useAshyStore` lip-sync fields; with no call the old voice path is untouched.
+ *
+ * Phase 10.2: `call:stage` (emotion/motion at the moment a segment starts playing) drives the
+ * stage emotion fields during a call; reference voices (`liveVoice:*`) and the test call
+ * (`call:startTest` → `call:testResult`) live here too.
  */
 import { create } from 'zustand'
 import {
+  ASHY_EMOTIONS,
   IDLE_CALL_STATE,
+  type AshyEmotion,
   type AshyHostBridge,
   type AshyHostStreamEvent,
   type AshyVisemeKey,
   type CallEndReason,
   type CallStateSnapshot,
   type CallStatus,
+  type CallTestResult,
   type CallVisemeFrame,
   type LiveCallMethod,
   type LiveModeSettings,
+  type LiveVoicePreviewResult,
   type LlamaCppEngineStatus,
   type LlamaCppVariant,
   type SaveLiveModeSettingsInput,
+  type VoiceReference,
 } from '@ashy/shared'
 import { getAshyHostBridge } from '../services/ashy-host-client'
-import { useAshyStore } from './useAshyStore'
+import {
+  isAcceptedVoiceFile,
+  normalizeVoiceReference,
+  readFileAsArrayBuffer,
+  voiceNameFromFile,
+  type VoiceReferenceAudioDeps,
+} from '../services/voice-reference-audio'
+import { resolveMotionPreset, useAshyStore } from './useAshyStore'
 
 export const LIVE_MODE_DEFAULT_MODEL_ID = 'lfm3-omni-2b-q4km'
 
@@ -107,6 +123,50 @@ export type CallStoreBusyAction =
   | 'stopEngine'
   | 'saveSettings'
   | 'installVcRuntime'
+  | 'voiceImport'
+  | 'voicePreview'
+  | 'voiceDelete'
+  | 'testCall'
+
+/** Test call lifecycle as the settings panel shows it. */
+export interface TestCallView {
+  status: 'idle' | 'running' | 'done' | 'failed'
+  callId: string | null
+  result: CallTestResult | null
+  error: string | null
+}
+
+export const IDLE_TEST_CALL: TestCallView = { status: 'idle', callId: null, result: null, error: null }
+
+/** pt-BR labels of the test-call steps. */
+export const CALL_TEST_STEP_LABELS: Record<CallTestResult['steps'][number]['step'], string> = {
+  engine: 'Motor',
+  session: 'Sessão',
+  vad: 'Detecção de fala',
+  transcription: 'Transcrição',
+  first_audio: 'Primeiro áudio',
+  playback: 'Reprodução',
+}
+
+/** Plays a WAV (base64) — replaceable in tests (jsdom has no audio output). */
+export type WavPlayer = (wavBase64: string) => Promise<void> | void
+
+const defaultWavPlayer: WavPlayer = async (wavBase64) => {
+  if (typeof Audio === 'undefined') return
+  const audio = new Audio(`data:audio/wav;base64,${wavBase64}`)
+  await audio.play()
+}
+
+let wavPlayer: WavPlayer = defaultWavPlayer
+let voiceAudioDeps: VoiceReferenceAudioDeps = {}
+
+export function setWavPlayerForTesting(player: WavPlayer | null): void {
+  wavPlayer = player ?? defaultWavPlayer
+}
+
+export function setVoiceAudioDepsForTesting(deps: VoiceReferenceAudioDeps | null): void {
+  voiceAudioDeps = deps ?? {}
+}
 
 export interface CallStoreState {
   callState: CallStateSnapshot
@@ -116,6 +176,11 @@ export interface CallStoreState {
   lastError: string | null
   busy: Partial<Record<CallStoreBusyAction, boolean>>
   initialized: boolean
+  /** Phase 10.2: reference voices (`liveVoice:list`). */
+  voices: VoiceReference[]
+  /** Last voice upload/preview/delete message (pt-BR), success or error. */
+  voiceMessage: { kind: 'ok' | 'error'; text: string } | null
+  testCall: TestCallView
 
   /** Subscribes to host events and bootstraps state (idempotent). */
   init(): Promise<void>
@@ -132,6 +197,15 @@ export interface CallStoreState {
   stopEngine(): Promise<void>
   installVcRuntime(): Promise<void>
   saveLiveSettings(partial: SaveLiveModeSettingsInput): Promise<LiveModeSettings | null>
+
+  loadVoices(): Promise<void>
+  /** Normalizes the file in the renderer (mono 24 kHz, trimmed, ≤ 30 s) and imports it. */
+  importVoiceFile(file: File, name?: string): Promise<VoiceReference | null>
+  previewVoice(id: string | null): Promise<void>
+  deleteVoice(id: string): Promise<void>
+  /** `null` = no reference (default female/male voice). */
+  useVoice(id: string | null): Promise<void>
+  startTestCall(): Promise<void>
 }
 
 let unsubscribeHost: (() => void) | null = null
@@ -222,7 +296,32 @@ const initialCallStoreState = () => ({
   lastError: null as string | null,
   busy: {} as Partial<Record<CallStoreBusyAction, boolean>>,
   initialized: false,
+  voices: [] as VoiceReference[],
+  voiceMessage: null as CallStoreState['voiceMessage'],
+  testCall: { ...IDLE_TEST_CALL } as TestCallView,
 })
+
+function isAshyEmotion(value: unknown): value is AshyEmotion {
+  return typeof value === 'string' && (ASHY_EMOTIONS as readonly string[]).includes(value)
+}
+
+/** Applies a `call:stage` signal to the avatar (only called while a call is active). */
+function applyStageSignal(signal: { emotion: string; intensity: number; motion?: string }): void {
+  const emotion = typeof signal.emotion === 'string' ? signal.emotion.trim().toLowerCase() : ''
+  const motion = resolveMotionPreset(signal.motion)
+  const patch: Partial<{ stageEmotion: AshyEmotion; emotionIntensity: number; activeMotion: NonNullable<typeof motion> }> = {}
+  if (isAshyEmotion(emotion)) {
+    patch.stageEmotion = emotion
+    const intensity = Number(signal.intensity)
+    patch.emotionIntensity = Number.isFinite(intensity) ? Math.min(1, Math.max(0, intensity)) : 0.85
+  }
+  if (motion) patch.activeMotion = motion
+  if (Object.keys(patch).length > 0) useAshyStore.setState(patch)
+}
+
+function isCallStateSnapshot(value: unknown): value is CallStateSnapshot {
+  return !!value && typeof value === 'object' && typeof (value as CallStateSnapshot).status === 'string'
+}
 
 export const useCallStore = create<CallStoreState>()((set, get) => {
   const withBusy = async <T>(action: CallStoreBusyAction, fn: () => Promise<T>): Promise<T | null> => {
@@ -243,6 +342,28 @@ export const useCallStore = create<CallStoreState>()((set, get) => {
     // Drop stale snapshots (the host stamps every emission).
     if (next.updatedAt && prev.updatedAt && next.updatedAt < prev.updatedAt) return
     set({ callState: { ...next } })
+    let test = get().testCall
+    if (test.status === 'running' && test.callId === null && isCallActiveStatus(next.status) && next.callId) {
+      // `call:startTest` may answer after the first `call:state` of the test call.
+      test = { ...test, callId: next.callId }
+      set({ testCall: test })
+    }
+    if (
+      test.status === 'running' &&
+      next.status === 'ended' &&
+      test.callId !== null &&
+      (next.callId === null || next.callId === test.callId)
+    ) {
+      // The engine reports the result before hanging up; ending without one means the test broke.
+      const reason = next.reason && next.reason !== 'user_hangup' ? CALL_END_REASON_MESSAGES[next.reason] : null
+      set({
+        testCall: {
+          ...test,
+          status: 'failed',
+          error: reason ?? next.detail ?? 'O teste terminou sem resultado.',
+        },
+      })
+    }
     if (!isCallActiveStatus(next.status)) {
       set({ viseme: null })
       releaseStage()
@@ -254,6 +375,30 @@ export const useCallStore = create<CallStoreState>()((set, get) => {
   const applyEngineStatus = (status: LlamaCppEngineStatus | null | undefined): void => {
     if (status && typeof status === 'object' && status.engineId === 'llamacpp') {
       set({ engineStatus: { ...status } })
+    }
+  }
+
+  const applyVoices = (value: unknown): void => {
+    const list = Array.isArray(value)
+      ? value
+      : value && typeof value === 'object' && Array.isArray((value as { voices?: unknown }).voices)
+        ? (value as { voices: unknown[] }).voices
+        : null
+    if (!list) return
+    set({
+      voices: list.filter(
+        (v): v is VoiceReference =>
+          !!v && typeof v === 'object' && typeof (v as VoiceReference).id === 'string',
+      ),
+    })
+  }
+
+  const reloadSettings = async (): Promise<void> => {
+    try {
+      const settings = await invoke<LiveModeSettings>('liveMode:getSettings')
+      if (settings) set({ liveSettings: settings })
+    } catch {
+      // keep the current snapshot
     }
   }
 
@@ -270,14 +415,16 @@ export const useCallStore = create<CallStoreState>()((set, get) => {
       }
       if (get().initialized) return
       set({ initialized: true })
-      const [state, engine, settings] = await Promise.allSettled([
+      const [state, engine, settings, voices] = await Promise.allSettled([
         invoke<CallStateSnapshot>('call:getState'),
         invoke<LlamaCppEngineStatus>('engines:getStatus'),
         invoke<LiveModeSettings>('liveMode:getSettings'),
+        invoke<VoiceReference[]>('liveVoice:list'),
       ])
       if (state.status === 'fulfilled') applyCallState(state.value)
       if (engine.status === 'fulfilled') applyEngineStatus(engine.value)
       if (settings.status === 'fulfilled' && settings.value) set({ liveSettings: settings.value })
+      if (voices.status === 'fulfilled') applyVoices(voices.value)
     },
 
     dispose() {
@@ -314,6 +461,19 @@ export const useCallStore = create<CallStoreState>()((set, get) => {
         case 'chat:appended':
           refreshChatForSession(event.sessionId)
           return
+        case 'call:stage': {
+          const { callState } = get()
+          if (!isCallActiveStatus(callState.status)) return
+          if (callState.callId && event.callId !== callState.callId) return
+          applyStageSignal(event)
+          return
+        }
+        case 'call:testResult': {
+          const result = event.result
+          if (!result || typeof result !== 'object' || !Array.isArray(result.steps)) return
+          set({ testCall: { status: 'done', callId: result.callId, result: { ...result }, error: null } })
+          return
+        }
         default:
           return
       }
@@ -395,6 +555,106 @@ export const useCallStore = create<CallStoreState>()((set, get) => {
       if (res) set({ liveSettings: res })
       return res
     },
+
+    async loadVoices() {
+      try {
+        applyVoices(await invoke<VoiceReference[]>('liveVoice:list'))
+      } catch (err) {
+        set({ voiceMessage: { kind: 'error', text: errorMessage(err) } })
+      }
+    },
+
+    async importVoiceFile(file, name) {
+      set({ voiceMessage: null })
+      if (!isAcceptedVoiceFile(file.name)) {
+        set({
+          voiceMessage: { kind: 'error', text: 'Formato não suportado. Use wav, mp3, flac, ogg ou m4a.' },
+        })
+        return null
+      }
+      set((s) => ({ busy: { ...s.busy, voiceImport: true } }))
+      try {
+        const data = await readFileAsArrayBuffer(file)
+        const normalized = await normalizeVoiceReference(data, voiceAudioDeps)
+        const voiceName = (name ?? '').trim() || voiceNameFromFile(file.name)
+        const created = await invoke<VoiceReference>('liveVoice:import', {
+          name: voiceName.slice(0, 60),
+          wavBase64: normalized.wavBase64,
+        })
+        await get().loadVoices()
+        set({
+          voiceMessage: {
+            kind: 'ok',
+            text: `Voz "${created?.name ?? voiceName}" importada (${(normalized.durationMs / 1000).toFixed(1).replace('.', ',')} s).`,
+          },
+        })
+        return created ?? null
+      } catch (err) {
+        set({ voiceMessage: { kind: 'error', text: errorMessage(err) } })
+        return null
+      } finally {
+        set((s) => ({ busy: { ...s.busy, voiceImport: false } }))
+      }
+    },
+
+    async previewVoice(id) {
+      set((s) => ({ busy: { ...s.busy, voicePreview: true }, voiceMessage: null }))
+      try {
+        const res = await invoke<LiveVoicePreviewResult>('liveVoice:preview', { id })
+        if (!res || typeof res.wavBase64 !== 'string' || res.wavBase64.length === 0) {
+          throw new Error('A prévia não retornou áudio.')
+        }
+        await wavPlayer(res.wavBase64)
+      } catch (err) {
+        set({ voiceMessage: { kind: 'error', text: errorMessage(err) } })
+      } finally {
+        set((s) => ({ busy: { ...s.busy, voicePreview: false } }))
+      }
+    },
+
+    async deleteVoice(id) {
+      set((s) => ({ busy: { ...s.busy, voiceDelete: true }, voiceMessage: null }))
+      try {
+        await invoke('liveVoice:delete', { id })
+        set((s) => ({ voices: s.voices.filter((v) => v.id !== id) }))
+        // Deleting the voice in use resets `hybrid.referenceVoiceId` host-side.
+        await Promise.all([get().loadVoices(), reloadSettings()])
+      } catch (err) {
+        set({ voiceMessage: { kind: 'error', text: errorMessage(err) } })
+      } finally {
+        set((s) => ({ busy: { ...s.busy, voiceDelete: false } }))
+      }
+    },
+
+    async useVoice(id) {
+      await get().saveLiveSettings({ hybrid: { referenceVoiceId: id } })
+    },
+
+    async startTestCall() {
+      if (get().testCall.status === 'running') return
+      set({ testCall: { status: 'running', callId: null, result: null, error: null } })
+      const res = await withBusy('testCall', () => invoke<unknown>('call:startTest', {}))
+      if (res === null) {
+        set((s) => ({
+          testCall: { ...s.testCall, status: 'failed', error: s.lastError ?? 'Falha ao iniciar o teste.' },
+        }))
+        return
+      }
+      const snapshot = isCallStateSnapshot(res)
+        ? res
+        : res && typeof res === 'object' && isCallStateSnapshot((res as { state?: unknown }).state)
+          ? (res as { state: CallStateSnapshot }).state
+          : null
+      const callId =
+        snapshot?.callId ??
+        (res && typeof res === 'object' && typeof (res as { callId?: unknown }).callId === 'string'
+          ? (res as { callId: string }).callId
+          : null)
+      set((s) =>
+        s.testCall.status === 'running' ? { testCall: { ...s.testCall, callId } } : {},
+      )
+      if (snapshot) applyCallState(snapshot)
+    },
   }
 })
 
@@ -405,5 +665,7 @@ export function resetCallStoreForTesting(): void {
   drivingStage = false
   chatRefreshInFlight = false
   chatRefreshQueued = false
+  wavPlayer = defaultWavPlayer
+  voiceAudioDeps = {}
   useCallStore.setState(initialCallStoreState())
 }

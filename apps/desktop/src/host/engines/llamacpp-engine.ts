@@ -8,9 +8,18 @@
  * - Runs `llama-server.exe` bound to 127.0.0.1 on a free port, health-checks `/health`, restarts on
  *   crash with 1/3/9 s backoff (max 3).
  * - A user-provided endpoint (`settings.llamacpp.endpoint = {url}`) is health-checked only.
+ * - Phase 10.2: every managed launch gets a fresh random 32-byte hex API key, handed to llama-server
+ *   through the `LLAMA_API_KEY` env var (`common/arg.cpp`: `--api-key` `.set_env("LLAMA_API_KEY")`)
+ *   — never argv, which is visible in Task Manager. llama-server b12024
+ *   (`tools/server/server-http.cpp`, `middleware_validate_api_key`) then requires
+ *   `Authorization: Bearer <key>` (or `X-Api-Key`) on every route except `/health` and `/v1/health`,
+ *   including the `/v1/realtime` WebSocket upgrade (vendored cpp-httplib 0.64 runs the pre-routing
+ *   handler before upgrading). There is no query-param form. The key is exposed only through
+ *   `getRequestHeaders()` / `getAuth()` (host + Electron main) and never enters
+ *   `LlamaCppEngineStatus`, an event or the log.
  */
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
@@ -49,6 +58,21 @@ export interface LlamaCppEngine {
    * No-op elsewhere.
    */
   installVcRuntime(): Promise<LlamaCppEngineStatus>
+  /**
+   * Headers every request to the engine must carry: `{ Authorization: 'Bearer <key>' }` while the
+   * managed llama-server runs, `{}` otherwise (a custom endpoint has no Ashy-generated key).
+   * SECRET: never forward to a renderer, an event or a log.
+   */
+  getRequestHeaders(): Record<string, string>
+  /** Origin/port/headers of the running managed engine (Electron main header injection, e2e). */
+  getAuth(): LlamaCppEngineAuth | null
+}
+
+export interface LlamaCppEngineAuth {
+  /** e.g. `http://127.0.0.1:45123` */
+  origin: string
+  port: number
+  headers: Record<string, string>
 }
 
 export interface ExecResult {
@@ -77,7 +101,8 @@ export interface LlamaCppChildProcess {
 export type LlamaCppSpawnImpl = (
   command: string,
   args: string[],
-  options: { cwd: string },
+  /** `env` = extra variables merged over the parent's environment. */
+  options: { cwd: string; env?: Record<string, string> },
 ) => LlamaCppChildProcess
 
 export interface CreateLlamaCppEngineOptions {
@@ -280,6 +305,7 @@ const defaultExec: LlamaCppExecImpl = (command, args, options) =>
 const defaultSpawn: LlamaCppSpawnImpl = (command, args, options) =>
   spawn(command, args, {
     cwd: options.cwd,
+    env: { ...process.env, ...(options.env ?? {}) },
     shell: false,
     windowsHide: true,
     detached: false,
@@ -436,6 +462,8 @@ export function createLlamaCppEngine(opts: CreateLlamaCppEngineOptions): LlamaCp
   let running = false
   let port: number | null = null
   let managedBaseUrl: string | null = null
+  /** API key of the CURRENT healthy managed llama-server process (regenerated on every launch). */
+  let apiKey: string | null = null
   let customRunningUrl: string | null = null
   let activeModelId: string | null = null
   let child: LlamaCppChildProcess | null = null
@@ -1173,7 +1201,10 @@ export function createLlamaCppEngine(opts: CreateLlamaCppEngineOptions): LlamaCp
     const args = buildArgs(record, spec, variant, p)
     log.write(`\n[${new Date().toISOString()}] starting ${LLAMA_SERVER_EXE} ${args.join(' ')}\n`)
 
-    const proc = spawnImpl(exe, args, { cwd: installDir })
+    // Fresh key per launch, via env (argv is world-readable on Windows). Adopted as `apiKey` only
+    // once this process is healthy, so a cancelled launch can't swap the key of a running one.
+    const launchKey = randomBytes(32).toString('hex')
+    const proc = spawnImpl(exe, args, { cwd: installDir, env: { LLAMA_API_KEY: launchKey } })
     let exitInfo: string | null = null
     proc.stdout?.on('data', (d: Buffer | string) => log.write(d))
     proc.stderr?.on('data', (d: Buffer | string) => log.write(d))
@@ -1210,6 +1241,7 @@ export function createLlamaCppEngine(opts: CreateLlamaCppEngineOptions): LlamaCp
     running = true
     port = p
     managedBaseUrl = baseUrl
+    apiKey = launchKey
     activeModelId = modelId
   }
 
@@ -1217,6 +1249,7 @@ export function createLlamaCppEngine(opts: CreateLlamaCppEngineOptions): LlamaCp
     running = false
     port = null
     managedBaseUrl = null
+    apiKey = null
     lastError = reason
     emit()
     while (crashRestarts < restartBackoffMs.length) {
@@ -1248,6 +1281,7 @@ export function createLlamaCppEngine(opts: CreateLlamaCppEngineOptions): LlamaCp
     running = false
     port = null
     managedBaseUrl = null
+    apiKey = null
     customRunningUrl = null
     activeModelId = null
     if (proc) await killChild(proc)
@@ -1486,7 +1520,17 @@ export function createLlamaCppEngine(opts: CreateLlamaCppEngineOptions): LlamaCp
   // initial disk scan
   refreshDiskState()
 
+  function currentAuth(): LlamaCppEngineAuth | null {
+    if (customUrl() !== null) return null
+    if (!running || !child || !apiKey || port === null || !managedBaseUrl) return null
+    return { origin: managedBaseUrl, port, headers: { Authorization: `Bearer ${apiKey}` } }
+  }
+
   return {
+    getRequestHeaders() {
+      return currentAuth()?.headers ?? {}
+    },
+    getAuth: currentAuth,
     getStatus() {
       // Cheap (a few existsSync): lets the UI offer the VC++ install before the first start attempt.
       vcRuntimeMissing = computeVcRuntimeMissing()

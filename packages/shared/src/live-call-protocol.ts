@@ -21,7 +21,7 @@ export type LiveBackendId = (typeof LIVE_BACKEND_IDS)[number]
 export const LiveBackendIdSchema = v.picklist(LIVE_BACKEND_IDS)
 
 /** Phase 10.1 implements only these backends; others are rejected by `call:start`. */
-export const LIVE_BACKENDS_IMPLEMENTED: readonly LiveBackendId[] = ['llamacpp-realtime']
+export const LIVE_BACKENDS_IMPLEMENTED: readonly LiveBackendId[] = ['llamacpp-realtime', 'llamacpp-hybrid']
 
 export const LIVE_INPUT_MODES = ['transcribed', 'audio-direct'] as const
 export type LiveInputMode = (typeof LIVE_INPUT_MODES)[number]
@@ -49,6 +49,16 @@ export interface LiveModeSettings {
     bargeInMinMs: number
     falseInterruptionMs: number
     aecWarmupMs: number
+  }
+  /** Hybrid: realtime session answers in text, llama-server /tts speaks it (optionally with the user's reference voice). */
+  hybrid: {
+    referenceVoiceId: string | null
+    /** Max /tts requests in flight (ordered playback). */
+    maxParallelTts: number
+  }
+  session: {
+    /** Rotate the realtime session (seeded with a recap) after this many turns — curbs 2B-model repetition. */
+    rotateAfterTurns: number
   }
   devices: { inputDeviceId?: string; outputDeviceId?: string }
   features: {
@@ -81,6 +91,13 @@ export const DEFAULT_LIVE_MODE_SETTINGS: LiveModeSettings = {
     bargeInMinMs: 400,
     falseInterruptionMs: 1500,
     aecWarmupMs: 1500,
+  },
+  hybrid: {
+    referenceVoiceId: null,
+    maxParallelTts: 2,
+  },
+  session: {
+    rotateAfterTurns: 6,
   },
   devices: {},
   features: {
@@ -130,6 +147,17 @@ export const SaveLiveModeSettingsInputSchema = v.object({
     v.object({
       inputDeviceId: v.optional(v.pipe(v.string(), v.maxLength(256))),
       outputDeviceId: v.optional(v.pipe(v.string(), v.maxLength(256))),
+    }),
+  ),
+  hybrid: v.optional(
+    v.object({
+      referenceVoiceId: v.optional(v.nullable(v.pipe(v.string(), v.regex(/^[a-z0-9-]{1,64}$/)))),
+      maxParallelTts: v.optional(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(4))),
+    }),
+  ),
+  session: v.optional(
+    v.object({
+      rotateAfterTurns: v.optional(v.pipe(v.number(), v.integer(), v.minValue(2), v.maxValue(50))),
     }),
   ),
   features: v.optional(
@@ -355,7 +383,7 @@ export interface CallVisemeFrame {
 }
 
 export type CallCommand =
-  | { command: 'start'; callId: string; backend: LiveBackendId; sessionId: string }
+  | { command: 'start'; callId: string; backend: LiveBackendId; sessionId: string; test?: boolean }
   | { command: 'stop'; callId: string }
   | { command: 'setMuted'; callId: string; muted: boolean }
 
@@ -414,6 +442,17 @@ export const LIVE_CALL_METHODS = [
   'call:buildContext',
   'call:transcribe',
   'call:recordTurn',
+  // Phase 10.2
+  'call:classifyAffect',
+  'call:reportStage',
+  'call:synthesize',
+  'call:startTest',
+  'call:getTestInput',
+  'call:reportTestResult',
+  'liveVoice:list',
+  'liveVoice:import',
+  'liveVoice:delete',
+  'liveVoice:preview',
 ] as const
 export type LiveCallMethod = (typeof LIVE_CALL_METHODS)[number]
 export const LiveCallMethodSchema = v.picklist(LIVE_CALL_METHODS)
@@ -508,6 +547,103 @@ export const EnginesStartInputSchema = v.object({
   modelId: v.optional(v.pipe(v.string(), v.maxLength(128))),
 })
 
+// ───────────────────────────── Phase 10.2: stage signals, hybrid TTS, voices, test call ─────────────────────────────
+
+/** Emotion/motion for the avatar, applied when the segment that carries it starts playing. */
+export interface CallStageSignal {
+  emotion: string
+  intensity: number
+  motion?: string
+}
+export const CallClassifyAffectInputSchema = v.object({
+  callId: v.string(),
+  text: v.pipe(v.string(), v.maxLength(2000)),
+})
+export const CallReportStageInputSchema = v.object({
+  callId: v.string(),
+  emotion: v.pipe(v.string(), v.maxLength(32)),
+  intensity: v.pipe(v.number(), v.minValue(0), v.maxValue(1)),
+  motion: v.optional(v.pipe(v.string(), v.maxLength(48))),
+})
+
+/** Hybrid mode: host synthesizes one text chunk with llama-server /tts (+ reference voice). */
+export const CallSynthesizeInputSchema = v.object({
+  callId: v.string(),
+  text: v.pipe(v.string(), v.minLength(1), v.maxLength(1000)),
+})
+export interface CallSynthesizeResult {
+  /** Mono PCM16 little-endian, base64. */
+  pcmBase64: string
+  sampleRate: number
+  durationMs: number
+  latencyMs: number
+}
+
+export interface VoiceReference {
+  id: string
+  name: string
+  durationMs: number
+  createdAt: number
+}
+/** The renderer normalizes the upload (decode → mono 24 kHz → trim silence) and sends a PCM16 WAV. */
+export const LiveVoiceImportInputSchema = v.object({
+  name: v.pipe(v.string(), v.trim(), v.minLength(1), v.maxLength(60)),
+  wavBase64: v.pipe(v.string(), v.maxLength(4_000_000)),
+})
+export const LiveVoiceIdInputSchema = v.object({ id: v.pipe(v.string(), v.regex(/^[a-z0-9-]{1,64}$/)) })
+export const LiveVoicePreviewInputSchema = v.object({
+  id: v.optional(v.nullable(v.pipe(v.string(), v.regex(/^[a-z0-9-]{1,64}$/)))),
+  text: v.optional(v.pipe(v.string(), v.maxLength(300))),
+})
+export interface LiveVoicePreviewResult {
+  wavBase64: string
+  latencyMs: number
+}
+
+/** Test call: one synthetic question replaces the microphone; each stage is checked. */
+export const CALL_TEST_STEPS = ['engine', 'session', 'vad', 'transcription', 'first_audio', 'playback'] as const
+export type CallTestStep = (typeof CALL_TEST_STEPS)[number]
+export interface CallTestResult {
+  callId: string
+  ok: boolean
+  steps: Array<{ step: CallTestStep; ok: boolean; ms?: number; detail?: string }>
+  metrics: CallMetrics | null
+  transcript: string | null
+  reply: string | null
+  finishedAt: number
+}
+export const CallGetTestInputSchema = v.object({ callId: v.string() })
+export interface CallTestInput {
+  /** Question audio (mono PCM16 WAV, 16 kHz) to feed instead of the mic. */
+  wavBase64: string
+  expectedText: string
+}
+export const CallReportTestResultInputSchema = v.object({
+  callId: v.string(),
+  ok: v.boolean(),
+  steps: v.array(
+    v.object({
+      step: v.picklist(CALL_TEST_STEPS),
+      ok: v.boolean(),
+      ms: v.optional(v.number()),
+      detail: v.optional(v.pipe(v.string(), v.maxLength(500))),
+    }),
+  ),
+  metrics: v.optional(
+    v.nullable(
+      v.object({
+        endpointMs: v.optional(v.number()),
+        asrMs: v.optional(v.number()),
+        ttfbMs: v.optional(v.number()),
+        playbackStartMs: v.optional(v.number()),
+        e2eMs: v.optional(v.number()),
+      }),
+    ),
+  ),
+  transcript: v.optional(v.nullable(v.pipe(v.string(), v.maxLength(4000)))),
+  reply: v.optional(v.nullable(v.pipe(v.string(), v.maxLength(4000)))),
+})
+
 // ───────────────────────────── Host → renderer events ─────────────────────────────
 
 export type LiveCallHostEvent =
@@ -516,6 +652,8 @@ export type LiveCallHostEvent =
   | ({ type: 'call:command' } & CallCommand)
   | { type: 'engine:status'; status: LlamaCppEngineStatus }
   | { type: 'chat:appended'; sessionId: string; messageIds: string[] }
+  | ({ type: 'call:stage'; callId: string } & CallStageSignal)
+  | { type: 'call:testResult'; result: CallTestResult }
 
 export const LIVE_CALL_EVENT_TYPES = [
   'call:state',
@@ -523,6 +661,8 @@ export const LIVE_CALL_EVENT_TYPES = [
   'call:command',
   'engine:status',
   'chat:appended',
+  'call:stage',
+  'call:testResult',
 ] as const
 
 export function isLiveCallHostEvent(e: { type: string }): e is LiveCallHostEvent {

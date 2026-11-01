@@ -2,18 +2,37 @@
  * Phase 10.1 — Live Call UI (spec §9.1–9.3): hub call orb + status strip, overlay call buttons and
  * state dot, and the "Live Mode" settings panel. Everything reads `useCallStore`.
  */
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import {
+  LIVE_BACKENDS_IMPLEMENTED,
   LIVE_LOCAL_MODELS,
   LLAMACPP_VARIANTS,
   type LiveBackendId,
   type LiveInputMode,
   type LlamaCppVariant,
 } from '@ashy/shared'
-import { Cpu, Mic, MicOff, Phone, PhoneOff, Play, Radio, Save, Square } from 'lucide-react'
+import {
+  Check,
+  Cpu,
+  FlaskConical,
+  Mic,
+  MicOff,
+  Phone,
+  PhoneOff,
+  Play,
+  Radio,
+  Save,
+  Square,
+  Trash2,
+  Upload,
+  Volume2,
+  X,
+} from 'lucide-react'
+import { VOICE_REF_ACCEPT_ATTR } from '../services/voice-reference-audio'
 import {
   CALL_END_REASON_MESSAGES,
   CALL_STATUS_LABELS,
+  CALL_TEST_STEP_LABELS,
   LIVE_MODE_DEFAULT_MODEL_ID,
   callRingKind,
   isCallActiveStatus,
@@ -176,6 +195,12 @@ const BACKEND_CARDS: ReadonlyArray<{ id: LiveBackendId; label: string; desc: str
     desc: 'Tudo no seu PC: voz entra e sai do modelo local.',
     enabled: true,
   },
+  {
+    id: 'llamacpp-hybrid',
+    label: 'Local omni + minha voz (híbrido)',
+    desc: 'O modelo local pensa em texto e o /tts do llama.cpp fala — com a sua voz de referência.',
+    enabled: true,
+  },
   { id: 'gemini-live', label: 'Gemini Live', desc: 'Nuvem realtime (Google).', enabled: false },
   { id: 'openai-realtime', label: 'OpenAI Realtime', desc: 'Nuvem realtime (OpenAI).', enabled: false },
   { id: 'cascade', label: 'Cascata (STT → LLM → TTS)', desc: 'Cada etapa com o seu provedor.', enabled: false },
@@ -217,6 +242,7 @@ export function LiveModeSettingsPanel(): React.ReactElement {
   const [endpointUrl, setEndpointUrl] = useState('')
   const [vadThreshold, setVadThreshold] = useState(0.5)
   const [endpointMs, setEndpointMs] = useState(700)
+  const [rotateAfterTurns, setRotateAfterTurns] = useState(6)
   const [inputDeviceId, setInputDeviceId] = useState('')
   const [devices, setDevices] = useState<Array<{ deviceId: string; label: string }>>([])
   const [savedNotice, setSavedNotice] = useState<string | null>(null)
@@ -237,6 +263,9 @@ export function LiveModeSettingsPanel(): React.ReactElement {
     }
     setVadThreshold(liveSettings.turn.vadThreshold)
     setEndpointMs(liveSettings.turn.endpointMs)
+    if (typeof liveSettings.session?.rotateAfterTurns === 'number') {
+      setRotateAfterTurns(liveSettings.session.rotateAfterTurns)
+    }
     setInputDeviceId(liveSettings.devices.inputDeviceId ?? '')
   }, [liveSettings])
 
@@ -278,13 +307,14 @@ export function LiveModeSettingsPanel(): React.ReactElement {
       return
     }
     const saved = await saveLiveSettings({
-      backend: 'llamacpp-realtime',
+      backend: LIVE_BACKENDS_IMPLEMENTED.includes(selectedBackend) ? selectedBackend : 'llamacpp-realtime',
       llamacpp: {
         voice,
         inputMode,
         endpoint: endpointMode === 'managed' ? 'managed' : { url: trimmedUrl },
       },
       turn: { vadThreshold, endpointMs },
+      session: { rotateAfterTurns: Math.min(50, Math.max(2, Math.round(rotateAfterTurns))) },
       devices: { inputDeviceId },
     })
     setSavedNotice(saved ? 'Configurações do Live Mode salvas.' : null)
@@ -317,7 +347,7 @@ export function LiveModeSettingsPanel(): React.ReactElement {
           <button
             key={card.id}
             type="button"
-            data-testid={`live-backend-card-${card.id}`}
+            data-testid={card.id === 'llamacpp-hybrid' ? 'live-backend-hybrid' : `live-backend-card-${card.id}`}
             disabled={!card.enabled}
             aria-pressed={card.enabled && selectedBackend === card.id}
             className={`ashy-call-backend-card ${card.enabled && selectedBackend === card.id ? 'active' : ''}`}
@@ -648,7 +678,31 @@ export function LiveModeSettingsPanel(): React.ReactElement {
             ))}
           </select>
         </div>
+        <div>
+          <label htmlFor="input-live-rotate-turns" style={fieldLabel}>
+            Rotação de sessão (turnos):
+          </label>
+          <input
+            id="input-live-rotate-turns"
+            data-testid="input-live-rotate-turns"
+            type="number"
+            className="ashy-input"
+            min={2}
+            max={50}
+            step={1}
+            value={rotateAfterTurns}
+            title="Abre uma sessão nova (com um resumo da conversa) a cada N turnos — evita que o modelo se repita."
+            onChange={(e) => {
+              const n = Number(e.target.value)
+              if (Number.isFinite(n)) setRotateAfterTurns(n)
+            }}
+          />
+        </div>
       </div>
+
+      {selectedBackend === 'llamacpp-hybrid' && <VoiceReferenceSection />}
+
+      <TestCallSection />
 
       <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '12px' }}>
         <button
@@ -667,5 +721,282 @@ export function LiveModeSettingsPanel(): React.ReactElement {
         )}
       </div>
     </section>
+  )
+}
+
+// ───────────────────────────── Phase 10.2: reference voice + test call ─────────────────────────────
+
+function formatDurationMs(ms: number): string {
+  return `${(ms / 1000).toFixed(1).replace('.', ',')} s`
+}
+
+/** Hybrid mode: upload / list / preview / use / delete reference voices. */
+export function VoiceReferenceSection(): React.ReactElement {
+  const voices = useCallStore((s) => s.voices)
+  const voiceMessage = useCallStore((s) => s.voiceMessage)
+  const busy = useCallStore((s) => s.busy)
+  const liveSettings = useCallStore((s) => s.liveSettings)
+  const importVoiceFile = useCallStore((s) => s.importVoiceFile)
+  const previewVoice = useCallStore((s) => s.previewVoice)
+  const deleteVoice = useCallStore((s) => s.deleteVoice)
+  const selectVoice = useCallStore((s) => s.useVoice)
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  const activeId = liveSettings?.hybrid?.referenceVoiceId ?? null
+  const fallbackVoice = liveSettings?.llamacpp.voice === 'male' ? 'masculina' : 'feminina'
+
+  useEffect(() => {
+    void useCallStore.getState().loadVoices()
+  }, [])
+
+  return (
+    <div className="ashy-call-engine-panel" data-testid="voice-ref-section">
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+        <Volume2 size={16} />
+        <strong style={{ fontSize: '13px' }}>Voz de referência</strong>
+        <span className="ashy-badge violet">{voices.length}/20</span>
+      </div>
+      <p style={{ fontSize: '11.5px', color: 'var(--text-secondary)', margin: 0 }}>
+        Envie de 5 a 30 s de fala limpa (wav, mp3, flac, ogg ou m4a). O áudio é convertido aqui mesmo
+        para mono 24 kHz, sem os silêncios das pontas.
+      </p>
+      <p
+        data-testid="voice-ref-consent"
+        style={{ fontSize: '11.5px', color: '#f2be79', margin: 0, fontWeight: 600 }}
+      >
+        Use só vozes que você tem direito de usar.
+      </p>
+      <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+        <label className="ashy-outline-btn" style={{ cursor: 'pointer' }}>
+          <Upload size={13} /> {busy.voiceImport ? 'Importando…' : 'Enviar amostra'}
+          <input
+            ref={inputRef}
+            type="file"
+            data-testid="voice-ref-upload"
+            accept={VOICE_REF_ACCEPT_ATTR}
+            disabled={busy.voiceImport === true}
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              if (!file) return
+              void importVoiceFile(file).finally(() => {
+                if (inputRef.current) inputRef.current.value = ''
+              })
+            }}
+          />
+        </label>
+        {voiceMessage && (
+          <span
+            data-testid="voice-ref-message"
+            role="status"
+            style={{
+              fontSize: '11.5px',
+              color: voiceMessage.kind === 'error' ? 'var(--status-danger)' : 'var(--text-secondary)',
+            }}
+          >
+            {voiceMessage.text}
+          </span>
+        )}
+      </div>
+
+      <ul className="ashy-voice-ref-list" data-testid="voice-ref-list">
+        <li
+          className={`ashy-voice-ref-item ${activeId === null ? 'active' : ''}`}
+          data-testid="voice-ref-none"
+          data-active={activeId === null ? 'true' : 'false'}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <strong style={{ fontSize: '12.5px' }}>Sem referência (voz padrão feminina/masculina)</strong>
+            <div style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
+              Usa a voz {fallbackVoice} escolhida em “Voz”.
+            </div>
+          </div>
+          <button
+            type="button"
+            className="ashy-outline-btn"
+            data-testid="btn-voice-ref-none-preview"
+            disabled={busy.voicePreview === true}
+            onClick={() => void previewVoice(null)}
+          >
+            <Play size={12} /> Ouvir
+          </button>
+          {activeId === null ? (
+            <span className="ashy-badge emerald">Em uso</span>
+          ) : (
+            <button
+              type="button"
+              className="ashy-outline-btn"
+              data-testid="btn-voice-ref-none-use"
+              disabled={busy.saveSettings === true}
+              onClick={() => void selectVoice(null)}
+            >
+              Usar voz padrão
+            </button>
+          )}
+        </li>
+        {voices.map((voice) => {
+          const inUse = voice.id === activeId
+          return (
+            <li
+              key={voice.id}
+              className={`ashy-voice-ref-item ${inUse ? 'active' : ''}`}
+              data-testid="voice-ref-item"
+              data-voice-id={voice.id}
+              data-active={inUse ? 'true' : 'false'}
+            >
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <strong style={{ fontSize: '12.5px' }}>{voice.name}</strong>
+                <div style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
+                  {formatDurationMs(voice.durationMs)}
+                </div>
+              </div>
+              <button
+                type="button"
+                className="ashy-outline-btn"
+                data-testid="btn-voice-ref-preview"
+                disabled={busy.voicePreview === true}
+                onClick={() => void previewVoice(voice.id)}
+              >
+                <Play size={12} /> Ouvir
+              </button>
+              {inUse ? (
+                <span className="ashy-badge emerald">Em uso</span>
+              ) : (
+                <button
+                  type="button"
+                  className="ashy-outline-btn"
+                  data-testid="btn-voice-ref-use"
+                  disabled={busy.saveSettings === true}
+                  onClick={() => void selectVoice(voice.id)}
+                >
+                  Usar esta voz
+                </button>
+              )}
+              <button
+                type="button"
+                className="ashy-outline-btn"
+                data-testid="btn-voice-ref-delete"
+                disabled={busy.voiceDelete === true}
+                title="Excluir esta voz"
+                onClick={() => void deleteVoice(voice.id)}
+              >
+                <Trash2 size={12} /> Excluir
+              </button>
+            </li>
+          )
+        })}
+      </ul>
+    </div>
+  )
+}
+
+/** "Testar chamada": a synthetic question replaces the mic; shows each stage ✓/✗ with timings. */
+export function TestCallSection(): React.ReactElement {
+  const testCall = useCallStore((s) => s.testCall)
+  const busy = useCallStore((s) => s.busy.testCall === true)
+  const callActive = useCallStore((s) => isCallActiveStatus(s.callState.status))
+  const startTestCall = useCallStore((s) => s.startTestCall)
+  const running = testCall.status === 'running'
+  const result = testCall.result
+  const metrics = result?.metrics ?? null
+  const metricEntries: Array<[string, number | undefined]> = [
+    ['Fim de fala', metrics?.endpointMs],
+    ['ASR', metrics?.asrMs],
+    ['1º byte', metrics?.ttfbMs],
+    ['Início do áudio', metrics?.playbackStartMs],
+    ['Ponta a ponta', metrics?.e2eMs],
+  ]
+
+  return (
+    <div className="ashy-call-engine-panel" data-testid="live-test-section">
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+        <FlaskConical size={16} />
+        <strong style={{ fontSize: '13px' }}>Testar chamada</strong>
+        <button
+          type="button"
+          className="ashy-peach-btn"
+          data-testid="btn-live-test-call"
+          data-test-status={testCall.status}
+          disabled={running || busy || callActive}
+          onClick={() => void startTestCall()}
+          title="A Ashy ouve uma pergunta sintetizada no lugar do microfone e responde; cada etapa é medida."
+        >
+          {running ? 'Testando…' : 'Testar chamada'}
+        </button>
+      </div>
+      <p style={{ fontSize: '11px', color: 'var(--text-secondary)', margin: 0 }}>
+        Uma pergunta sintetizada substitui o microfone por um turno. Nada disso vai para a memória.
+      </p>
+      {running && (
+        <div data-testid="live-test-running" role="status" style={{ fontSize: '12px' }}>
+          Teste em andamento…
+        </div>
+      )}
+      {testCall.status === 'failed' && (
+        <div
+          data-testid="live-test-error"
+          role="status"
+          style={{ fontSize: '12px', color: 'var(--status-danger)' }}
+        >
+          {testCall.error ?? 'O teste falhou.'}
+        </div>
+      )}
+      {result && (
+        <div
+          data-testid="live-test-result"
+          data-ok={result.ok ? 'true' : 'false'}
+          className="ashy-call-test-result"
+        >
+          <div
+            style={{
+              fontSize: '12.5px',
+              fontWeight: 600,
+              color: result.ok ? '#8fd6a8' : 'var(--status-danger)',
+            }}
+          >
+            {result.ok ? '✓ Chamada funcionando' : '✗ Alguma etapa falhou'}
+          </div>
+          <ul className="ashy-call-test-steps">
+            {result.steps.map((step) => (
+              <li
+                key={step.step}
+                data-testid={`live-test-step-${step.step}`}
+                data-ok={step.ok ? 'true' : 'false'}
+              >
+                <span className={step.ok ? 'ashy-test-ok' : 'ashy-test-fail'} aria-hidden="true">
+                  {step.ok ? <Check size={12} /> : <X size={12} />}
+                </span>
+                <span>
+                  {step.ok ? '✓' : '✗'} {CALL_TEST_STEP_LABELS[step.step] ?? step.step}
+                </span>
+                {typeof step.ms === 'number' && (
+                  <span style={{ color: 'var(--text-secondary)' }}>{Math.round(step.ms)} ms</span>
+                )}
+                {step.detail && (
+                  <span style={{ color: 'var(--text-secondary)', fontSize: '11px' }}>— {step.detail}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+          {metrics && (
+            <div data-testid="live-test-metrics" style={{ fontSize: '11.5px', color: 'var(--text-secondary)' }}>
+              {metricEntries
+                .filter(([, value]) => typeof value === 'number')
+                .map(([label, value]) => `${label}: ${Math.round(value!)} ms`)
+                .join(' · ')}
+            </div>
+          )}
+          {result.transcript && (
+            <div data-testid="live-test-transcript" style={{ fontSize: '12px' }}>
+              Você (teste): {result.transcript}
+            </div>
+          )}
+          {result.reply && (
+            <div data-testid="live-test-reply" style={{ fontSize: '12px' }}>
+              Ashy: {result.reply}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   )
 }
