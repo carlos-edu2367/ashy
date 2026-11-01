@@ -12,6 +12,14 @@
  * The server streams `response.output_text.delta` / `response.output_audio.delta` (base64 PCM16 mono)
  * then `response.done`; `response.cancel` stops it. There is no server VAD, no truncate.
  * A runaway watchdog cancels degenerate responses (mandatory, see spec §4).
+ *
+ * Phase 10.3 tools (2026-11-01 spike): `init.tools` go in `session.update` with `tool_choice:'auto'`.
+ * Audio-mode responses never call tools, so `submitUserText(text, {toolChoice:'auto'})` runs a TEXT-only
+ * tool step (`response.create {response:{tool_choice:'auto', output_modalities:['text']}}`) that emits
+ * `tool_step_started` → `tool_call` (per `response.output_item.added` function_call +
+ * `response.function_call_arguments.done`) → `tool_step_done`. `submitToolResults` sends the
+ * `function_call_output` items and asks for the spoken answer (`tool_choice:'none'` + session modalities).
+ * With tools configured every other response.create carries `tool_choice:'none'`.
  */
 import type { LiveInputMode } from '@ashy/shared'
 import { base64ToInt16, int16ToBase64 } from './pcm-utils'
@@ -31,6 +39,10 @@ import {
   type VoiceSessionCapabilities,
   type VoiceSessionEventMap,
   type VoiceSessionInit,
+  type VoiceSubmitOptions,
+  type VoiceToolCall,
+  type VoiceToolChoice,
+  type VoiceToolResult,
   type WebSocketFactory,
   type WebSocketLike,
 } from './types'
@@ -49,10 +61,15 @@ export interface LlamaCppRealtimeSessionOptions {
   /** audio-direct: append chunk size (ms of input audio). Spec: 40–100 ms. */
   appendChunkMs?: number
   watchdog?: Partial<RunawayWatchdogOptions>
+  /** Output modalities of the session (default ['text','audio']; the hybrid session uses ['text']). */
+  outputModalities?: Array<'text' | 'audio'>
 }
 
 export interface LlamaCppRealtimeSession extends VoiceSession {
-  submitUserText(text: string, contextText?: string): void
+  submitUserText(text: string, contextOrOptions?: string | VoiceSubmitOptions, options?: VoiceSubmitOptions): void
+  submitToolResults(results: VoiceToolResult[], options?: VoiceSubmitOptions): void
+  /** Phase 10.3 — true when the session was configured with tools in `session.update`. */
+  readonly hasTools: boolean
   readonly connected: boolean
   readonly url: string
 }
@@ -64,6 +81,10 @@ interface ActiveResponse {
   audioSamples: number
   started: boolean
   cancelled: boolean
+  /** Phase 10.3: 'tool' = text-only tool step (emits tool_step_* instead of response_*). */
+  kind: 'speech' | 'tool'
+  /** Function calls announced by `response.output_item.added` / completed by `…arguments.done`. */
+  calls: Array<VoiceToolCall & { done: boolean }>
 }
 
 export function buildRealtimeUrl(baseUrl: string, modelId?: string): string {
@@ -106,6 +127,9 @@ export function createLlamaCppRealtimeSession(options: LlamaCppRealtimeSessionOp
   const appendChunkMs = Math.max(20, Math.min(100, options.appendChunkMs ?? 50))
   const watchdogOpts: RunawayWatchdogOptions = { ...DEFAULT_RUNAWAY_WATCHDOG_OPTIONS, ...(options.watchdog ?? {}) }
   const url = buildRealtimeUrl(options.baseUrl, options.modelId)
+  const outputModalities: Array<'text' | 'audio'> =
+    options.outputModalities && options.outputModalities.length > 0 ? [...options.outputModalities] : ['text', 'audio']
+  let hasTools = false
 
   const emitter = createEmitter<VoiceSessionEventMap>()
   const caps: VoiceSessionCapabilities = {
@@ -114,7 +138,7 @@ export function createLlamaCppRealtimeSession(options: LlamaCppRealtimeSessionOp
     mutableInstructions: false,
     contextInjection: 'input_text_item',
     userTranscription: false,
-    toolCalls: false,
+    toolCalls: true,
     imageInput: false,
     speakerReference: false,
     voices: ['female', 'male'],
@@ -163,7 +187,40 @@ export function createLlamaCppRealtimeSession(options: LlamaCppRealtimeSessionOp
   function ensureStarted(r: ActiveResponse): void {
     if (r.started) return
     r.started = true
-    emitter.emit('response_started', { responseId: r.localId })
+    if (r.kind === 'tool') emitter.emit('tool_step_started', { responseId: r.localId })
+    else emitter.emit('response_started', { responseId: r.localId })
+  }
+
+  function completedCalls(r: ActiveResponse): VoiceToolCall[] {
+    return r.calls
+      .filter((c) => c.name)
+      .map(({ callId, name, arguments: args }) => ({ callId, name, arguments: args || '{}' }))
+  }
+
+  /** End of a response: tool steps report `tool_step_done`, spoken ones `response_done`. */
+  function emitDone(r: ActiveResponse, cancelled: boolean, reason?: VoiceSessionCancelReason, detail?: string): void {
+    ensureStarted(r)
+    const calls = cancelled ? [] : completedCalls(r)
+    if (r.kind === 'tool') {
+      emitter.emit('tool_step_done', {
+        responseId: r.localId,
+        text: r.text,
+        calls,
+        cancelled,
+        ...(cancelled && reason ? { cancelReason: reason } : {}),
+        ...(detail ? { detail } : {}),
+      })
+      return
+    }
+    emitter.emit('response_done', {
+      responseId: r.localId,
+      text: r.text,
+      audioMs: audioMsOf(r),
+      cancelled,
+      ...(cancelled && reason ? { cancelReason: reason } : {}),
+      ...(detail ? { detail } : {}),
+      ...(calls.length > 0 ? { toolCalls: calls } : {}),
+    })
   }
 
   function doCancel(reason: VoiceSessionCancelReason, detail?: string): void {
@@ -178,15 +235,7 @@ export function createLlamaCppRealtimeSession(options: LlamaCppRealtimeSessionOp
       finishSettling()
     }, cancelSettleMs)
     active = null
-    ensureStarted(r)
-    emitter.emit('response_done', {
-      responseId: r.localId,
-      text: r.text,
-      audioMs: audioMsOf(r),
-      cancelled: true,
-      cancelReason: reason,
-      ...(detail ? { detail } : {}),
-    })
+    emitDone(r, true, reason, detail)
   }
 
   function runWatchdog(r: ActiveResponse): void {
@@ -196,17 +245,46 @@ export function createLlamaCppRealtimeSession(options: LlamaCppRealtimeSessionOp
     }
   }
 
-  function startResponse(): void {
+  /**
+   * `choice` 'auto' → text-only tool step; 'none' → spoken with tool_choice none (plus the session
+   * modalities when `withModalities`); undefined → 'none' if the session has tools, else a bare
+   * response.create (pre-10.3 wire format). 'auto' without session tools degrades to a spoken turn.
+   */
+  function startResponse(choice?: VoiceToolChoice, withModalities = false): void {
     responseSeq += 1
+    const effective: VoiceToolChoice | undefined = !hasTools ? (choice === 'none' ? 'none' : undefined) : (choice ?? 'none')
+    const kind: ActiveResponse['kind'] = effective === 'auto' ? 'tool' : 'speech'
     active = {
-      localId: `resp_${responseSeq}`,
+      localId: `${kind === 'tool' ? 'tool' : 'resp'}_${responseSeq}`,
       serverId: null,
       text: '',
       audioSamples: 0,
       started: false,
       cancelled: false,
+      kind,
+      calls: [],
     }
-    send({ type: 'response.create' })
+    if (effective === 'auto') {
+      send({ type: 'response.create', response: { tool_choice: 'auto', output_modalities: ['text'] } })
+    } else if (effective === 'none') {
+      send({
+        type: 'response.create',
+        response: { tool_choice: 'none', ...(withModalities ? { output_modalities: [...outputModalities] } : {}) },
+      })
+    } else {
+      send({ type: 'response.create' })
+    }
+  }
+
+  function upsertCall(r: ActiveResponse, callId: string, name: string): VoiceToolCall & { done: boolean } {
+    let c = callId ? r.calls.find((x) => x.callId === callId) : undefined
+    if (!c) {
+      c = { callId: callId || `call_${r.localId}_${r.calls.length + 1}`, name, arguments: '', done: false }
+      r.calls.push(c)
+    } else if (name && !c.name) {
+      c.name = name
+    }
+    return c
   }
 
   function sendInputText(text: string): void {
@@ -233,7 +311,7 @@ export function createLlamaCppRealtimeSession(options: LlamaCppRealtimeSessionOp
         const r = active
         ensureStarted(r)
         r.text += delta
-        emitter.emit('response_text', { responseId: r.localId, delta, text: r.text })
+        if (r.kind === 'speech') emitter.emit('response_text', { responseId: r.localId, delta, text: r.text })
         runWatchdog(r)
         return
       }
@@ -242,6 +320,7 @@ export function createLlamaCppRealtimeSession(options: LlamaCppRealtimeSessionOp
         if (settlingCancel || !active || active.cancelled) return
         const delta = typeof ev.delta === 'string' ? ev.delta : ''
         if (!delta) return
+        if (active.kind === 'tool') return // text-only step: stray audio is ignored
         const pcm = base64ToInt16(delta)
         if (pcm.length === 0) return
         const r = active
@@ -267,26 +346,36 @@ export function createLlamaCppRealtimeSession(options: LlamaCppRealtimeSessionOp
         active = null
         const status = (ev.response as { status?: unknown } | undefined)?.status
         const serverCancelled = status === 'cancelled'
-        ensureStarted(r)
-        emitter.emit('response_done', {
-          responseId: r.localId,
-          text: r.text,
-          audioMs: audioMsOf(r),
-          cancelled: serverCancelled,
-          ...(serverCancelled ? { cancelReason: 'server' as const } : {}),
-        })
+        emitDone(r, serverCancelled, serverCancelled ? 'server' : undefined)
+        return
+      }
+      case 'response.output_item.added': {
+        const item = ev.item as { type?: unknown; name?: unknown; call_id?: unknown } | undefined
+        if (settlingCancel || !active || active.cancelled || item?.type !== 'function_call') return
+        ensureStarted(active)
+        upsertCall(active, typeof item.call_id === 'string' ? item.call_id : '', typeof item.name === 'string' ? item.name : '')
         return
       }
       case 'response.function_call_arguments.done': {
         const callId = typeof ev.call_id === 'string' ? ev.call_id : ''
-        const name = typeof ev.name === 'string' ? ev.name : ''
-        if (callId && name) {
-          emitter.emit('tool_call', {
-            callId,
-            name,
-            arguments: typeof ev.arguments === 'string' ? ev.arguments : '{}',
-          })
+        const evName = typeof ev.name === 'string' ? ev.name : ''
+        const args = typeof ev.arguments === 'string' ? ev.arguments : '{}'
+        const r = active
+        if (settlingCancel || (r && r.cancelled)) return
+        if (!r) {
+          if (callId && evName) emitter.emit('tool_call', { callId, name: evName, arguments: args })
+          return
         }
+        ensureStarted(r)
+        // llama.cpp sends call_id here; fall back to the last open call when it doesn't.
+        const c =
+          (callId ? r.calls.find((x) => x.callId === callId) : undefined) ??
+          (!callId ? [...r.calls].reverse().find((x) => !x.done) : undefined) ??
+          upsertCall(r, callId, evName)
+        if (evName && !c.name) c.name = evName
+        c.arguments = args
+        c.done = true
+        if (c.name) emitter.emit('tool_call', { callId: c.callId, name: c.name, arguments: args, responseId: r.localId })
         return
       }
       case 'error': {
@@ -388,12 +477,17 @@ export function createLlamaCppRealtimeSession(options: LlamaCppRealtimeSessionOp
             const outRate = readRate(ev.session, 'output')
             if (inRate) caps.inputSampleRate = inRate
             if (outRate) caps.outputSampleRate = outRate
+            const tools = Array.isArray(init.tools)
+              ? init.tools.filter((t) => t && typeof t.name === 'string' && t.name.length > 0)
+              : []
+            hasTools = tools.length > 0
             send({
               type: 'session.update',
               session: {
                 instructions: init.instructions,
-                output_modalities: ['text', 'audio'],
+                output_modalities: [...outputModalities],
                 max_output_tokens: maxOutputTokens,
+                ...(hasTools ? { tools, tool_choice: 'auto' } : {}),
               },
             })
           } else if (ev.type === 'session.updated' && phase === 'created') {
@@ -442,6 +536,9 @@ export function createLlamaCppRealtimeSession(options: LlamaCppRealtimeSessionOp
     get connected() {
       return ready
     },
+    get hasTools() {
+      return hasTools
+    },
     url,
     connect,
     pushAudio(pcm: Int16Array): void {
@@ -456,27 +553,46 @@ export function createLlamaCppRealtimeSession(options: LlamaCppRealtimeSessionOp
       flushAppend()
       send({ type: 'input_audio_buffer.commit' })
     },
-    respond(opts?: { contextText?: string }): void {
+    respond(opts?: { contextText?: string } & VoiceSubmitOptions): void {
       if (!assertReady('respond')) return
       cancelIfActive()
       const contextText = opts?.contextText?.trim() ?? ''
+      const choice = opts?.toolChoice
       sendWhenSettled(() => {
         if (contextText) sendInputText(contextText)
-        startResponse()
+        startResponse(choice)
       })
     },
-    submitUserText(text: string, contextText?: string): void {
+    submitUserText(text: string, contextOrOptions?: string | VoiceSubmitOptions, maybeOptions?: VoiceSubmitOptions): void {
       if (!assertReady('submitUserText')) return
       if (inputMode !== 'transcribed') {
         emitter.emit('error', { message: 'submitUserText in audio-direct mode', code: 'mode', fatal: false })
       }
+      const contextText = typeof contextOrOptions === 'string' ? contextOrOptions : undefined
+      const opts = typeof contextOrOptions === 'object' && contextOrOptions !== null ? contextOrOptions : maybeOptions
       cancelIfActive()
       const ctx = contextText?.trim() ?? ''
       const userText = text.trim()
+      const choice = opts?.toolChoice
       sendWhenSettled(() => {
         if (ctx) sendInputText(ctx)
         if (userText) sendInputText(userText)
-        startResponse()
+        startResponse(choice)
+      })
+    },
+    submitToolResults(results: VoiceToolResult[], opts?: VoiceSubmitOptions): void {
+      if (!assertReady('submitToolResults')) return
+      cancelIfActive()
+      const list = results.filter((r) => r && typeof r.callId === 'string' && r.callId.length > 0)
+      const choice: VoiceToolChoice = opts?.toolChoice ?? 'none'
+      sendWhenSettled(() => {
+        for (const r of list) {
+          send({
+            type: 'conversation.item.create',
+            item: { type: 'function_call_output', call_id: r.callId, output: String(r.output ?? '') },
+          })
+        }
+        startResponse(choice, true)
       })
     },
     cancelResponse(reason: VoiceSessionCancelReason = 'client'): void {

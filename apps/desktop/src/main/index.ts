@@ -27,6 +27,12 @@ import {
   type SafeAutoUpdaterController,
 } from './auto-updater'
 import {
+  createScreenCaptureProvider,
+  type ElectronDesktopCapturerLike,
+  type ElectronScreenLike,
+  type ScreenCaptureProvider,
+} from './screen-capture'
+import {
   createAshySystemTray,
   type AshySystemTrayController,
   type ElectronMenuLike,
@@ -278,6 +284,9 @@ export interface ElectronBrowserWindowInstanceLike {
   setBounds?(bounds: { x: number; y: number; width: number; height: number }): void
   getPosition?(): [number, number]
   setPosition?(x: number, y: number): void
+  /** Phase 10.3: used to exclude Ashy's own windows from window capture. */
+  getTitle?(): string
+  getMediaSourceId?(): string
 }
 
 function isWindowUsable(
@@ -781,6 +790,9 @@ export interface BootAshyElectronMainDeps {
   globalShortcut?: ElectronGlobalShortcutLike
   /** Electron `session.defaultSession` (fallback for the call window's permission handlers). */
   session?: ElectronSessionLike
+  /** Phase 10.3: Electron `desktopCapturer` + `screen` for the call's vision (screen capture provider). */
+  desktopCapturer?: ElectronDesktopCapturerLike
+  screen?: ElectronScreenLike
   /** Overrides the hidden call-engine window idle auto-destroy (tests). */
   callWindowIdleDestroyMs?: number
   callWindowTimers?: CallWindowTimers
@@ -1290,6 +1302,22 @@ export async function bootAshyElectronMain(
     }
   })
 
+  // Phase 10.3: real screen/window capture for the call's vision. The host decides when a
+  // capture is allowed (eyesMode/consent); main only picks the source and returns the PNG.
+  const screenCaptureKernel = kernel as AshyHostKernel & {
+    setScreenCaptureProvider?: (provider: ScreenCaptureProvider | null) => void
+  }
+  const screenCaptureProvider: ScreenCaptureProvider | null = deps.desktopCapturer
+    ? createScreenCaptureProvider({
+        desktopCapturer: deps.desktopCapturer,
+        screen: deps.screen ?? null,
+        getOwnWindows: () => [hubWindowRef, overlayWindowRef, callWindowController.getWindow()],
+      })
+    : null
+  if (screenCaptureProvider && typeof screenCaptureKernel.setScreenCaptureProvider === 'function') {
+    screenCaptureKernel.setScreenCaptureProvider(screenCaptureProvider)
+  }
+
   const toggleLiveCall = async (): Promise<void> => {
     if (typeof kernel.invokeLiveCall !== 'function') return
     const current = (await kernel.invokeLiveCall({ method: 'call:getState' })) as
@@ -1449,6 +1477,9 @@ export async function bootAshyElectronMain(
     trayController?.destroy()
     deps.globalShortcut?.unregisterAll()
     unsubscribeCallState()
+    if (screenCaptureProvider && typeof screenCaptureKernel.setScreenCaptureProvider === 'function') {
+      screenCaptureKernel.setScreenCaptureProvider(null)
+    }
     if (typeof kernel.setCallWindowController === 'function') {
       kernel.setCallWindowController(null)
     }
@@ -1504,6 +1535,8 @@ if (
       session: unknown
       Tray: unknown
       Menu: unknown
+      desktopCapturer: unknown
+      screen: unknown
     }>
   )
     .then(async (electronMod) => {
@@ -1516,6 +1549,8 @@ if (
         session,
         Tray,
         Menu,
+        desktopCapturer,
+        screen,
       } = electronMod
 
       if (
@@ -1546,6 +1581,8 @@ if (
           ?.defaultSession,
         Tray: Tray as unknown as ElectronTrayConstructorLike,
         Menu: Menu as unknown as ElectronMenuLike,
+        desktopCapturer: desktopCapturer as unknown as ElectronDesktopCapturerLike,
+        screen: screen as unknown as ElectronScreenLike,
         preloadPath,
         trayIconPath,
         staticDistDir: distDir,

@@ -18,6 +18,7 @@ import {
   type ApprovalScope,
   type AuthorizedVisionSensor,
   type CapturedScreenFrame,
+  type PendingActionCard,
   type McpProtocolClient,
 } from '@ashy/agency'
 import type { AshyCortex } from '@ashy/cortex'
@@ -33,6 +34,7 @@ import {
   type VisionObservationResult,
 } from '@ashy/shared'
 import type { ProviderVault } from './provider-vault'
+import { buildAgencyPendingCardView, type AgencyEventBridge } from './live-call/approvals'
 
 export { isSensitiveHostPath }
 
@@ -41,6 +43,16 @@ export interface HostAgencyRuntimeOptions {
   readonly userDataDir: string
   readonly providerVault?: ProviderVault
   readonly fetchImpl?: typeof fetch
+  /**
+   * Phase 10.3 — push events (`agency:pending` / `agency:resolved`) for EVERY pending action
+   * (chat or call), and lets the Live Call host reach this runtime once it is built.
+   */
+  readonly eventBridge?: AgencyEventBridge
+}
+
+/** Phase 10.3 — where a tool call came from (a live call stamps its callId on the card). */
+export interface AgencyCallOrigin {
+  callId?: string
 }
 
 export interface HostAgencyRuntime {
@@ -52,6 +64,8 @@ export interface HostAgencyRuntime {
   callMcpTool(input: {
     toolName: string
     args?: Record<string, unknown>
+    /** Phase 10.3 — stamped on any card this call stages (host-internal, not part of the RPC). */
+    origin?: AgencyCallOrigin
   }): Promise<{
     status: 'executed' | 'staged' | 'blocked_privacy' | 'blocked_traversal' | 'blocked_policy'
     output?: unknown
@@ -61,7 +75,13 @@ export interface HostAgencyRuntime {
   }>
   approvePendingAction(input: {
     actionId: string
-    scope?: ApprovalScope
+    /**
+     * Phase 10.3 — 'always' approves once AND persists an allow rule for the tool
+     * (`toolRiskOverrides[tool] = 'read-safe'`, survives restarts; revoke by removing the override
+     * via `updateConsent({ toolRiskOverrides })`). Never applies to blast-radius actions — the
+     * gatekeeper forces those back to staged-confirm regardless of the override.
+     */
+    scope?: ApprovalScope | 'always'
   }): Promise<{
     status: 'executed'
     card: SharedPendingActionCard
@@ -89,6 +109,12 @@ export interface HostAgencyRuntime {
   }>
   registerExternalMcpServer(input: ExternalMcpServerConfig): Promise<AgencySnapshot>
   getActiveVisionContextForTurn(): string | undefined
+  /** Phase 10.3 — raw OS active window title (null when unknown); the caller checks privacy. */
+  getActiveWindowTitle(): Promise<string | null>
+  /** Phase 10.3 — origin (callId) of the live call that staged this card; undefined = chat. */
+  getCardOrigin(cardId: string): AgencyCallOrigin | undefined
+  /** Phase 10.3 — cards still in status 'pending', oldest first. */
+  listPendingCards(): PendingActionCard[]
   close(): Promise<void>
 }
 
@@ -397,6 +423,56 @@ export function createHostAgencyRuntime(
 
   const initialAuditEntries = [...cortex.db.listActionAuditLog(100)].reverse()
 
+  // ── Phase 10.3: push events for pending actions (chat AND live call) ──
+  // No AsyncLocalStorage: this module is also bundled into the renderer. A staged card is
+  // "claimed" by callMcpTool right after the gatekeeper returns (same microtask chain) and
+  // emitted there with its origin; anything staged elsewhere is emitted on the next macrotask.
+  const unclaimedStaged = new Set<string>()
+  const cardOrigins = new Map<string, AgencyCallOrigin>()
+  /** Cards being approved via approvePendingAction (it emits `agency:resolved` WITH the output). */
+  const resolvingWithOutput = new Set<string>()
+  const MAX_CARD_ORIGINS = 200
+  /** Set once `gatekeeper` exists (its constructor may replay audit entries). */
+  let gatekeeperReady = false
+
+  function emitAgencyEvent(event: Parameters<AgencyEventBridge['emit']>[0]): void {
+    try {
+      options.eventBridge?.emit(event)
+    } catch {
+      // Fault-isolated: a UI push must never break the gatekeeper
+    }
+  }
+
+  function emitPendingCard(actionId: string, callId: string | undefined): void {
+    const card = gatekeeper.getPendingActions().find((c) => c.id === actionId)
+    if (!card || card.status !== 'pending') return
+    if (callId) {
+      cardOrigins.set(actionId, { callId })
+      while (cardOrigins.size > MAX_CARD_ORIGINS) {
+        const oldest = cardOrigins.keys().next().value
+        if (oldest === undefined) break
+        cardOrigins.delete(oldest)
+      }
+    }
+    emitAgencyEvent({ type: 'agency:pending', card: buildAgencyPendingCardView(card, callId) })
+  }
+
+  function emitAgencyEventForAudit(entry: { decision: string; actionId?: string }): void {
+    if (!options.eventBridge || !entry.actionId || !gatekeeperReady) return
+    const actionId = entry.actionId
+    if (entry.decision === 'staged') {
+      unclaimedStaged.add(actionId)
+      setTimeout(() => {
+        if (unclaimedStaged.delete(actionId)) emitPendingCard(actionId, undefined)
+      }, 0)
+    } else if (entry.decision === 'approved') {
+      if (resolvingWithOutput.has(actionId)) return
+      emitAgencyEvent({ type: 'agency:resolved', cardId: actionId, status: 'approved' })
+    } else if (entry.decision === 'denied') {
+      emitAgencyEvent({ type: 'agency:resolved', cardId: actionId, status: 'denied' })
+    }
+  }
+
   const gatekeeper = new ActionGatekeeper({
     privacyController,
     approvalPolicy: consent.approvalPolicy,
@@ -417,6 +493,7 @@ export function createHostAgencyRuntime(
       ...(entry.diffPreview ? { diffPreview: entry.diffPreview } : {}),
     })),
     onAuditEntry: (entry) => {
+      emitAgencyEventForAudit(entry)
       try {
         cortex.db.insertActionAuditLog({
           id: entry.id,
@@ -438,6 +515,23 @@ export function createHostAgencyRuntime(
       }
     },
   })
+
+  gatekeeperReady = true
+
+  /** Tools that may never get a persistent "always allow" rule (shell commands always ask). */
+  const NEVER_ALWAYS_ALLOW = new Set(['run_cleanup_command'])
+
+  /**
+   * Phase 10.3 "sempre permitir": persists `toolRiskOverrides[tool] = 'read-safe'` in the agency
+   * consent state (same persistence as the Consent Center). Blast-radius actions still ask: the
+   * gatekeeper forces any action with a blast-radius warning back to staged-confirm.
+   */
+  function persistAlwaysAllow(card: PendingActionCard): void {
+    if (card.blastRadiusWarning || NEVER_ALWAYS_ALLOW.has(card.toolName)) return
+    const overrides = { ...gatekeeper.getToolRiskOverrides(), [card.toolName]: 'read-safe' as const }
+    gatekeeper.setToolRiskOverrides(overrides)
+    consent = cortex.db.saveAgencyConsentState({ toolRiskOverrides: overrides })
+  }
 
   let cachedOsWindowTitle: { title: string | null; cachedAt: number } | null = null
 
@@ -1311,7 +1405,7 @@ export function createHostAgencyRuntime(
     return safeArgs
   }
 
-  return {
+  const runtime: HostAgencyRuntime = {
     privacyController,
     gatekeeper,
     mcpRegistry,
@@ -1325,10 +1419,19 @@ export function createHostAgencyRuntime(
         throw new Error('Invalid MCP tool call: toolName must be non-empty')
       }
       const enrichedArgs = await enrichToolArgs(toolName, input?.args)
+      const originCallId =
+        typeof input?.origin?.callId === 'string' && input.origin.callId.length > 0
+          ? input.origin.callId
+          : undefined
       const res = await mcpRegistry.call_mcp_tool({
         toolName,
         args: enrichedArgs,
       })
+      if (res.status === 'staged' && res.pendingCard && unclaimedStaged.delete(res.pendingCard.id)) {
+        emitPendingCard(res.pendingCard.id, originCallId)
+      } else if (res.status === 'staged' && res.pendingCard && originCallId) {
+        cardOrigins.set(res.pendingCard.id, { callId: originCallId })
+      }
       return {
         status: res.status,
         ...(res.output !== undefined ? { output: res.output } : {}),
@@ -1343,9 +1446,36 @@ export function createHostAgencyRuntime(
       if (!actionId) {
         throw new Error('actionId is required to approve a pending action')
       }
+      const wantsAlways = input?.scope === 'always'
       const scope: ApprovalScope =
-        input?.scope !== undefined ? v.parse(ApprovalScopeSchema, input.scope) : 'once'
-      const res = await gatekeeper.approveAction(actionId, scope)
+        input?.scope !== undefined && !wantsAlways ? v.parse(ApprovalScopeSchema, input.scope) : 'once'
+      resolvingWithOutput.add(actionId)
+      let res: Awaited<ReturnType<typeof gatekeeper.approveAction>>
+      try {
+        res = await gatekeeper.approveAction(actionId, scope)
+      } catch (err) {
+        if (gatekeeper.getPendingActions().some((c) => c.id === actionId && c.status === 'pending')) {
+          // The tool handler threw: the card stays pending and the UI learns it failed.
+          emitAgencyEvent({
+            type: 'agency:resolved',
+            cardId: actionId,
+            status: 'failed',
+            output: (err instanceof Error ? err.message : String(err)).slice(0, 500),
+          })
+        }
+        throw err
+      } finally {
+        resolvingWithOutput.delete(actionId)
+      }
+      if (wantsAlways) {
+        persistAlwaysAllow(res.card)
+      }
+      emitAgencyEvent({
+        type: 'agency:resolved',
+        cardId: actionId,
+        status: 'approved',
+        output: stringifyAgencyOutput(res.output, 2000),
+      })
       return {
         status: res.status,
         card: res.card,
@@ -1509,6 +1639,19 @@ export function createHostAgencyRuntime(
       return lastObs.summary
     },
 
+    getActiveWindowTitle(): Promise<string | null> {
+      return queryOsActiveWindowTitle()
+    },
+
+    getCardOrigin(cardId: string): AgencyCallOrigin | undefined {
+      const origin = cardOrigins.get(cardId)
+      return origin ? { ...origin } : undefined
+    },
+
+    listPendingCards(): PendingActionCard[] {
+      return gatekeeper.getPendingActions().filter((c) => c.status === 'pending')
+    },
+
     async close(): Promise<void> {
       await bootReconnectPromise
       for (const client of activeExternalClients.values()) {
@@ -1521,4 +1664,21 @@ export function createHostAgencyRuntime(
       activeExternalClients.clear()
     },
   }
+  options.eventBridge?.attachRuntime(runtime)
+  return runtime
+}
+
+/** Compact JSON/string rendering of a tool output (≤ maxChars). */
+export function stringifyAgencyOutput(output: unknown, maxChars: number): string {
+  let text: string
+  if (typeof output === 'string') {
+    text = output
+  } else {
+    try {
+      text = JSON.stringify(output) ?? ''
+    } catch {
+      text = String(output)
+    }
+  }
+  return text.length > maxChars ? `${text.slice(0, Math.max(0, maxChars - 1))}…` : text
 }

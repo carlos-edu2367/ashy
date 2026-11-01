@@ -79,6 +79,11 @@ export interface CallHub {
   reportState(input: CallReportStateInput): CallStateSnapshot
   /** Returns true when the frame was re-emitted (false = throttled or no active call). */
   reportViseme(frame: CallVisemeFrame): boolean
+  /**
+   * Phase 10.3 — asks the call engine to speak proactively (approval result / initiative).
+   * Only for the active call; the engine queues it until `listening`. Returns false when not active.
+   */
+  inject(input: { callId: string; contextText: string; reason: 'approval' | 'initiative' }): boolean
 }
 
 export interface CallReportStateInput {
@@ -352,6 +357,18 @@ export function createCallHub(deps: CallHubDeps): CallHub {
         active = null
       }
       return publish(next)
+    },
+
+    inject(input) {
+      if (!active || active.callId !== input.callId || TERMINAL_STATUSES.has(state.status)) return false
+      deps.emit({
+        type: 'call:command',
+        command: 'inject',
+        callId: input.callId,
+        contextText: input.contextText.slice(0, 2000),
+        reason: input.reason,
+      })
+      return true
     },
 
     reportViseme(frame) {

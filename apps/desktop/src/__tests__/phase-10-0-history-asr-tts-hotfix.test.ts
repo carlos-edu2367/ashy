@@ -143,6 +143,21 @@ describe('Phase 10.0 T2 — sanitizeConversationHistory', () => {
     expect(isPlaceholderUserContent('ashy-omni-turn-rev-3')).toBe(true)
     expect(isPlaceholderUserContent('oi')).toBe(false)
   })
+
+  it('Phase 10.3: merges consecutive (non-duplicate) assistant replies instead of dropping the older one', () => {
+    const out = sanitizeConversationHistory(
+      [
+        { role: 'user', content: 'Resolvi o bug do backend!' },
+        { role: 'assistant', content: 'Boa! O fantasma foi exorcizado.' },
+        // injected initiative turn: assistant row with no user row before it
+        { role: 'assistant', content: 'Aliás, você comeu alguma coisa hoje?' },
+        { role: 'user', content: 'Ainda não.' },
+      ],
+      { maxMessages: 80, maxChars: 120000, dropTrailingUser: false },
+    )
+    expect(out.map((m) => m.role)).toEqual(['user', 'assistant', 'user'])
+    expect(out[1]!.content).toBe('Boa! O fantasma foi exorcizado.\n\nAliás, você comeu alguma coisa hoje?')
+  })
 })
 
 describe('Phase 10.0 T2 — ASR duration/RMS guard', () => {

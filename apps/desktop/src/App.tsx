@@ -72,12 +72,16 @@ import { ModelsSettingsPanel } from './components/ModelsSettingsPanel'
 import {
   HubCallOrb,
   HubCallStatusStrip,
+  HubPendingApprovals,
   LiveModeSettingsPanel,
   OverlayCallButtons,
   OverlayCallStateDot,
+  PendingApprovalCard,
+  VOICE_APPROVAL_HINT,
+  VisionIndicator,
 } from './components/LiveCallControls'
 import { bootCallEngine, shouldMountCallEngineInline } from './call-engine/boot'
-import { useCallStore } from './store/useCallStore'
+import { isCallActiveStatus, useCallStore } from './store/useCallStore'
 import {
   useAshyStore,
   type FeaturedMemoryCard,
@@ -276,6 +280,15 @@ export function App(): React.ReactElement {
   useEffect(() => {
     void useCallStore.getState().init().catch(() => {})
   }, [])
+
+  // Phase 10.3: push approval cards (`agency:pending`) feed the overlay bubble too, deduped by id
+  // against the snapshot list (`state.pendingActions`).
+  const pushPendingCards = useCallStore((s) => s.pendingCards)
+  const callIsActive = useCallStore((s) => isCallActiveStatus(s.callState.status))
+  const snapshotPendingIds = new Set(state.pendingActions.map((card) => card.id))
+  const extraPushCards = pushPendingCards.filter((card) => !snapshotPendingIds.has(card.id))
+  const pushCardById = new Map(pushPendingCards.map((card) => [card.id, card] as const))
+  const overlayPendingCount = state.pendingActions.length + extraPushCards.length
 
   // Phase 10.1: without the Electron preload (plain-browser dev over HTTP) there is no hidden
   // call-engine window, so the hub owns the call engine inline. Never in the overlay.
@@ -548,6 +561,8 @@ export function App(): React.ReactElement {
 
           {/* Phase 10.1: call state dot — stays visible during a call even without hover */}
           <OverlayCallStateDot hovering={isHoveringOverlay} />
+          {/* Phase 10.3: "👁 vendo a tela" while the host captures the screen */}
+          <VisionIndicator className="ashy-vision-indicator--overlay" />
 
           {/* Stage Quick Controls Island */}
           <div
@@ -643,7 +658,7 @@ export function App(): React.ReactElement {
             </div>
           </div>
 
-          {state.pendingActions.length > 0 && (
+          {overlayPendingCount > 0 && (
             <div
               data-testid="stage-pending-action-bubble"
               data-ui-island="true"
@@ -659,7 +674,7 @@ export function App(): React.ReactElement {
               }}
             >
               <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--accent-peach)' }}>
-                Permissão solicitada pela Ashy ({state.pendingActions.length})
+                Permissão solicitada pela Ashy ({overlayPendingCount})
               </div>
               {state.pendingActions.map((card) => (
                 <div
@@ -722,6 +737,18 @@ export function App(): React.ReactElement {
                     >
                       Permitir na sessão
                     </button>
+                    {!card.blastRadiusWarning && (
+                      <button
+                        type="button"
+                        className="ashy-outline-btn"
+                        style={{ padding: '4px 10px', fontSize: '11px' }}
+                        data-testid="btn-card-always"
+                        data-card-id={card.id}
+                        onClick={() => void useCallStore.getState().approveCard(card.id, 'always')}
+                      >
+                        Sempre permitir
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="ashy-danger-outline-btn"
@@ -732,7 +759,20 @@ export function App(): React.ReactElement {
                       Recusar
                     </button>
                   </div>
+                  {callIsActive &&
+                    pushCardById.get(card.id)?.voiceApprovable === true &&
+                    !card.blastRadiusWarning && (
+                      <div
+                        style={{ fontSize: '11px', color: 'var(--text-secondary)' }}
+                        data-testid="stage-pending-voice-hint"
+                      >
+                        {VOICE_APPROVAL_HINT}
+                      </div>
+                    )}
                 </div>
+              ))}
+              {extraPushCards.map((card) => (
+                <PendingApprovalCard key={card.id} card={card} compact />
               ))}
             </div>
           )}
@@ -1172,6 +1212,7 @@ export function App(): React.ReactElement {
 
               {/* Bottom Floating Voice Dock */}
               <div className="ashy-voice-dock-wrap">
+                <HubPendingApprovals />
                 <HubCallStatusStrip />
                 <div className="ashy-voice-dock" data-ui-island="true">
                   <div className="ashy-dock-action">
@@ -6128,6 +6169,48 @@ export function App(): React.ReactElement {
                         </div>
                       )
                     })}
+                  </div>
+
+                  {/* Phase 10.3: tools approved with "Sempre permitir" (override = read-safe) */}
+                  <div
+                    style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}
+                    data-testid="always-allowed-tools"
+                  >
+                    <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-secondary)' }}>
+                      Ferramentas sempre permitidas
+                    </div>
+                    {Object.entries(state.toolRiskOverrides).filter(([, tier]) => tier === 'read-safe')
+                      .length === 0 ? (
+                      <span
+                        style={{ fontSize: '11.5px', color: 'var(--text-muted)' }}
+                        data-testid="always-allowed-empty"
+                      >
+                        Nenhuma — use “Sempre permitir” num pedido de permissão para não ser
+                        perguntado de novo (ações com alerta de impacto sempre pedem confirmação).
+                      </span>
+                    ) : (
+                      Object.entries(state.toolRiskOverrides)
+                        .filter(([, tier]) => tier === 'read-safe')
+                        .map(([toolName]) => (
+                          <div
+                            key={toolName}
+                            className="ashy-setting-box"
+                            style={{ padding: '6px 12px' }}
+                            data-testid={`always-allowed-${toolName}`}
+                          >
+                            <strong style={{ fontSize: '12.5px' }}>{toolName}</strong>
+                            <button
+                              type="button"
+                              className="ashy-danger-outline-btn"
+                              style={{ padding: '4px 10px', fontSize: '11px' }}
+                              data-testid={`btn-revoke-always-${toolName}`}
+                              onClick={() => state.setToolRiskTierOverride(toolName, 'staged-confirm')}
+                            >
+                              Revogar
+                            </button>
+                          </div>
+                        ))
+                    )}
                   </div>
 
                   {/* Allowed Paths Editor */}

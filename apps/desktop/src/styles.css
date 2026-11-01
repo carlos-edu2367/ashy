@@ -1750,6 +1750,102 @@ input[type='range'] {
 .ashy-call-ended {
   color: #f2be79;
 }
+/* Phase 10.3: push approval cards + "vendo a tela" indicator */
+.ashy-call-approvals {
+  pointer-events: auto;
+  position: absolute;
+  bottom: calc(100% + 30px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  width: min(520px, 94%);
+  max-height: 46vh;
+  overflow-y: auto;
+}
+.ashy-call-approvals > .ashy-vision-indicator {
+  align-self: center;
+}
+.ashy-approval-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(28, 22, 38, 0.96);
+  border: 1px solid rgba(242, 190, 121, 0.55);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.ashy-approval-card.compact {
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: 11.5px;
+}
+.ashy-approval-card-args {
+  display: block;
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: #12101b;
+  font-size: 10.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 90px;
+  overflow-y: auto;
+}
+.ashy-approval-card-warning {
+  color: var(--status-danger);
+  font-weight: 600;
+}
+.ashy-approval-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.ashy-approval-card-actions > button {
+  padding: 4px 10px;
+  font-size: 11px;
+}
+.ashy-approval-card-hint {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.ashy-vision-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(111, 211, 155, 0.16);
+  border: 1px solid rgba(111, 211, 155, 0.55);
+  color: #9fe3bd;
+  font-size: 11.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  animation: ashyCallPulse 1.4s ease-in-out infinite;
+}
+.ashy-vision-indicator--overlay {
+  position: absolute;
+  top: 6px;
+  left: 28px;
+  z-index: 21;
+  pointer-events: none;
+}
+.ashy-call-feature-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+}
+.ashy-call-feature-desc {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
 .ashy-call-dot {
   position: absolute;
   top: 10px;

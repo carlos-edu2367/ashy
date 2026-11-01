@@ -386,6 +386,8 @@ export type CallCommand =
   | { command: 'start'; callId: string; backend: LiveBackendId; sessionId: string; test?: boolean }
   | { command: 'stop'; callId: string }
   | { command: 'setMuted'; callId: string; muted: boolean }
+  /** Phase 10.3 — speak proactively (approved-action result, initiative) when the call is listening. */
+  | { command: 'inject'; callId: string; contextText: string; reason: 'approval' | 'initiative' }
 
 /** Runtime config the call-engine renderer needs to open a backend session. */
 export interface CallRuntimeConfig {
@@ -408,6 +410,28 @@ export interface CallContextResult {
    * context + labelled turn into ONE input_text item gave the best replies.
    */
   userLabel?: string
+  /**
+   * Phase 10.3 — only on the session-level call (no userText): tool definitions to send in
+   * `session.update` (tools can only be set before the first input). Absent/empty = no tools.
+   */
+  tools?: CallToolDefinition[]
+  /**
+   * Phase 10.3 — per-turn tool policy decided host-side from the user's words (PT intent check).
+   * 'auto': run the turn as a text-only tool step first (`response.create {tool_choice:'auto',
+   * output_modalities:['text']}`), then the spoken answer. 'none': plain spoken turn with
+   * `tool_choice:'none'` (the 2B model otherwise calls tools for small talk — 2026-11-01 spike).
+   */
+  toolChoice?: 'auto' | 'none'
+  /** Phase 10.3 — true when the host consumed the turn as a voice approval/denial of a pending action. */
+  approvalHandled?: boolean
+}
+
+/** OpenAI-Realtime style function tool (what llama.cpp `/v1/realtime` accepts in `session.update`). */
+export interface CallToolDefinition {
+  type: 'function'
+  name: string
+  description: string
+  parameters: Record<string, unknown>
 }
 
 /** Formats the single input_text item for a transcribed user turn (context + labelled speech). */
@@ -453,6 +477,11 @@ export const LIVE_CALL_METHODS = [
   'liveVoice:import',
   'liveVoice:delete',
   'liveVoice:preview',
+  // Phase 10.3
+  'call:executeTool',
+  'call:checkInitiative',
+  'agency:approve',
+  'agency:deny',
 ] as const
 export type LiveCallMethod = (typeof LIVE_CALL_METHODS)[number]
 export const LiveCallMethodSchema = v.picklist(LIVE_CALL_METHODS)
@@ -535,6 +564,11 @@ export const CallRecordTurnInputSchema = v.object({
       e2eMs: v.optional(v.number()),
     }),
   ),
+  /**
+   * Phase 10.3 — Ashy spoke on her own (approved-action result / initiative): there is no user
+   * utterance, so only the assistant row is persisted (no "🎤 (fala não transcrita)" user row).
+   */
+  injectReason: v.optional(v.picklist(['approval', 'initiative'] as const)),
 })
 export const EnginesInstallInputSchema = v.object({
   engineId: v.literal('llamacpp'),
@@ -644,6 +678,50 @@ export const CallReportTestResultInputSchema = v.object({
   reply: v.optional(v.nullable(v.pipe(v.string(), v.maxLength(4000)))),
 })
 
+// ───────────────────────────── Phase 10.3: tools, approvals, vision, initiative ─────────────────────────────
+
+export const CallExecuteToolInputSchema = v.object({
+  callId: v.string(),
+  toolCallId: v.pipe(v.string(), v.maxLength(128)),
+  name: v.pipe(v.string(), v.maxLength(128)),
+  argsJson: v.pipe(v.string(), v.maxLength(20000)),
+})
+export interface CallExecuteToolResult {
+  status: 'executed' | 'staged' | 'blocked' | 'error'
+  /** String handed back to the model as the function_call_output. */
+  output: string
+  cardId?: string
+}
+
+export const CallCheckInitiativeInputSchema = v.object({
+  callId: v.string(),
+  idleMs: v.number(),
+})
+export interface CallCheckInitiativeResult {
+  speak: boolean
+  contextText?: string
+  reason?: string
+}
+
+/** Minimal view of an agency pending-action card pushed to the UI. */
+export interface AgencyPendingCardView {
+  id: string
+  toolName: string
+  summary: string
+  argsPreview: string
+  riskTier: string
+  blastRadiusWarning?: string
+  /** true when the action can be approved by voice (never for blast-radius actions). */
+  voiceApprovable: boolean
+  callId?: string
+  createdAt: number
+}
+export const AgencyResolveInputSchema = v.object({
+  cardId: v.pipe(v.string(), v.maxLength(128)),
+  /** 'always' persists an allow rule for this tool (never applies to blast-radius actions). */
+  scope: v.optional(v.picklist(['once', 'session', 'always'] as const)),
+})
+
 // ───────────────────────────── Host → renderer events ─────────────────────────────
 
 export type LiveCallHostEvent =
@@ -654,6 +732,9 @@ export type LiveCallHostEvent =
   | { type: 'chat:appended'; sessionId: string; messageIds: string[] }
   | ({ type: 'call:stage'; callId: string } & CallStageSignal)
   | { type: 'call:testResult'; result: CallTestResult }
+  | { type: 'agency:pending'; card: AgencyPendingCardView }
+  | { type: 'agency:resolved'; cardId: string; status: 'approved' | 'denied' | 'failed'; output?: string }
+  | { type: 'vision:capture'; active: boolean; source: 'screen' | 'window' }
 
 export const LIVE_CALL_EVENT_TYPES = [
   'call:state',
@@ -663,6 +744,9 @@ export const LIVE_CALL_EVENT_TYPES = [
   'chat:appended',
   'call:stage',
   'call:testResult',
+  'agency:pending',
+  'agency:resolved',
+  'vision:capture',
 ] as const
 
 export function isLiveCallHostEvent(e: { type: string }): e is LiveCallHostEvent {

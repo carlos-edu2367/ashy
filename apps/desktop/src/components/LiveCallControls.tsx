@@ -1,12 +1,16 @@
 /**
  * Phase 10.1 — Live Call UI (spec §9.1–9.3): hub call orb + status strip, overlay call buttons and
  * state dot, and the "Live Mode" settings panel. Everything reads `useCallStore`.
+ *
+ * Phase 10.3: push approval cards (hub strip + overlay bubble), the "👁 vendo a tela" indicator
+ * and Live Mode › "Recursos na chamada" (tools / vision / initiative).
  */
 import React, { useEffect, useRef, useState } from 'react'
 import {
   LIVE_BACKENDS_IMPLEMENTED,
   LIVE_LOCAL_MODELS,
   LLAMACPP_VARIANTS,
+  type AgencyPendingCardView,
   type LiveBackendId,
   type LiveInputMode,
   type LlamaCppVariant,
@@ -24,6 +28,7 @@ import {
   Save,
   Square,
   Trash2,
+  Wrench,
   Upload,
   Volume2,
   X,
@@ -53,6 +58,121 @@ export function callEndedMessage(
 ): string | null {
   if (status !== 'ended' || !reason || reason === 'user_hangup') return null
   return CALL_END_REASON_MESSAGES[reason] ?? null
+}
+
+// ───────────────────────────── Phase 10.3: approvals + vision ─────────────────────────────
+
+export const VOICE_APPROVAL_HINT = 'ou diga “pode”, “pode sempre” ou “não”'
+export const VISION_INDICATOR_LABEL = '👁 vendo a tela'
+
+/** One push approval card (`agency:pending`) with Aprovar / Sempre permitir / Negar. */
+export function PendingApprovalCard({
+  card,
+  compact = false,
+}: {
+  card: AgencyPendingCardView
+  compact?: boolean
+}): React.ReactElement {
+  const callActive = useCallStore((s) => isCallActiveStatus(s.callState.status))
+  const resolving = useCallStore((s) => s.resolvingCardIds.includes(card.id))
+  const approveCard = useCallStore((s) => s.approveCard)
+  const denyCard = useCallStore((s) => s.denyCard)
+  return (
+    <div
+      className={`ashy-approval-card${compact ? ' compact' : ''}`}
+      data-testid="push-approval-card"
+      data-card-id={card.id}
+      role="group"
+      aria-label={`Permissão: ${card.summary}`}
+    >
+      <div className="ashy-approval-card-title">
+        <strong>{card.toolName}</strong> — {card.summary}
+      </div>
+      {card.argsPreview && !compact && (
+        <code className="ashy-approval-card-args" data-testid="push-approval-args">
+          {card.argsPreview}
+        </code>
+      )}
+      {card.blastRadiusWarning && (
+        <div className="ashy-approval-card-warning" data-testid="push-approval-blast-radius" role="alert">
+          ⚠️ {card.blastRadiusWarning}
+        </div>
+      )}
+      <div className="ashy-approval-card-actions">
+        <button
+          type="button"
+          className="ashy-peach-btn"
+          data-testid="btn-card-approve"
+          data-card-id={card.id}
+          disabled={resolving}
+          onClick={() => void approveCard(card.id, 'once')}
+        >
+          Aprovar
+        </button>
+        {!card.blastRadiusWarning && (
+          <button
+            type="button"
+            className="ashy-outline-btn"
+            data-testid="btn-card-always"
+            data-card-id={card.id}
+            disabled={resolving}
+            title={`Não perguntar de novo para ${card.toolName}`}
+            onClick={() => void approveCard(card.id, 'always')}
+          >
+            Sempre permitir
+          </button>
+        )}
+        <button
+          type="button"
+          className="ashy-danger-outline-btn"
+          data-testid="btn-card-deny"
+          data-card-id={card.id}
+          disabled={resolving}
+          onClick={() => void denyCard(card.id)}
+        >
+          Negar
+        </button>
+        {card.voiceApprovable && !card.blastRadiusWarning && callActive && (
+          <span className="ashy-approval-card-hint" data-testid="push-approval-voice-hint">
+            {VOICE_APPROVAL_HINT}
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** "👁 vendo a tela" while the host captures the screen (`vision:capture`). */
+export function VisionIndicator({ className = '' }: { className?: string }): React.ReactElement | null {
+  const capturing = useCallStore((s) => s.capturingScreen)
+  const source = useCallStore((s) => s.capturingSource)
+  if (!capturing) return null
+  return (
+    <span
+      className={`ashy-vision-indicator ${className}`.trim()}
+      data-testid="vision-indicator"
+      data-source={source ?? 'screen'}
+      role="status"
+      title={source === 'window' ? 'A Ashy está vendo a janela em foco' : 'A Ashy está vendo a tela'}
+    >
+      {VISION_INDICATOR_LABEL}
+    </span>
+  )
+}
+
+/** Hub: push approval cards + vision indicator above the call strip (also outside calls). */
+export function HubPendingApprovals(): React.ReactElement | null {
+  const cards = useCallStore((s) => s.pendingCards)
+  const capturing = useCallStore((s) => s.capturingScreen)
+  if (cards.length === 0 && !capturing) return null
+  return (
+    <div className="ashy-call-approvals" data-ui-island="true" data-testid="hub-call-approvals">
+      <VisionIndicator />
+      {cards.map((card) => (
+        <PendingApprovalCard key={card.id} card={card} />
+      ))}
+    </div>
+  )
 }
 
 // ───────────────────────────── Hub ─────────────────────────────
@@ -700,6 +820,8 @@ export function LiveModeSettingsPanel(): React.ReactElement {
         </div>
       </div>
 
+      <CallFeaturesSection />
+
       {selectedBackend === 'llamacpp-hybrid' && <VoiceReferenceSection />}
 
       <TestCallSection />
@@ -721,6 +843,110 @@ export function LiveModeSettingsPanel(): React.ReactElement {
         )}
       </div>
     </section>
+  )
+}
+
+// ───────────────────────────── Phase 10.3: Recursos na chamada ─────────────────────────────
+
+export const CALL_TOOLS_NOTICE =
+  'As ferramentas usam o modelo local de 2B; funciona melhor para pedidos simples.'
+const IDLE_NUDGE_MIN_SEC = 20
+const IDLE_NUDGE_MAX_SEC = 3600
+const IDLE_NUDGE_DEFAULT_SEC = 90
+
+function clampIdleNudge(value: number): number {
+  if (!Number.isFinite(value)) return IDLE_NUDGE_DEFAULT_SEC
+  return Math.min(IDLE_NUDGE_MAX_SEC, Math.max(IDLE_NUDGE_MIN_SEC, Math.round(value)))
+}
+
+type CallFeatureKey = 'toolsInCall' | 'visionInCall' | 'initiativeInCall'
+
+const CALL_FEATURE_TOGGLES: ReadonlyArray<{ key: CallFeatureKey; testId: string; label: string; desc: string }> = [
+  {
+    key: 'toolsInCall',
+    testId: 'toggle-tools-in-call',
+    label: 'Ferramentas',
+    desc: 'Ver a janela em foco, ler arquivos do workspace e anotar (com a sua aprovação).',
+  },
+  {
+    key: 'visionInCall',
+    testId: 'toggle-vision-in-call',
+    label: 'Visão',
+    desc: 'Olha a tela quando você pedir (respeita o modo Tela da privacidade).',
+  },
+  {
+    key: 'initiativeInCall',
+    testId: 'toggle-initiative-in-call',
+    label: 'Iniciativa',
+    desc: 'Puxa assunto depois de um tempo em silêncio (respeita o Não perturbe).',
+  },
+]
+
+/** Live Mode › Recursos na chamada: each change saves right away (`liveMode:saveSettings {features}`). */
+export function CallFeaturesSection(): React.ReactElement {
+  const features = useCallStore((s) => s.liveSettings?.features)
+  const saving = useCallStore((s) => s.busy.saveSettings === true)
+  const saveLiveSettings = useCallStore((s) => s.saveLiveSettings)
+  const savedIdle =
+    typeof features?.idleNudgeSec === 'number' ? features.idleNudgeSec : IDLE_NUDGE_DEFAULT_SEC
+  const [idleText, setIdleText] = useState(String(savedIdle))
+
+  useEffect(() => {
+    setIdleText(String(savedIdle))
+  }, [savedIdle])
+
+  const commitIdle = () => {
+    const n = clampIdleNudge(Number(idleText))
+    setIdleText(String(n))
+    if (n !== savedIdle) void saveLiveSettings({ features: { idleNudgeSec: n } })
+  }
+
+  return (
+    <div className="ashy-call-engine-panel" data-testid="call-features-section">
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <Wrench size={16} />
+        <strong style={{ fontSize: '13px' }}>Recursos na chamada</strong>
+      </div>
+      {CALL_FEATURE_TOGGLES.map((t) => (
+        <label key={t.key} className="ashy-call-feature-row">
+          <input
+            type="checkbox"
+            data-testid={t.testId}
+            checked={features?.[t.key] === true}
+            disabled={saving}
+            onChange={(e) => void saveLiveSettings({ features: { [t.key]: e.target.checked } })}
+          />
+          <span>
+            <span style={{ fontWeight: 500 }}>{t.label}</span>
+            <span className="ashy-call-feature-desc"> — {t.desc}</span>
+          </span>
+        </label>
+      ))}
+      <div className="ashy-call-feature-row">
+        <label htmlFor="input-idle-nudge-sec" style={fieldLabel}>
+          Puxar assunto após (segundos de silêncio):
+        </label>
+        <input
+          id="input-idle-nudge-sec"
+          data-testid="input-idle-nudge-sec"
+          type="number"
+          className="ashy-input"
+          style={{ maxWidth: '110px' }}
+          min={IDLE_NUDGE_MIN_SEC}
+          max={IDLE_NUDGE_MAX_SEC}
+          step={5}
+          value={idleText}
+          onChange={(e) => setIdleText(e.target.value)}
+          onBlur={commitIdle}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') commitIdle()
+          }}
+        />
+      </div>
+      <div className="ashy-call-feature-desc" data-testid="call-tools-notice" role="note">
+        {CALL_TOOLS_NOTICE}
+      </div>
+    </div>
   )
 }
 

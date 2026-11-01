@@ -21,6 +21,13 @@ import {
   LiveVoiceIdInputSchema,
   LiveVoiceImportInputSchema,
   LiveVoicePreviewInputSchema,
+  AgencyResolveInputSchema,
+  CallCheckInitiativeInputSchema,
+  CallExecuteToolInputSchema,
+  type CallCheckInitiativeResult,
+  type CallExecuteToolResult,
+  type EvaluateInitiativeInput,
+  type ProactiveInitiativeRecord,
   type CallContextResult,
   type CallStageSignal,
   type LiveCallHostEvent,
@@ -50,8 +57,14 @@ import { classifyCallAffect, normalizeStageSignal } from './affect'
 import { createCallSynthesizer, requestLlamaTts, resolveLlamaBaseUrl, type FetchLike } from './synthesize'
 import { createTestCallManager } from './test-call'
 import { createVoiceStore, VOICE_PREVIEW_DEFAULT_TEXT, type VoiceStore } from './voices'
+import type { HostAgencyRuntime } from '../agency-runtime'
+import { createAgencyEventBridge, createCallApprovals, type AgencyEventBridge } from './approvals'
+import { buildCallToolDefinitions, executeCallTool } from './tools'
+import { createVisionDescriber, hasVisualIntent, type ScreenCaptureProvider, type VisionDescriber } from './vision'
+import { createCallInitiative } from './initiative'
 
-export type CallHostCortex = CallRecorderCortex & Pick<AshyCortex, 'compileTurnPrompt' | 'db'>
+export type CallHostCortex = CallRecorderCortex &
+  Pick<AshyCortex, 'compileTurnPrompt' | 'db' | 'evaluateAttentionInitiative'>
 
 export interface CallHostApi {
   readonly registry: LiveCallRegistry
@@ -81,12 +94,26 @@ export interface CallHostDeps {
   /** Host → llama-server HTTP (tests). */
   fetchImpl?: FetchLike
   ttsTimeoutMs?: number
+  /**
+   * Phase 10.3 — the agency runtime (tools, approvals, privacy). Default: the runtime that
+   * attached itself to `handlers.agencyBridge` (kernel passes the bridge to createHostAgencyRuntime).
+   */
+  getAgencyRuntime?: () => HostAgencyRuntime | null
+  /** Phase 10.3 — overrides `cortex.evaluateAttentionInitiative` (tests). */
+  evaluateInitiative?: (input: EvaluateInitiativeInput) => ProactiveInitiativeRecord
+  visionTimeoutMs?: number
+  visionCacheTtlMs?: number
 }
 
 export interface CallHostHandlers {
   hub: CallHub
   /** Present when `userDataDir` was given. */
   voices: VoiceStore | null
+  /** Phase 10.3 — hand to `createHostAgencyRuntime({ eventBridge })`. */
+  agencyBridge: AgencyEventBridge
+  /** Phase 10.3 — Electron main's desktopCapturer provider (`kernel.setScreenCaptureProvider`). */
+  setScreenCaptureProvider(provider: ScreenCaptureProvider | null): void
+  vision: VisionDescriber
   unregister(): void
 }
 
@@ -153,6 +180,70 @@ export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): 
     return record
   }
 
+  // ── Phase 10.3: agency bridge, vision, approvals, initiative ──
+  const agencyBridge = createAgencyEventBridge((event) => api.emit(event))
+  const getRuntime = (): HostAgencyRuntime | null => {
+    try {
+      return deps.getAgencyRuntime ? deps.getAgencyRuntime() ?? null : agencyBridge.getRuntime()
+    } catch {
+      return null
+    }
+  }
+  let screenCaptureProvider: ScreenCaptureProvider | null = null
+  const vision = createVisionDescriber({
+    getProvider: () => screenCaptureProvider,
+    getPrivacy: () => getRuntime()?.privacyController ?? null,
+    getActiveWindowTitle: async () => (await getRuntime()?.getActiveWindowTitle()) ?? null,
+    getSettings: () => deps.settings.get(),
+    engine: deps.engine,
+    emit: (event) => api.emit(event),
+    now: nowMs,
+    ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+    ...(deps.visionTimeoutMs !== undefined ? { timeoutMs: deps.visionTimeoutMs } : {}),
+    ...(deps.visionCacheTtlMs !== undefined ? { cacheTtlMs: deps.visionCacheTtlMs } : {}),
+  })
+  const lastUserTextByCall = new Map<string, string>()
+  const agency = {
+    getRuntime,
+    features: () => deps.settings.get().features,
+    modelSupportsTools: (): boolean => {
+      try {
+        const modelId = deps.settings.get().llamacpp.modelId
+        return deps.engine.getModelSpec(modelId)?.capabilities.tools ?? true
+      } catch {
+        return true
+      }
+    },
+    rememberUserText(callId: string, text: string) {
+      lastUserTextByCall.delete(callId)
+      lastUserTextByCall.set(callId, text)
+      while (lastUserTextByCall.size > 20) {
+        const oldest = lastUserTextByCall.keys().next().value
+        if (oldest === undefined) break
+        lastUserTextByCall.delete(oldest)
+      }
+    },
+    approvals: createCallApprovals({
+      getRuntime,
+      getActiveCallId: () => hub.getActiveCall()?.callId ?? null,
+      inject: (callId, contextText) => {
+        hub.inject({ callId, contextText, reason: 'approval' })
+      },
+    }),
+    initiative: createCallInitiative({
+      getSettings: () => deps.settings.get(),
+      getActiveCall: () => hub.getActiveCall(),
+      isMuted: () => hub.getState().muted,
+      getDndMode: () => getRuntime()?.privacyController.dndMode ?? null,
+      evaluate: (input) =>
+        deps.evaluateInitiative
+          ? deps.evaluateInitiative(input)
+          : deps.getCortex().evaluateAttentionInitiative(input),
+      getLastUserText: (callId) => lastUserTextByCall.get(callId) ?? null,
+      now: nowMs,
+    }),
+  }
+
   const unregisterFns = [
     api.registry.register('call:start', (payload) =>
       hub.start(parseOrThrow(CallStartInputSchema, payload, 'call:start')),
@@ -178,6 +269,20 @@ export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): 
     api.registry.register('call:buildContext', async (payload): Promise<CallContextResult> => {
       const input = parseOrThrow(CallBuildContextInputSchema, payload, 'call:buildContext')
       const call = requireKnownCall(input.callId)
+      // Phase 10.3 — tools / voice approval / screen context (never in a test call).
+      const features = agency.features()
+      const toolsOn = !call.test && features.toolsInCall && agency.modelSupportsTools()
+      const userText = (input.userText ?? '').trim()
+      let approval: { handled: boolean; contextLine?: string } | null = null
+      let screen: string | null = null
+      if (userText.length > 0 && !call.test) {
+        agency.rememberUserText(input.callId, userText)
+        approval = await agency.approvals.handleVoiceTurn(input.callId, userText).catch(() => null)
+        if (!approval?.handled && !toolsOn && features.visionInCall && hasVisualIntent(userText)) {
+          const seen = await vision.describe()
+          screen = seen.text
+        }
+      }
       const built = await contextBuilder.build({
         sessionId: call.sessionId,
         // Hybrid: the realtime session answers in TEXT (llama-server /tts speaks it).
@@ -186,6 +291,9 @@ export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): 
         ...(input.interruptedAfterText !== undefined
           ? { interruptedAfterText: input.interruptedAfterText }
           : {}),
+        ...(toolsOn ? { tools: buildCallToolDefinitions() } : {}),
+        ...(approval ? { approval } : {}),
+        ...(screen ? { screen } : {}),
       })
       if (built.retrieval && !call.test) {
         lastRetrievalByCall.set(input.callId, built.retrieval)
@@ -195,7 +303,37 @@ export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): 
         instructions: built.instructions,
         perTurnContext: built.perTurnContext,
         ...(built.userLabel ? { userLabel: built.userLabel } : {}),
+        ...(built.tools ? { tools: built.tools } : {}),
+        ...(built.toolChoice ? { toolChoice: built.toolChoice } : {}),
+        ...(built.approvalHandled ? { approvalHandled: true } : {}),
       }
+    }),
+    // ── Phase 10.3 ──
+    api.registry.register('call:executeTool', async (payload): Promise<CallExecuteToolResult> => {
+      const input = parseOrThrow(CallExecuteToolInputSchema, payload, 'call:executeTool')
+      const call = requireKnownCall(input.callId)
+      if (call.test || !agency.features().toolsInCall) {
+        return {
+          status: 'blocked',
+          output: JSON.stringify({ status: 'bloqueado', motivo: 'ferramentas desligadas nesta chamada' }),
+        }
+      }
+      return executeCallTool(
+        { callId: input.callId, name: input.name, argsJson: input.argsJson },
+        { getRuntime: agency.getRuntime, describeScreen: () => vision.describe() },
+      )
+    }),
+    api.registry.register('call:checkInitiative', (payload): CallCheckInitiativeResult => {
+      const input = parseOrThrow(CallCheckInitiativeInputSchema, payload, 'call:checkInitiative')
+      return agency.initiative.check(input)
+    }),
+    api.registry.register('agency:approve', (payload) => {
+      const input = parseOrThrow(AgencyResolveInputSchema, payload, 'agency:approve')
+      return agency.approvals.approve({ cardId: input.cardId, ...(input.scope ? { scope: input.scope } : {}) })
+    }),
+    api.registry.register('agency:deny', (payload) => {
+      const input = parseOrThrow(AgencyResolveInputSchema, payload, 'agency:deny')
+      return agency.approvals.deny({ cardId: input.cardId })
     }),
     api.registry.register('call:transcribe', async (payload) => {
       const input = parseOrThrow(CallTranscribeInputSchema, payload, 'call:transcribe')
@@ -231,6 +369,7 @@ export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): 
         ...(input.playedMs !== undefined ? { playedMs: input.playedMs } : {}),
         ...(input.emotion !== undefined ? { emotion: input.emotion } : {}),
         ...(input.metrics !== undefined ? { metrics: input.metrics } : {}),
+        ...(input.injectReason !== undefined ? { injectReason: input.injectReason } : {}),
         retrieval,
         // Test calls never reach the chat history, the mood or the memory.
         test: call.test,
@@ -243,10 +382,17 @@ export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): 
   return {
     hub,
     voices: quality.voices,
+    agencyBridge,
+    setScreenCaptureProvider(provider) {
+      screenCaptureProvider = provider
+      vision.clearCache()
+    },
+    vision,
     unregister() {
       for (const fn of unregisterFns) fn()
       quality.unregister()
       lastRetrievalByCall.clear()
+      lastUserTextByCall.clear()
     },
   }
 }

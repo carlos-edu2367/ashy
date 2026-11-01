@@ -382,6 +382,7 @@ export interface AshyHostKernel extends AshyHostBridge {
   readonly liveCall: AshyHostLiveCallApi
   invokeLiveCall(input: LiveCallInvokeInput): Promise<unknown>
   setCallWindowController(controller: CallWindowController | null): void
+  setScreenCaptureProvider(provider: import('./live-call/vision').ScreenCaptureProvider | null): void
   readonly container: DIContainer
   readonly cortex: AshyCortex
   readonly voiceStore: VoiceIdentityStore
@@ -936,7 +937,7 @@ export async function createAshyHostKernel(
     },
   })
   registerEngineHandlers(liveCallApi, { llamaCppEngine, liveModeSettingsStore })
-  registerCallHostHandlers(liveCallApi, {
+  const callHost = registerCallHostHandlers(liveCallApi, {
     userDataDir: options.userDataDir,
     settings: liveModeSettingsStore,
     engine: llamaCppEngine,
@@ -1016,6 +1017,7 @@ export async function createAshyHostKernel(
         providerVault,
         userDataDir: options.userDataDir,
         fetchImpl: options.fetchImpl,
+        eventBridge: callHost.agencyBridge,
       } as Parameters<typeof createHostAgencyRuntime>[0]),
     onStop: async (instance) => {
       await instance.close()
@@ -1567,6 +1569,7 @@ export async function createAshyHostKernel(
     setCallWindowController(controller: CallWindowController | null): void {
       callWindowController = controller
     },
+    setScreenCaptureProvider: (provider) => callHost.setScreenCaptureProvider(provider),
 
     async getBootstrapSnapshot(): Promise<AshyBootstrapSnapshot> {
       return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)

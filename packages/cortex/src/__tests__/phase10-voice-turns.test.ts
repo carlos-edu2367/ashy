@@ -168,10 +168,31 @@ describe('Phase 10.1 cortex: v6 voice chat messages', () => {
       interrupted: true,
       backendId: 'llamacpp-realtime',
     })
-    expect(res.userMessage.content).toBe(VOICE_UNTRANSCRIBED_PLACEHOLDER)
+    expect(res.userMessage!.content).toBe(VOICE_UNTRANSCRIBED_PLACEHOLDER)
     expect(VOICE_UNTRANSCRIBED_PLACEHOLDER).toBe('🎤 (fala não transcrita)')
     expect(res.assistantMessage).toBeNull()
     expect(cortex.listChatMessages('s1')).toHaveLength(1)
+    cortex.close()
+  })
+
+  it('Phase 10.3: an injected turn (Ashy spoke on her own) persists only the assistant row', () => {
+    const cortex = createAshyCortex()
+    cortex.createChatSession({ id: 's1', title: 'Call' })
+    const res = cortex.appendVoiceTurn({
+      sessionId: 's1',
+      userTranscript: '',
+      assistantSpokenText: 'Ei, e aquele bug do backend, resolveu?',
+      interrupted: false,
+      backendId: 'llamacpp-realtime',
+      skipUserRow: true,
+      injectReason: 'initiative',
+    })
+    expect(res.userMessage).toBeNull()
+    expect(res.assistantMessage!.content).toBe('Ei, e aquele bug do backend, resolveu?')
+    expect(JSON.parse(res.assistantMessage!.metaJson!).injectReason).toBe('initiative')
+    const rows = cortex.listChatMessages('s1')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.role).toBe('assistant')
     cortex.close()
   })
 

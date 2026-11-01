@@ -11,11 +11,21 @@
  * model repeating itself), emotion per sentence (ACT marker or host.classifyAffect) reported when that
  * sentence starts playing, and a test mode where a WAV replaces the microphone.
  *
+ * Phase 10.3: tools. When the session-level `buildContext` returns tools they go in `session.update`
+ * (again on every rotation / reconnect). A turn whose context says `toolChoice:'auto'` runs as a
+ * TEXT-only tool step first (audio responses never call tools on LFM3): its function calls are executed
+ * by `host.executeTool` and their outputs sent back, then the spoken answer is requested with
+ * `tool_choice:'none'` (≤ 3 rounds per turn). A tool step without calls is not regenerated: its
+ * text is spoken (session TTS when it has one, otherwise `host.synthesize` into the same playback /
+ * ledger path). `inject()` speaks proactively (approval results, initiative) when listening, with a
+ * one-slot queue (30 s); a silence timer asks `host.checkInitiative` (`features.initiativeInCall`).
+ *
  * The engine knows no backend: it only reads `session.caps`. Every browser API is injected.
  */
 import {
   type CallCaption,
   type CallEndReason,
+  type CallToolDefinition,
   type CallMetrics,
   type CallStageSignal,
   type CallStatus,
@@ -47,11 +57,13 @@ import {
 } from './call-quality'
 import {
   createInitialCallMachineState,
+  isCallActiveStatus,
   transitionCall,
   type CallMachineEvent,
   type CallMachineState,
 } from './call-state-machine'
 import {
+  base64ToInt16,
   computePcmVisemeFrames,
   float32ToInt16,
   int16ToFloat32,
@@ -69,6 +81,9 @@ import {
   type CallTimers,
   type VoiceSession,
   type VoiceSessionEventMap,
+  type VoiceSubmitOptions,
+  type VoiceToolCall,
+  type VoiceToolResult,
 } from './types'
 
 const CAPTURE_RATE = 16000
@@ -87,6 +102,18 @@ const STAGE_MIN_MS_PER_CHAR = 1000 / 15
 const TEST_TRAILING_SILENCE_MS = 1500
 const TEST_TIMEOUT_MS = 45000
 const TEST_BLOCK_MS = 20
+/** Phase 10.3: max tool rounds (execute + send outputs) per turn. */
+export const MAX_TOOL_ROUNDS = 3
+/** Phase 10.3: a queued `inject` (call busy) is dropped after this long. */
+export const INJECT_QUEUE_TTL_MS = 30000
+/** Caption while a tool runs. */
+export function toolCaptionText(toolName: string): string {
+  return `🔧 usando ${toolName}…`
+}
+
+export type CallInjectReason = 'approval' | 'initiative'
+/** 'sent' now, 'queued' (call busy, one slot, 30 s) or 'dropped' (no call / test call / empty text). */
+export type CallInjectOutcome = 'sent' | 'queued' | 'dropped'
 
 export interface CallEngineOptions {
   callId: string
@@ -141,6 +168,12 @@ export interface CallEngine {
   setMuted(muted: boolean): void
   getStatus(): CallStatus
   getSnapshot(): CallEngineSnapshot
+  /**
+   * Phase 10.3 — speak proactively: `contextText` goes as an input_text item, then response.create.
+   * Only while listening; otherwise it waits in a one-slot queue (newest wins) for up to 30 s.
+   * The turn is recorded with an empty `userTranscript`.
+   */
+  inject(contextText: string, reason: CallInjectReason): CallInjectOutcome
 }
 
 interface LedgerChunk {
@@ -182,6 +215,10 @@ interface ResponseLedger {
   stage: StageTrack
   /** Recap bookkeeping done (once per ledger). */
   noted: boolean
+  /** Phase 10.3: this turn runs the tool flow (tool step → rounds → spoken answer). */
+  tool: { rounds: number; fallbackUsed: boolean } | null
+  /** Phase 10.3: proactive turn (no user speech). */
+  injectReason: CallInjectReason | null
 }
 
 interface ActiveTurn {
@@ -275,6 +312,9 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
   let session: VoiceSession | null = null
   let sessionUnsubs: Array<() => void> = []
   let instructions = ''
+  /** Phase 10.3: tools of the session-level buildContext (re-sent on rotation / reconnect). */
+  let sessionTools: CallToolDefinition[] = []
+  let synthSeq = 0
 
   // ── turn / ledger ──
   let turnSeq = 0
@@ -309,6 +349,12 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
   let pendingRecap = ''
   let lastUserLabel: string | undefined
 
+  // ── inject / initiative (Phase 10.3) ──
+  let queuedInject: { text: string; reason: CallInjectReason; at: number; timer: unknown } | null = null
+  let initiativeTimer: unknown = null
+  let initiativeInFlight = false
+  let listeningSince = 0
+
   // ── test mode (Phase 10.2) ──
   const testInput = options.testInput ?? null
   const test: TestTracker | null = testInput
@@ -330,6 +376,8 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
         reported: false,
       }
     : null
+  const initiativeEnabled = settings.features?.initiativeInCall === true && !test
+  const idleNudgeMs = Math.max(1000, (Number(settings.features?.idleNudgeSec) || 90) * 1000)
 
   // ───────────────────────── state reporting ─────────────────────────
 
@@ -406,6 +454,11 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       if (test && test.committed && !test.reported) {
         void Promise.resolve().then(() => finishTest())
       }
+      listeningSince = now()
+      armInitiative()
+      if (queuedInject) void Promise.resolve().then(() => flushQueuedInject())
+    } else {
+      clearInitiativeTimer()
     }
   }
 
@@ -591,6 +644,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
         interrupted: outcome.interrupted,
         playedMs: Math.round(outcome.playedMs),
         metrics: { ...l.metrics },
+        ...(l.injectReason ? { injectReason: l.injectReason } : {}),
       })
     } catch (err) {
       log('recordTurn failed', err)
@@ -634,6 +688,15 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     return exchange
   }
 
+  /** Same instructions and tools for the first session, every rotation and every reconnect. */
+  function sessionInit(): { instructions: string; voice: 'female' | 'male'; tools?: CallToolDefinition[] } {
+    return {
+      instructions,
+      voice: settings.llamacpp.voice,
+      ...(sessionTools.length > 0 ? { tools: sessionTools } : {}),
+    }
+  }
+
   function startRotation(): Promise<void> {
     if (!rotating) {
       const reason = rotationDue ?? 'manual'
@@ -655,7 +718,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     let next: VoiceSession
     try {
       next = options.createSession()
-      await next.connect({ instructions, voice: settings.llamacpp.voice })
+      await next.connect(sessionInit())
     } catch (err) {
       log('session rotation failed; keeping the current session', err)
       return
@@ -795,6 +858,8 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       safetyTimer: null,
       stage: newStageTrack(),
       noted: false,
+      tool: null,
+      injectReason: null,
     }
   }
 
@@ -805,7 +870,9 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     return { text: (res?.text ?? '').trim(), asrMs: Math.round(now() - t0) }
   }
 
-  async function buildTurnContext(userText?: string): Promise<{ context: string; userLabel?: string }> {
+  async function buildTurnContext(
+    userText?: string,
+  ): Promise<{ context: string; userLabel?: string; toolChoice?: 'auto' | 'none'; approvalHandled?: boolean }> {
     try {
       const ctx = await host.buildContext({
         callId,
@@ -815,6 +882,8 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       return {
         context: ctx?.perTurnContext ?? '',
         ...(ctx?.userLabel ? { userLabel: ctx.userLabel } : {}),
+        ...(ctx?.toolChoice === 'auto' || ctx?.toolChoice === 'none' ? { toolChoice: ctx.toolChoice } : {}),
+        ...(ctx?.approvalHandled === true ? { approvalHandled: true } : {}),
       }
     } catch (err) {
       log('buildContext failed; continuing without context', err)
@@ -861,7 +930,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       sessionTokens += tokensOf(contextText) + audioTokens(userAudioMs)
       // Send first, then install the ledger: synchronous events of an older response
       // (e.g. an implicit cancel) must never be adopted by the new ledger.
-      session?.respond({ contextText })
+      session?.respond({ contextText, ...(sessionTools.length > 0 ? { toolChoice: 'none' as const } : {}) })
       ledger = l
       void transcriptPromise.then((text) => {
         if (!stopped && text && turnSeq === seq) {
@@ -925,8 +994,260 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     const item = formatTranscribedUserTurn(text, takeTurnContext(turnContext.context), turnContext.userLabel)
     sessionTurns += 1
     sessionTokens += tokensOf(item)
-    s.submitUserText(item)
+    // Phase 10.3: a tool turn starts with a TEXT-only tool step; a voice approval is never a tool turn.
+    const toolTurn =
+      turnContext.toolChoice === 'auto' &&
+      !turnContext.approvalHandled &&
+      sessionTools.length > 0 &&
+      s.caps.toolCalls &&
+      typeof s.submitToolResults === 'function'
+    if (toolTurn) l.tool = { rounds: 0, fallbackUsed: false }
+    const submitOpts: VoiceSubmitOptions | undefined =
+      sessionTools.length > 0 ? { toolChoice: toolTurn ? 'auto' : 'none' } : undefined
+    if (submitOpts) s.submitUserText(item, submitOpts)
+    else s.submitUserText(item)
     ledger = l
+  }
+
+  // ───────────────────────── tools (Phase 10.3) ─────────────────────────
+
+  function failToolTurn(l: ResponseLedger, why: string): void {
+    if (ledger !== l || l.finalized) return
+    detail = why
+    if (test) test.playbackDetail = why
+    void finalizeLedger(l, { interrupted: false, playedMs: 0, spokenOverride: '' })
+    ledger = null
+    releaseTurnLease()
+    turn = null
+    caption = null
+    dispatch({ type: 'response_failed' })
+  }
+
+  function onToolStepStarted(e: VoiceSessionEventMap['tool_step_started']): void {
+    const l = ledger
+    if (l && l.tool && !l.finalized && l.itemId === null) l.itemId = e.responseId
+  }
+
+  function onToolCall(e: VoiceSessionEventMap['tool_call']): void {
+    const l = ledger
+    if (!l || !l.tool || l.finalized) return
+    if (e.responseId && l.itemId !== e.responseId) return
+    caption = { role: 'assistant', text: toolCaptionText(e.name).slice(0, 4000), final: false }
+    report()
+  }
+
+  function onToolStepDone(e: VoiceSessionEventMap['tool_step_done']): void {
+    const l = ledger
+    if (!l || !l.tool || l.finalized || l.itemId !== e.responseId) return
+    if (e.cancelled) {
+      // A client cancel (barge-in / new turn) already dropped this ledger; anything else fails the turn.
+      failToolTurn(l, e.cancelReason === 'watchdog' ? `watchdog: ${e.detail ?? 'runaway tool step'}` : 'tool step cancelled')
+      return
+    }
+    if (e.calls.length > 0 && l.tool.rounds < MAX_TOOL_ROUNDS) {
+      void runToolRound(l, e.calls)
+      return
+    }
+    const text = stripMarkers(e.text).trim()
+    if (!text) {
+      failToolTurn(l, 'tool step produced no text')
+      return
+    }
+    speakFallback(l, e.text)
+  }
+
+  /** Executes the calls (sequentially, through the host gatekeeper) and asks for the spoken answer. */
+  async function runToolRound(l: ResponseLedger, calls: VoiceToolCall[]): Promise<void> {
+    if (!l.tool) return
+    const s = session
+    l.tool.rounds += 1
+    l.done = false
+    const round = l.tool.rounds
+    const results: VoiceToolResult[] = []
+    for (const call of calls) {
+      caption = { role: 'assistant', text: toolCaptionText(call.name).slice(0, 4000), final: false }
+      report()
+      let output: string
+      try {
+        const res = await host.executeTool({
+          callId,
+          toolCallId: call.callId.slice(0, 128),
+          name: call.name.slice(0, 128),
+          argsJson: (call.arguments || '{}').slice(0, 20000),
+        })
+        output = typeof res?.output === 'string' ? res.output : JSON.stringify({ status: res?.status ?? 'error' })
+        log(`tool ${call.name} → ${res?.status ?? '?'}`, { round })
+      } catch (err) {
+        output = JSON.stringify({ status: 'erro', detalhe: String((err as Error)?.message ?? err).slice(0, 300) })
+        log(`tool ${call.name} failed`, err)
+      }
+      // Barge-in / new turn / reconnect while the tool ran: drop every pending result.
+      if (stopped || ledger !== l || l.finalized || session !== s) return
+      results.push({ callId: call.callId, output })
+    }
+    if (stopped || ledger !== l || l.finalized || !s || session !== s || typeof s.submitToolResults !== 'function') return
+    sessionTokens += results.reduce((acc, r) => acc + tokensOf(r.output), 0)
+    l.itemId = null
+    s.submitToolResults(results, { toolChoice: 'none' })
+  }
+
+  /** A tool step that called nothing: speak its text instead of generating again. */
+  function speakFallback(l: ResponseLedger, text: string): void {
+    if (!l.tool) return
+    l.tool.fallbackUsed = true
+    l.done = false
+    l.itemId = null
+    l.text = ''
+    const s = session
+    if (s && typeof s.speakText === 'function') {
+      s.speakText(text)
+      return
+    }
+    void speakViaHost(l, text)
+  }
+
+  /** Realtime backend fallback: host /tts per sentence (one ahead), into the regular playback / ledger path. */
+  async function speakViaHost(l: ResponseLedger, text: string): Promise<void> {
+    synthSeq += 1
+    const responseId = `synth_${synthSeq}`
+    l.itemId = responseId
+    onResponseText({ responseId, delta: text, text })
+    const clean = stripMarkers(text).trim()
+    const parts = splitCompletedSentences(clean, true)
+      .map((sp) => sp.text.trim())
+      .filter((t) => /[\p{L}\p{N}]/u.test(t))
+    if (parts.length === 0 && clean) parts.push(clean)
+    const alive = () => !stopped && ledger === l && !l.finalized && l.itemId === responseId
+    const launch = (part: string) =>
+      Promise.resolve()
+        .then(() => host.synthesize({ callId, text: part.slice(0, 4000) }))
+        .catch((err: unknown) => {
+          log('synthesize failed', err)
+          return null
+        })
+    let pending: ReturnType<typeof launch> | null = parts.length > 0 ? launch(parts[0]!) : null
+    for (let i = 0; i < parts.length; i++) {
+      const cur = pending!
+      pending = i + 1 < parts.length ? launch(parts[i + 1]!) : null
+      const res = await cur
+      if (!alive()) return
+      const pcm = res && typeof res.pcmBase64 === 'string' ? base64ToInt16(res.pcmBase64) : new Int16Array(0)
+      if (pcm.length > 0) {
+        onResponseAudio({ responseId, pcm, sampleRate: res && res.sampleRate > 0 ? res.sampleRate : 24000 })
+      }
+    }
+    if (!alive()) return
+    onResponseDone({ responseId, text, audioMs: l.totalAudioMs, cancelled: false })
+  }
+
+  // ───────────────────────── inject / initiative (Phase 10.3) ─────────────────────────
+
+  function canInjectNow(): boolean {
+    return !stopped && machine.status === 'listening' && !rotating && session !== null && ledger === null
+  }
+
+  function clearQueuedInject(): void {
+    if (queuedInject?.timer != null) timers.clearTimeout(queuedInject.timer)
+    queuedInject = null
+  }
+
+  function sendInject(text: string, reason: CallInjectReason): void {
+    const s = session
+    if (!s) return
+    const contextText = takeTurnContext(text)
+    const l = newLedger('', now(), {})
+    l.injectReason = reason
+    metrics = null
+    caption = null
+    sessionTurns += 1
+    sessionTokens += tokensOf(contextText)
+    log(`inject (${reason})`)
+    dispatch({ type: 'proactive_response' })
+    s.respond({ contextText, ...(sessionTools.length > 0 ? { toolChoice: 'none' as const } : {}) })
+    ledger = l
+  }
+
+  function flushQueuedInject(): void {
+    const q = queuedInject
+    if (!q) return
+    if (now() - q.at > INJECT_QUEUE_TTL_MS) {
+      clearQueuedInject()
+      return
+    }
+    if (rotating && !stopped && machine.status === 'listening') {
+      void rotating.then(() => flushQueuedInject())
+      return
+    }
+    if (!canInjectNow()) return
+    clearQueuedInject()
+    sendInject(q.text, q.reason)
+  }
+
+  function inject(contextText: string, reason: CallInjectReason): CallInjectOutcome {
+    const text = typeof contextText === 'string' ? contextText.trim() : ''
+    const status = machine.status
+    if (!text || stopped || test || status === 'idle' || status === 'ended') return 'dropped'
+    if (canInjectNow()) {
+      clearQueuedInject()
+      sendInject(text, reason)
+      return 'sent'
+    }
+    if (!isCallActiveStatus(status) && status !== 'connecting' && status !== 'reconnecting') return 'dropped'
+    clearQueuedInject()
+    const entry: { text: string; reason: CallInjectReason; at: number; timer: unknown } = {
+      text,
+      reason,
+      at: now(),
+      timer: null,
+    }
+    entry.timer = timers.setTimeout(() => {
+      if (queuedInject === entry) {
+        queuedInject = null
+        log(`queued inject (${reason}) expired`)
+      }
+    }, INJECT_QUEUE_TTL_MS)
+    queuedInject = entry
+    // Listening but momentarily not free (e.g. rotating): retry when it settles.
+    if (status === 'listening') void Promise.resolve().then(() => flushQueuedInject())
+    return 'queued'
+  }
+
+  function clearInitiativeTimer(): void {
+    if (initiativeTimer !== null) {
+      timers.clearTimeout(initiativeTimer)
+      initiativeTimer = null
+    }
+  }
+
+  /** (Re)starts the silence timer; only while listening and with `features.initiativeInCall`. */
+  function armInitiative(): void {
+    clearInitiativeTimer()
+    if (!initiativeEnabled || stopped || machine.status !== 'listening') return
+    initiativeTimer = timers.setTimeout(() => {
+      initiativeTimer = null
+      void checkInitiative()
+    }, idleNudgeMs)
+  }
+
+  async function checkInitiative(): Promise<void> {
+    if (stopped || machine.status !== 'listening') return
+    if (muted || queuedInject || initiativeInFlight || ledger || typeof host.checkInitiative !== 'function') {
+      armInitiative()
+      return
+    }
+    initiativeInFlight = true
+    let res: Awaited<ReturnType<typeof host.checkInitiative>> | null = null
+    try {
+      res = await host.checkInitiative({ callId, idleMs: Math.round(now() - listeningSince) })
+    } catch (err) {
+      log('checkInitiative failed', err)
+    } finally {
+      initiativeInFlight = false
+    }
+    if (stopped || machine.status !== 'listening') return
+    const ctx = res?.speak ? (res.contextText ?? '').trim() : ''
+    if (ctx && !muted && inject(ctx, 'initiative') !== 'dropped') return
+    armInitiative()
   }
 
   // ───────────────────────── barge-in ─────────────────────────
@@ -1135,6 +1456,19 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       if (!dispatch({ type: 'queue_drained' })) report()
       return
     }
+    if (l.tool && !e.cancelled && l.chunks.length === 0) {
+      // Phase 10.3: the spoken answer called a tool anyway (tool_choice ignored) → another round;
+      // or it produced only text → speak that text (once).
+      const calls = e.toolCalls ?? []
+      if (calls.length > 0 && l.tool.rounds < MAX_TOOL_ROUNDS) {
+        void runToolRound(l, calls)
+        return
+      }
+      if (stripMarkers(l.text).trim() && !l.tool.fallbackUsed) {
+        speakFallback(l, l.text)
+        return
+      }
+    }
     if (l.chunks.length === 0) {
       // No audio at all: nothing was heard.
       if (test) test.playbackDetail = 'response had no audio'
@@ -1176,6 +1510,9 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       s.on('response_text', (e) => s === session && onResponseText(e)),
       s.on('response_audio', (e) => s === session && onResponseAudio(e)),
       s.on('response_done', (e) => s === session && onResponseDone(e)),
+      s.on('tool_step_started', (e) => s === session && onToolStepStarted(e)),
+      s.on('tool_call', (e) => s === session && onToolCall(e)),
+      s.on('tool_step_done', (e) => s === session && onToolStepDone(e)),
       s.on('closed', (e) => s === session && onSessionClosed(e)),
       s.on('error', (e) => s === session && onSessionError(e)),
     ]
@@ -1185,7 +1522,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     const s = options.createSession()
     session = s
     attachSession(s)
-    await s.connect({ instructions, voice: settings.llamacpp.voice })
+    await s.connect(sessionInit())
     sessionTurns = 0
     sessionTokens = tokensOf(instructions)
     rotationDue = null
@@ -1257,6 +1594,8 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     stopped = true
     clearFalseInterruptTimer()
     clearTestTimers()
+    clearInitiativeTimer()
+    clearQueuedInject()
     if (reconnectTimer !== null) {
       timers.clearTimeout(reconnectTimer)
       reconnectTimer = null
@@ -1453,6 +1792,9 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     const sessionPromise = (async () => {
       const ctx = await host.buildContext({ callId })
       instructions = ctx?.instructions ?? ''
+      sessionTools = Array.isArray(ctx?.tools)
+        ? ctx.tools.filter((t) => t && t.type === 'function' && typeof t.name === 'string' && t.name.length > 0)
+        : []
       const t0 = now()
       await openSession()
       if (test) test.sessionMs = Math.round(now() - t0)
@@ -1549,5 +1891,6 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     setMuted,
     getStatus: () => machine.status,
     getSnapshot: snapshot,
+    inject,
   }
 }

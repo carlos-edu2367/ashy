@@ -2,7 +2,10 @@
 import { vi } from 'vitest'
 import {
   DEFAULT_LIVE_MODE_SETTINGS,
+  type CallCheckInitiativeResult,
   type CallContextResult,
+  type CallExecuteToolResult,
+  type CallToolDefinition,
   type CallStageSignal,
   type CallVisemeFrame,
   type LiveModeSettings,
@@ -11,7 +14,9 @@ import {
   int16ToBase64,
   float32ToInt16,
   synthesizeVoicedSpeechPcm,
+  type CallCheckInitiativeInput,
   type CallEngineHost,
+  type CallExecuteToolInput,
   type CallRecordTurnInput,
   type CallReportStageInput,
   type CallReportStateInput,
@@ -262,8 +267,17 @@ export function createFakeHost(
     perTurnContext?: string
     asrDelayMs?: number
     classifyAffect?: (text: string) => CallStageSignal | null
+    /** Phase 10.3: tools of the session-level context. */
+    tools?: CallToolDefinition[]
+    /** Phase 10.3: per-turn tool choice (by user text). */
+    toolChoice?: (userText: string) => 'auto' | 'none' | undefined
+    approvalHandled?: (userText: string) => boolean
+    executeTool?: (input: CallExecuteToolInput) => Promise<CallExecuteToolResult> | CallExecuteToolResult
+    checkInitiative?: (input: CallCheckInitiativeInput) => Promise<CallCheckInitiativeResult> | CallCheckInitiativeResult
   } = {},
 ) {
+  const toolExecutions: CallExecuteToolInput[] = []
+  const initiativeChecks: CallCheckInitiativeInput[] = []
   const affects: Array<{ callId: string; text: string }> = []
   const stages: Array<CallReportStageInput & { at: number }> = []
   const testResults: CallReportTestResultInput[] = []
@@ -280,6 +294,12 @@ export function createFakeHost(
         instructions: TEST_INSTRUCTIONS,
         perTurnContext: input.userText ? (opts.perTurnContext ?? '[Contexto] hora local 21:00') : '',
       }
+      if (!input.userText && opts.tools) res.tools = opts.tools
+      if (input.userText && opts.toolChoice) {
+        const choice = opts.toolChoice(input.userText)
+        if (choice) res.toolChoice = choice
+      }
+      if (input.userText && opts.approvalHandled?.(input.userText)) res.approvalHandled = true
       return res
     }),
     transcribe: vi.fn(async (input) => {
@@ -312,8 +332,30 @@ export function createFakeHost(
       return { ok: true }
     }),
     synthesize: vi.fn(async () => ({ pcmBase64: '', sampleRate: 24000, durationMs: 0, latencyMs: 0 })),
+    // Phase 10.3
+    executeTool: vi.fn(async (input) => {
+      toolExecutions.push(input)
+      if (opts.executeTool) return opts.executeTool(input)
+      return { status: 'executed' as const, output: JSON.stringify({ ok: true, tool: input.name }) }
+    }),
+    checkInitiative: vi.fn(async (input) => {
+      initiativeChecks.push(input)
+      return opts.checkInitiative ? opts.checkInitiative(input) : { speak: false }
+    }),
   }
-  return { host, states, turns, visemes, contexts, transcribes, affects, stages, testResults }
+  return {
+    host,
+    states,
+    turns,
+    visemes,
+    contexts,
+    transcribes,
+    affects,
+    stages,
+    testResults,
+    toolExecutions,
+    initiativeChecks,
+  }
 }
 
 export function testSettings(patch: {
@@ -321,9 +363,11 @@ export function testSettings(patch: {
   interrupt?: Partial<LiveModeSettings['interrupt']>
   llamacpp?: Partial<LiveModeSettings['llamacpp']>
   session?: Partial<LiveModeSettings['session']>
+  features?: Partial<LiveModeSettings['features']>
 } = {}): LiveModeSettings {
   return {
     ...DEFAULT_LIVE_MODE_SETTINGS,
+    features: { ...DEFAULT_LIVE_MODE_SETTINGS.features, ...(patch.features ?? {}) },
     session: { ...DEFAULT_LIVE_MODE_SETTINGS.session, ...(patch.session ?? {}) },
     llamacpp: { ...DEFAULT_LIVE_MODE_SETTINGS.llamacpp, ...(patch.llamacpp ?? {}) },
     turn: { ...DEFAULT_LIVE_MODE_SETTINGS.turn, ...(patch.turn ?? {}) },

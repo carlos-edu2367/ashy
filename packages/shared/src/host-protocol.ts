@@ -2101,6 +2101,13 @@ export const CallCommandEventSchema = v.variant('command', [
     callId: NonEmptyStringSchema,
     muted: v.boolean(),
   }),
+  v.object({
+    type: v.literal('call:command'),
+    command: v.literal('inject'),
+    callId: NonEmptyStringSchema,
+    contextText: v.string(),
+    reason: v.picklist(['approval', 'initiative'] as const),
+  }),
 ])
 
 export const LlamaCppEngineStatusSchema = v.object({
@@ -2185,6 +2192,32 @@ export const CallTestResultEventSchema = v.object({
   }),
 })
 
+export const AgencyPendingEventSchema = v.object({
+  type: v.literal('agency:pending'),
+  card: v.object({
+    id: NonEmptyStringSchema,
+    toolName: v.string(),
+    summary: v.string(),
+    argsPreview: v.string(),
+    riskTier: v.string(),
+    blastRadiusWarning: v.optional(v.string()),
+    voiceApprovable: v.boolean(),
+    callId: v.optional(v.string()),
+    createdAt: v.number(),
+  }),
+})
+export const AgencyResolvedEventSchema = v.object({
+  type: v.literal('agency:resolved'),
+  cardId: NonEmptyStringSchema,
+  status: v.picklist(['approved', 'denied', 'failed'] as const),
+  output: v.optional(v.string()),
+})
+export const VisionCaptureEventSchema = v.object({
+  type: v.literal('vision:capture'),
+  active: v.boolean(),
+  source: v.picklist(['screen', 'window'] as const),
+})
+
 /** Validates any of the Live Call host events (`LiveCallHostEvent`). */
 export const LiveCallHostEventSchema = v.union([
   CallStateEventSchema,
@@ -2194,6 +2227,9 @@ export const LiveCallHostEventSchema = v.union([
   ChatAppendedEventSchema,
   CallStageEventSchema,
   CallTestResultEventSchema,
+  AgencyPendingEventSchema,
+  AgencyResolvedEventSchema,
+  VisionCaptureEventSchema,
 ])
 
 export const AshyHostStreamEventSchema = v.union([
@@ -2291,6 +2327,9 @@ export const AshyHostStreamEventSchema = v.union([
   ChatAppendedEventSchema,
   CallStageEventSchema,
   CallTestResultEventSchema,
+  AgencyPendingEventSchema,
+  AgencyResolvedEventSchema,
+  VisionCaptureEventSchema,
 ])
 
 export type AshyHostStreamEvent =

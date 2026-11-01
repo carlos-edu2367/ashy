@@ -9,12 +9,31 @@
  */
 import type { AshyCortex, RankedEpisodicMemory } from '@ashy/cortex'
 import { decayMoodToBaseline } from '@ashy/cortex'
-import type { CallContextResult, MoodVector, ProspectiveIntent } from '@ashy/shared'
+import type { CallContextResult, CallToolDefinition, MoodVector, ProspectiveIntent } from '@ashy/shared'
 
 export const CALL_INSTRUCTIONS_MODE_LINE = 'Respond in interleaved text and audio.'
 /** Phase 10.2 hybrid: the realtime session answers in text only (model-card text-mode line). */
 export const CALL_INSTRUCTIONS_TEXT_MODE_LINE = 'Respond in text.'
 export type CallInstructionsMode = 'audio' | 'text'
+/** Phase 10.3 — tool-capable model-card mode lines (spike 2026-11-01: must be the LAST line). */
+export const CALL_INSTRUCTIONS_TOOLS_MODE_LINE =
+  'Respond with function calls, and interleaved text and audio.\n\nList of tools:'
+export const CALL_INSTRUCTIONS_TOOLS_TEXT_MODE_LINE = 'Respond with function calls, and text.\n\nList of tools:'
+
+/**
+ * Phase 10.3 — per-turn tool policy. The 2B model calls tools for small talk, so the host only
+ * offers tools (`'auto'`) when the user's words show a tool intent (window/screen/file/note…).
+ */
+const TOOL_INTENT_RE =
+  /(?<![\p{L}\p{N}])(janelas?|telas?|arquivos?|notas?|anota|anote|anotar|anotação|lê|le o|le a|ler|leia|abre|abra|abrir|olha|olhe|olhada|vê|veja|procura|procure|procurar|pesquisa|pesquise|pesquisar|salva|salve|salvar|o que aparece)(?![\p{L}\p{N}])/iu
+
+export function detectToolIntent(text: string): boolean {
+  return TOOL_INTENT_RE.test(text)
+}
+
+export function decideToolChoice(text: string): 'auto' | 'none' {
+  return detectToolIntent(text) ? 'auto' : 'none'
+}
 export const CALL_INSTRUCTIONS_LANGUAGE_LINE =
   'Always respond in Brazilian Portuguese, briefly and naturally (1–3 sentences unless asked).'
 export const CALL_INSTRUCTIONS_MAX_CHARS = 1200
@@ -48,6 +67,16 @@ export interface CallContextBuildInput {
   mode?: CallInstructionsMode
   userText?: string
   interruptedAfterText?: string
+  /**
+   * Phase 10.3 — tool definitions when `features.toolsInCall` (and the model supports tools):
+   * switches the instructions to the tool mode line, returns `tools` on the session-level call
+   * (no userText) and a per-turn `toolChoice` otherwise.
+   */
+  tools?: readonly CallToolDefinition[]
+  /** Phase 10.3 — voice approval outcome for this turn. */
+  approval?: { handled: boolean; contextLine?: string } | null
+  /** Phase 10.3 — screen description for this turn (no-tools vision path). */
+  screen?: string | null
 }
 
 export interface CallContextBuildOutput extends CallContextResult {
@@ -67,7 +96,7 @@ function oneLine(raw: string | null | undefined): string {
 
 /** Session-level instructions for llama.cpp realtime (≤ ~1200 chars, mode line LAST). */
 export function buildCallInstructions(
-  input: { userName?: string | null; mode?: CallInstructionsMode } = {},
+  input: { userName?: string | null; mode?: CallInstructionsMode; tools?: boolean } = {},
 ): string {
   const userName = oneLine(input.userName)
     .replace(/[^\p{L}\p{N} .'-]/gu, '')
@@ -84,10 +113,20 @@ export function buildCallInstructions(
   if (userName.length > 0) {
     lines.push(`The user's name is ${userName}.`)
   }
+  if (input.tools === true) {
+    lines.push('If a tool result says "aguardando_aprovacao", ask the user to approve it; never say it is done.')
+  }
   const body = lines
     .join('\n')
     .replace(FORBIDDEN_INSTRUCTION_RE, '')
-  const modeLine = input.mode === 'text' ? CALL_INSTRUCTIONS_TEXT_MODE_LINE : CALL_INSTRUCTIONS_MODE_LINE
+  const modeLine =
+    input.tools === true
+      ? input.mode === 'text'
+        ? CALL_INSTRUCTIONS_TOOLS_TEXT_MODE_LINE
+        : CALL_INSTRUCTIONS_TOOLS_MODE_LINE
+      : input.mode === 'text'
+        ? CALL_INSTRUCTIONS_TEXT_MODE_LINE
+        : CALL_INSTRUCTIONS_MODE_LINE
   const tail = `${CALL_INSTRUCTIONS_LANGUAGE_LINE}\n${modeLine}`
   const maxBody = Math.max(0, CALL_INSTRUCTIONS_MAX_CHARS - tail.length - 1)
   return `${body.slice(0, maxBody).trimEnd()}\n${tail}`
@@ -126,6 +165,10 @@ export function buildPerTurnContext(input: {
   localTime?: string | null
   mood?: string | null
   interruptedAfterText?: string | null
+  /** Phase 10.3 — voice-approval outcome line (`[Contexto] O usuário aprovou …`), placed first. */
+  approvalNote?: string | null
+  /** Phase 10.3 — one-line screen description (no-tools vision path) → `[Tela] …`. */
+  screen?: string | null
 }): string {
   const lines: string[] = []
   if (input.localTime) lines.push(`Hora local: ${input.localTime}.`)
@@ -151,9 +194,13 @@ export function buildPerTurnContext(input: {
   }
 
   const blocks: string[] = []
+  const approvalNote = oneLine(input.approvalNote)
+  if (approvalNote.length > 0) blocks.push(approvalNote)
   if (lines.length > 0) {
     blocks.push(['[Contexto]', ...lines].join('\n'))
   }
+  const screen = oneLine(input.screen)
+  if (screen.length > 0) blocks.push(`[Tela] ${screen}`)
   const interrupted = oneLine(input.interruptedAfterText).replace(/[«»]/g, '')
   if (interrupted.length > 0) {
     const snippet =
@@ -195,7 +242,12 @@ export function createCallContextBuilder(deps: CallContextDeps) {
       } catch {
         userName = null
       }
-      const instructions = buildCallInstructions({ userName, mode: input.mode ?? 'audio' })
+      const toolsEnabled = (input.tools?.length ?? 0) > 0
+      const instructions = buildCallInstructions({
+        userName,
+        mode: input.mode ?? 'audio',
+        ...(toolsEnabled ? { tools: true } : {}),
+      })
 
       const userText = oneLine(input.userText)
       const interruptedAfterText = oneLine(input.interruptedAfterText)
@@ -228,6 +280,8 @@ export function createCallContextBuilder(deps: CallContextDeps) {
           localTime: formatLocalTimePt(now(), deps.timeZone),
           mood: describeMoodPt(mood),
           interruptedAfterText,
+          approvalNote: input.approval?.contextLine ?? null,
+          screen: input.screen ?? null,
         })
       }
 
@@ -237,11 +291,32 @@ export function createCallContextBuilder(deps: CallContextDeps) {
           .slice(0, 40)
           .trim() || 'Usuário'
 
+      // Phase 10.3 — tools: definitions on the session-level call, per-turn policy otherwise.
+      let toolFields: Pick<CallContextResult, 'tools' | 'toolChoice' | 'approvalHandled'> = {}
+      if (toolsEnabled) {
+        if (input.userText === undefined) {
+          toolFields = { tools: input.tools!.map((t) => ({ ...t })) }
+        } else {
+          toolFields = { toolChoice: input.approval?.handled ? 'none' : decideToolChoice(userText) }
+        }
+      }
+      if (input.approval?.handled) toolFields.approvalHandled = true
+
+      // Phase 10.3 — tool turns go WITHOUT the per-turn context. Real check (2026-11-01, LFM3-2B):
+      // with "[Contexto]" + memories merged into the turn, 0/4 tool requests produced a function
+      // call (the model copied answers out of the memories, incl. earlier hallucinated ones);
+      // with the bare labelled utterance, 4/4 picked the right tool with correct args. The spoken
+      // follow-up still has the session context and the tool result.
+      if (toolFields.toolChoice === 'auto') {
+        perTurnContext = ''
+      }
+
       return {
         sessionId: input.sessionId,
         instructions,
         perTurnContext,
         userLabel,
+        ...toolFields,
         retrieval,
         memoryTimedOut,
       }

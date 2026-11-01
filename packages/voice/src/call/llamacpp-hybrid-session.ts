@@ -13,6 +13,10 @@
  * watchdog: with no audio deltas only the text checks can fire) and rewrites its `session.update`
  * to text-only on the wire. `cancelResponse` cancels the realtime response, drops every pending /tts and
  * ignores late results.
+ *
+ * Phase 10.3: tools pass through to the realtime session (tool steps, `submitToolResults`); every
+ * per-response `output_modalities` override is forced to text on the wire. `speakText` speaks a ready
+ * text (a tool step that called nothing) through the same phrase TTS, without a new generation.
  */
 import type { CallSynthesizeResult } from '@ashy/shared'
 import { cleanSpeakableMarkdown } from '../markdown-segmenter'
@@ -29,6 +33,9 @@ import {
   type VoiceSessionCapabilities,
   type VoiceSessionEventMap,
   type VoiceSessionInit,
+  type VoiceSubmitOptions,
+  type VoiceToolCall,
+  type VoiceToolResult,
   type WebSocketFactory,
   type WebSocketLike,
 } from './types'
@@ -52,7 +59,10 @@ export interface LlamaCppHybridSessionOptions {
 }
 
 export interface LlamaCppHybridSession extends VoiceSession {
-  submitUserText(text: string, contextText?: string): void
+  submitUserText(text: string, contextOrOptions?: string | VoiceSubmitOptions, options?: VoiceSubmitOptions): void
+  submitToolResults(results: VoiceToolResult[], options?: VoiceSubmitOptions): void
+  /** Phase 10.3 — speaks a ready text through the phrase TTS (no generation), with the regular events. */
+  speakText(text: string): void
   readonly connected: boolean
   readonly url: string
 }
@@ -94,6 +104,13 @@ function textOnlySocket(real: WebSocketLike): WebSocketLike {
         if (msg && msg.type === 'session.update' && msg.session && typeof msg.session === 'object') {
           msg.session.output_modalities = ['text']
           out = JSON.stringify(msg)
+        } else if (msg && msg.type === 'response.create') {
+          // Phase 10.3 per-response overrides: never ask the server for audio.
+          const response = (msg as { response?: Record<string, unknown> }).response
+          if (response && typeof response === 'object' && 'output_modalities' in response) {
+            response.output_modalities = ['text']
+            out = JSON.stringify(msg)
+          }
         }
       } catch {
         // not JSON: pass through
@@ -150,6 +167,8 @@ interface HybridResponse {
   audioMs: number
   textDone: boolean
   finished: boolean
+  /** Phase 10.3 — function calls of the realtime response (passed on with response_done). */
+  toolCalls?: VoiceToolCall[]
 }
 
 export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOptions): LlamaCppHybridSession {
@@ -161,6 +180,7 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
     inputMode: 'transcribed',
     ...(options.maxOutputTokens !== undefined ? { maxOutputTokens: options.maxOutputTokens } : {}),
     webSocketFactory: (url) => textOnlySocket(baseFactory(url)),
+    outputModalities: ['text'],
     ...(options.timers ? { timers: options.timers } : {}),
     ...(options.handshakeTimeoutMs !== undefined ? { handshakeTimeoutMs: options.handshakeTimeoutMs } : {}),
     ...(options.cancelSettleMs !== undefined ? { cancelSettleMs: options.cancelSettleMs } : {}),
@@ -174,7 +194,7 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
     mutableInstructions: false,
     contextInjection: 'input_text_item',
     userTranscription: false,
-    toolCalls: false,
+    toolCalls: true,
     imageInput: false,
     speakerReference: true,
     voices: ['female', 'male'],
@@ -189,6 +209,7 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
   let current: HybridResponse | null = null
   const byId = new Map<string, HybridResponse>()
   let closed = false
+  let speakSeq = 0
 
   function newResponse(responseId: string): HybridResponse {
     return {
@@ -217,6 +238,7 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
       cancelled,
       ...(cancelled && reason ? { cancelReason: reason } : {}),
       ...(detail ? { detail } : {}),
+      ...(!cancelled && r.toolCalls && r.toolCalls.length > 0 ? { toolCalls: r.toolCalls } : {}),
     })
   }
 
@@ -336,6 +358,7 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
       return
     }
     r.text = ev.text || r.text
+    if (ev.toolCalls && ev.toolCalls.length > 0) r.toolCalls = ev.toolCalls
     feedText(r)
     r.textDone = true
     enqueuePhrases(r, r.chunker.flush())
@@ -349,6 +372,8 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
   inner.on('user_speech_stopped', (p) => emitter.emit('user_speech_stopped', p))
   inner.on('user_transcript', (p) => emitter.emit('user_transcript', p))
   inner.on('tool_call', (p) => emitter.emit('tool_call', p))
+  inner.on('tool_step_started', (p) => !closed && emitter.emit('tool_step_started', p))
+  inner.on('tool_step_done', (p) => !closed && emitter.emit('tool_step_done', p))
   inner.on('error', (p) => emitter.emit('error', p))
   inner.on('closed', (p) => {
     const r = current
@@ -376,13 +401,33 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
     commitUserTurn() {
       inner.commitUserTurn()
     },
-    respond(opts?: { contextText?: string }) {
+    respond(opts?: { contextText?: string } & VoiceSubmitOptions) {
       cancelOwn('client')
       inner.respond(opts)
     },
-    submitUserText(text: string, contextText?: string) {
+    submitUserText(text: string, contextOrOptions?: string | VoiceSubmitOptions, options?: VoiceSubmitOptions) {
       cancelOwn('client')
-      inner.submitUserText(text, contextText)
+      inner.submitUserText(text, contextOrOptions, options)
+    },
+    submitToolResults(results: VoiceToolResult[], options?: VoiceSubmitOptions) {
+      cancelOwn('client')
+      inner.submitToolResults(results, options)
+    },
+    speakText(text: string) {
+      cancelOwn('client')
+      if (closed) return
+      speakSeq += 1
+      const responseId = `speak_${speakSeq}`
+      const r = newResponse(responseId)
+      byId.set(responseId, r)
+      current = r
+      emitter.emit('response_started', { responseId })
+      r.text = text
+      if (text) emitter.emit('response_text', { responseId, delta: text, text })
+      feedText(r)
+      r.textDone = true
+      enqueuePhrases(r, r.chunker.flush())
+      drainOrdered(r)
     },
     cancelResponse(reason: VoiceSessionCancelReason = 'client') {
       cancelOwn(reason)

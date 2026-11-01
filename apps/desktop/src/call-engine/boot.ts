@@ -10,15 +10,20 @@
  * answer is spoken through `call:synthesize`); a `start {test:true}` command fetches
  * `call:getTestInput` and runs the engine on that WAV instead of the mic.
  *
+ * Phase 10.3: `call:command inject` (active callId only) → `engine.inject`; the host adapter also
+ * carries `call:executeTool` and `call:checkInitiative`.
+ *
  * Without the Electron preload (plain-browser dev over the HTTP bridge) the hub mounts this boot
  * inline instead (see `shouldMountCallEngineInline`).
  */
 import type {
   AshyHostBridge,
   AshyHostStreamEvent,
+  CallCheckInitiativeResult,
   CallCommand,
   CallContextResult,
   CallEndReason,
+  CallExecuteToolResult,
   CallRuntimeConfig,
   CallStateSnapshot,
   CallStageSignal,
@@ -46,6 +51,8 @@ export interface CallEngineLike {
   stop(reason?: CallEndReason, detail?: string): Promise<void>
   setMuted(muted: boolean): void
   getStatus(): CallStatus
+  /** Phase 10.3 — proactive speech (`call:command inject`); see `CallEngine.inject`. */
+  inject?(contextText: string, reason: 'approval' | 'initiative'): unknown
 }
 
 export interface CreateCallEngineArgs {
@@ -160,6 +167,9 @@ export function createCallEngineHostOverBridge(bridge: AshyHostBridge): CallEngi
     reportStage: (input) => invoke<unknown>('call:reportStage', input),
     reportTestResult: (input) => invoke<unknown>('call:reportTestResult', input),
     synthesize: (input) => invoke<CallSynthesizeResult>('call:synthesize', input),
+    // Phase 10.3
+    executeTool: (input) => invoke<CallExecuteToolResult>('call:executeTool', input),
+    checkInitiative: (input) => invoke<CallCheckInitiativeResult>('call:checkInitiative', input),
   }
 }
 
@@ -169,6 +179,8 @@ interface ActiveCall {
   starting: boolean
   stopRequested: boolean
   muted: boolean | null
+  /** Phase 10.3: inject received before the engine was created. */
+  pendingInject: { contextText: string; reason: 'approval' | 'initiative' } | null
 }
 
 export function bootCallEngine(options: CallEngineBootOptions = {}): CallEngineBoot {
@@ -217,6 +229,7 @@ export function bootCallEngine(options: CallEngineBootOptions = {}): CallEngineB
       starting: true,
       stopRequested: false,
       muted: null,
+      pendingInject: null,
     }
     current = call
     try {
@@ -264,6 +277,16 @@ export function bootCallEngine(options: CallEngineBootOptions = {}): CallEngineB
       }
       call.engine = engine
       if (call.muted !== null) engine.setMuted(call.muted)
+      if (call.pendingInject && typeof engine.inject === 'function') {
+        // Queued by the engine until the call reaches `listening` (30 s expiry).
+        const { contextText, reason } = call.pendingInject
+        call.pendingInject = null
+        try {
+          engine.inject(contextText, reason)
+        } catch (err) {
+          log('engine.inject failed', err)
+        }
+      }
       try {
         await engine.start()
       } catch (err) {
@@ -311,6 +334,29 @@ export function bootCallEngine(options: CallEngineBootOptions = {}): CallEngineB
         } catch (err) {
           log('engine.stop failed', err)
         }
+      }
+      return
+    }
+    if (command.command === 'inject') {
+      // Phase 10.3: approval result / initiative. The engine speaks only when listening (else it
+      // queues one item for 30 s); before the engine exists the latest inject waits on the call.
+      if (call.stopRequested) return
+      const reason = command.reason === 'initiative' ? 'initiative' : 'approval'
+      const contextText = typeof command.contextText === 'string' ? command.contextText : ''
+      if (!contextText.trim()) return
+      if (call.engine) {
+        if (typeof call.engine.inject !== 'function') {
+          log('engine has no inject; ignoring', command.callId)
+          return
+        }
+        try {
+          const outcome = call.engine.inject(contextText, reason)
+          log(`inject (${reason}): ${outcome}`, command.callId)
+        } catch (err) {
+          log('engine.inject failed', err)
+        }
+      } else {
+        call.pendingInject = { contextText, reason }
       }
       return
     }

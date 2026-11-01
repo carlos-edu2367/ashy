@@ -142,8 +142,10 @@ export function textSimilarity(a: string, b: string): number {
  * 2. collapses near-duplicate assistant replies (similarity ≥ threshold),
  *    keeping only the most recent occurrence;
  * 3. restores role alternation: consecutive user messages are merged (joined
- *    by a newline), and for consecutive assistant messages only the latest is
- *    kept; trailing user messages are dropped (see `dropTrailingUser`);
+ *    by a newline) and so are consecutive assistant messages (blank line) —
+ *    e.g. a reply followed by an injected Live Call turn (initiative/approval
+ *    result, Phase 10.3) has no user row in between; near-duplicates were
+ *    already removed in step 2; trailing user messages are dropped (see `dropTrailingUser`);
  * 4. caps to the last `maxMessages` and then to `maxChars` (oldest dropped
  *    first; a single oversized message keeps its most recent tail).
  * Messages with roles other than user/assistant (e.g. system) are passed
@@ -225,8 +227,11 @@ export function sanitizeConversationHistory<T extends ConversationHistoryEntry>(
           content: `${lastConversational.content.trim()}\n${record.content.trim()}`,
         }
       } else {
-        alternated.splice(lastIndex, 1)
-        alternated.push(record)
+        alternated[lastIndex] = {
+          ...lastConversational,
+          ...record,
+          content: `${lastConversational.content.trim()}\n\n${record.content.trim()}`,
+        }
       }
       continue
     }

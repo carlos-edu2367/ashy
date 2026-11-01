@@ -63,6 +63,7 @@ interface FakeEngine extends CallEngineLike {
   start: ReturnType<typeof vi.fn>
   stop: ReturnType<typeof vi.fn>
   setMuted: ReturnType<typeof vi.fn>
+  inject: ReturnType<typeof vi.fn>
 }
 
 function createFakeFactory(opts: { failStart?: boolean } = {}) {
@@ -80,6 +81,7 @@ function createFakeFactory(opts: { failStart?: boolean } = {}) {
         engine.status = 'idle'
       }),
       setMuted: vi.fn(),
+      inject: vi.fn(() => 'sent'),
       getStatus: () => engine.status,
     }
     engines.push(engine)
@@ -248,5 +250,44 @@ describe('Phase 10.1 — call-engine boot (command routing, guards, error report
     await flush()
     expect(engines).toHaveLength(1)
     boot.dispose()
+  })
+
+  it('7. Phase 10.3: inject goes to the active call only (also before the engine exists); executeTool/checkInitiative go over invokeLiveCall', async () => {
+    const fake = createFakeHost((p) => config(p.callId))
+    const { factory, engines } = createFakeFactory()
+    const boot = bootCallEngine({ bridge: fake.bridge, createEngine: factory, log: () => undefined })
+    fake.emit({ command: 'start', callId: 'c1', backend: 'llamacpp-realtime', sessionId: 's1' })
+    await flush()
+    fake.emit({ command: 'inject', callId: 'other', contextText: '[Contexto] x', reason: 'approval' })
+    await flush()
+    expect(engines[0]!.inject).not.toHaveBeenCalled()
+    fake.emit({ command: 'inject', callId: 'c1', contextText: '[Contexto] Ação aprovada: nota.', reason: 'approval' })
+    fake.emit({ command: 'inject', callId: 'c1', contextText: '   ', reason: 'initiative' })
+    await flush()
+    expect(engines[0]!.inject).toHaveBeenCalledTimes(1)
+    expect(engines[0]!.inject).toHaveBeenCalledWith('[Contexto] Ação aprovada: nota.', 'approval')
+
+    const host = engines[0]!.args.host
+    await host.executeTool({ callId: 'c1', toolCallId: 't1', name: 'get_active_window_title', argsJson: '{}' })
+    await host.checkInitiative({ callId: 'c1', idleMs: 90000 })
+    expect(fake.invokeLiveCall).toHaveBeenCalledWith({
+      method: 'call:executeTool',
+      payload: { callId: 'c1', toolCallId: 't1', name: 'get_active_window_title', argsJson: '{}' },
+    })
+    expect(fake.invokeLiveCall).toHaveBeenCalledWith({ method: 'call:checkInitiative', payload: { callId: 'c1', idleMs: 90000 } })
+    boot.dispose()
+
+    // Before the engine exists: the latest inject is handed over on creation.
+    let release: (v: unknown) => void = () => undefined
+    const fake2 = createFakeHost(() => new Promise((r) => (release = r)))
+    const f2 = createFakeFactory()
+    const boot2 = bootCallEngine({ bridge: fake2.bridge, createEngine: f2.factory, log: () => undefined })
+    fake2.emit({ command: 'start', callId: 'c9', backend: 'llamacpp-realtime', sessionId: 's1' })
+    await flush()
+    fake2.emit({ command: 'inject', callId: 'c9', contextText: '[Contexto] (Iniciativa) gatos', reason: 'initiative' })
+    release(config('c9'))
+    await flush()
+    expect(f2.engines[0]!.inject).toHaveBeenCalledWith('[Contexto] (Iniciativa) gatos', 'initiative')
+    boot2.dispose()
   })
 })

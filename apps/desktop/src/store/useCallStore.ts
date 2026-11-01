@@ -9,11 +9,15 @@
  * Phase 10.2: `call:stage` (emotion/motion at the moment a segment starts playing) drives the
  * stage emotion fields during a call; reference voices (`liveVoice:*`) and the test call
  * (`call:startTest` → `call:testResult`) live here too.
+ *
+ * Phase 10.3: push approval cards (`agency:pending` / `agency:resolved`, also outside calls),
+ * the "vendo a tela" flag (`vision:capture`, auto-off after 5 s) and `agency:approve|deny`.
  */
 import { create } from 'zustand'
 import {
   ASHY_EMOTIONS,
   IDLE_CALL_STATE,
+  type AgencyPendingCardView,
   type AshyEmotion,
   type AshyHostBridge,
   type AshyHostStreamEvent,
@@ -128,6 +132,13 @@ export type CallStoreBusyAction =
   | 'voiceDelete'
   | 'testCall'
 
+/** Phase 10.3: the "👁 vendo a tela" flag turns itself off after this long without a closing event. */
+export const VISION_CAPTURE_AUTO_OFF_MS = 5_000
+/** `agency:approve` scope: 'always' persists a per-tool allow rule host-side (never for blast-radius cards). */
+export type AgencyApprovalScope = 'once' | 'session' | 'always'
+/** Upper bound of push cards kept in memory (oldest dropped). */
+const MAX_PENDING_CARDS = 20
+
 /** Test call lifecycle as the settings panel shows it. */
 export interface TestCallView {
   status: 'idle' | 'running' | 'done' | 'failed'
@@ -181,6 +192,13 @@ export interface CallStoreState {
   /** Last voice upload/preview/delete message (pt-BR), success or error. */
   voiceMessage: { kind: 'ok' | 'error'; text: string } | null
   testCall: TestCallView
+  /** Phase 10.3: push approval cards (`agency:pending`), oldest first, deduped by id. */
+  pendingCards: AgencyPendingCardView[]
+  /** Card ids with an approve/deny RPC in flight. */
+  resolvingCardIds: string[]
+  /** Phase 10.3: true while the host is capturing the screen for the call's vision. */
+  capturingScreen: boolean
+  capturingSource: 'screen' | 'window' | null
 
   /** Subscribes to host events and bootstraps state (idempotent). */
   init(): Promise<void>
@@ -206,6 +224,10 @@ export interface CallStoreState {
   /** `null` = no reference (default female/male voice). */
   useVoice(id: string | null): Promise<void>
   startTestCall(): Promise<void>
+  /** Phase 10.3: `agency:approve` (default scope 'once'). */
+  approveCard(cardId: string, scope?: AgencyApprovalScope): Promise<void>
+  /** Phase 10.3: `agency:deny`. */
+  denyCard(cardId: string): Promise<void>
 }
 
 let unsubscribeHost: (() => void) | null = null
@@ -214,6 +236,14 @@ let subscribedBridge: AshyHostBridge | null = null
 let drivingStage = false
 let chatRefreshInFlight = false
 let chatRefreshQueued = false
+let visionAutoOffTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearVisionTimer(): void {
+  if (visionAutoOffTimer !== null) {
+    clearTimeout(visionAutoOffTimer)
+    visionAutoOffTimer = null
+  }
+}
 
 function errorMessage(err: unknown): string {
   return (err instanceof Error ? err.message : String(err)).slice(0, 500)
@@ -299,7 +329,39 @@ const initialCallStoreState = () => ({
   voices: [] as VoiceReference[],
   voiceMessage: null as CallStoreState['voiceMessage'],
   testCall: { ...IDLE_TEST_CALL } as TestCallView,
+  pendingCards: [] as AgencyPendingCardView[],
+  resolvingCardIds: [] as string[],
+  capturingScreen: false,
+  capturingSource: null as 'screen' | 'window' | null,
 })
+
+function isPendingCardView(value: unknown): value is AgencyPendingCardView {
+  if (!value || typeof value !== 'object') return false
+  const c = value as AgencyPendingCardView
+  return typeof c.id === 'string' && c.id.length > 0 && typeof c.toolName === 'string'
+}
+
+/** Re-reads `consent.toolRiskOverrides` from the host after a "Sempre permitir" (best-effort). */
+async function refreshToolRiskOverrides(): Promise<void> {
+  try {
+    const bridge = getAshyHostBridge()
+    if (typeof bridge.getAgencySnapshot !== 'function') return
+    const snap = await bridge.getAgencySnapshot()
+    const overrides = snap?.consent?.toolRiskOverrides
+    if (overrides && typeof overrides === 'object') {
+      useAshyStore.setState({ toolRiskOverrides: { ...overrides } })
+    }
+  } catch {
+    // keep the current mirror
+  }
+}
+
+/** Drops a resolved card from the agency snapshot mirror too (so the overlay bubble clears). */
+function dropSnapshotPendingAction(cardId: string): void {
+  const app = useAshyStore.getState()
+  if (!Array.isArray(app.pendingActions) || !app.pendingActions.some((c) => c.id === cardId)) return
+  useAshyStore.setState({ pendingActions: app.pendingActions.filter((c) => c.id !== cardId) })
+}
 
 function isAshyEmotion(value: unknown): value is AshyEmotion {
   return typeof value === 'string' && (ASHY_EMOTIONS as readonly string[]).includes(value)
@@ -432,7 +494,8 @@ export const useCallStore = create<CallStoreState>()((set, get) => {
       unsubscribeHost = null
       subscribedBridge = null
       releaseStage()
-      set({ initialized: false })
+      clearVisionTimer()
+      set({ initialized: false, capturingScreen: false, capturingSource: null })
     },
 
     handleHostEvent(event) {
@@ -472,6 +535,38 @@ export const useCallStore = create<CallStoreState>()((set, get) => {
           const result = event.result
           if (!result || typeof result !== 'object' || !Array.isArray(result.steps)) return
           set({ testCall: { status: 'done', callId: result.callId, result: { ...result }, error: null } })
+          return
+        }
+        case 'agency:pending': {
+          const card = event.card
+          if (!isPendingCardView(card)) return
+          set((s) => {
+            const rest = s.pendingCards.filter((c) => c.id !== card.id)
+            const next = [...rest, { ...card }]
+            return { pendingCards: next.slice(Math.max(0, next.length - MAX_PENDING_CARDS)) }
+          })
+          return
+        }
+        case 'agency:resolved': {
+          if (typeof event.cardId !== 'string') return
+          set((s) => ({
+            pendingCards: s.pendingCards.filter((c) => c.id !== event.cardId),
+            resolvingCardIds: s.resolvingCardIds.filter((id) => id !== event.cardId),
+          }))
+          dropSnapshotPendingAction(event.cardId)
+          return
+        }
+        case 'vision:capture': {
+          clearVisionTimer()
+          if (event.active) {
+            set({ capturingScreen: true, capturingSource: event.source === 'window' ? 'window' : 'screen' })
+            visionAutoOffTimer = setTimeout(() => {
+              visionAutoOffTimer = null
+              set({ capturingScreen: false, capturingSource: null })
+            }, VISION_CAPTURE_AUTO_OFF_MS)
+          } else {
+            set({ capturingScreen: false, capturingSource: null })
+          }
           return
         }
         default:
@@ -655,6 +750,35 @@ export const useCallStore = create<CallStoreState>()((set, get) => {
       )
       if (snapshot) applyCallState(snapshot)
     },
+
+    async approveCard(cardId, scope) {
+      await resolveCard(cardId, 'agency:approve', scope ? { cardId, scope } : { cardId })
+    },
+
+    async denyCard(cardId) {
+      await resolveCard(cardId, 'agency:deny', { cardId })
+    },
+  }
+
+  async function resolveCard(
+    cardId: string,
+    method: 'agency:approve' | 'agency:deny',
+    payload: { cardId: string; scope?: AgencyApprovalScope },
+  ): Promise<void> {
+    if (!cardId || get().resolvingCardIds.includes(cardId)) return
+    set((s) => ({ resolvingCardIds: [...s.resolvingCardIds, cardId], lastError: null }))
+    try {
+      await invoke(method, payload)
+      // The host also emits `agency:resolved`; drop the card now so the UI doesn't wait on it.
+      set((s) => ({ pendingCards: s.pendingCards.filter((c) => c.id !== cardId) }))
+      dropSnapshotPendingAction(cardId)
+      // 'always' persisted a per-tool allow rule host-side: mirror it into the consent center.
+      if (payload.scope === 'always') void refreshToolRiskOverrides()
+    } catch (err) {
+      set({ lastError: errorMessage(err) })
+    } finally {
+      set((s) => ({ resolvingCardIds: s.resolvingCardIds.filter((id) => id !== cardId) }))
+    }
   }
 })
 
@@ -665,6 +789,7 @@ export function resetCallStoreForTesting(): void {
   drivingStage = false
   chatRefreshInFlight = false
   chatRefreshQueued = false
+  clearVisionTimer()
   wavPlayer = defaultWavPlayer
   voiceAudioDeps = {}
   useCallStore.setState(initialCallStoreState())

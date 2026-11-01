@@ -53,10 +53,13 @@ export interface RecordCallTurnInput {
   retrieval?: CallMemoryRetrieval | null
   /** Phase 10.2: turn of a test call → skipped. */
   test?: boolean
+  /** Phase 10.3: Ashy spoke on her own → assistant row only, no affect/memory pipeline. */
+  injectReason?: 'approval' | 'initiative'
 }
 
 export interface RecordCallTurnResult {
-  userMessage: ChatMessageRecord
+  /** `null` for injected turns (Ashy spoke on her own). */
+  userMessage: ChatMessageRecord | null
   assistantMessage: ChatMessageRecord | null
 }
 
@@ -84,7 +87,8 @@ export function createCallRecorder(deps: CallRecorderDeps) {
       const turnId = `voice-${input.callId}-${sequence}`.replace(/[^A-Za-z0-9_-]/g, '').slice(-64)
       const emotion: AshyEmotion =
         input.emotion && VALID_EMOTIONS.has(input.emotion) ? (input.emotion as AshyEmotion) : 'neutral'
-      const transcript = input.userTranscript.trim()
+      const injected = input.injectReason !== undefined
+      const transcript = injected ? '' : input.userTranscript.trim()
 
       const { userMessage, assistantMessage } = cortex.appendVoiceTurn({
         sessionId: input.sessionId,
@@ -97,6 +101,7 @@ export function createCallRecorder(deps: CallRecorderDeps) {
         backendId: input.backendId,
         modelId: input.modelId ?? null,
         ...(input.metrics ? { metrics: input.metrics } : {}),
+        ...(injected ? { injectReason: input.injectReason, skipUserRow: true } : {}),
         turnId,
         nowMs,
       })
@@ -104,7 +109,7 @@ export function createCallRecorder(deps: CallRecorderDeps) {
       deps.emit({
         type: 'chat:appended',
         sessionId: input.sessionId,
-        messageIds: assistantMessage ? [userMessage.id, assistantMessage.id] : [userMessage.id],
+        messageIds: [userMessage?.id, assistantMessage?.id].filter((id): id is string => typeof id === 'string'),
       })
 
       if (transcript.length > 0) {

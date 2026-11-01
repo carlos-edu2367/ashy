@@ -22,6 +22,8 @@ export type CallMachineEvent =
   | { type: 'speech_confirmed' }
   /** Silence ≥ endpointMs: user turn committed. */
   | { type: 'turn_end' }
+  /** Phase 10.3: the engine speaks on its own (approval result / initiative) while listening. */
+  | { type: 'proactive_response' }
   /** Short silence / unconfirmed onset: back to listening (grace). */
   | { type: 'turn_incomplete' }
   /** First audio sample scheduled/played. */
@@ -107,7 +109,9 @@ export function transitionCall(state: CallMachineState, event: CallMachineEvent)
     case 'reconnecting':
       return event.type === 'reconnected' ? to(state, 'listening', { reconnectAttempts: 0, detail: null }) : state
     case 'listening':
-      return event.type === 'speech_confirmed' ? to(state, 'user_speaking') : state
+      if (event.type === 'speech_confirmed') return to(state, 'user_speaking')
+      if (event.type === 'proactive_response') return to(state, 'thinking')
+      return state
     case 'user_speaking':
       if (event.type === 'turn_end') return to(state, 'thinking')
       if (event.type === 'turn_incomplete') return to(state, 'listening')

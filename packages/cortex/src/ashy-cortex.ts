@@ -183,11 +183,15 @@ export interface AppendVoiceTurnInput {
   }
   /** Stable id suffix for the two rows (default: timestamp + random). */
   turnId?: string
+  /** Phase 10.3: Ashy spoke on her own — persist only the assistant row. */
+  skipUserRow?: boolean
+  injectReason?: 'approval' | 'initiative'
   nowMs?: number
 }
 
 export interface AppendVoiceTurnResult {
-  userMessage: ChatMessageRecord
+  /** `null` when `skipUserRow` (injected turn). */
+  userMessage: ChatMessageRecord | null
   /** `null` when nothing was played (nothing to persist for the assistant). */
   assistantMessage: ChatMessageRecord | null
 }
@@ -373,7 +377,9 @@ export class AshyCortex {
     const userContent = transcript.length > 0 ? transcript : VOICE_UNTRANSCRIBED_PLACEHOLDER
     const emotion = (input.emotion ?? 'neutral') as AshyEmotion
 
-    const userMessage = this.db.appendChatMessage({
+    const userMessage = input.skipUserRow
+      ? null
+      : this.db.appendChatMessage({
       id: `msg-user-voice-${suffix}`,
       sessionId: input.sessionId,
       role: 'user',
@@ -397,6 +403,7 @@ export class AshyCortex {
       playedMs: Number.isFinite(input.playedMs) ? Number(input.playedMs) : null,
       metrics: input.metrics ?? null,
       backend: input.backendId,
+      ...(input.injectReason ? { injectReason: input.injectReason } : {}),
     }
     const assistantMessage = this.db.appendChatMessage({
       id: `msg-assistant-voice-${suffix}`,

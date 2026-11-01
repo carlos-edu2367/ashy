@@ -7,7 +7,10 @@
  */
 import type {
   CallCaption,
+  CallCheckInitiativeResult,
   CallContextResult,
+  CallExecuteToolResult,
+  CallToolDefinition,
   CallEndReason,
   CallMetrics,
   CallStageSignal,
@@ -66,6 +69,39 @@ export interface VoiceSessionInit {
   /** Session instructions, always provided by the host (`call:buildContext`). Never invented by the session. */
   instructions: string
   voice?: string
+  /**
+   * Phase 10.3 — function tools sent in `session.update` (with `tool_choice:'auto'`). llama.cpp only
+   * accepts them before the first input, so a rotated / reconnected session must get them again.
+   */
+  tools?: CallToolDefinition[]
+}
+
+/** Phase 10.3 — per-turn tool policy (host decides from the user's words; see `CallContextResult.toolChoice`). */
+export type VoiceToolChoice = 'auto' | 'none'
+
+export interface VoiceSubmitOptions {
+  /**
+   * 'auto': the turn runs as a TEXT-only tool step (`response.create {tool_choice:'auto',
+   * output_modalities:['text']}`) that emits `tool_step_started` / `tool_call` / `tool_step_done`
+   * instead of the regular response events (audio-mode responses never call tools — 2026-11-01 spike).
+   * 'none': plain spoken response with `tool_choice:'none'`. Omitted: `'none'` when the session has
+   * tools, otherwise a bare `response.create` (pre-10.3 wire format).
+   */
+  toolChoice?: VoiceToolChoice
+}
+
+/** One completed function call of a response. */
+export interface VoiceToolCall {
+  callId: string
+  name: string
+  /** JSON string as produced by the model (may be malformed; the host validates). */
+  arguments: string
+}
+
+/** Output of one executed tool, sent back as a `function_call_output` item. */
+export interface VoiceToolResult {
+  callId: string
+  output: string
 }
 
 export type VoiceSessionCancelReason = 'client' | 'watchdog' | 'server'
@@ -86,8 +122,22 @@ export interface VoiceSessionEventMap {
     cancelReason?: VoiceSessionCancelReason
     /** Watchdog diagnostic (why the response was cut). */
     detail?: string
+    /** Phase 10.3 — function calls the (spoken) response produced anyway (e.g. tool_choice ignored). */
+    toolCalls?: VoiceToolCall[]
   }
-  tool_call: { callId: string; name: string; arguments: string }
+  /** One function call whose arguments are complete (`response.function_call_arguments.done`). */
+  tool_call: { callId: string; name: string; arguments: string; responseId?: string }
+  /** Phase 10.3 — a text-only tool step started (it emits no response_started / response_text). */
+  tool_step_started: { responseId: string }
+  /** Phase 10.3 — the tool step finished: its function calls (maybe none) and its text. */
+  tool_step_done: {
+    responseId: string
+    text: string
+    calls: VoiceToolCall[]
+    cancelled: boolean
+    cancelReason?: VoiceSessionCancelReason
+    detail?: string
+  }
   error: { message: string; code?: string; fatal: boolean }
   closed: { code?: number; reason?: string; expected: boolean }
 }
@@ -100,9 +150,24 @@ export interface VoiceSession {
   /** audio-direct: PCM16 mono at `caps.inputSampleRate`. */
   pushAudio(pcm: Int16Array): void
   commitUserTurn(): void
-  respond(opts?: { contextText?: string }): void
-  /** transcribed mode: context item (when non-empty), then user text item, then response.create. */
-  submitUserText?(text: string, contextText?: string): void
+  respond(opts?: { contextText?: string } & VoiceSubmitOptions): void
+  /**
+   * transcribed mode: context item (when non-empty), then user text item, then response.create.
+   * Phase 10.3: the second argument may be the options instead of a context string.
+   */
+  submitUserText?(text: string, contextOrOptions?: string | VoiceSubmitOptions, options?: VoiceSubmitOptions): void
+  /**
+   * Phase 10.3 — one `function_call_output` item per result, then `response.create` (default
+   * `tool_choice:'none'` with the session's output modalities = the spoken answer; 'auto' = another
+   * text-only tool step).
+   */
+  submitToolResults?(results: VoiceToolResult[], options?: VoiceSubmitOptions): void
+  /**
+   * Phase 10.3 — speak a ready text without a new generation (no-tool fallback of a tool step), with
+   * the regular response events. Sessions without their own TTS leave it undefined and the engine
+   * speaks through `host.synthesize`.
+   */
+  speakText?(text: string): void
   cancelResponse(reason?: VoiceSessionCancelReason): void
   truncate?(itemId: string, playedMs: number): Promise<void>
   injectContext(text: string): Promise<void>
@@ -124,6 +189,8 @@ export interface CallRecordTurnInput {
   playedMs?: number
   emotion?: string
   metrics?: CallMetrics
+  /** Phase 10.3 — set for turns Ashy started herself (inject); no user row is persisted. */
+  injectReason?: 'approval' | 'initiative'
 }
 
 /** Mirrors `CallReportStateInputSchema`. */
@@ -175,6 +242,20 @@ export interface CallReportTestResultInput {
   reply?: string | null
 }
 
+/** Mirrors `CallExecuteToolInputSchema` (Phase 10.3). */
+export interface CallExecuteToolInput {
+  callId: string
+  toolCallId: string
+  name: string
+  argsJson: string
+}
+
+/** Mirrors `CallCheckInitiativeInputSchema` (Phase 10.3). */
+export interface CallCheckInitiativeInput {
+  callId: string
+  idleMs: number
+}
+
 /** Implemented by the call-engine window glue on top of `liveCall:invoke`. */
 export interface CallEngineHost {
   buildContext(input: CallBuildContextInput): Promise<CallContextResult>
@@ -190,6 +271,10 @@ export interface CallEngineHost {
   reportTestResult(input: CallReportTestResultInput): Promise<unknown>
   /** Phase 10.2 — hybrid mode: /tts of one text chunk (`call:synthesize`); used by the hybrid session. */
   synthesize(input: CallSynthesizeInput): Promise<CallSynthesizeResult>
+  /** Phase 10.3 — runs one model tool call through the host gatekeeper (`call:executeTool`). */
+  executeTool(input: CallExecuteToolInput): Promise<CallExecuteToolResult>
+  /** Phase 10.3 — asks the host whether to speak proactively after a silence (`call:checkInitiative`). */
+  checkInitiative(input: CallCheckInitiativeInput): Promise<CallCheckInitiativeResult>
 }
 
 // ───────────────────────────── Timers / clock ─────────────────────────────
