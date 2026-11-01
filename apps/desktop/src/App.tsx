@@ -70,6 +70,15 @@ import {
 import { FirstMeetingWizard } from './components/FirstMeetingWizard'
 import { ModelsSettingsPanel } from './components/ModelsSettingsPanel'
 import {
+  HubCallOrb,
+  HubCallStatusStrip,
+  LiveModeSettingsPanel,
+  OverlayCallButtons,
+  OverlayCallStateDot,
+} from './components/LiveCallControls'
+import { bootCallEngine, shouldMountCallEngineInline } from './call-engine/boot'
+import { useCallStore } from './store/useCallStore'
+import {
   useAshyStore,
   type FeaturedMemoryCard,
   type HubTabId,
@@ -262,6 +271,20 @@ export function App(): React.ReactElement {
     void useAshyStore.getState().bootstrapFromHost().catch(() => {})
     void useAshyStore.getState().refreshMicDevices().catch(() => {})
   }, [])
+
+  // Phase 10.1: hub + overlay are views of the host-owned call state.
+  useEffect(() => {
+    void useCallStore.getState().init().catch(() => {})
+  }, [])
+
+  // Phase 10.1: without the Electron preload (plain-browser dev over HTTP) there is no hidden
+  // call-engine window, so the hub owns the call engine inline. Never in the overlay.
+  const isTransparentOverlay = state.isTransparentOverlayWindow
+  useEffect(() => {
+    if (isTransparentOverlay || !shouldMountCallEngineInline()) return
+    const boot = bootCallEngine()
+    return () => boot.dispose()
+  }, [isTransparentOverlay])
 
   useEffect(() => {
     if (state.lastExportedSoulArchive) {
@@ -523,6 +546,9 @@ export function App(): React.ReactElement {
             </div>
           )}
 
+          {/* Phase 10.1: call state dot — stays visible during a call even without hover */}
+          <OverlayCallStateDot hovering={isHoveringOverlay} />
+
           {/* Stage Quick Controls Island */}
           <div
             data-testid="stage-quick-controls"
@@ -557,6 +583,10 @@ export function App(): React.ReactElement {
                   }
             }
           >
+            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+              <OverlayCallButtons />
+            </div>
+
             <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
               <button
                 type="button"
@@ -1090,9 +1120,10 @@ export function App(): React.ReactElement {
                 <div className="ashy-stage-pills">
                   <button
                     type="button"
+                    data-testid="btn-toggle-lipsync"
                     className="ashy-stage-pill active"
                     onClick={() => void state.toggleVoiceConversation()}
-                    title="Alternar voz local"
+                    title="Conversar por voz (modo clássico, sem chamada)"
                   >
                     <Mic size={13} />
                     <span>Voz local</span>
@@ -1141,6 +1172,7 @@ export function App(): React.ReactElement {
 
               {/* Bottom Floating Voice Dock */}
               <div className="ashy-voice-dock-wrap">
+                <HubCallStatusStrip />
                 <div className="ashy-voice-dock" data-ui-island="true">
                   <div className="ashy-dock-action">
                     <button
@@ -1185,28 +1217,8 @@ export function App(): React.ReactElement {
                     })}
                   </div>
 
-                  {/* Center Warm Peach Mic Orb */}
-                  <div className="ashy-dock-action">
-                    <button
-                      type="button"
-                      data-testid="btn-toggle-lipsync"
-                      className={`ashy-mic-hero-btn ${state.isSpeaking || state.isVoiceListening ? 'listening' : ''}`}
-                      onClick={() => void state.toggleVoiceConversation()}
-                      title="Conversar por voz"
-                    >
-                      <Mic size={22} />
-                    </button>
-                    <span
-                      className="ashy-dock-label"
-                      style={{ color: 'var(--text-primary)', fontWeight: 500 }}
-                    >
-                      {state.isSpeaking
-                        ? 'Falando com você...'
-                        : state.isVoiceListening
-                          ? 'Ouvindo... (Conversar por voz)'
-                          : 'Conversar por voz'}
-                    </span>
-                  </div>
+                  {/* Center Warm Peach Orb — Phase 10.1: Ligar/Desligar (Live Call) */}
+                  <HubCallOrb />
 
                   {/* Right Waveform */}
                   <div className="ashy-waveform" aria-hidden="true">
@@ -4175,6 +4187,7 @@ export function App(): React.ReactElement {
                   { id: 'todas', label: 'Todas', icon: <Sparkles size={15} /> },
                   { id: 'geral', label: 'Geral', icon: <Settings size={15} /> },
                   { id: 'voz', label: 'Voz', icon: <Mic size={15} /> },
+                  { id: 'live', label: 'Live Mode', icon: <Wifi size={15} /> },
                   { id: 'modelos', label: 'Modelos', icon: <Box size={15} /> },
                   { id: 'privacidade', label: 'Privacidade', icon: <Shield size={15} /> },
                 ] as ReadonlyArray<{
@@ -4205,6 +4218,9 @@ export function App(): React.ReactElement {
               {/* Left Column */}
               <div className="ashy-settings-column">
                 {/* Models & Provider Vault Panel (Ajustes > Modelos) */}
+                {/* Phase 10.1: Configurações › Live Mode (chamada de voz) */}
+                {state.settingsSubTab === 'live' && <LiveModeSettingsPanel />}
+
                 {(state.settingsSubTab === 'todas' || state.settingsSubTab === 'modelos') && (
                   <ModelsSettingsPanel />
                 )}

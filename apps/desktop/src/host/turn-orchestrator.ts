@@ -40,6 +40,7 @@ import {
   resolveConversationHistoryLimits,
   sanitizeConversationHistory,
 } from './conversation-history'
+import { runPostTurnMemoryPipeline } from './post-turn-memory'
 import {
   buildCompactLocalOmniSystemPrompt,
   synthesizeNativeOllamaOmniSpeech,
@@ -745,6 +746,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
           .map((m) => ({
             role: m.role,
             content: m.content,
+            ...(m.interrupted ? { interrupted: true } : {}),
           })),
         resolveConversationHistoryLimits(providerState.activeProviderId),
       )
@@ -1346,24 +1348,16 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
       let persistenceWarning: string | null = null
       try {
         cortex.appendChatMessage(assistantMessage)
-        cortex.indexTurnMemory({
+        await runPostTurnMemoryPipeline(cortex, {
           turnId,
+          sessionId: input.sessionId,
           userText: currentEffectiveUserText,
           assistantText: finalCleanContent,
           emotion: turnEmotion,
-          now: completedAt,
-        })
-        cortex.reviewTurnMemories({
+          nowMs: completedAt,
           retrievedMemories: compiled.retrievedMemories,
-          assistantText: assistantMessage.content,
           invokedMotifIds,
           eligibleIntents: compiled.eligibleIntents,
-          nowMs: completedAt,
-        })
-        await cortex.consolidateSessionMemories({
-          sessionId: input.sessionId,
-          nowMs: completedAt,
-          force: false,
         })
         lastPersistenceWarning = null
         options.onPersistenceWarning?.(null)

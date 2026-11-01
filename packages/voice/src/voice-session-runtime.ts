@@ -1009,6 +1009,11 @@ export function createGaplessAudioPlayer(
     }
     activeSourceNodes.length = 0
 
+    // The cut audio will never play: pull the timeline back to the end of the fade, otherwise the
+    // next reply is scheduled after the cancelled one's would-be end (found by the Phase 10.1
+    // end-to-end check: +7.5 s of silence after a barge-in).
+    nextScheduledTimeSec = Math.min(nextScheduledTimeSec, fadeEndTimeSec)
+
     gainValue = 0
     playing = false
     queueDrained = true

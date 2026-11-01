@@ -5,6 +5,7 @@ import type {
   DeleteLocalModelInput,
   ListProviderModelsInput,
   ListProviderModelsResult,
+  LiveCallInvokeInput,
   LocalRuntimeStatus,
   PullLocalModelInput,
   StageOverlayRuntimeState,
@@ -60,6 +61,7 @@ export interface AshyPreloadApi {
   installLocalEngine?(): Promise<LocalRuntimeStatus>
   pullLocalModel?(input: PullLocalModelInput): Promise<LocalRuntimeStatus>
   deleteLocalModel?(input: DeleteLocalModelInput): Promise<LocalRuntimeStatus>
+  invokeLiveCall?(input: LiveCallInvokeInput): Promise<unknown>
   onEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
 
@@ -204,6 +206,12 @@ export function createAshyPreloadApi(
         method: 'localRuntime:deleteModel',
         payload: input,
       }) as Promise<LocalRuntimeStatus>
+    },
+    invokeLiveCall(input: LiveCallInvokeInput): Promise<unknown> {
+      return ipcRenderer.invoke('ashy:rpc', {
+        method: 'liveCall:invoke',
+        payload: input,
+      })
     },
     onEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       listeners.add(listener)

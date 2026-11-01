@@ -25,6 +25,7 @@ import type {
   InitiativePolicy,
   ListProviderModelsInput,
   ListProviderModelsResult,
+  LiveCallInvokeInput,
   LlmProviderId,
   LocalRuntimeStatus,
   MemoryGovernanceCategory,
@@ -135,6 +136,19 @@ export function createPreloadHostBridge(
     event: AshyHostStreamEvent,
   ): void {
     if (!event || typeof event !== 'object' || typeof event.type !== 'string') {
+      return
+    }
+    if (event.type === 'call:viseme') {
+      // Viseme frames are IPC-only (filtered from SSE host-side) and arrive at frame rate;
+      // identical consecutive frames (e.g. silence) are legitimate, so skip deduplication.
+      if (channel !== 'ipc') return
+      for (const listener of Array.from(listeners)) {
+        try {
+          listener(event)
+        } catch {
+          // Isolate subscriber errors
+        }
+      }
       return
     }
     const turnKey = computeEventDedupeKey(channel, event)
@@ -511,6 +525,12 @@ export function createPreloadHostBridge(
     deleteLocalModel(input: DeleteLocalModelInput): Promise<LocalRuntimeStatus> {
       return invoke<LocalRuntimeStatus>('localRuntime:deleteModel', input)
     },
+    invokeLiveCall(input: LiveCallInvokeInput): Promise<unknown> {
+      if (typeof preloadApi.invokeLiveCall === 'function') {
+        return preloadApi.invokeLiveCall(input)
+      }
+      return invoke<unknown>('liveCall:invoke', input)
+    },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       listeners.add(listener)
       ensureSubscriptions()
@@ -877,6 +897,9 @@ export function createHttpSseHostBridge(
     },
     deleteLocalModel(input: DeleteLocalModelInput): Promise<LocalRuntimeStatus> {
       return rpc<LocalRuntimeStatus>('localRuntime:deleteModel', input)
+    },
+    invokeLiveCall(input: LiveCallInvokeInput): Promise<unknown> {
+      return rpc<unknown>('liveCall:invoke', input)
     },
     onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
       listeners.add(listener)

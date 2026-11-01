@@ -39,7 +39,7 @@ describe('@ashy/cortex Phase 8 — Contextual Initiative, Own World & Dream Jour
         forceMemoryFallback ? { forceMemoryFallback: true } : { filePath: dbPath },
       )
 
-      expect(db.getAppliedMigrations().map((m) => m.version)).toEqual([1, 2, 3, 4, 5])
+      expect(db.getAppliedMigrations().map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6])
       expect(db.getAppliedMigrations().find((m) => m.version === 5)?.name).toBe(
         'v5_phase8_initiative_and_reflection_journal',
       )

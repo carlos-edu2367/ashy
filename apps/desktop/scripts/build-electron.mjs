@@ -157,6 +157,7 @@ const externalModules = [
   'node:stream',
   'node:buffer',
   'node:zlib',
+  'node:net',
   'fs',
   'path',
   'crypto',
@@ -170,6 +171,7 @@ const externalModules = [
   'stream',
   'buffer',
   'zlib',
+  'net',
 ]
 
 async function buildElectronBundles() {

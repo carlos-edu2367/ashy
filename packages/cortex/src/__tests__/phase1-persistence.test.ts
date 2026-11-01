@@ -129,7 +129,7 @@ describe('@ashy/cortex Phase 1 persistence & Migration v2', () => {
 
     const db = createCortexDatabase({ filePath: dbPath })
     expect(db.isPersistent).toBe(true)
-    expect(db.getAppliedMigrations().map((m) => m.version)).toEqual([1, 2, 3, 4, 5])
+    expect(db.getAppliedMigrations().map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6])
 
     const files = fs.readdirSync(dir)
     expect(files.some((f) => f.startsWith('ashy.db.corrupt.'))).toBe(true)
@@ -265,7 +265,7 @@ describe('@ashy/cortex Phase 1 persistence & Migration v2', () => {
       )
 
       const migrations = db1.getAppliedMigrations()
-      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5])
+      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6])
       expect(migrations.find((m) => m.version === 3)?.name).toBe('v3_phase2_self_writing_memory')
       expect(db1.listSqlTables()).toContain('memory_governance_settings')
 
@@ -547,7 +547,7 @@ describe('@ashy/cortex Phase 1 persistence & Migration v2', () => {
       )
 
       const migrations = db1.getAppliedMigrations()
-      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5])
+      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6])
       expect(migrations.find((m) => m.version === 4)?.name).toBe(
         'v4_phase7_agency_audit_and_consent',
       )
@@ -689,7 +689,7 @@ describe('@ashy/cortex Phase 1 persistence & Migration v2', () => {
       )
 
       const migrations = db1.getAppliedMigrations()
-      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5])
+      expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6])
       expect(migrations.find((m) => m.version === 5)?.name).toBe(
         'v5_phase8_initiative_and_reflection_journal',
       )

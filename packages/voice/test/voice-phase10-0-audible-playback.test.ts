@@ -172,6 +172,21 @@ describe('@ashy/voice — Phase 10.0 (T3): audible gapless playback', () => {
     expect(frames.length).toBe(afterEnd)
   })
 
+  it('after stopWithFade the next reply starts right after the fade, not after the cut audio would have ended', () => {
+    const { ctx, sources } = createFakeAudioContext()
+    const player = createGaplessAudioPlayer({ audioContext: ctx })
+    // 10 s of queued reply audio starting at t=0
+    player.scheduleChunk({ seq: 0, text: 'longa', samples: new Float32Array(240000), sampleRate: 24000 })
+    ctx.currentTime = 2
+    player.stopWithFade(120)
+    // new reply arrives at t=2.5
+    ctx.currentTime = 2.5
+    player.scheduleChunk({ seq: 1, text: 'nova', samples: new Float32Array(24000), sampleRate: 24000 })
+    const startAt = sources[1]!.start.mock.calls[0]?.[0] as number
+    expect(startAt).toBeLessThan(2.6)
+    expect(startAt).toBeGreaterThanOrEqual(2.12 - 1e-9)
+  })
+
   it('interruptOmniPlayback stops the in-flight sources with a fade', () => {
     const { ctx, sources, gains } = createFakeAudioContext()
     const runtime = createVoiceSessionRuntime({ micMode: 'continuous', wakeWordEnabled: false })

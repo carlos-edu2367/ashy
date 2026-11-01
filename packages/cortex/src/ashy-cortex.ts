@@ -42,6 +42,7 @@ import {
 import {
   CortexDatabase,
   createCortexDatabase,
+  type AffectiveStateSnapshot,
   type CortexDatabaseOptions,
   type CortexEncryptionCodec,
 } from './db/cortex-db'
@@ -156,6 +157,39 @@ export interface CompileTurnPromptInput {
   topKMemories?: number
   userHabits?: readonly UserHabit[]
   prospectiveIntents?: readonly ProspectiveIntent[]
+}
+
+/** Content stored for a voice turn whose user speech could not be transcribed (never sent to the LLM). */
+export const VOICE_UNTRANSCRIBED_PLACEHOLDER = '🎤 (fala não transcrita)'
+
+export interface AppendVoiceTurnInput {
+  sessionId: string
+  userTranscript: string
+  /** Only what was actually played to the user. */
+  assistantSpokenText: string
+  /** Full generated text (meta only). */
+  assistantFullText?: string
+  interrupted: boolean
+  playedMs?: number
+  emotion?: AshyEmotion | string
+  backendId: string
+  modelId?: string | null
+  metrics?: {
+    endpointMs?: number
+    asrMs?: number
+    ttfbMs?: number
+    playbackStartMs?: number
+    e2eMs?: number
+  }
+  /** Stable id suffix for the two rows (default: timestamp + random). */
+  turnId?: string
+  nowMs?: number
+}
+
+export interface AppendVoiceTurnResult {
+  userMessage: ChatMessageRecord
+  /** `null` when nothing was played (nothing to persist for the assistant). */
+  assistantMessage: ChatMessageRecord | null
 }
 
 export interface AshyCortexOptions extends CortexDatabaseOptions {
@@ -322,6 +356,70 @@ export class AshyCortex {
     return this.db.listChatMessages(sessionId, limit)
   }
 
+  /**
+   * Phase 10.1 (spec §7.4): persists one Live Call exchange as two `modality='voice'`
+   * rows. The assistant row carries ONLY what was actually played (`assistantSpokenText`);
+   * the full generated text goes to `metaJson` and never into history. An empty user
+   * transcript is stored as {@link VOICE_UNTRANSCRIBED_PLACEHOLDER} (excluded from LLM
+   * history). When nothing was played the assistant row is skipped (`null`).
+   * Pure persistence: affect and memory side effects are the caller's job.
+   */
+  public appendVoiceTurn(input: AppendVoiceTurnInput): AppendVoiceTurnResult {
+    const nowMs = Number.isFinite(input.nowMs) ? Number(input.nowMs) : Date.now()
+    const suffix =
+      (input.turnId ?? '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64) ||
+      `${nowMs}-${Math.random().toString(36).slice(2, 8)}`
+    const transcript = (input.userTranscript ?? '').replace(/\0/g, '').trim()
+    const userContent = transcript.length > 0 ? transcript : VOICE_UNTRANSCRIBED_PLACEHOLDER
+    const emotion = (input.emotion ?? 'neutral') as AshyEmotion
+
+    const userMessage = this.db.appendChatMessage({
+      id: `msg-user-voice-${suffix}`,
+      sessionId: input.sessionId,
+      role: 'user',
+      content: userContent,
+      rawContent: userContent,
+      emotion: 'neutral',
+      markersJson: '[]',
+      providerId: null,
+      modelId: null,
+      latencyMs: null,
+      createdAt: nowMs,
+      modality: 'voice',
+    })
+
+    const spoken = (input.assistantSpokenText ?? '').replace(/\0/g, '').trim()
+    if (spoken.length === 0) {
+      return { userMessage, assistantMessage: null }
+    }
+    const meta = {
+      fullText: input.assistantFullText ?? spoken,
+      playedMs: Number.isFinite(input.playedMs) ? Number(input.playedMs) : null,
+      metrics: input.metrics ?? null,
+      backend: input.backendId,
+    }
+    const assistantMessage = this.db.appendChatMessage({
+      id: `msg-assistant-voice-${suffix}`,
+      sessionId: input.sessionId,
+      role: 'assistant',
+      content: spoken,
+      rawContent: spoken,
+      emotion,
+      markersJson: '[]',
+      providerId: null,
+      modelId: input.modelId ?? null,
+      latencyMs:
+        input.metrics && Number.isFinite(input.metrics.e2eMs)
+          ? Math.round(Number(input.metrics.e2eMs))
+          : null,
+      createdAt: nowMs + 1,
+      modality: 'voice',
+      ...(input.interrupted ? { interrupted: true } : {}),
+      metaJson: JSON.stringify(meta),
+    })
+    return { userMessage, assistantMessage }
+  }
+
   // Governance & Quarantine delegation helpers
   public getMemoryGovernancePolicy(): MemoryGovernancePolicy {
     return this.db.getMemoryGovernancePolicy()
@@ -416,21 +514,45 @@ export class AshyCortex {
     return 'stranger'
   }
 
-  public compileTurnPrompt(params: CompileTurnPromptInput): ComposedTurnPrompt {
-    const nowMs = params.nowMs ?? Date.now()
-    const resolvedStage = params.stage ?? this.deriveRelationshipStage()
-    const resolvedQueryEmbedding =
-      params.queryEmbedding ?? embedTextSync128(params.userMessage)
+  /** Decayed mood + user-reaction for a user message (pure; nothing is written). */
+  private computeUserTurnAffect(userMessage: string, nowMs: number) {
     const state = this.db.getAffectiveState()
     const elapsedMinutes =
       state.updatedAt > 0 ? Math.max(0, (nowMs - state.updatedAt) / 60_000) : 0
     const decayedMood = decayMoodToBaseline(state.mood, elapsedMinutes)
-    const seriousness = evaluateSeriousnessGate(params.userMessage)
-
-    const { mood: reactedMood } = applyUserReactionToMood(decayedMood, params.userMessage, {
+    const seriousness = evaluateSeriousnessGate(userMessage)
+    const { mood: reactedMood } = applyUserReactionToMood(decayedMood, userMessage, {
       seriousness,
     })
-    this.db.saveAffectiveState({ ...state, mood: reactedMood, updatedAt: nowMs })
+    return { state, reactedMood, seriousness }
+  }
+
+  /**
+   * Applies (and persists) the user-reaction mood side effect of a user turn —
+   * the same write `compileTurnPrompt` does by default. Phase 10.1: Live Call
+   * builds context with `sideEffects:false` and applies this ONCE per turn when
+   * the turn is recorded.
+   */
+  public applyUserTurnAffect(userMessage: string, nowMs = Date.now()): AffectiveStateSnapshot {
+    const { state, reactedMood } = this.computeUserTurnAffect(userMessage, nowMs)
+    return this.db.saveAffectiveState({ ...state, mood: reactedMood, updatedAt: nowMs })
+  }
+
+  public compileTurnPrompt(
+    params: CompileTurnPromptInput,
+    opts?: { sideEffects?: boolean },
+  ): ComposedTurnPrompt {
+    const nowMs = params.nowMs ?? Date.now()
+    const resolvedStage = params.stage ?? this.deriveRelationshipStage()
+    const resolvedQueryEmbedding =
+      params.queryEmbedding ?? embedTextSync128(params.userMessage)
+    const { state, reactedMood, seriousness } = this.computeUserTurnAffect(
+      params.userMessage,
+      nowMs,
+    )
+    if (opts?.sideEffects !== false) {
+      this.db.saveAffectiveState({ ...state, mood: reactedMood, updatedAt: nowMs })
+    }
     const effectiveMood = reactedMood
 
     const rawRetrievedMemories = this.db.searchEpisodicMemoriesHybrid(

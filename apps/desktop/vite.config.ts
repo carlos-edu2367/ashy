@@ -19,6 +19,11 @@ export default defineConfig({
       '@ashy/evals': path.resolve(__dirname, '../../packages/evals/src/index.ts'),
     },
   },
+  // Phase 10.1: onnxruntime-web (Silero VAD in the call-engine window) resolves its .wasm/.mjs
+  // runtime files relative to its own module URL; esbuild pre-bundling would break that in dev.
+  optimizeDeps: {
+    exclude: ['onnxruntime-web'],
+  },
   server: {
     host: '127.0.0.1',
     port: 5173,

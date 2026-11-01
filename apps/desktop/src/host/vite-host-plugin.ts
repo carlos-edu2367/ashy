@@ -16,6 +16,7 @@ import type {
   ImportSoulInput,
   ListProviderModelsInput,
   ListVoiceProviderModelsInput,
+  LiveCallInvokeInput,
   LlmProviderId,
   MemoryGovernanceCategory,
   PersonalityEvolutionRecord,
@@ -132,6 +133,7 @@ const ALLOWED_RPC_METHODS = new Set<string>([
   'installLocalEngine',
   'pullLocalModel',
   'deleteLocalModel',
+  'liveCall:invoke',
 ])
 
 export class DisallowedRpcMethodError extends Error {
@@ -815,6 +817,14 @@ export async function dispatchHostRpc(
       return kernel.deleteLocalModel({ model })
     }
 
+    case 'liveCall:invoke': {
+      if (!kernel.invokeLiveCall) {
+        throw new DisallowedRpcMethodError(method)
+      }
+      const obj = assertObjectPayload<LiveCallInvokeInput>(payload, method)
+      return kernel.invokeLiveCall(obj)
+    }
+
     default:
       throw new DisallowedRpcMethodError(method)
   }
@@ -995,6 +1005,8 @@ export function createAshyHostHttpMiddleware(
         .then((kernel) => {
           if (closed || res.writableEnded) return
           unsubscribe = kernel.onHostEvent((event) => {
+            // call:viseme is high-rate and IPC-only; never serialize it onto the SSE stream.
+            if (event.type === 'call:viseme') return
             if (!closed && !res.writableEnded) {
               res.write(`data: ${JSON.stringify(event)}\n\n`)
             }
@@ -1045,6 +1057,7 @@ export function createAshyHostHttpMiddleware(
             err instanceof DisallowedRpcMethodError ||
             message.startsWith('Invalid RPC') ||
             message.includes('INVALID_LOCAL_MODEL_NAME') ||
+            message.startsWith('LIVE_CALL_METHOD_UNAVAILABLE') ||
             message.includes('maximum allowed size')
           sendJson(res, isClientError ? 400 : 500, {
             ok: false,

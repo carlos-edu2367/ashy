@@ -716,7 +716,7 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
     })
 
     const overlayWin = createdWindows[1]!
-    expect(fakeGlobalShortcut.register).toHaveBeenCalledTimes(6)
+    expect(fakeGlobalShortcut.register).toHaveBeenCalledTimes(7) // + Phase 10.1 Live Call toggle (Ctrl+Alt+L)
     expect(Array.from(registeredShortcuts.keys())).toEqual(
       expect.arrayContaining([
         'CommandOrControl+Shift+M',
@@ -725,6 +725,7 @@ describe('Ashy Dual-Runtime Transport (IPC & HTTP RPC)', () => {
         'CommandOrControl+Shift+H',
         'CommandOrControl+Shift+Space',
         'CommandOrControl+Shift+K',
+        'CommandOrControl+Alt+L',
       ]),
     )
 

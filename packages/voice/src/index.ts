@@ -11,5 +11,6 @@ export * from './vad-engine'
 export * from './providers'
 export * from './turn-intelligence'
 export * from './voice-session-runtime'
+export * from './call'
 
 export type { SealedOmniAudioTurn, TtsVowelLipSyncFrame } from './voice-session-runtime'

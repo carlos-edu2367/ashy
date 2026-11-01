@@ -9,7 +9,8 @@
     "test": "vitest run --root ../.. packages/voice/test"
   },
   "dependencies": {
+    "@ashy/llm": "workspace:*",
     "@ashy/shared": "workspace:*",
-    "@ashy/llm": "workspace:*"
+    "onnxruntime-web": "^1.31.1"
   }
 }

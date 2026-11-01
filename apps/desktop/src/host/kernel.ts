@@ -58,6 +58,9 @@ import {
   type ExternalMcpServerConfig,
   type ImportSoulInput,
   type InitiativePolicy,
+  LiveCallInvokeInputSchema,
+  type LiveCallHostEvent,
+  type LiveCallInvokeInput,
   type ListProviderModelsInput,
   type ListProviderModelsResult,
   type ListVoiceProviderModelsInput,
@@ -115,6 +118,11 @@ import {
 import { seedAshyDemoFixtures } from '../test/fixtures/demo-seed'
 import { createHostAgencyRuntime, type HostAgencyRuntime } from './agency-runtime'
 import { removeFileAtomicWithBackups, writeAtomicWithBackup } from './atomic-file'
+import { registerEngineHandlers } from './engines/handlers'
+import { createLlamaCppEngine, type CreateLlamaCppEngineOptions } from './engines/llamacpp-engine'
+import { registerCallHostHandlers } from './live-call/handlers'
+import { createLiveCallRegistry, type LiveCallRegistry } from './live-call/registry'
+import { createLiveModeSettingsStore } from './live-call/settings'
 import {
   createLocalRuntimeManager,
   type LocalRuntimeManager,
@@ -346,10 +354,28 @@ export interface AshyHostKernelOptions {
   keepaliveIntervalMs?: number
   dreamIdleTimeoutMs?: number
   localRuntimeOptions?: Partial<LocalRuntimeManagerOptions>
+  /** Phase 10.1: overrides for the managed llama.cpp engine (tests inject fetch/exec/spawn). */
+  llamaCppEngineOptions?: Partial<Omit<CreateLlamaCppEngineOptions, 'userDataDir' | 'getSettings'>>
+}
+
+/** Extension point the Electron main process provides for the hidden `call-engine` window. */
+export interface CallWindowController {
+  ensure(): Promise<void>
+  destroy(): void
+}
+
+export interface AshyHostLiveCallApi {
+  readonly registry: LiveCallRegistry
+  /** Emits a Live Call event to every host event subscriber (IPC + SSE; viseme is IPC-only). */
+  emit(event: LiveCallHostEvent): void
+  getCallWindowController(): CallWindowController | null
 }
 
 export interface AshyHostKernel extends AshyHostBridge {
   readonly userDataDir: string
+  readonly liveCall: AshyHostLiveCallApi
+  invokeLiveCall(input: LiveCallInvokeInput): Promise<unknown>
+  setCallWindowController(controller: CallWindowController | null): void
   readonly container: DIContainer
   readonly cortex: AshyCortex
   readonly voiceStore: VoiceIdentityStore
@@ -879,6 +905,46 @@ export async function createAshyHostKernel(
       }
     }
   }
+
+  const liveCallRegistry = createLiveCallRegistry()
+  let callWindowController: CallWindowController | null = null
+  const liveCallApi: AshyHostLiveCallApi = {
+    registry: liveCallRegistry,
+    emit(event: LiveCallHostEvent): void {
+      emitHostEvent(event)
+    },
+    getCallWindowController(): CallWindowController | null {
+      return callWindowController
+    },
+  }
+
+  const liveModeSettingsStore = createLiveModeSettingsStore({ userDataDir: options.userDataDir })
+  const llamaCppEngine = createLlamaCppEngine({
+    ...options.llamaCppEngineOptions,
+    userDataDir: options.userDataDir,
+    getSettings: () => liveModeSettingsStore.get(),
+    onStatus: (status) => {
+      options.llamaCppEngineOptions?.onStatus?.(status)
+      liveCallApi.emit({ type: 'engine:status', status })
+    },
+  })
+  registerEngineHandlers(liveCallApi, { llamaCppEngine, liveModeSettingsStore })
+  registerCallHostHandlers(liveCallApi, {
+    settings: liveModeSettingsStore,
+    engine: llamaCppEngine,
+    getCortex: () => cortexInstance,
+    resolveSessionId: () => {
+      const sessions = cortexInstance.listChatSessions()
+      const session =
+        sessions.find((s) => s.id === activeSessionId) ??
+        sessions[0] ??
+        cortexInstance.createChatSession({ id: `session-${Date.now()}-call`, title: 'Chamada' })
+      activeSessionId = session.id
+      return session.id
+    },
+    // Same host STT path as Phase 10.0 (`ollama-transcriptions` + chat-style heuristic).
+    transcribe: (input) => kernel.transcribeVoiceAudio!(input),
+  })
 
   let kernelEpoch = 0
   let encryptionUpdatedAt: string | null = null
@@ -1425,6 +1491,7 @@ export async function createAshyHostKernel(
 
   async function stop(): Promise<void> {
     localRuntimeManager.dispose()
+    await llamaCppEngine.dispose().catch(() => undefined)
     if (!started) return
     clearDreamIdleTimer()
     turnOrchestratorUnsub?.()
@@ -1445,7 +1512,7 @@ export async function createAshyHostKernel(
 
   await start()
 
-  return {
+  const kernel: AshyHostKernel = {
     userDataDir: options.userDataDir,
     container,
     get cortex() {
@@ -1470,6 +1537,28 @@ export async function createAshyHostKernel(
     start,
     stop,
     dispose: stop,
+
+    liveCall: liveCallApi,
+
+    async invokeLiveCall(input: LiveCallInvokeInput): Promise<unknown> {
+      const parsed = v.safeParse(LiveCallInvokeInputSchema, input)
+      if (!parsed.success) {
+        const rawMethod =
+          input && typeof input === 'object' ? (input as { method?: unknown }).method : undefined
+        if (typeof rawMethod === 'string') {
+          // Well-formed envelope, unknown method name.
+          return liveCallRegistry.invoke(rawMethod, undefined)
+        }
+        throw new Error(
+          'Invalid RPC argument for liveCall:invoke: expected { method: LiveCallMethod, payload?: unknown }',
+        )
+      }
+      return liveCallRegistry.invoke(parsed.output.method, parsed.output.payload)
+    },
+
+    setCallWindowController(controller: CallWindowController | null): void {
+      callWindowController = controller
+    },
 
     async getBootstrapSnapshot(): Promise<AshyBootstrapSnapshot> {
       return buildSnapshot(cortexInstance, voiceStoreInstance, providerVaultInstance)
@@ -2956,4 +3045,5 @@ export async function createAshyHostKernel(
       }
     },
   }
+  return kernel
 }

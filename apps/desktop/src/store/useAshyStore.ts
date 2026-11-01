@@ -48,6 +48,7 @@ import {
   type AshyStageSignal,
 } from '@ashy/llm'
 import {
+  isLiveCallHostEvent,
   ASHY_BASELINE_MOOD,
   ASHY_DEFAULT_TRAITS,
   ASHY_EMOTIONS,
@@ -175,7 +176,7 @@ import {
 export type DesktopViewMode = 'hub' | 'stage'
 export type HubTabId = 'studio' | 'story' | 'memories' | 'personality' | 'agency'
 export type MemoryFilterCategory = 'todas' | 'momentos' | 'sobre_voce' | 'referencias' | 'planos'
-export type SettingsSubTab = 'todas' | 'geral' | 'voz' | 'modelos' | 'privacidade'
+export type SettingsSubTab = 'todas' | 'geral' | 'voz' | 'live' | 'modelos' | 'privacidade'
 
 export interface FeaturedMemoryCard {
   id: string
@@ -2218,6 +2219,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
     if (event.type === 'local-runtime:status') {
       set({ localRuntime: event.status })
+      return
+    }
+
+    // Phase 10 Live Call events are consumed by the call store / call-engine window, not here.
+    if (isLiveCallHostEvent(event)) {
       return
     }
 

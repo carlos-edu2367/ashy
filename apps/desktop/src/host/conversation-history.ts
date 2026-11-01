@@ -13,6 +13,13 @@
 export const OMNI_VOICE_PLACEHOLDER_TEXT = '[Mensagem de voz Omni]'
 /** Placeholder persisted when only media (frames/attachments) was sent. */
 export const OMNI_MEDIA_PLACEHOLDER_TEXT = '[Mídia enviada para análise Omni]'
+/**
+ * Phase 10.1: persisted by `cortex.appendVoiceTurn` when a Live Call user turn
+ * could not be transcribed (mirrors `VOICE_UNTRANSCRIBED_PLACEHOLDER` in @ashy/cortex).
+ */
+export const VOICE_UNTRANSCRIBED_PLACEHOLDER_TEXT = '🎤 (fala não transcrita)'
+/** Phase 10.1: appended to assistant replies the user interrupted (barge-in). */
+export const INTERRUPTED_REPLY_SUFFIX = '…'
 
 /**
  * User contents that carry no conversational meaning. Matching is done on the
@@ -21,6 +28,7 @@ export const OMNI_MEDIA_PLACEHOLDER_TEXT = '[Mídia enviada para análise Omni]'
 const PLACEHOLDER_USER_CONTENTS = new Set<string>([
   OMNI_VOICE_PLACEHOLDER_TEXT,
   OMNI_MEDIA_PLACEHOLDER_TEXT,
+  VOICE_UNTRANSCRIBED_PLACEHOLDER_TEXT,
   '🎤 (áudio)',
   '🎤 (áudio sem transcrição)',
 ])
@@ -30,6 +38,11 @@ const SYNTHETIC_OMNI_REVISION_REGEX = /^ashy-omni-turn-rev-\d+$/i
 export interface ConversationHistoryEntry {
   role: string
   content: string
+  /**
+   * Phase 10.1: assistant reply cut by the user. The sanitizer appends `…` to
+   * its content and strips this flag from the output.
+   */
+  interrupted?: boolean
 }
 
 export interface ConversationHistoryLimits {
@@ -157,6 +170,15 @@ export function sanitizeConversationHistory<T extends ConversationHistoryEntry>(
       continue
     }
     if (record.role === 'assistant' && record.content.trim().length === 0) {
+      continue
+    }
+    if ('interrupted' in record) {
+      const { interrupted, ...rest } = record
+      const content =
+        interrupted === true && record.role === 'assistant'
+          ? `${record.content.trimEnd()}${INTERRUPTED_REPLY_SUFFIX}`
+          : record.content
+      withoutPlaceholders.push({ ...rest, content } as unknown as T)
       continue
     }
     withoutPlaceholders.push(record)

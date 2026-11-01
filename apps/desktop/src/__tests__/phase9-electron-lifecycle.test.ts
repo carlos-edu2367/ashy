@@ -482,7 +482,8 @@ describe('Phase 9 — Native Electron Lifecycle (System Tray, Global Shortcuts P
     })
 
     try {
-      expect(registeredShortcuts.size).toBe(6)
+      // 6 Phase 9 shortcuts + Phase 10.1 Live Call toggle (Ctrl+Alt+L)
+      expect(registeredShortcuts.size).toBe(7)
       expect(Array.from(registeredShortcuts.keys())).toEqual(
         expect.arrayContaining([
           DEFAULT_STAGE_SHORTCUTS.electronGlobalMic,

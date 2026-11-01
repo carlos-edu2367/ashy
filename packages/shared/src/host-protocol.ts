@@ -1,6 +1,14 @@
 import * as v from 'valibot'
 import { AshyEmotionSchema, type AshyEmotion } from './emotions'
 import { MilestoneCategorySchema } from './memory-types'
+import {
+  CALL_END_REASONS,
+  CALL_STATUSES,
+  LIVE_BACKEND_IDS,
+  LLAMACPP_VARIANTS,
+  type LiveCallHostEvent,
+  type LiveCallInvokeInput,
+} from './live-call-protocol'
 import type {
   DreamReflectionCycleResult,
   CrossEpisodeLink,
@@ -700,6 +708,12 @@ export interface ChatMessageRecord {
   latencyMs?: number | null
   consolidatedEpisodeId?: string | null
   createdAt: number
+  /** Phase 10.1 (cortex v6): 'voice' for Live Call turns; absent/'text' otherwise. */
+  modality?: 'text' | 'voice'
+  /** Phase 10.1: assistant speech cut by the user (barge-in). */
+  interrupted?: boolean
+  /** Phase 10.1: JSON meta (voice turns: {fullText, playedMs, metrics, backend}). */
+  metaJson?: string | null
 }
 
 export interface PublicProviderConfig {
@@ -1889,6 +1903,7 @@ export const ASHY_HOST_RPC_METHODS = [
   'installLocalEngine',
   'pullLocalModel',
   'deleteLocalModel',
+  'liveCall:invoke',
 ] as const
 
 export type AshyHostRpcMethod = (typeof ASHY_HOST_RPC_METHODS)[number]
@@ -2018,6 +2033,143 @@ export const TurnAudioDeltaEventSchema = v.object({
   vowelFrames: v.optional(v.array(VoiceSynthesizedVowelFrameSchema)),
 })
 
+// ───────────── Phase 10 Live Call host → renderer events (see live-call-protocol.ts) ─────────────
+
+const FiniteNumberSchema = v.pipe(v.number(), v.finite())
+const LiveBackendIdEventSchema = v.picklist(LIVE_BACKEND_IDS)
+const LlamaCppVariantEventSchema = v.picklist(LLAMACPP_VARIANTS)
+
+const CallMetricsEventSchema = v.object({
+  endpointMs: v.optional(FiniteNumberSchema),
+  asrMs: v.optional(FiniteNumberSchema),
+  ttfbMs: v.optional(FiniteNumberSchema),
+  playbackStartMs: v.optional(FiniteNumberSchema),
+  e2eMs: v.optional(FiniteNumberSchema),
+})
+
+export const CallStateSnapshotSchema = v.object({
+  callId: v.nullable(v.string()),
+  status: v.picklist(CALL_STATUSES),
+  muted: v.boolean(),
+  backend: v.nullable(LiveBackendIdEventSchema),
+  sessionId: v.nullable(v.string()),
+  caption: v.nullable(
+    v.object({
+      role: v.picklist(['user', 'assistant'] as const),
+      text: v.string(),
+      final: v.boolean(),
+    }),
+  ),
+  metrics: v.nullable(CallMetricsEventSchema),
+  reason: v.nullable(v.picklist(CALL_END_REASONS)),
+  detail: v.nullable(v.string()),
+  updatedAt: FiniteNumberSchema,
+})
+
+export const CallStateEventSchema = v.object({
+  type: v.literal('call:state'),
+  state: CallStateSnapshotSchema,
+})
+
+export const CallVisemeEventSchema = v.object({
+  type: v.literal('call:viseme'),
+  A: FiniteNumberSchema,
+  E: FiniteNumberSchema,
+  I: FiniteNumberSchema,
+  O: FiniteNumberSchema,
+  U: FiniteNumberSchema,
+  volume: FiniteNumberSchema,
+})
+
+export const CallCommandEventSchema = v.variant('command', [
+  v.object({
+    type: v.literal('call:command'),
+    command: v.literal('start'),
+    callId: NonEmptyStringSchema,
+    backend: LiveBackendIdEventSchema,
+    sessionId: NonEmptyStringSchema,
+  }),
+  v.object({
+    type: v.literal('call:command'),
+    command: v.literal('stop'),
+    callId: NonEmptyStringSchema,
+  }),
+  v.object({
+    type: v.literal('call:command'),
+    command: v.literal('setMuted'),
+    callId: NonEmptyStringSchema,
+    muted: v.boolean(),
+  }),
+])
+
+export const LlamaCppEngineStatusSchema = v.object({
+  engineId: v.literal('llamacpp'),
+  build: v.string(),
+  installed: v.boolean(),
+  installedVariant: v.nullable(LlamaCppVariantEventSchema),
+  detectedGpu: v.nullable(
+    v.object({
+      vendor: v.picklist(['nvidia', 'amd', 'intel', 'other', 'none'] as const),
+      name: v.optional(v.string()),
+      vramMb: v.optional(FiniteNumberSchema),
+      recommendedVariant: LlamaCppVariantEventSchema,
+    }),
+  ),
+  running: v.boolean(),
+  managed: v.boolean(),
+  baseUrl: v.nullable(v.string()),
+  port: v.nullable(FiniteNumberSchema),
+  activeModelId: v.nullable(v.string()),
+  installedModelIds: v.array(v.string()),
+  activeDownload: v.nullable(
+    v.object({
+      fileName: v.string(),
+      phase: v.picklist(['binary', 'model'] as const),
+      status: v.picklist([
+        'downloading',
+        'verifying',
+        'extracting',
+        'completed',
+        'error',
+      ] as const),
+      completedBytes: FiniteNumberSchema,
+      totalBytes: FiniteNumberSchema,
+      percent: FiniteNumberSchema,
+      error: v.optional(v.string()),
+    }),
+  ),
+  lastError: v.nullable(v.string()),
+  vcRuntimeMissing: v.boolean(),
+  vcRuntimeInstall: v.nullable(
+    v.object({
+      status: v.picklist(['downloading', 'verifying', 'installing', 'completed', 'error'] as const),
+      percent: v.optional(FiniteNumberSchema),
+      error: v.optional(v.string()),
+      rebootRequired: v.optional(v.boolean()),
+    }),
+  ),
+})
+
+export const EngineStatusEventSchema = v.object({
+  type: v.literal('engine:status'),
+  status: LlamaCppEngineStatusSchema,
+})
+
+export const ChatAppendedEventSchema = v.object({
+  type: v.literal('chat:appended'),
+  sessionId: NonEmptyStringSchema,
+  messageIds: v.array(NonEmptyStringSchema),
+})
+
+/** Validates any of the 5 Live Call host events (`LiveCallHostEvent`). */
+export const LiveCallHostEventSchema = v.union([
+  CallStateEventSchema,
+  CallVisemeEventSchema,
+  CallCommandEventSchema,
+  EngineStatusEventSchema,
+  ChatAppendedEventSchema,
+])
+
 export const AshyHostStreamEventSchema = v.union([
   v.object({
     type: v.literal('turn:started'),
@@ -2106,6 +2258,11 @@ export const AshyHostStreamEventSchema = v.union([
     type: v.literal('local-runtime:status'),
     status: LocalRuntimeStatusSchema,
   }),
+  CallStateEventSchema,
+  CallVisemeEventSchema,
+  CallCommandEventSchema,
+  EngineStatusEventSchema,
+  ChatAppendedEventSchema,
 ])
 
 export type AshyHostStreamEvent =
@@ -2213,6 +2370,7 @@ export type AshyHostStreamEvent =
       type: 'local-runtime:status'
       status: LocalRuntimeStatus
     }
+  | LiveCallHostEvent
 
 export interface AshyHostBridge {
   getBootstrapSnapshot(): Promise<AshyBootstrapSnapshot>
@@ -2352,6 +2510,8 @@ export interface AshyHostBridge {
   installLocalEngine?(): Promise<LocalRuntimeStatus>
   pullLocalModel?(input: PullLocalModelInput): Promise<LocalRuntimeStatus>
   deleteLocalModel?(input: DeleteLocalModelInput): Promise<LocalRuntimeStatus>
+  /** Phase 10 generic Live Call RPC; routed host-side by the LiveCallRegistry. */
+  invokeLiveCall?(input: LiveCallInvokeInput): Promise<unknown>
   onHostEvent(listener: (event: AshyHostStreamEvent) => void): () => void
 }
 

@@ -291,6 +291,20 @@ function openPersistentDatabase(filePath: string): SqliteDatabaseLike | null {
 }
 
 const VALID_CHAT_ROLES = new Set(['user', 'assistant', 'system'])
+
+/** v6 optional voice fields, only present when non-default (keeps text records unchanged). */
+function pickVoiceMessageFields(
+  input: Pick<ChatMessageRecord, 'modality' | 'interrupted' | 'metaJson'>,
+): Pick<ChatMessageRecord, 'modality' | 'interrupted' | 'metaJson'> {
+  return {
+    ...(input.modality === 'voice' ? { modality: 'voice' as const } : {}),
+    ...(input.interrupted === true ? { interrupted: true } : {}),
+    ...(typeof input.metaJson === 'string' && input.metaJson.length > 0
+      ? { metaJson: input.metaJson }
+      : {}),
+  }
+}
+
 const VALID_EMOTIONS = new Set<string>(ASHY_EMOTIONS)
 const VALID_GOVERNANCE_CATEGORIES = new Set<string>(MEMORY_GOVERNANCE_CATEGORIES)
 const VALID_EYES_MODES = new Set<string>(EYES_MODES)
@@ -369,6 +383,11 @@ export class MemoryStorageAdapter {
     this.migrations.set(5, {
       version: 5,
       name: 'v5_phase8_initiative_and_reflection_journal',
+      appliedAt: now,
+    })
+    this.migrations.set(6, {
+      version: 6,
+      name: 'v6_phase10_voice_chat_messages',
       appliedAt: now,
     })
     for (const ex of DEFAULT_GOLDEN_STYLE_EXEMPLARS) {
@@ -846,6 +865,10 @@ export class CortexDatabase {
     this.ensureColumnExists('prospective_intents', 'source_episode_id', 'TEXT')
     this.ensureColumnExists('prospective_intents', 'approval_status', "TEXT NOT NULL DEFAULT 'approved'")
     this.ensureColumnExists('chat_messages', 'consolidated_episode_id', 'TEXT')
+    // v6 (Phase 10.1): Live Call voice turns
+    this.ensureColumnExists('chat_messages', 'modality', "TEXT DEFAULT 'text'")
+    this.ensureColumnExists('chat_messages', 'interrupted', 'INTEGER DEFAULT 0')
+    this.ensureColumnExists('chat_messages', 'meta_json', 'TEXT')
 
     const now = Date.now()
     const insertMigration = this.sqlite.prepare(`
@@ -857,6 +880,7 @@ export class CortexDatabase {
     insertMigration.run(3, 'v3_phase2_self_writing_memory', now)
     insertMigration.run(4, 'v4_phase7_agency_audit_and_consent', now)
     insertMigration.run(5, 'v5_phase8_initiative_and_reflection_journal', now)
+    insertMigration.run(6, 'v6_phase10_voice_chat_messages', now)
 
     this.seedDefaultsIfEmpty()
   }
@@ -2149,6 +2173,7 @@ export class CortexDatabase {
           ? input.consolidatedEpisodeId
           : (existingMemMsg?.consolidatedEpisodeId ?? null),
       createdAt: input.createdAt,
+      ...pickVoiceMessageFields(input),
     }
 
     const preview = record.content.slice(0, 140)
@@ -2193,8 +2218,9 @@ export class CortexDatabase {
           `INSERT OR REPLACE INTO chat_messages (
             id, session_id, role, content, raw_content, emotion,
             markers_json, provider_id, model_id, latency_ms,
-            consolidated_episode_id, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            consolidated_episode_id, created_at,
+            modality, interrupted, meta_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           record.id,
@@ -2209,6 +2235,9 @@ export class CortexDatabase {
           record.latencyMs ?? null,
           record.consolidatedEpisodeId ?? null,
           record.createdAt,
+          record.modality ?? 'text',
+          record.interrupted ? 1 : 0,
+          record.metaJson ? this.encryptField(record.metaJson, 'chat_messages.meta_json') : null,
         )
 
       this.sqlite
@@ -2399,6 +2428,11 @@ export class CortexDatabase {
           ? null
           : String(row.consolidated_episode_id),
       createdAt: Number(row.created_at),
+      ...(row.modality === 'voice' ? { modality: 'voice' as const } : {}),
+      ...(Number(row.interrupted ?? 0) === 1 ? { interrupted: true } : {}),
+      ...(typeof row.meta_json === 'string' && row.meta_json.length > 0
+        ? { metaJson: this.decryptField(row.meta_json, 'chat_messages.meta_json') }
+        : {}),
     }
   }
 
@@ -3153,12 +3187,13 @@ export class CortexDatabase {
 
       // 8. chat_messages
       const updateMsgStmt = this.sqlite.prepare(
-        'UPDATE chat_messages SET content = ?, raw_content = ? WHERE id = ?',
+        'UPDATE chat_messages SET content = ?, raw_content = ?, meta_json = ? WHERE id = ?',
       )
       for (const msg of this.memory.chatMessages) {
         updateMsgStmt.run(
           this.encryptField(msg.content, 'chat_messages.content'),
           this.encryptField(msg.rawContent, 'chat_messages.raw_content'),
+          msg.metaJson ? this.encryptField(msg.metaJson, 'chat_messages.meta_json') : null,
           msg.id,
         )
       }
@@ -3461,6 +3496,7 @@ export class CortexDatabase {
         latencyMs: m.latencyMs ?? null,
         consolidatedEpisodeId: m.consolidatedEpisodeId ?? null,
         createdAt: Number(m.createdAt),
+        ...pickVoiceMessageFields(m),
       }
     })
 
@@ -3717,8 +3753,9 @@ export class CortexDatabase {
           `INSERT INTO chat_messages (
             id, session_id, role, content, raw_content, emotion,
             markers_json, provider_id, model_id, latency_ms,
-            consolidated_episode_id, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            consolidated_episode_id, created_at,
+            modality, interrupted, meta_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         for (const msg of validatedMessages) {
           msgStmt.run(
@@ -3734,6 +3771,9 @@ export class CortexDatabase {
             msg.latencyMs ?? null,
             msg.consolidatedEpisodeId ?? null,
             msg.createdAt,
+            msg.modality ?? 'text',
+            msg.interrupted ? 1 : 0,
+            msg.metaJson ? this.encryptField(msg.metaJson, 'chat_messages.meta_json') : null,
           )
         }
 

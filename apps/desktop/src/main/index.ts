@@ -9,6 +9,7 @@ import {
   SetStageOverlayVisibleInputSchema,
   type AshyHostBridge,
   type AshyHostStreamEvent,
+  type CallStateSnapshot,
 } from '@ashy/shared'
 import {
   createAshyElectronOverlayConfig,
@@ -50,6 +51,7 @@ const STATIC_MIME_TYPES: Record<string, string> = {
   '.mp3': 'audio/mpeg',
   '.ogg': 'audio/ogg',
   '.moc3': 'application/octet-stream',
+  '.onnx': 'application/octet-stream',
   '.bin': 'application/octet-stream',
 }
 
@@ -151,12 +153,58 @@ export interface ElectronWebContentsNavigationEventLike {
   preventDefault(): void
 }
 
+/** Permission details Electron passes to request handlers (`media` carries `mediaTypes`). */
+export interface ElectronPermissionRequestDetailsLike {
+  mediaTypes?: ReadonlyArray<string>
+  requestingUrl?: string
+  [key: string]: unknown
+}
+
+/** Permission details Electron passes to check handlers (`media` carries `mediaType`). */
+export interface ElectronPermissionCheckDetailsLike {
+  mediaType?: string
+  requestingUrl?: string
+  [key: string]: unknown
+}
+
+export type ElectronPermissionRequestHandlerLike = (
+  webContents: unknown,
+  permission: string,
+  callback: (granted: boolean) => void,
+  details?: ElectronPermissionRequestDetailsLike,
+) => void
+
+export type ElectronPermissionCheckHandlerLike = (
+  webContents: unknown,
+  permission: string,
+  requestingOrigin: string,
+  details?: ElectronPermissionCheckDetailsLike,
+) => boolean
+
+export interface ElectronSessionLike {
+  setPermissionRequestHandler?(handler: ElectronPermissionRequestHandlerLike | null): void
+  setPermissionCheckHandler?(handler: ElectronPermissionCheckHandlerLike | null): void
+}
+
 export interface ElectronWebContentsLike {
+  id?: number
+  session?: ElectronSessionLike
   isDestroyed?: () => boolean
   send(channel: string, payload: AshyHostStreamEvent): void
   on?(
     event: 'will-navigate',
     listener: (event: ElectronWebContentsNavigationEventLike, url: string) => void,
+  ): void
+  once?(event: 'did-finish-load', listener: () => void): void
+  once?(
+    event: 'did-fail-load',
+    listener: (
+      event: unknown,
+      errorCode: number,
+      errorDescription: string,
+      validatedUrl: string,
+      isMainFrame: boolean,
+    ) => void,
   ): void
   setWindowOpenHandler?(
     handler: (details: { url: string }) => { action: 'deny' | 'allow' },
@@ -202,6 +250,8 @@ export interface ElectronBrowserWindowInstanceLike {
   unmaximize?(): void
   isMaximized?(): boolean
   close?(): void
+  destroy?(): void
+  on?(event: 'closed', listener: () => void): void
   getBounds?(): { x: number; y: number; width: number; height: number }
   setBounds?(bounds: { x: number; y: number; width: number; height: number }): void
   getPosition?(): [number, number]
@@ -268,6 +318,260 @@ export interface ElectronBrowserWindowConstructorLike {
   new (options: Record<string, unknown>): ElectronBrowserWindowInstanceLike
 }
 
+// ───────────────────────────── Phase 10.1: hidden call-engine window ─────────────────────────────
+
+/** Global shortcut that toggles the Live Call (spec §9.1). */
+export const CALL_TOGGLE_SHORTCUT = 'CommandOrControl+Alt+L'
+/** The hidden call-engine window is destroyed this long after the call goes idle/ended. */
+export const CALL_WINDOW_IDLE_DESTROY_MS = 60_000
+
+export function buildViewUrl(baseRendererUrl: string, view: string): string {
+  return baseRendererUrl.includes('?')
+    ? `${baseRendererUrl}&view=${view}`
+    : `${baseRendererUrl}?view=${view}`
+}
+
+/** True when a `media` permission request asks for audio only (no camera / screen). */
+function isAudioOnlyMediaRequest(details?: ElectronPermissionRequestDetailsLike): boolean {
+  const types = details?.mediaTypes
+  if (!Array.isArray(types) || types.length === 0) return false
+  return types.every((t) => t === 'audio')
+}
+
+interface SessionPermissionRouter {
+  scopes: Set<(webContents: unknown) => 'grant-audio' | 'pass'>
+}
+
+const sessionPermissionRouters = new WeakMap<object, SessionPermissionRouter>()
+
+/**
+ * Installs (once per Electron session) permission handlers that grant `media` (audio only) to the
+ * webContents claimed by a registered scope, and keep Electron's default behaviour (`fallback*`,
+ * which defaults to "allow", i.e. what Electron does when no handler is installed) for every other
+ * webContents so the hub/overlay are unaffected. A claimed webContents gets nothing but audio.
+ * Returns an unregister function for the scope.
+ */
+export function installScopedMediaPermission(
+  session: ElectronSessionLike | null | undefined,
+  claim: (webContents: unknown) => boolean,
+  options: {
+    fallbackRequest?: ElectronPermissionRequestHandlerLike
+    fallbackCheck?: ElectronPermissionCheckHandlerLike
+  } = {},
+): () => void {
+  if (!session || typeof session !== 'object') return () => undefined
+  let router = sessionPermissionRouters.get(session)
+  if (!router) {
+    const created: SessionPermissionRouter = { scopes: new Set() }
+    router = created
+    sessionPermissionRouters.set(session, created)
+    const fallbackRequest: ElectronPermissionRequestHandlerLike =
+      options.fallbackRequest ?? ((_wc, _permission, callback) => callback(true))
+    const fallbackCheck: ElectronPermissionCheckHandlerLike =
+      options.fallbackCheck ?? (() => true)
+    const isClaimed = (wc: unknown): boolean => {
+      for (const scope of created.scopes) {
+        if (scope(wc) === 'grant-audio') return true
+      }
+      return false
+    }
+    session.setPermissionRequestHandler?.((wc, permission, callback, details) => {
+      if (isClaimed(wc)) {
+        callback(permission === 'media' && isAudioOnlyMediaRequest(details))
+        return
+      }
+      fallbackRequest(wc, permission, callback, details)
+    })
+    session.setPermissionCheckHandler?.((wc, permission, origin, details) => {
+      if (isClaimed(wc)) {
+        return permission === 'media' && details?.mediaType !== 'video'
+      }
+      return fallbackCheck(wc, permission, origin, details)
+    })
+  }
+  const scope = (wc: unknown): 'grant-audio' | 'pass' => (claim(wc) ? 'grant-audio' : 'pass')
+  router.scopes.add(scope)
+  const ownRouter = router
+  return () => {
+    ownRouter.scopes.delete(scope)
+  }
+}
+
+export interface CallWindowTimers {
+  setTimeout(fn: () => void, ms: number): unknown
+  clearTimeout(handle: unknown): void
+}
+
+export interface CreateCallWindowControllerOptions {
+  BrowserWindow: ElectronBrowserWindowConstructorLike
+  preloadPath: string
+  /** Renderer URL with `view=call-engine`. */
+  url: string
+  /** Called when the window is created (e.g. to start forwarding host events to it). */
+  onWindowCreated?: (win: ElectronBrowserWindowInstanceLike) => void
+  /** Called once when the window is gone (destroyed by us or closed by the OS). */
+  onWindowGone?: (win: ElectronBrowserWindowInstanceLike) => void
+  /** Fallback session when the window's webContents exposes none. */
+  session?: ElectronSessionLike | null
+  idleDestroyMs?: number
+  timers?: CallWindowTimers
+}
+
+export interface ElectronCallWindowController {
+  ensure(): Promise<void>
+  destroy(): void
+  getWindow(): ElectronBrowserWindowInstanceLike | null
+  /** Feed every `call:state`: arms the idle auto-destroy on idle/ended, cancels it otherwise. */
+  handleCallState(status: string): void
+}
+
+function sameWebContents(candidate: unknown, target: ElectronWebContentsLike): boolean {
+  if (!candidate || typeof candidate !== 'object') return false
+  if (candidate === target) return true
+  const id = (candidate as { id?: unknown }).id
+  return typeof id === 'number' && typeof target.id === 'number' && id === target.id
+}
+
+export function createCallWindowController(
+  options: CreateCallWindowControllerOptions,
+): ElectronCallWindowController {
+  const idleDestroyMs = options.idleDestroyMs ?? CALL_WINDOW_IDLE_DESTROY_MS
+  const timers: CallWindowTimers = options.timers ?? {
+    setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
+    clearTimeout: (h) => globalThis.clearTimeout(h as ReturnType<typeof setTimeout>),
+  }
+  let win: ElectronBrowserWindowInstanceLike | null = null
+  let loaded = false
+  let pending: Promise<void> | null = null
+  let idleTimer: unknown = null
+  let releasePermission: (() => void) | null = null
+
+  const cancelIdleTimer = (): void => {
+    if (idleTimer !== null) {
+      timers.clearTimeout(idleTimer)
+      idleTimer = null
+    }
+  }
+
+  const forget = (target: ElectronBrowserWindowInstanceLike): void => {
+    if (win !== target) return
+    win = null
+    loaded = false
+    pending = null
+    releasePermission?.()
+    releasePermission = null
+    options.onWindowGone?.(target)
+  }
+
+  const create = (): ElectronBrowserWindowInstanceLike => {
+    const created = new options.BrowserWindow({
+      show: false,
+      width: 320,
+      height: 240,
+      skipTaskbar: true,
+      backgroundColor: '#111017',
+      webPreferences: {
+        preload: options.preloadPath,
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        webSecurity: true,
+        backgroundThrottling: false,
+        autoplayPolicy: 'no-user-gesture-required',
+      },
+    })
+    attachWindowSecurityGuards(created)
+    const wc = created.webContents
+    releasePermission = installScopedMediaPermission(
+      wc.session ?? options.session ?? null,
+      (candidate) => win === created && sameWebContents(candidate, wc),
+    )
+    created.on?.('closed', () => forget(created))
+    return created
+  }
+
+  const controller: ElectronCallWindowController = {
+    ensure() {
+      cancelIdleTimer()
+      if (win && isWindowUsable(win) && loaded) return Promise.resolve()
+      if (pending) return pending
+      if (win && !isWindowUsable(win)) forget(win)
+      const target = create()
+      win = target
+      options.onWindowCreated?.(target)
+      const url = options.url
+      const attempt = new Promise<void>((resolve, reject) => {
+        let settled = false
+        const ok = () => {
+          if (settled) return
+          settled = true
+          if (win === target) loaded = true
+          resolve()
+        }
+        const fail = (err: unknown) => {
+          if (settled) return
+          settled = true
+          reject(err instanceof Error ? err : new Error(String(err)))
+        }
+        target.webContents.once?.('did-finish-load', ok)
+        target.webContents.once?.(
+          'did-fail-load',
+          (_event: unknown, errorCode: number, errorDescription: string, _url: string, isMainFrame: boolean) => {
+            // -3 = ERR_ABORTED (superseded navigation); sub-frame failures don't matter.
+            if (errorCode === -3 || isMainFrame === false) return
+            fail(new Error(`call-engine window failed to load (${errorCode}): ${errorDescription}`))
+          },
+        )
+        target.loadURL(url).then(ok, fail)
+      })
+      const tracked = attempt.then(
+        () => {
+          if (pending === tracked) pending = null
+        },
+        (err: unknown) => {
+          if (pending === tracked) pending = null
+          if (win === target) controller.destroy()
+          throw err
+        },
+      )
+      pending = tracked
+      return tracked
+    },
+
+    destroy() {
+      cancelIdleTimer()
+      const target = win
+      if (!target) return
+      try {
+        if (isWindowUsable(target)) {
+          if (typeof target.destroy === 'function') target.destroy()
+          else target.close?.()
+        }
+      } catch {
+        // window already gone
+      }
+      forget(target)
+    },
+
+    getWindow() {
+      return win && isWindowUsable(win) ? win : null
+    },
+
+    handleCallState(status) {
+      if (status === 'idle' || status === 'ended') {
+        if (!win || idleTimer !== null) return
+        idleTimer = timers.setTimeout(() => {
+          idleTimer = null
+          controller.destroy()
+        }, idleDestroyMs)
+        return
+      }
+      cancelIdleTimer()
+    },
+  }
+  return controller
+}
+
 export interface ElectronAppLike {
   getPath(name: 'userData'): string
   on(event: 'before-quit', listener: () => void | Promise<void>): void
@@ -293,6 +597,11 @@ export interface BootAshyElectronMainDeps {
   ipcMain: ElectronIpcMainLike
   safeStorage?: ElectronSafeStorageLike
   globalShortcut?: ElectronGlobalShortcutLike
+  /** Electron `session.defaultSession` (fallback for the call window's permission handlers). */
+  session?: ElectronSessionLike
+  /** Overrides the hidden call-engine window idle auto-destroy (tests). */
+  callWindowIdleDestroyMs?: number
+  callWindowTimers?: CallWindowTimers
   Tray?: ElectronTrayConstructorLike
   Menu?: ElectronMenuLike
   trayIconPath?: string
@@ -311,6 +620,7 @@ export interface BootedAshyElectronRuntime {
   hubWindow: ElectronBrowserWindowInstanceLike
   overlayWindow: ElectronBrowserWindowInstanceLike
   overlayController: AshyElectronOverlayController
+  callWindowController: ElectronCallWindowController
   autoUpdater: SafeAutoUpdaterController
   trayController: AshySystemTrayController | null
   shutdown(): Promise<void>
@@ -703,9 +1013,8 @@ export async function bootAshyElectronMain(
     process.env.ASHY_ELECTRON_RENDERER_URL ??
     embeddedServer?.baseUrl ??
     'http://localhost:5173'
-  const overlayUrl = baseRendererUrl.includes('?')
-    ? `${baseRendererUrl}&view=stage-overlay`
-    : `${baseRendererUrl}?view=stage-overlay`
+  const overlayUrl = buildViewUrl(baseRendererUrl, 'stage-overlay')
+  const callEngineUrl = buildViewUrl(baseRendererUrl, 'call-engine')
 
   const defaultIconCandidate = path.resolve(moduleDir, '../../build/icon.png')
   const hubIconPath = fs.existsSync(defaultIconCandidate)
@@ -761,6 +1070,49 @@ export async function bootAshyElectronMain(
     hubWindow.focus?.()
   }
   await overlayWindow.loadURL(overlayUrl)
+
+  // Phase 10.1: hidden call-engine window (owner of mic/VAD/session/playback), created on demand
+  // by `call:start` and destroyed 60 s after the call goes idle. Same preload, same origin (so
+  // `validateIpcSender` accepts it like the hub/overlay) and it receives host events like them.
+  const callWindowController = createCallWindowController({
+    BrowserWindow: deps.BrowserWindow,
+    preloadPath,
+    url: callEngineUrl,
+    session: deps.session ?? null,
+    ...(deps.callWindowIdleDestroyMs !== undefined
+      ? { idleDestroyMs: deps.callWindowIdleDestroyMs }
+      : {}),
+    ...(deps.callWindowTimers ? { timers: deps.callWindowTimers } : {}),
+    onWindowCreated: (win) => {
+      if (!activeWindows.includes(win)) activeWindows.push(win)
+    },
+    onWindowGone: (win) => {
+      const idx = activeWindows.indexOf(win)
+      if (idx >= 0) activeWindows.splice(idx, 1)
+    },
+  })
+  if (typeof kernel.setCallWindowController === 'function') {
+    kernel.setCallWindowController({
+      ensure: () => callWindowController.ensure(),
+      destroy: () => callWindowController.destroy(),
+    })
+  }
+  const unsubscribeCallState = kernel.onHostEvent((evt) => {
+    if (evt.type === 'call:state') {
+      callWindowController.handleCallState(evt.state.status)
+    }
+  })
+
+  const toggleLiveCall = async (): Promise<void> => {
+    if (typeof kernel.invokeLiveCall !== 'function') return
+    const current = (await kernel.invokeLiveCall({ method: 'call:getState' })) as
+      | CallStateSnapshot
+      | undefined
+    const status = current?.status ?? 'idle'
+    await kernel.invokeLiveCall({
+      method: status === 'idle' || status === 'ended' ? 'call:start' : 'call:stop',
+    })
+  }
 
   const activatePrivacyShieldAndBroadcast = async (): Promise<void> => {
     await kernel.activatePrivacyShield()
@@ -853,6 +1205,12 @@ export async function bootAshyElectronMain(
       })()
     })
 
+    deps.globalShortcut.register(CALL_TOGGLE_SHORTCUT, () => {
+      void toggleLiveCall().catch(() => {
+        // ignore shortcut error
+      })
+    })
+
     deps.globalShortcut.register(
       DEFAULT_STAGE_SHORTCUTS.electronGlobalPrivacyShield,
       () => {
@@ -903,6 +1261,11 @@ export async function bootAshyElectronMain(
     processRef.removeListener('SIGINT', onSigInt)
     trayController?.destroy()
     deps.globalShortcut?.unregisterAll()
+    unsubscribeCallState()
+    if (typeof kernel.setCallWindowController === 'function') {
+      kernel.setCallWindowController(null)
+    }
+    callWindowController.destroy()
     cleanupIpc()
     if (embeddedServer) {
       await embeddedServer.close().catch(() => undefined)
@@ -925,6 +1288,7 @@ export async function bootAshyElectronMain(
     hubWindow,
     overlayWindow,
     overlayController,
+    callWindowController,
     autoUpdater,
     trayController,
     shutdown,
@@ -950,6 +1314,7 @@ if (
       ipcMain: unknown
       safeStorage: unknown
       globalShortcut: unknown
+      session: unknown
       Tray: unknown
       Menu: unknown
     }>
@@ -961,6 +1326,7 @@ if (
         ipcMain,
         safeStorage,
         globalShortcut,
+        session,
         Tray,
         Menu,
       } = electronMod
@@ -989,6 +1355,8 @@ if (
         ipcMain: ipcMain as unknown as ElectronIpcMainLike,
         safeStorage: safeStorage as unknown as ElectronSafeStorageLike,
         globalShortcut: globalShortcut as unknown as ElectronGlobalShortcutLike,
+        session: (session as { defaultSession?: ElectronSessionLike } | undefined)
+          ?.defaultSession,
         Tray: Tray as unknown as ElectronTrayConstructorLike,
         Menu: Menu as unknown as ElectronMenuLike,
         preloadPath,
