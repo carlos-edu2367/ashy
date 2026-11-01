@@ -81,6 +81,7 @@ import {
   type ConversationMessage,
 } from './prompt/soul-composer'
 import { recordMotifInvocation, selectEligibleMotifs } from './relational/inside-joke-engine'
+import { isPlaceholderUtterance, normalizeConversationText } from './memory/conversation-hygiene'
 import { evaluateAttentionLoop } from './initiative/attention-loop'
 import { deriveAshyRoomEnvironment } from './world/ashy-room'
 
@@ -94,6 +95,11 @@ const USER_TOOL_DECLARATION_RE =
   /uso muito\s+([^.!?\n]{3,80})/i
 const USER_PROJECT_DECLARATION_RE =
   /(?:meu projeto atual é|estou trabalhando no projeto)\s+([^.!?\n]{2,80})/i
+/** "meu gato se chama Biscoito", "minha irmã chama Ana", "o nome do meu cachorro é Thor". */
+export const USER_NAMED_RELATION_RE =
+  /(?:\b(?:[Mm]eu|[Mm]inha)\s+([a-zà-ÿ]{3,20}(?:\s+[a-zà-ÿ]{3,20})?)\s+(?:se\s+)?chama\s+|\b[Oo]\s+nome\s+d[oa]\s+(?:meu|minha)\s+([a-zà-ÿ]{3,20}(?:\s+[a-zà-ÿ]{3,20})?)\s+é\s+)([A-ZÀ-Ý][\wÀ-ÿ'-]{1,30}(?:\s+[A-ZÀ-Ý][\wÀ-ÿ'-]{1,30})?)/u
+const USER_LIVES_IN_RE = /\beu\s+moro\s+(?:em|no|na|nos|nas)\s+([^.!?\n,;]{2,60})/i
+const USER_LIKES_RE = /\beu\s+(?:gosto\s+(?:muito\s+)?de|adoro|curto|amo)\s+([^.!?\n,;]{3,60})/i
 const CLAUSE_CONTINUATION_SPLIT_RE =
   /\s*(?:,\s*(?:uso muito|eu trabalho com|meu projeto atual é|estou trabalhando no projeto|meu editor favorito é|agora meu|prefiro|amanhã|semana que vem|me lembra de|depois preciso|sempre costumo|todo dia)|\s+e\s+(?:uso muito|eu trabalho com|meu projeto atual é|estou trabalhando no projeto|pode me chamar de|meu nome é|meu editor favorito é|agora meu|prefiro|amanhã|semana que vem|me lembra de|depois preciso|sempre costumo|todo dia))(?=\s|$).*$/i
 
@@ -798,6 +804,51 @@ export class AshyCortex {
       }
     }
 
+    // 2026-11-01 — personal facts a companion must not forget (pets, family, city, likes).
+    const namedMatch = USER_NAMED_RELATION_RE.exec(cleanUserText)
+    if (namedMatch?.[3]) {
+      const noun = normKey(namedMatch[1] ?? namedMatch[2] ?? '').replace(/\s+/g, '_')
+      const nounSlug = normalizeConversationText(noun.replace(/_/g, ' ')).replace(/\s+/g, '_')
+      const name = cleanExtractedFactValue(namedMatch[3], 40)
+      if (nounSlug.length >= 3 && name.length >= 2 && !/^(?:de|do|da|que|ele|ela)$/i.test(name)) {
+        persistTurnFact({
+          defaultId: `fact-user-named-${nounSlug}`,
+          category: 'relationship',
+          predicate: `named:${noun}`,
+          object: name,
+          confidence: 0.9,
+        })
+      }
+    }
+    const livesMatch = USER_LIVES_IN_RE.exec(cleanUserText)
+    if (livesMatch?.[1]) {
+      const place = cleanExtractedFactValue(livesMatch[1], 60)
+      if (place.length >= 2) {
+        persistTurnFact({
+          defaultId: 'fact-user-lives-in',
+          category: 'identity',
+          predicate: 'lives_in',
+          object: place,
+          confidence: 0.85,
+        })
+      }
+    }
+    const likesMatch = USER_LIKES_RE.exec(cleanUserText)
+    if (likesMatch?.[1]) {
+      const liked = cleanExtractedFactValue(likesMatch[1], 60)
+      if (liked.length >= 3 && !/^(?:voc[eê]|vc|isso|disso|ele|ela|te|tu|ti|mim)(?=$|[\s,.!?;:])/i.test(liked)) {
+        const likedSlug = normalizeConversationText(liked).replace(/\s+/g, '-').slice(0, 32)
+        // One fact per liked thing (`likes:<slug>`): liking B does not invalidate liking A.
+        persistTurnFact({
+          defaultId: `fact-user-likes-${likedSlug}`,
+          category: 'interest',
+          predicate: `likes:${likedSlug}`,
+          object: liked,
+          confidence: 0.8,
+        })
+      }
+    }
+
     const isHighAffect =
       input.emotion === 'excited' ||
       input.emotion === 'sad' ||
@@ -811,6 +862,7 @@ export class AshyCortex {
 
     let episodeCreated = false
     if (
+      !isPlaceholderUtterance(cleanUserText) &&
       cleanUserText.length >= 12 &&
       (!isTrivial || factsCreated > 0 || Boolean(intentMatch))
     ) {
@@ -829,8 +881,15 @@ export class AshyCortex {
       this.db.upsertEpisodicMemory({
         id: episodeId,
         title: cleanUserText.slice(0, 60),
-        summary: `Usuário: ${cleanUserText.slice(0, 120)} | Ashy: ${cleanAssistantText.slice(0, 120)}`,
-        content: `Usuário: ${cleanUserText}\nAshy: ${cleanAssistantText}`,
+        // No assistant text (the caller judged Ashy's reply not worth remembering) → user side only.
+        summary:
+          cleanAssistantText.length > 0
+            ? `Usuário: ${cleanUserText.slice(0, 120)} | Ashy: ${cleanAssistantText.slice(0, 120)}`
+            : `Usuário: ${cleanUserText.slice(0, 160)}`,
+        content:
+          cleanAssistantText.length > 0
+            ? `Usuário: ${cleanUserText}\nAshy: ${cleanAssistantText}`
+            : `Usuário: ${cleanUserText}`,
         createdAt: now,
         lastReviewedAt: now,
         stability: 3.0,

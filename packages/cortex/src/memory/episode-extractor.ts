@@ -18,6 +18,7 @@ import * as v from 'valibot'
 import { DEFAULT_BASE_COOLDOWN_HOURS } from '../relational/inside-joke-engine'
 import { isSubstantiveTopicMessage } from './episode-segmenter'
 import { tokenizeForSearch } from './fsrs-ranker'
+import { isEchoReply, isGreetingOnlyReply, isPlaceholderUtterance } from './conversation-hygiene'
 
 const DAY_MS = 86_400_000
 
@@ -513,15 +514,22 @@ export function extractEpisodeDeterministic(
       ? (sortedMessages.slice(primaryUserIdx + 1).find((m) => m.role === 'assistant') ??
         assistantMessages[0])
       : assistantMessages[0]
-  const pairedAssistantText = sanitizeExtractedText(
-    pairedAssistantMsg?.content ?? '',
-    160,
-  )
+  // 2026-11-01: an assistant reply that parrots the user or is only a greeting / "how can I help?" is
+  // not memory material (it fed the small-model greeting loop back as a "memory").
+  const isJunkReply = (userText: string, reply: string) =>
+    isEchoReply(userText, reply) || isGreetingOnlyReply(reply) || isPlaceholderUtterance(reply)
+  const rawPairedAssistant = sanitizeExtractedText(pairedAssistantMsg?.content ?? '', 160)
+  const pairedAssistantText = isJunkReply(firstUserText, rawPairedAssistant) ? '' : rawPairedAssistant
 
-  const contentLines = sortedMessages.map((m) => {
+  const contentLines: string[] = []
+  let lastUserText = ''
+  for (const m of sortedMessages) {
     const label = m.role === 'user' ? 'Usuário' : m.role === 'assistant' ? 'Ashy' : 'Sistema'
-    return `${label}: ${sanitizeExtractedText(m.content, 600)}`
-  })
+    const text = sanitizeExtractedText(m.content, 600)
+    if (m.role === 'user') lastUserText = text
+    if (m.role === 'assistant' && isJunkReply(lastUserText, text)) continue
+    contentLines.push(`${label}: ${text}`)
+  }
   const fullContent = contentLines.join('\n')
 
   const summary = sanitizeExtractedText(

@@ -6,6 +6,7 @@ export * from './memory/fsrs-ranker'
 export * from './memory/episode-segmenter'
 export * from './memory/episode-extractor'
 export * from './memory/fsrs-turn-loop'
+export * from './memory/conversation-hygiene'
 export * from './relational/inside-joke-engine'
 export * from './affect/affect-engine'
 export {
