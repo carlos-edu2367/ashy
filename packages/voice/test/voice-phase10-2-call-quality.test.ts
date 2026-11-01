@@ -98,7 +98,7 @@ describe('Phase 10.2 textSimilarity / recap', () => {
     expect(isNearRepeat('Hoje faz sol em Fortaleza.', ['Oi!', cats])).toBe(false)
   })
 
-  it('builds ONE "[Contexto] Resumo da conversa até aqui" from the last 4 exchanges with near-duplicates removed', () => {
+  it('builds ONE recap line with only the topics the USER brought up (never Ashy\'s own lines)', () => {
     const recap = buildSessionRecap(
       [
         { user: 'oi', assistant: 'Oi! Tudo bem?' },
@@ -109,11 +109,11 @@ describe('Phase 10.2 textSimilarity / recap', () => {
       ],
       { userLabel: 'Carlos' },
     )
-    expect(recap.startsWith('[Contexto] Resumo da conversa até aqui:')).toBe(true)
-    expect(recap).not.toContain('Oi! Tudo bem?') // only the last 4 exchanges
-    expect(recap.split(cats).length - 1).toBe(1) // the repeated reply appears once
-    expect(recap).toContain('- Carlos: tudo bem?')
-    expect(recap).toContain('- Você: Eu sou a Ashy.')
+    expect(recap).toBe(
+      '[Contexto] Assuntos que Carlos já trouxe nesta conversa: «me fala de gatos»; «e cachorros?»; «tudo bem?»; «qual seu nome?». A ligação já está em andamento: não cumprimente de novo.',
+    )
+    expect(recap).not.toContain(cats) // nothing Ashy said — the 2B model copies it
+    expect(recap).not.toContain('Eu sou a Ashy.')
     expect(buildSessionRecap([])).toBe('')
   })
 })

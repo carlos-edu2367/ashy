@@ -187,10 +187,11 @@ describe('Phase 10.2 CallEngine — session rotation', () => {
     await flush()
     expect(sentTypes(ws2)).toEqual(['session.update', 'conversation.item.create', 'response.create'])
     const [item] = userItems(ws2)
-    expect(item!.startsWith('[Contexto] Resumo da conversa até aqui:')).toBe(true)
-    expect(item).toContain(`- Usuário: me fala de gatos`)
-    expect(item).toContain(`- Você: ${cats}`)
-    expect(item).toContain('- Você: Cachorros são leais e brincalhões demais.')
+    expect(item!.startsWith('[Contexto] Assuntos que')).toBe(true)
+    expect(item).toContain('«me fala de gatos»')
+    // Ashy's own past lines never go into the recap (the 2B model copies them).
+    expect(item).not.toContain(cats)
+    expect(item).not.toContain('Cachorros são leais e brincalhões demais.')
     expect(item!.endsWith('[Contexto] hora local 21:00\n\nUsuário: me fala de gatos')).toBe(true)
     // The recap is sent once only.
     ctx.server.streamResponse(ws2, { text: ['Ok!'], audioMs: [300] })
@@ -204,19 +205,35 @@ describe('Phase 10.2 CallEngine — session rotation', () => {
     expect(userItems(ws1)).toHaveLength(2)
   })
 
-  it('rotates immediately after a near-repeat reply, with the repeat deduped from the recap', async () => {
+  it('a near-repeat reply does NOT rotate the session (rotation-with-recap caused the greeting loop)', async () => {
     const ctx = setup()
     await startCall(ctx)
     await runTurn(ctx, cats)
     expect(ctx.server.sockets).toHaveLength(1)
     await runTurn(ctx, `Claro! ${cats}`) // "tudo bem?" answered with the cats answer again
     await flush()
+    expect(ctx.server.sockets).toHaveLength(1) // same continuous session
+    await speakTurn(ctx)
+    await flush()
+    expect(userItems(ctx.server.last).some((t) => t.includes('Gatos são ótimos parceiros'))).toBe(false)
+  })
+
+  it('a RUN of near-repeats (stuck model) rotates once, with a user-only recap that forbids a new greeting', async () => {
+    const ctx = setup()
+    await startCall(ctx)
+    await runTurn(ctx, cats)
+    await runTurn(ctx, `Claro! ${cats}`)
+    await flush()
+    expect(ctx.server.sockets).toHaveLength(1)
+    await runTurn(ctx, `Pois é. ${cats}`) // second consecutive repeat → stuck
+    await flush()
     expect(ctx.server.sockets).toHaveLength(2)
     await speakTurn(ctx)
     await flush()
-    const item = userItems(ctx.server.last)[0]!
-    expect(item.startsWith('[Contexto] Resumo da conversa até aqui:')).toBe(true)
-    expect(item.split('Gatos são ótimos parceiros').length - 1).toBe(1)
+    const [item] = userItems(ctx.server.last)
+    expect(item!.startsWith('[Contexto] Assuntos que')).toBe(true)
+    expect(item).toContain('não cumprimente de novo')
+    expect(item).not.toContain('Gatos são ótimos parceiros')
   })
 
   it('rotates when the token estimate passes 70 % of contextSize', async () => {
@@ -230,7 +247,7 @@ describe('Phase 10.2 CallEngine — session rotation', () => {
     expect(ctx.server.sockets).toHaveLength(2)
     await speakTurn(ctx)
     await flush()
-    expect(userItems(ctx.server.last)[0]!.startsWith('[Contexto] Resumo da conversa até aqui:')).toBe(true)
+    expect(userItems(ctx.server.last)[0]!.startsWith('[Contexto] Assuntos que')).toBe(true)
   })
 
   it('a due rotation after a barge-in completes before the next turn is submitted', async () => {
@@ -252,7 +269,7 @@ describe('Phase 10.2 CallEngine — session rotation', () => {
     expect(ctx.server.sockets).toHaveLength(2)
     const ws2 = ctx.server.last
     expect(sentTypes(ws2)).toEqual(['session.update', 'conversation.item.create', 'response.create'])
-    expect(userItems(ws2)[0]!).toContain('[Contexto] Resumo da conversa até aqui:')
+    expect(userItems(ws2)[0]!).toContain('[Contexto] Assuntos que')
     expect(userItems(ws1)).toHaveLength(2)
   })
 })

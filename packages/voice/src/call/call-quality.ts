@@ -56,6 +56,12 @@ export function textSimilarity(a: string, b: string): number {
 /** Threshold above which a reply counts as a near-repeat (plan 10.2: ≥ 0.8 vs any of the last 6 replies). */
 export const NEAR_REPEAT_SIMILARITY = 0.8
 export const NEAR_REPEAT_WINDOW = 6
+/**
+ * Loop self-heal (2026-11-01): this many CONSECUTIVE near-repeat replies rotate the session. One repeat
+ * never does (see the engine); a stuck run is escaped with a fresh session whose recap only lists the
+ * user's topics, so there is no assistant line left to copy.
+ */
+export const STUCK_REPEAT_ROTATE = 2
 
 export function isNearRepeat(reply: string, previous: readonly string[], threshold = NEAR_REPEAT_SIMILARITY): boolean {
   if (!reply.trim()) return false
@@ -93,24 +99,17 @@ export function buildSessionRecap(exchanges: readonly CallExchange[], opts: Sess
   const maxExchanges = opts.maxExchanges ?? 4
   const maxChars = opts.maxCharsPerLine ?? 220
   const label = (opts.userLabel ?? '').trim() || 'Usuário'
+  // Only what the user brought up. Ashy's own past lines are deliberately left out: the 2B model
+  // copies any assistant sentence it sees in the turn (2026-11-01 reproduction of the greeting loop).
   const recent = exchanges.slice(-maxExchanges)
   const keptUser: string[] = []
-  const keptAssistant: string[] = []
-  const lines: string[] = []
   for (const ex of recent) {
     const user = ex.user.trim()
-    const assistant = ex.assistant.trim()
-    if (user && !isNearRepeat(user, keptUser)) {
-      keptUser.push(user)
-      lines.push(`- ${label}: ${clip(user, maxChars)}`)
-    }
-    if (assistant && !isNearRepeat(assistant, keptAssistant)) {
-      keptAssistant.push(assistant)
-      lines.push(`- Você: ${clip(assistant, maxChars)}`)
-    }
+    if (user && !isNearRepeat(user, keptUser)) keptUser.push(clip(user, maxChars))
   }
-  if (lines.length === 0) return ''
-  return `[Contexto] Resumo da conversa até aqui:\n${lines.join('\n')}\n(Não repita respostas anteriores; responda só à nova fala.)`
+  if (keptUser.length === 0) return ''
+  // The fresh session's "first reply" must not greet again: the call is already going on.
+  return `[Contexto] Assuntos que ${label} já trouxe nesta conversa: ${keptUser.map((u) => `«${u}»`).join('; ')}. A ligação já está em andamento: não cumprimente de novo.`
 }
 
 // ───────────────────────────── ACT markers ─────────────────────────────
@@ -218,4 +217,74 @@ function pushSpan(spans: SentenceSpan[], text: string, start: number, end: numbe
   const trimmed = slice.trim()
   if (!trimmed) return
   spans.push({ start: start + lead, end, text: trimmed })
+}
+
+// ───────────────────────────── conversation guard (2026-11-01) ─────────────────────────────
+
+/**
+ * The user's words inside a transcribed turn item (`formatTranscribedUserTurn`): the last paragraph,
+ * without a leading "<Nome>: " label. '' when the item has no user words.
+ */
+export function userUtteranceOfTurnItem(item: string): string {
+  const paragraphs = (item ?? '').split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean)
+  const last = paragraphs.at(-1) ?? ''
+  if (/^\[(?:contexto|tela|sua fala)/i.test(last)) return ''
+  return last.replace(/^[\p{L}\p{N} .'-]{1,40}:\s+/u, '').trim()
+}
+
+function normalizedWords(text: string): string {
+  return text
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9\s]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** True when `sentence` repeats the user's `utterance` (similarity ≥ 0.8, or it starts with it). */
+export function isEchoOfUtterance(utterance: string, sentence: string): boolean {
+  const u = normalizedWords(utterance)
+  const s = normalizedWords(sentence)
+  if (u.length === 0 || s.length === 0) return false
+  if (s === u) return true
+  if (u.split(' ').length >= 3 && s.startsWith(u)) return true
+  return u.split(' ').length >= 2 && textSimilarity(utterance, sentence) >= 0.8
+}
+
+const LEADING_FILLER_RE = /^(?:(?:ah+|oh+|hum+|hmm+|ok|okay|certo|claro|ol[aá]|oi)[,!.…]?\s+)+/i
+
+/**
+ * Echo guard for text-first backends (hybrid): when the reply OPENS by repeating the user's utterance
+ * (LFM3-2B habit: "O que você sabe fazer?" → "O que você sabe fazer? …"), the char offset where the real
+ * answer starts (0 = no echo). `whole` = the reply is nothing but the echo.
+ */
+export function echoedOpening(utterance: string, reply: string): { cut: number; whole: boolean } {
+  const text = reply ?? ''
+  if (!utterance.trim() || !text.trim()) return { cut: 0, whole: false }
+  const lead = text.length - text.trimStart().length
+  const body = text.slice(lead)
+  const filler = LEADING_FILLER_RE.exec(body)?.[0] ?? ''
+  const rest = body.slice(filler.length)
+  const m = /^(.+?[.!?…]+)(?=\s|$)/s.exec(rest)
+  const first = m ? m[1]! : rest
+  if (!isEchoOfUtterance(utterance, first)) return { cut: 0, whole: false }
+  const cut = lead + filler.length + first.length
+  const remaining = text.slice(cut)
+  const ws = remaining.length - remaining.trimStart().length
+  return { cut: cut + ws, whole: remaining.trim().length === 0 }
+}
+
+/**
+ * Removes Ashy addressing HERSELF by name — the 2B model mirrors the user's vocative ("Oi, Ashy!" →
+ * "Oi, Ashy! Tudo bem?"): ", Ashy" before punctuation, or "Oi/Olá/Boa noite… Ashy". Text is otherwise kept.
+ */
+export function removeSelfVocative(text: string, assistantName = 'Ashy'): string {
+  const name = assistantName.replace(/[^\p{L}\p{N}]/gu, '')
+  if (!name) return text
+  const greet = '(oi|ol[aá]|ei|e a[ií]|bom dia|boa tarde|boa noite|tchau|valeu|obrigad[oa]|tudo bem|beleza)'
+  return text
+    .replace(new RegExp(`(^|[^\\p{L}])${greet},?\\s+${name}(?=[\\s!?.,…]|$)`, 'giu'), '$1$2')
+    .replace(new RegExp(`,\\s*${name}(?=\\s*[!?.…]|\\s*$)`, 'gu'), '')
+    .replace(new RegExp(`^\\s*${name}\\s*[,!]\\s*`, 'u'), '')
 }

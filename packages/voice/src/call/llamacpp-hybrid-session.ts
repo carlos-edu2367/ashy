@@ -17,11 +17,18 @@
  * Phase 10.3: tools pass through to the realtime session (tool steps, `submitToolResults`); every
  * per-response `output_modalities` override is forced to text on the wire. `speakText` speaks a ready
  * text (a tool step that called nothing) through the same phrase TTS, without a new generation.
+ *
+ * 2026-11-01 conversation guard (small-model quality, default on): the reply to a user turn is held until
+ * its first sentence is complete (~100–200 ms of text generation). A first sentence that repeats the
+ * user's utterance is dropped before TTS (LFM3-2B echo habit); a reply that is NOTHING but the echo is
+ * regenerated once with a private nudge. Ashy addressing herself by name ("Oi, Ashy!" mirrored from the
+ * user) is removed from what is spoken and reported.
  */
 import type { CallSynthesizeResult } from '@ashy/shared'
 import { cleanSpeakableMarkdown } from '../markdown-segmenter'
 import { createTtsChunker, type TtsChunker } from '../tts-chunker'
 import { createLlamaCppRealtimeSession, type LlamaCppRealtimeSession } from './llamacpp-realtime-session'
+import { echoedOpening, removeSelfVocative, userUtteranceOfTurnItem } from './call-quality'
 import { base64ToInt16 } from './pcm-utils'
 import type { RunawayWatchdogOptions } from './runaway-watchdog'
 import {
@@ -56,7 +63,13 @@ export interface LlamaCppHybridSessionOptions {
   watchdog?: Partial<RunawayWatchdogOptions>
   /** Chunker tuning (defaults: boost of 2 short phrases, then sentences). */
   chunker?: { boostChunks?: number; minBoostWords?: number; maxBoostWords?: number; maxChunkChars?: number }
+  /** 2026-11-01 echo / self-vocative guard (default true). */
+  conversationGuard?: boolean
 }
+
+/** Private nudge of the one regeneration after a reply that only repeated the user. */
+export const HYBRID_ECHO_RETRY_CONTEXT =
+  '[Contexto] Você só repetiu a fala do usuário. Responda a ela agora com algo novo, sem repeti-la.'
 
 export interface LlamaCppHybridSession extends VoiceSession {
   submitUserText(text: string, contextOrOptions?: string | VoiceSubmitOptions, options?: VoiceSubmitOptions): void
@@ -169,6 +182,14 @@ interface HybridResponse {
   finished: boolean
   /** Phase 10.3 — function calls of the realtime response (passed on with response_done). */
   toolCalls?: VoiceToolCall[]
+  /** Conversation guard: the user's words this reply answers (null = no echo check). */
+  utterance: string | null
+  /** Held: nothing emitted / spoken until the first sentence is judged. */
+  held: boolean
+  startedEmitted: boolean
+  /** Raw-text offset where the spoken answer starts (an echoed opening is cut). */
+  cut: number
+  retried: boolean
 }
 
 export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOptions): LlamaCppHybridSession {
@@ -206,13 +227,23 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
     },
   }
 
+  const guard = options.conversationGuard !== false
+  /** User words of the last submitted turn, consumed by the next response. */
+  let pendingUtterance: string | null = null
+  /** Set while the one echo regeneration is in flight. */
+  let pendingRetry: { utterance: string } | null = null
   let current: HybridResponse | null = null
   const byId = new Map<string, HybridResponse>()
   let closed = false
   let speakSeq = 0
 
-  function newResponse(responseId: string): HybridResponse {
+  function newResponse(responseId: string, utterance: string | null = null, retried = false): HybridResponse {
     return {
+      utterance,
+      held: guard && utterance !== null && utterance.length > 0,
+      startedEmitted: false,
+      cut: 0,
+      retried,
       responseId,
       text: '',
       fedChars: 0,
@@ -231,9 +262,13 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
     r.finished = true
     byId.delete(r.responseId)
     if (current === r) current = null
+    if (!r.startedEmitted) {
+      r.startedEmitted = true
+      emitter.emit('response_started', { responseId: r.responseId })
+    }
     emitter.emit('response_done', {
       responseId: r.responseId,
-      text: r.text,
+      text: outText(r),
       audioMs: r.audioMs,
       cancelled,
       ...(cancelled && reason ? { cancelReason: reason } : {}),
@@ -308,15 +343,22 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
 
   function enqueuePhrases(r: HybridResponse, chunks: string[]): void {
     for (const chunk of chunks) {
-      const text = speakablePhrase(chunk)
+      const text = guard ? speakablePhrase(removeSelfVocative(chunk)) : speakablePhrase(chunk)
       if (!/[\p{L}\p{N}]/u.test(text)) continue
       r.jobs.push({ index: r.jobs.length, text, state: 'queued', pcm: null, sampleRate: DEFAULT_OUTPUT_RATE })
     }
     pump(r)
   }
 
+  /** What Ashy actually says: the raw text minus a cut echo, without self-vocatives. */
+  function outText(r: HybridResponse): string {
+    const raw = r.cut > 0 ? r.text.slice(r.cut) : r.text
+    return guard ? removeSelfVocative(raw) : raw
+  }
+
   function feedText(r: HybridResponse): void {
-    const speakable = speakableStreamText(r.text)
+    if (r.held) return
+    const speakable = speakableStreamText(r.cut > 0 ? r.text.slice(r.cut) : r.text)
     if (speakable.length <= r.fedChars) return
     const fresh = speakable.slice(r.fedChars)
     r.fedChars = speakable.length
@@ -334,19 +376,66 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
     if (r && !r.finished) finish(r, true, reason)
   }
 
+  /**
+   * Judges the held first sentence: cut an echoed opening; a reply that is only the echo is regenerated
+   * once (returns false: the response was replaced). Then emits what was held and starts the TTS.
+   */
+  function release(r: HybridResponse, final: boolean): boolean {
+    const echo = echoedOpening(r.utterance ?? '', r.text)
+    // Only the echo so far: keep holding until the answer starts (or the response ends).
+    if (echo.cut > 0 && echo.whole && !final) return true
+    r.held = false
+    if (echo.cut > 0 && echo.whole && final && !r.retried && !closed) {
+      // Discard silently (nothing was emitted) and ask once more, with a private nudge.
+      r.finished = true
+      byId.delete(r.responseId)
+      if (current === r) current = null
+      pendingRetry = { utterance: r.utterance ?? '' }
+      inner.respond({ contextText: HYBRID_ECHO_RETRY_CONTEXT })
+      return false
+    }
+    if (echo.cut > 0 && !echo.whole) r.cut = echo.cut
+    if (!r.startedEmitted) {
+      r.startedEmitted = true
+      emitter.emit('response_started', { responseId: r.responseId })
+    }
+    const spoken = outText(r)
+    if (spoken) emitter.emit('response_text', { responseId: r.responseId, delta: spoken, text: spoken })
+    feedText(r)
+    return true
+  }
+
+  /** The first sentence (after a leading "Ah," / "Oi!") is complete, or long enough, to be judged. */
+  function firstSentenceReady(text: string): boolean {
+    const t = text.trim()
+    const afterLead = t.replace(/^\S+[,!]\s+/, '')
+    return /[.!?…](?:\s|$)/.test(afterLead) || t.length >= 240
+  }
+
   inner.on('response_started', ({ responseId }) => {
     if (closed) return
-    const r = newResponse(responseId)
+    const retry = pendingRetry
+    pendingRetry = null
+    const utterance = retry ? retry.utterance : pendingUtterance
+    pendingUtterance = null
+    const r = newResponse(responseId, utterance, retry !== null)
     byId.set(responseId, r)
     current = r
-    emitter.emit('response_started', { responseId })
+    if (!r.held) {
+      r.startedEmitted = true
+      emitter.emit('response_started', { responseId })
+    }
   })
 
   inner.on('response_text', ({ responseId, delta, text }) => {
     const r = byId.get(responseId)
     if (!r || r.finished || r.textDone) return
     r.text = text
-    emitter.emit('response_text', { responseId, delta, text })
+    if (r.held) {
+      if (firstSentenceReady(text)) release(r, false)
+      return
+    }
+    emitter.emit('response_text', { responseId, delta, text: guard ? outText(r) : text })
     feedText(r)
   })
 
@@ -359,6 +448,7 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
     }
     r.text = ev.text || r.text
     if (ev.toolCalls && ev.toolCalls.length > 0) r.toolCalls = ev.toolCalls
+    if (r.held && !release(r, true)) return
     feedText(r)
     r.textDone = true
     enqueuePhrases(r, r.chunker.flush())
@@ -403,14 +493,21 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
     },
     respond(opts?: { contextText?: string } & VoiceSubmitOptions) {
       cancelOwn('client')
+      pendingUtterance = null
+      pendingRetry = null
       inner.respond(opts)
     },
     submitUserText(text: string, contextOrOptions?: string | VoiceSubmitOptions, options?: VoiceSubmitOptions) {
       cancelOwn('client')
+      pendingRetry = null
+      const toolStep = (typeof contextOrOptions === 'object' ? contextOrOptions : options)?.toolChoice === 'auto'
+      pendingUtterance = guard && !toolStep ? userUtteranceOfTurnItem(text) || null : null
       inner.submitUserText(text, contextOrOptions, options)
     },
     submitToolResults(results: VoiceToolResult[], options?: VoiceSubmitOptions) {
       cancelOwn('client')
+      pendingUtterance = null
+      pendingRetry = null
       inner.submitToolResults(results, options)
     },
     speakText(text: string) {
@@ -421,6 +518,7 @@ export function createLlamaCppHybridSession(options: LlamaCppHybridSessionOption
       const r = newResponse(responseId)
       byId.set(responseId, r)
       current = r
+      r.startedEmitted = true
       emitter.emit('response_started', { responseId })
       r.text = text
       if (text) emitter.emit('response_text', { responseId, delta: text, text })

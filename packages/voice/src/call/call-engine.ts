@@ -49,6 +49,7 @@ import {
   buildSessionRecap,
   extractActMarkers,
   isNearRepeat,
+  STUCK_REPEAT_ROTATE,
   NEAR_REPEAT_WINDOW,
   splitCompletedSentences,
   stripCallMarkers,
@@ -371,6 +372,8 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
   let rotating: Promise<void> | null = null
   /** Recap to send (inside the context part of the next user turn) to a freshly opened session. */
   let pendingRecap = ''
+  /** Consecutive near-repeat replies (loop self-heal). */
+  let consecutiveRepeats = 0
   let lastUserLabel: string | undefined
 
   // ── inject / initiative (Phase 10.3) ──
@@ -708,9 +711,18 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       exchanges.push(exchange)
       if (exchanges.length > 12) exchanges.splice(0, exchanges.length - 12)
     }
-    if (rotationDue === null && fullText && isNearRepeat(fullText, recentReplies)) {
-      rotationDue = 'repetition'
-      log('near-repeat reply detected: rotating the session', { reply: fullText.slice(0, 120) })
+    // A near-repeat is only logged. Rotating on it (10.2) made things worse: the fresh session was
+    // seeded with a recap containing the repeated line, the 2B model copied it again, which rotated
+    // again — the "Olá, Carlos! Tudo bem…" loop of the 2026-11-01 real report. The same continuous
+    // session answered every turn correctly in the reproduction.
+    // 2026-11-01 loop self-heal: only a RUN of near-repeats (the model is stuck, e.g. "Entendi, Carlos. Pode
+    // um descanso, né?" on every turn) rotates; the recap now carries only the user's topics.
+    const repeated = fullText.length > 0 && isNearRepeat(fullText, recentReplies)
+    if (repeated) {
+      consecutiveRepeats += 1
+      log('near-repeat reply detected', { reply: fullText.slice(0, 120), run: consecutiveRepeats })
+    } else if (fullText) {
+      consecutiveRepeats = 0
     }
     if (fullText) {
       recentReplies.push(fullText)
@@ -718,6 +730,10 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     }
     // Phase 10.4: cloud backends manage their own context window (compression / truncation): never rotate.
     const managed = session?.caps.managesContext === true
+    if (!managed && rotationDue === null && consecutiveRepeats >= STUCK_REPEAT_ROTATE) {
+      rotationDue = 'stuck'
+      consecutiveRepeats = 0
+    }
     if (!managed && rotationDue === null && sessionTurns >= rotateAfterTurns) rotationDue = 'turns'
     if (!managed && rotationDue === null && sessionTokens >= contextSize * CONTEXT_ROTATE_RATIO) rotationDue = 'context'
     return exchange
