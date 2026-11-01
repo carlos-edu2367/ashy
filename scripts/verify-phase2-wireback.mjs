@@ -95,7 +95,9 @@ const organChecks = [
   {
     organ: 'Post-Turn FSRS-6 Memory Usage Loop',
     producer: ['packages/cortex/src/memory/fsrs-turn-loop.ts', /evaluateTurnMemoryUsage/],
-    reader: ['apps/desktop/src/host/turn-orchestrator.ts', /reviewTurnMemories/],
+    // Phase 10.1 moved the post-turn pipeline (index → FSRS review → consolidate) out of the
+    // orchestrator into post-turn-memory.ts, shared by chat turns and the live-call recorder.
+    reader: ['apps/desktop/src/host/post-turn-memory.ts', /cortex\.reviewTurnMemories\(/],
     test: ['apps/desktop/src/__tests__/phase2-memory-ui.test.tsx', /reviewTurnMemories/],
   },
   {
