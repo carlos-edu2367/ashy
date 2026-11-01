@@ -111,6 +111,20 @@ function writeSseChunk(res: http.ServerResponse, payload: unknown): void {
   res.write(`data: ${JSON.stringify(payload)}\n\n`)
 }
 
+/** One Ollama `/api/chat` NDJSON frame (one JSON object per line). */
+function writeNdjsonLine(res: http.ServerResponse, payload: unknown): void {
+  res.write(`${JSON.stringify(payload)}\n`)
+}
+
+const OLLAMA_DONE_STATS = {
+  total_duration: 120_000_000,
+  load_duration: 1_000_000,
+  prompt_eval_count: 32,
+  prompt_eval_duration: 10_000_000,
+  eval_count: 28,
+  eval_duration: 100_000_000,
+}
+
 export async function startLocalAiTestServer(
   options: StartLocalAiTestServerOptions = {},
 ): Promise<LocalAiTestServer> {
@@ -265,7 +279,7 @@ export async function startLocalAiTestServer(
         return
       }
 
-      // 6. OpenAI-compatible & Ollama chat completions
+      // 6. OpenAI-compatible chat completions (SSE) & Ollama native /api/chat (NDJSON)
       if (
         method === 'POST' &&
         (urlPath === '/v1/chat/completions' ||
@@ -277,6 +291,14 @@ export async function startLocalAiTestServer(
             ? (parsedBody as Record<string, unknown>)
             : {}
         const messages = Array.isArray(bodyObj.messages) ? bodyObj.messages : []
+        // Ollama native `/api/chat` speaks NDJSON (stream defaults to true there too); the
+        // OpenAI-compatible routes keep speaking SSE `chat.completion.chunk`s.
+        const isOllamaNative = urlPath === '/api/chat'
+        const ollamaModel = typeof bodyObj.model === 'string' ? bodyObj.model : 'lfm3-omni:2b'
+        const ollamaOptions =
+          typeof bodyObj.options === 'object' && bodyObj.options !== null
+            ? (bodyObj.options as Record<string, unknown>)
+            : {}
         const isStreaming = bodyObj.stream !== false
         const modalities = Array.isArray(bodyObj.modalities) ? bodyObj.modalities : []
         const wantsOmniAudio = modalities.includes('audio')
@@ -298,7 +320,59 @@ export async function startLocalAiTestServer(
           ) as Record<string, unknown> | undefined
         const lastUserText = extractTextFromMessageContent(lastUserMsg?.content)
 
+        const writeOllamaFinal = (
+          message: Record<string, unknown>,
+          createdAt: string,
+        ): void => {
+          // Non-streaming `/api/chat` returns a single object; streaming ends with `done:true`.
+          const finalFrame = {
+            model: ollamaModel,
+            created_at: createdAt,
+            message,
+            done: true,
+            done_reason: 'stop',
+            ...OLLAMA_DONE_STATS,
+          }
+          if (!isStreaming) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+            res.end(JSON.stringify(finalFrame))
+            return
+          }
+          writeNdjsonLine(res, finalFrame)
+          res.end()
+        }
+
+        const respondWithOllamaText = (textContent: string) => {
+          const createdAt = new Date().toISOString()
+          if (!isStreaming) {
+            writeOllamaFinal({ role: 'assistant', content: textContent }, createdAt)
+            return
+          }
+          res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8' })
+          // Split marker and body if a stage marker is present so streaming delta handling is exercised
+          const markerEndIdx = textContent.indexOf('|>')
+          const pieces =
+            markerEndIdx !== -1
+              ? [textContent.slice(0, markerEndIdx + 2), textContent.slice(markerEndIdx + 2)]
+              : [textContent]
+          for (const piece of pieces) {
+            if (piece.length === 0) continue
+            writeNdjsonLine(res, {
+              model: ollamaModel,
+              created_at: createdAt,
+              message: { role: 'assistant', content: piece },
+              done: false,
+            })
+          }
+          writeOllamaFinal({ role: 'assistant', content: '' }, createdAt)
+        }
+
         const respondWithText = (textContent: string, includeOmniAudio = false) => {
+          if (isOllamaNative) {
+            // `/api/chat` has no audio output channel, so the Omni audio branch never applies here.
+            respondWithOllamaText(textContent)
+            return
+          }
           if (!isStreaming) {
             res.writeHead(200, { 'Content-Type': 'application/json' })
             res.end(
@@ -392,7 +466,11 @@ export async function startLocalAiTestServer(
         }
 
         // Case A: Connection health ping
-        if (lastUserText.trim() === 'ping' || bodyObj.max_tokens === 8) {
+        if (
+          lastUserText.trim() === 'ping' ||
+          bodyObj.max_tokens === 8 ||
+          ollamaOptions.num_predict === 8
+        ) {
           respondWithText('pong', false)
           return
         }
@@ -474,6 +552,36 @@ export async function startLocalAiTestServer(
           Array.isArray(bodyObj.tools) &&
           bodyObj.tools.length > 0
         ) {
+          const toolCallArgs = [
+            {
+              title: 'Arquitetura Release Aprovada',
+              content: '# Arquitetura Release 1.0\nNota validada e aprovada pelo usuário.\n',
+            },
+            {
+              title: 'Rascunho Temporario Recusado',
+              content: '# Rascunho Temporário\nEsta nota será recusada no Gatekeeper.\n',
+            },
+          ]
+          if (isOllamaNative) {
+            // Ollama emits tool calls in `message.tool_calls` with `function.arguments` as an
+            // OBJECT (no ids / index), followed by the final `done:true` frame.
+            const createdAt = new Date().toISOString()
+            const message = {
+              role: 'assistant',
+              content: '',
+              tool_calls: toolCallArgs.map((args) => ({
+                function: { name: 'write_project_note', arguments: args },
+              })),
+            }
+            if (!isStreaming) {
+              writeOllamaFinal(message, createdAt)
+              return
+            }
+            res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8' })
+            writeNdjsonLine(res, { model: ollamaModel, created_at: createdAt, message, done: false })
+            writeOllamaFinal({ role: 'assistant', content: '' }, createdAt)
+            return
+          }
           res.writeHead(200, {
             'Content-Type': 'text/event-stream; charset=utf-8',
             'Cache-Control': 'no-cache, no-transform',
@@ -493,11 +601,7 @@ export async function startLocalAiTestServer(
                       type: 'function',
                       function: {
                         name: 'write_project_note',
-                        arguments: JSON.stringify({
-                          title: 'Arquitetura Release Aprovada',
-                          content:
-                            '# Arquitetura Release 1.0\nNota validada e aprovada pelo usuário.\n',
-                        }),
+                        arguments: JSON.stringify(toolCallArgs[0]),
                       },
                     },
                     {
@@ -506,10 +610,7 @@ export async function startLocalAiTestServer(
                       type: 'function',
                       function: {
                         name: 'write_project_note',
-                        arguments: JSON.stringify({
-                          title: 'Rascunho Temporario Recusado',
-                          content: '# Rascunho Temporário\nEsta nota será recusada no Gatekeeper.\n',
-                        }),
+                        arguments: JSON.stringify(toolCallArgs[1]),
                       },
                     },
                   ],
