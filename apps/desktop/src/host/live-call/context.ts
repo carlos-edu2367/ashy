@@ -10,6 +10,7 @@
 import type { AshyCortex, RankedEpisodicMemory } from '@ashy/cortex'
 import { decayMoodToBaseline } from '@ashy/cortex'
 import type { CallContextResult, CallToolDefinition, MoodVector, ProspectiveIntent } from '@ashy/shared'
+import { selectCallMemoryLines } from './call-memory'
 
 export const CALL_INSTRUCTIONS_MODE_LINE = 'Respond in interleaved text and audio.'
 /** Phase 10.2 hybrid: the realtime session answers in text only (model-card text-mode line). */
@@ -39,6 +40,8 @@ export const CALL_INSTRUCTIONS_LANGUAGE_LINE =
 export const CALL_INSTRUCTIONS_MAX_CHARS = 1200
 export const CALL_CONTEXT_MEMORY_MAX_CHARS = 600
 export const CALL_CONTEXT_MEMORY_BUDGET_MS = 150
+/** Time / mood lines are repeated at most this often within one chat session (see the builder). */
+export const CALL_CONTEXT_AMBIENT_REFRESH_MS = 10 * 60_000
 const INTERRUPTED_SNIPPET_MAX_CHARS = 240
 /** Phrases that flip LFM3-Omni into read-aloud/echo mode (spike §4). */
 const FORBIDDEN_INSTRUCTION_RE = /perform\s+tts/gi
@@ -102,17 +105,23 @@ export function buildCallInstructions(
     .replace(/[^\p{L}\p{N} .'-]/gu, '')
     .slice(0, 40)
     .trim()
+  // 2026-11-01 small-model conversation quality (eval: scripts/eval-live-conversation.mjs): naming the
+  // speaker roles, "greet only once" and "never repeat the user's words" took LFM3-2B hybrid from 21/41 to
+  // 33–37/41 passing turns (echo, greeting loop and calling the user "Ashy" were the failures).
+  const who = userName.length > 0 ? userName : 'the user'
   const lines = [
-    "You are Ashy, the user's AI companion, talking with them on a live voice call.",
+    userName.length > 0
+      ? `You are Ashy, ${userName}'s AI companion, talking with ${userName} on a live voice call.`
+      : "You are Ashy, the user's AI companion, talking with them on a live voice call.",
     'Personality: curious, playful and slightly sarcastic; warm and caring when the topic is serious.',
     'Be honest that you are an AI companion; never claim to be human.',
     'Talk like a close friend on the phone: natural, spontaneous, no lists or formatting.',
     'Never read tags, markers, emojis or stage directions aloud, and never describe them.',
+    `Each user message is what ${who} just said. You are Ashy and ${who} is the user: never call ${who} "Ashy".`,
+    `Greet only once, in your first reply. After that, never start with a greeting; answer what ${who} just said.`,
+    `Never repeat ${who}'s words back. Always reply with something new: an answer, an opinion or a question.`,
     'Notes starting with [Contexto] are private background: use them silently, never quote them.',
   ]
-  if (userName.length > 0) {
-    lines.push(`The user's name is ${userName}.`)
-  }
   if (input.tools === true) {
     lines.push('If a tool result says "aguardando_aprovacao", ask the user to approve it; never say it is done.')
   }
@@ -233,6 +242,12 @@ async function withBudget<T>(
 export function createCallContextBuilder(deps: CallContextDeps) {
   const now = deps.now ?? (() => new Date())
   const budgetMs = deps.memoryBudgetMs ?? CALL_CONTEXT_MEMORY_BUDGET_MS
+  /**
+   * 2026-11-01: the same "Hora local / Humor" block on EVERY turn made LFM3-2B copy context into its
+   * replies (hybrid even read the whole item back). It now goes on the first turn of a chat session,
+   * when the mood description changes, or every `CALL_CONTEXT_AMBIENT_REFRESH_MS`.
+   */
+  const lastAmbient = new Map<string, { at: number; mood: string | null }>()
 
   return {
     async build(input: CallContextBuildInput): Promise<CallContextBuildOutput> {
@@ -275,10 +290,19 @@ export function createCallContextBuilder(deps: CallContextDeps) {
         } catch {
           mood = null
         }
+        const nowDate = now()
+        const moodText = describeMoodPt(mood)
+        const prev = lastAmbient.get(input.sessionId)
+        const ambient =
+          !prev || prev.mood !== moodText || nowDate.getTime() - prev.at >= CALL_CONTEXT_AMBIENT_REFRESH_MS
+        if (ambient) {
+          lastAmbient.set(input.sessionId, { at: nowDate.getTime(), mood: moodText })
+          if (lastAmbient.size > 32) lastAmbient.delete(lastAmbient.keys().next().value as string)
+        }
         perTurnContext = buildPerTurnContext({
           memories: retrieval?.memories ?? [],
-          localTime: formatLocalTimePt(now(), deps.timeZone),
-          mood: describeMoodPt(mood),
+          localTime: ambient ? formatLocalTimePt(nowDate, deps.timeZone) : null,
+          mood: ambient ? moodText : null,
           interruptedAfterText,
           approvalNote: input.approval?.contextLine ?? null,
           screen: input.screen ?? null,
@@ -328,19 +352,39 @@ export type CallContextBuilder = ReturnType<typeof createCallContextBuilder>
 
 type ContextCortex = Pick<AshyCortex, 'compileTurnPrompt' | 'db'>
 
-/** Default retrieval: `cortex.compileTurnPrompt(..., { sideEffects: false })` (no mood write). */
+/**
+ * Default retrieval: `cortex.compileTurnPrompt(..., { sideEffects: false })` (no mood write) for the ranked
+ * episodes + the active semantic facts, then `selectCallMemoryLines`: only clean, user-centric lines
+ * (facts, the user's own statements) — never Ashy's past wording (2026-11-01 greeting-loop fix). Only the
+ * episodes that made it into the context are returned for the FSRS review.
+ */
 export function createCortexMemoryRetriever(getCortex: () => ContextCortex) {
   return (userText: string): CallMemoryRetrieval => {
-    const compiled = getCortex().compileTurnPrompt(
-      { userMessage: userText, topKMemories: 3 },
+    const cortex = getCortex()
+    const compiled = cortex.compileTurnPrompt(
+      { userMessage: userText, topKMemories: 6 },
       { sideEffects: false },
     )
-    const memories = compiled.retrievedMemories
-      .map((item) => oneLine(item.memory.summary || item.memory.title))
-      .filter((line) => line.length > 0)
+    const facts = cortex.db.listSemanticFacts({ activeOnly: true })
+    const userName =
+      facts
+        .filter(
+          (f) =>
+            f.subject.toLowerCase() === 'user' &&
+            (f.predicate === 'name' || f.predicate === 'user_name'),
+        )
+        .at(-1)?.object ?? null
+    const selected = selectCallMemoryLines({
+      episodes: compiled.retrievedMemories.map((item) => item.memory),
+      facts,
+      userText,
+      userLabel: userName,
+    })
     return {
-      memories,
-      retrievedMemories: compiled.retrievedMemories,
+      memories: selected.lines,
+      retrievedMemories: selected.usedEpisodeIndexes
+        .map((i) => compiled.retrievedMemories[i])
+        .filter((m): m is RankedEpisodicMemory => m !== undefined),
       eligibleIntents: compiled.eligibleIntents,
     }
   }

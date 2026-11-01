@@ -56,7 +56,12 @@ function readPersisted(filePath: string): LiveModeSettings {
     if (!parsed.success) {
       return structuredClone(DEFAULT_LIVE_MODE_SETTINGS)
     }
-    return mergeSettings(DEFAULT_LIVE_MODE_SETTINGS, parsed.output)
+    const loaded = mergeSettings(DEFAULT_LIVE_MODE_SETTINGS, parsed.output)
+    // 10.3 hotfix: 6 was the 10.2 default (rotation every 6 turns fed the greeting loop) → 40.
+    if (loaded.session.rotateAfterTurns === 6) {
+      loaded.session = { ...loaded.session, rotateAfterTurns: DEFAULT_LIVE_MODE_SETTINGS.session.rotateAfterTurns }
+    }
+    return loaded
   } catch {
     // Corrupt JSON: keep a forensic copy and fall back to defaults.
     try {

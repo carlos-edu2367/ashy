@@ -9,8 +9,19 @@
  * Steps 3–4 are fault-isolated; an untranscribed turn never feeds memory.
  * Phase 10.2: turns of a TEST call (`test: true`) are ignored entirely — nothing is persisted,
  * no event, no affect, no memory.
+ * 2026-11-01 memory hygiene: the chat row keeps what Ashy said, but the memory pipeline only gets Ashy's
+ * reply when it is worth remembering — an echo of the user, a bare greeting / "how can I help?" or a
+ * near-repeat of an earlier reply of the call is indexed as '' (user side only), so a bad reply can never
+ * come back as a "memory" (the greeting loop of the 2026-11-01 real call). Placeholder transcripts
+ * ("[Mensagem de voz Omni]", ids) never feed memory.
  */
 import type { AshyCortex } from '@ashy/cortex'
+import {
+  conversationSimilarity,
+  isEchoReply,
+  isGreetingOnlyReply,
+  isPlaceholderUtterance,
+} from '@ashy/cortex'
 import { ASHY_EMOTIONS, type AshyEmotion, type ChatMessageRecord, type LiveCallHostEvent } from '@ashy/shared'
 import { runPostTurnMemoryPipeline } from '../post-turn-memory'
 import type { CallMemoryRetrieval } from './context'
@@ -71,10 +82,31 @@ export interface SkippedCallTurnResult {
 }
 
 const VALID_EMOTIONS = new Set<string>(ASHY_EMOTIONS)
+const NEAR_REPEAT_SIMILARITY = 0.8
+const RECENT_REPLIES_PER_CALL = 6
+
+/**
+ * What the memory pipeline may keep of Ashy's reply ('' = index the user side only): never an echo of
+ * the user, a bare greeting / generic offer, a placeholder or a near-repeat of a recent reply.
+ */
+export function memoryWorthyAssistantText(input: {
+  userText: string
+  assistantText: string
+  recentReplies?: readonly string[]
+  userName?: string | null
+}): string {
+  const reply = input.assistantText.trim()
+  if (reply.length === 0 || isPlaceholderUtterance(reply)) return ''
+  if (isEchoReply(input.userText, reply, { userName: input.userName ?? null })) return ''
+  if (isGreetingOnlyReply(reply, input.userName)) return ''
+  if ((input.recentReplies ?? []).some((p) => conversationSimilarity(reply, p) >= NEAR_REPEAT_SIMILARITY)) return ''
+  return reply
+}
 
 export function createCallRecorder(deps: CallRecorderDeps) {
   const now = deps.now ?? (() => Date.now())
   let sequence = 0
+  const recentRepliesByCall = new Map<string, string[]>()
 
   return {
     async recordTurn(input: RecordCallTurnInput): Promise<RecordCallTurnResult | SkippedCallTurnResult> {
@@ -112,7 +144,24 @@ export function createCallRecorder(deps: CallRecorderDeps) {
         messageIds: [userMessage?.id, assistantMessage?.id].filter((id): id is string => typeof id === 'string'),
       })
 
-      if (transcript.length > 0) {
+      const spoken = (assistantMessage?.content ?? '').trim()
+      const recent = recentRepliesByCall.get(input.callId) ?? []
+      const assistantForMemory = memoryWorthyAssistantText({
+        userText: transcript,
+        assistantText: spoken,
+        recentReplies: recent,
+      })
+      if (spoken.length > 0) {
+        recent.push(spoken)
+        if (recent.length > RECENT_REPLIES_PER_CALL) recent.splice(0, recent.length - RECENT_REPLIES_PER_CALL)
+        recentRepliesByCall.set(input.callId, recent)
+        if (recentRepliesByCall.size > 8) {
+          const oldest = recentRepliesByCall.keys().next().value
+          if (oldest !== undefined && oldest !== input.callId) recentRepliesByCall.delete(oldest)
+        }
+      }
+
+      if (transcript.length > 0 && !isPlaceholderUtterance(transcript)) {
         try {
           cortex.applyUserTurnAffect(transcript, nowMs)
         } catch (err) {
@@ -123,7 +172,7 @@ export function createCallRecorder(deps: CallRecorderDeps) {
             turnId,
             sessionId: input.sessionId,
             userText: transcript,
-            assistantText: assistantMessage?.content ?? '',
+            assistantText: assistantForMemory,
             emotion,
             nowMs: nowMs + 1,
             retrievedMemories: input.retrieval?.retrievedMemories ?? [],
