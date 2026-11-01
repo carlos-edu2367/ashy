@@ -5,6 +5,11 @@ export interface TtsChunkerOptions {
   minBoostWords?: number
   maxBoostWords?: number
   maxChunkChars?: number
+  /**
+   * Word cap of the FIRST chunk only (default: `maxBoostWords`). A short first phrase reaches the TTS
+   * sooner, so the first audio starts earlier.
+   */
+  firstChunkMaxWords?: number
   onChunk?: (chunk: string, index: number) => void
 }
 
@@ -44,6 +49,7 @@ export function createTtsChunker(options: TtsChunkerOptions = {}): TtsChunker {
   const minBoostWords = Math.max(1, options.minBoostWords ?? 4)
   const maxBoostWords = Math.max(minBoostWords, options.maxBoostWords ?? 12)
   const maxChunkChars = Math.max(16, options.maxChunkChars ?? 160)
+  const firstChunkMaxWords = Math.max(1, options.firstChunkMaxWords ?? maxBoostWords)
 
   const graphemeStreamer = createGraphemeStreamer()
   let buffer = ''
@@ -68,6 +74,8 @@ export function createTtsChunker(options: TtsChunkerOptions = {}): TtsChunker {
     }
 
     const inBoost = chunkIndex < boostChunks
+    const boostWordCap = chunkIndex === 0 ? firstChunkMaxWords : maxBoostWords
+    const softMinWords = chunkIndex === 0 ? Math.min(minBoostWords, boostWordCap) : minBoostWords
     const len = buf.length
 
     for (let i = leadingOffset; i < len; i++) {
@@ -108,7 +116,7 @@ export function createTtsChunker(options: TtsChunkerOptions = {}): TtsChunker {
           return i + 1
         }
 
-        if (inBoost && isSoft && words >= minBoostWords) {
+        if (inBoost && isSoft && words >= softMinWords) {
           return i + 1
         }
       }
@@ -116,7 +124,7 @@ export function createTtsChunker(options: TtsChunkerOptions = {}): TtsChunker {
       // In boost mode, force cut at word boundary once maxBoostWords (12) is reached
       if (inBoost && isWhitespace(ch)) {
         const candidate = buf.slice(leadingOffset, i)
-        if (countWords(candidate) >= maxBoostWords) {
+        if (countWords(candidate) >= boostWordCap) {
           return i + 1
         }
       }

@@ -1738,6 +1738,15 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     return l.itemId === responseId ? l : null
   }
 
+  function onResponseStatus(e: VoiceSessionEventMap['response_status']): void {
+    const l = ledger
+    if (!l || l.finalized || l.chunks.length > 0 || stripMarkers(l.text).trim()) return
+    // The status may arrive before `response_started` linked the ledger to this response.
+    if (l.itemId !== null && l.itemId !== e.responseId) return
+    caption = { role: 'assistant', text: e.text.slice(0, 200), final: false }
+    report()
+  }
+
   function onResponseText(e: VoiceSessionEventMap['response_text']): void {
     const l = ledgerFor(e.responseId)
     if (!l) return
@@ -1877,6 +1886,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     sessionUnsubs = [
       s.on('response_started', (e) => s === session && onResponseStarted(e)),
       s.on('response_text', (e) => s === session && onResponseText(e)),
+      s.on('response_status', (e) => s === session && onResponseStatus(e)),
       s.on('response_audio', (e) => s === session && onResponseAudio(e)),
       s.on('response_done', (e) => s === session && onResponseDone(e)),
       s.on('tool_step_started', (e) => s === session && onToolStepStarted(e)),

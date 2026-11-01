@@ -140,6 +140,11 @@ export interface VoiceSessionEventMap {
   user_turn_committed: { itemId?: string }
   response_started: { responseId: string }
   response_text: { responseId: string; delta: string; text: string }
+  /**
+   * Phase 10.5 — transient status caption while a response has produced nothing yet (e.g. the cascade
+   * LLM is still loading: "carregando o modelo…"). Never part of the response text.
+   */
+  response_status: { responseId: string; text: string }
   /** PCM16 mono at `sampleRate` (llama.cpp: session.created.session.audio.output.format.rate, 24 kHz). */
   response_audio: { responseId: string; pcm: Int16Array; sampleRate: number }
   response_done: {

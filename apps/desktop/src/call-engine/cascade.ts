@@ -3,13 +3,23 @@
  *
  * `createCascadeSessionOverBridge` builds a `CascadeSession` on top of the host bridge:
  *   startTurn → `call:cascadeTurn`, abortTurn → `call:cascadeAbort`, synthesize → `call:synthesize`
- *   (routed host-side to `settings.cascade.ttsProviderId`), and the streamed `call:cascade` host
- *   events of THIS call routed to the session.
+ *   / `call:synthesizeStream` (+ `call:ttsChunk` events, `call:synthesizeAbort`), routed host-side to
+ *   `settings.cascade.ttsProviderId`, and the streamed `call:cascade` host events of THIS call.
+ * At connect the LLM warm-up (`call:cascadeWarmup`) runs in parallel with the TTS warm-up: only the
+ * TTS one is awaited and may fail the call; an LLM warm-up failure is logged and the call continues.
  * `createCascadeCallEngine` is the CallEngine for a cascade runtime config (transcribed input forced,
  * no llama.cpp endpoint needed). Wire it from `boot.ts`' default factory:
  *   if (config.backend === 'cascade') return createCascadeCallEngine({ config, host, testInput })
  */
-import type { AshyHostBridge, AshyHostStreamEvent, CallRuntimeConfig, CallTestInput, LiveCallMethod } from '@ashy/shared'
+import type {
+  AshyHostBridge,
+  AshyHostStreamEvent,
+  CallRuntimeConfig,
+  CallSynthesizeStreamResult,
+  CallTestInput,
+  CallTtsChunk,
+  LiveCallMethod,
+} from '@ashy/shared'
 import {
   createCallEngine,
   createCascadeSession,
@@ -47,6 +57,17 @@ export function createCascadeSessionOverBridge(args: CascadeSessionOverBridgeArg
     startTurn: (request) => invoke('call:cascadeTurn', { callId, ...request }),
     abortTurn: (turnId) => invoke('call:cascadeAbort', { callId, turnId }),
     synthesize: (text) => host.synthesize({ callId, text }),
+    synthesizeStream: (request) =>
+      invoke('call:synthesizeStream', { callId, ...request }) as Promise<CallSynthesizeStreamResult>,
+    abortSynthesis: (streamId) => invoke('call:synthesizeAbort', { callId, streamId }),
+    subscribeTtsChunks: (listener) =>
+      bridge.onHostEvent((event: AshyHostStreamEvent) => {
+        const e = event as { type: string; callId?: string }
+        if (e.type !== 'call:ttsChunk' || e.callId !== callId) return
+        listener(event as unknown as CallTtsChunk)
+      }),
+    // Loads the cascade LLM (cold Ollama load can exceed the 45 s turn timeout) — not awaited by connect.
+    warmup: () => invoke('call:cascadeWarmup', { callId }),
     subscribe: (listener) =>
       bridge.onHostEvent((event: AshyHostStreamEvent) => {
         const e = event as { type: string; callId?: string }
