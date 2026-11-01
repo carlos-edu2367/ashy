@@ -505,4 +505,131 @@ test.describe.serial('Ashy Release 1.0 — Full E2E Suite', () => {
       timeout: 15_000,
     })
   })
+
+  /**
+   * Spec Phase 10 §11 row 10.6 ("E2E Flow 6 Live Call"). Named Flow 7 here because Flow 6 already
+   * exists in this suite.
+   *
+   * UI-level on purpose: this suite runs the renderer in a browser against the Vite dev host
+   * (`vite-host-plugin`), where there is no Electron main and therefore no hidden call-engine
+   * window, no webRequest header injection and no managed llama-server. A real call (mic → VAD →
+   * `/v1/realtime` → playback) cannot run here without an Electron launch and a local model, so the
+   * flow verifies the Live Mode settings contract over the REAL host RPC (`liveCall:invoke` →
+   * `liveMode:getSettings` / `liveMode:saveSettings`, persisted across a reload) and that the hub
+   * and overlay call controls render the idle call state mirrored from the host.
+   * The call engine itself is covered by the Vitest suites (packages/voice/test/voice-phase10-*,
+   * apps/desktop/src/__tests__/phase-10-*), which drive fake realtime servers.
+   */
+  test('Flow 7: Live Call — Settings › Live Mode backends, hub call button & overlay call controls', async ({
+    page,
+  }) => {
+    await page.goto('/')
+
+    // Flow 6 ends with a factory reset (and a filtered run starts from an empty userData): onboard again.
+    const wizard = page.getByTestId('first-meeting-wizard')
+    // The wizard appears once the host snapshot says "not onboarded" (after the studio shell).
+    const needsOnboarding = await wizard
+      .waitFor({ state: 'visible', timeout: 8_000 })
+      .then(() => true)
+      .catch(() => false)
+    if (needsOnboarding) {
+      await page.getByTestId('onboarding-user-name-input').fill('Carlos')
+      await page.getByTestId('onboarding-mode-local-omni').click()
+      await page.getByTestId('onboarding-base-url-input').fill(aiServer.baseUrl)
+      await page.getByTestId('onboarding-complete-btn').click()
+      await expect(wizard).toBeHidden({ timeout: 15_000 })
+    }
+
+    // 1. Hub: the dock orb is the Ligar/Desligar call button, idle (no call yet).
+    await page.getByTestId('tab-studio').click()
+    const hubCallBtn = page.getByTestId('btn-call-toggle')
+    await expect(hubCallBtn).toBeVisible()
+    await expect(hubCallBtn).toHaveAttribute('data-call-status', 'idle')
+    await expect(hubCallBtn).toHaveAttribute('aria-pressed', 'false')
+    await expect(hubCallBtn).toHaveAttribute('title', /Ctrl\+Alt\+L/)
+    await expect(page.getByTestId('call-status-label')).toHaveText('Ligar')
+    // Mute / caption / latency only exist during a call.
+    await expect(page.getByTestId('btn-call-mute')).toHaveCount(0)
+
+    // 2. Settings › Live Mode: the five backend cards, hybrid selected by default.
+    await page.getByTestId('tab-agency').click()
+    await page.getByTestId('subtab-live').click()
+    const panel = page.getByTestId('live-mode-panel')
+    await expect(panel).toBeVisible()
+    await expect(panel).toContainText('Ctrl+Alt+L')
+
+    const cards = {
+      realtime: page.getByTestId('live-backend-card-llamacpp-realtime'),
+      hybrid: page.getByTestId('live-backend-hybrid'),
+      openai: page.getByTestId('live-backend-openai-realtime'),
+      gemini: page.getByTestId('live-backend-gemini-live'),
+      cascade: page.getByTestId('live-backend-cascade'),
+    }
+    for (const card of Object.values(cards)) {
+      await expect(card).toBeVisible()
+      await expect(card).toBeEnabled()
+    }
+    await expect(cards.hybrid).toHaveAttribute('aria-pressed', 'true', { timeout: 15_000 })
+    await expect(cards.realtime).toHaveAttribute('aria-pressed', 'false')
+
+    // Hybrid: local engine panel (llama.cpp b12024), reference voice, call features, test call.
+    await expect(page.getByTestId('live-engine-panel')).toBeVisible()
+    await expect(page.getByTestId('live-engine-build')).toContainText('b12024')
+    await expect(page.getByTestId('voice-ref-section')).toBeVisible()
+    await expect(page.getByTestId('voice-ref-consent')).toBeVisible()
+    await expect(page.getByTestId('call-features-section')).toBeVisible()
+    await expect(page.getByTestId('toggle-tools-in-call')).not.toBeChecked()
+    await expect(page.getByTestId('toggle-vision-in-call')).not.toBeChecked()
+    await expect(page.getByTestId('toggle-initiative-in-call')).not.toBeChecked()
+    await expect(page.getByTestId('input-idle-nudge-sec')).toHaveValue('90')
+    await expect(page.getByTestId('btn-live-test-call')).toBeVisible()
+
+    // 3. Cloud backends show their own panels and a key field (keys are write-only from the UI).
+    await cards.openai.click()
+    await expect(cards.openai).toHaveAttribute('aria-pressed', 'true')
+    await expect(page.getByTestId('cloud-realtime-panel')).toBeVisible()
+    await expect(page.getByTestId('cloud-provider-select')).toBeVisible()
+    await expect(page.getByTestId('cloud-context-panel')).toBeVisible()
+    await expect(page.getByTestId('live-engine-panel')).toHaveCount(0)
+
+    await cards.gemini.click()
+    await expect(cards.gemini).toHaveAttribute('aria-pressed', 'true')
+    await expect(page.getByTestId('gemini-live-panel')).toBeVisible()
+    await expect(page.getByTestId('cloud-key-gemini')).toBeVisible()
+
+    // 4. Cascade: STT → text LLM → TTS selectors (default voice = llama.cpp /tts, so the engine panel shows).
+    await cards.cascade.click()
+    await expect(cards.cascade).toHaveAttribute('aria-pressed', 'true')
+    await expect(page.getByTestId('cascade-panel')).toBeVisible()
+    await expect(page.getByTestId('cascade-stt-provider')).toBeVisible()
+    await expect(page.getByTestId('cascade-llm-provider')).toBeVisible()
+    await expect(page.getByTestId('cascade-tts-provider')).toBeVisible()
+    await expect(page.getByTestId('live-engine-cascade-hint')).toBeVisible()
+
+    // 5. The backend choice is host state: it survives a reload, then we go back to hybrid.
+    await page.reload()
+    await page.getByTestId('tab-agency').click()
+    await page.getByTestId('subtab-live').click()
+    await expect(page.getByTestId('live-backend-cascade')).toHaveAttribute('aria-pressed', 'true', {
+      timeout: 15_000,
+    })
+    await page.getByTestId('live-backend-hybrid').click()
+    await expect(page.getByTestId('live-backend-hybrid')).toHaveAttribute('aria-pressed', 'true')
+
+    // 6. Floating overlay: call controls inside the quick-controls island + the call state dot.
+    await page.goto('/?view=stage-overlay')
+    await expect(page.getByTestId('floating-stage-overlay')).toBeVisible()
+    const quickControls = page.getByTestId('stage-quick-controls')
+    await expect(quickControls).toBeVisible()
+    const overlayCallBtn = quickControls.getByTestId('btn-call-toggle')
+    await expect(overlayCallBtn).toBeVisible()
+    await expect(overlayCallBtn).toHaveText('Ligar')
+    await expect(overlayCallBtn).toHaveAttribute('data-call-status', 'idle')
+    const overlayMuteBtn = quickControls.getByTestId('btn-call-mute')
+    await expect(overlayMuteBtn).toBeVisible()
+    await expect(overlayMuteBtn).toBeDisabled()
+    const dot = page.getByTestId('call-state-dot')
+    await expect(dot).toBeAttached()
+    await expect(dot).toHaveAttribute('data-call-status', 'idle')
+  })
 })
