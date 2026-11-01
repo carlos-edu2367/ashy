@@ -199,6 +199,30 @@ describe('Phase 9.2 — Ollama Native LFM3-Omni-2B 24kHz Voice Bridge & Compact 
           headers: { 'Content-Type': 'audio/wav' },
         })
       }
+      if (url === 'http://127.0.0.1:11434/api/chat') {
+        // Phase 10.0: the Ollama provider now uses the native /api/chat NDJSON adapter
+        const bodyText =
+          init?.body instanceof Uint8Array
+            ? Buffer.from(init.body).toString('utf8')
+            : String(init?.body ?? '{}')
+        const parsed = JSON.parse(bodyText) as Record<string, unknown>
+        capturedChatRequests.push(parsed)
+        const ndjson = [
+          JSON.stringify({
+            message: {
+              role: 'assistant',
+              content:
+                '<|ACT {"emotion":"curious","intensity":0.85,"motion":"head_tilt"}>Oi Carlos! Estou falando com minha voz nativa de 24kHz.',
+            },
+            done: false,
+          }),
+          JSON.stringify({ message: { role: 'assistant', content: '' }, done: true, done_reason: 'stop' }),
+        ].join('\n')
+        return new Response(`${ndjson}\n`, {
+          status: 200,
+          headers: { 'Content-Type': 'application/x-ndjson' },
+        })
+      }
       if (url.endsWith('/chat/completions')) {
         const bodyText =
           init?.body instanceof Uint8Array
@@ -276,6 +300,10 @@ describe('Phase 9.2 — Ollama Native LFM3-Omni-2B 24kHz Voice Bridge & Compact 
     // Tools must remain enabled for local Ollama
     expect(Array.isArray(chatReq.tools)).toBe(true)
     expect((chatReq.tools as unknown[]).length).toBeGreaterThan(0)
+
+    // Native /api/chat must override the GGUF's greedy top_k=1 metadata
+    expect(chatReq.options).toMatchObject({ top_k: 40, top_p: 0.9, repeat_penalty: 1.1 })
+    expect(chatReq.think).toBe(false)
 
     // Stage marker must be emitted even though LFM3 emitted }> instead of }|>
     const markerEv = events.find((e) => e.type === 'turn:marker')

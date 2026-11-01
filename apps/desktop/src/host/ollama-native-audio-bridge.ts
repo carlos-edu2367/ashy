@@ -173,6 +173,158 @@ function createBoundedAbortSignal(
   }
 }
 
+/**
+ * The llama-server `/tts` of LFM3-Omni only knows `'female' | 'male'`; the app
+ * stores persona voice ids such as `'ashy-warm-ptbr'`. Ids mentioning
+ * male/masc (and not female/fem) map to `'male'`; everything else, including
+ * unknown ids, maps to `'female'`.
+ */
+export function normalizeNativeOmniTtsVoice(voice: string | null | undefined): 'female' | 'male' {
+  const normalized = (voice ?? '').trim().toLowerCase()
+  if (!normalized) return 'female'
+  if (/fem/.test(normalized)) return 'female'
+  if (/male|masc/.test(normalized)) return 'male'
+  return 'female'
+}
+
+/**
+ * Derives the Ollama server origin from a configured base URL
+ * (`http://127.0.0.1:11434/v1` → `http://127.0.0.1:11434`).
+ */
+export function deriveOllamaOrigin(baseUrl: string | null | undefined): string | null {
+  const trimmed = (baseUrl ?? '').trim()
+  if (!trimmed) return null
+  try {
+    return new URL(trimmed).origin
+  } catch {
+    return null
+  }
+}
+
+/** Prefixes that only a model describing the clip would produce. */
+const META_TRANSCRIPT_PREFIXES = [
+  'a unica palavra',
+  'o audio',
+  'este audio',
+  'esse audio',
+  'neste audio',
+  'nesse audio',
+  'no audio',
+  'a gravacao',
+  'nesta gravacao',
+  'o usuario disse',
+  'o usuario falou',
+  'aqui esta a transcricao',
+  'a transcricao',
+  'transcricao:',
+  'the audio',
+  'the only word',
+  'the transcription',
+]
+
+/**
+ * Apology/negation prefixes. A real user can say "Não consigo dormir" or
+ * "Desculpe, Ashy", so these only reject when the text also talks about the
+ * audio itself (see `AUDIO_META_TERMS`).
+ */
+const APOLOGY_TRANSCRIPT_PREFIXES = [
+  'nao ha',
+  'nao consigo',
+  'nao foi possivel',
+  'nao e possivel',
+  'nao entendi',
+  'nao identifiquei',
+  'desculpe',
+  'sinto muito',
+  'there is no',
+  "i'm sorry",
+  'i am sorry',
+  'sorry',
+  'i cannot',
+  "i can't",
+]
+
+const AUDIO_META_TERMS =
+  /\b(audio|som|sons|fala|falad[ao]s?|voz|transcri\w*|gravacao|palavras?|ouvir|ouvi|entender o que|speech|transcrib\w*|recording|words?)\b/
+
+/**
+ * Heuristic: LFM3-Omni, when given junk/short audio, sometimes answers like a
+ * chat assistant describing the clip (e.g. `A única palavra falada é "Ah".`)
+ * instead of returning a transcript. A result is rejected (treated as failed
+ * ASR) when, after lowercasing and stripping accents, it:
+ *  - starts with a meta prefix (`META_TRANSCRIPT_PREFIXES`: "A única palavra",
+ *    "O áudio", "A transcrição", …), or
+ *  - starts with an apology/negation prefix (`APOLOGY_TRANSCRIPT_PREFIXES`:
+ *    "Não há", "Não consigo", "Desculpe", …) AND mentions the audio itself
+ *    (áudio/fala/voz/transcrição/palavra/ouvir…), or
+ *  - quotes something while describing the audio (a quote character plus one
+ *    of: palavra, frase, áudio, falado(a), dito(a), transcrição), or
+ *  - is a bracketed/parenthesized non-speech tag (`[silêncio]`, `(inaudível)`)
+ *    or has no letters at all.
+ */
+export function isChatStyleNonTranscript(text: string | null | undefined): boolean {
+  const trimmed = (text ?? '').trim()
+  if (!trimmed) return true
+  const normalized = trimmed
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+  if (!/\p{L}/u.test(normalized)) return true
+  if (/^[[(*].*[\])*]$/.test(normalized)) return true
+  const head = normalized.replace(/^["'“”«»\s]+/, '')
+  if (META_TRANSCRIPT_PREFIXES.some((prefix) => head.startsWith(prefix))) return true
+  if (
+    APOLOGY_TRANSCRIPT_PREFIXES.some((prefix) => head.startsWith(prefix)) &&
+    AUDIO_META_TERMS.test(normalized)
+  ) {
+    return true
+  }
+  const hasQuote = /["“”«»]/.test(normalized)
+  if (hasQuote && /\b(palavra|frase|audio|falad[ao]s?|dit[ao]|transcri\w*)\b/.test(normalized)) {
+    return true
+  }
+  return false
+}
+
+async function transcribeViaOllamaOfficialEndpoint(input: {
+  wavBytes: Buffer
+  origin: string
+  modelId: string
+  language: string
+  signal?: AbortSignal
+  timeoutMs: number
+  fetchFn: typeof fetch
+}): Promise<{ ok: true; text: string } | { ok: false }> {
+  const form = new FormData()
+  form.append('model', input.modelId)
+  form.append('language', input.language)
+  form.append(
+    'file',
+    new Blob([new Uint8Array(input.wavBytes)], { type: 'audio/wav' }),
+    'audio.wav',
+  )
+  const bounded = createBoundedAbortSignal(input.signal, input.timeoutMs)
+  try {
+    const res = await input.fetchFn(`${input.origin}/v1/audio/transcriptions`, {
+      method: 'POST',
+      body: form,
+      signal: bounded.signal,
+    })
+    if (!res.ok) {
+      return { ok: false }
+    }
+    const json = (await res.json()) as { text?: unknown }
+    if (typeof json.text !== 'string') {
+      return { ok: false }
+    }
+    return { ok: true, text: stripResidualStageMarkers(json.text).trim() }
+  } catch {
+    return { ok: false }
+  } finally {
+    bounded.cleanup()
+  }
+}
+
 export async function synthesizeNativeOllamaOmniSpeech(input: {
   text: string
   voice?: string
@@ -199,7 +351,7 @@ export async function synthesizeNativeOllamaOmniSpeech(input: {
     return null
   }
 
-  const mappedVoice = input.voice === 'male' ? 'male' : 'female'
+  const mappedVoice = normalizeNativeOmniTtsVoice(input.voice)
   const payload = Buffer.from(
     JSON.stringify({
       input: cleanText,
@@ -271,6 +423,32 @@ export async function transcribeNativeOllamaOmniAudio(input: {
   }
 
   const fetchFn = input.fetchImpl ?? globalThis.fetch
+  const timeoutMs = input.timeoutMs ?? 20_000
+
+  // 1. Official Ollama endpoint (Phase 10.0). A chat-style answer here means
+  // the model heard nothing usable: fail the ASR without retrying the hidden
+  // llama-server (same model, same audio). Only transport/HTTP/format failures
+  // fall through to the legacy path.
+  const ollamaOrigin = deriveOllamaOrigin(input.ollamaBaseUrl)
+  if (ollamaOrigin && input.modelId) {
+    const official = await transcribeViaOllamaOfficialEndpoint({
+      wavBytes: Buffer.from(cleanBase64, 'base64'),
+      origin: ollamaOrigin,
+      modelId: input.modelId,
+      language: input.language ?? 'pt',
+      signal: input.signal,
+      timeoutMs,
+      fetchFn,
+    })
+    if (input.signal?.aborted) {
+      return null
+    }
+    if (official.ok) {
+      return isChatStyleNonTranscript(official.text) ? null : official.text
+    }
+  }
+
+  // 2. Legacy fallback: hidden llama-server child discovered via server.log.
   const resolvedLlamaBase =
     input.llamaServerBaseUrl ??
     (await discoverOllamaLlamaServerBaseUrl({
@@ -311,7 +489,7 @@ export async function transcribeNativeOllamaOmniAudio(input: {
     'utf8',
   )
 
-  const bounded = createBoundedAbortSignal(input.signal, input.timeoutMs ?? 20_000)
+  const bounded = createBoundedAbortSignal(input.signal, timeoutMs)
   try {
     const res = await fetchFn(endpoint, {
       method: 'POST',
@@ -329,7 +507,7 @@ export async function transcribeNativeOllamaOmniAudio(input: {
     }
     const rawContent = json.choices?.[0]?.message?.content ?? ''
     const cleaned = stripResidualStageMarkers(rawContent).trim()
-    return cleaned.length > 0 ? cleaned : null
+    return cleaned.length > 0 && !isChatStyleNonTranscript(cleaned) ? cleaned : null
   } catch {
     return null
   } finally {

@@ -35,6 +35,12 @@ import {
 import { decodeWavToPcmBlocks, extractPcmFrameVowelWeights } from '@ashy/voice'
 import type { HostAgencyRuntime } from './agency-runtime'
 import {
+  OMNI_MEDIA_PLACEHOLDER_TEXT,
+  OMNI_VOICE_PLACEHOLDER_TEXT,
+  resolveConversationHistoryLimits,
+  sanitizeConversationHistory,
+} from './conversation-history'
+import {
   buildCompactLocalOmniSystemPrompt,
   synthesizeNativeOllamaOmniSpeech,
   transcribeNativeOllamaOmniAudio,
@@ -308,15 +314,66 @@ export function resolveOmniTurnUserText(input: {
   }
   if (input.inputAudio) {
     return {
-      effectiveUserText: '[Mensagem de voz Omni]',
+      effectiveUserText: OMNI_VOICE_PLACEHOLDER_TEXT,
       inputTranscriptSource: null,
       emittedTranscript: null,
     }
   }
   return {
-    effectiveUserText: '[Mídia enviada para análise Omni]',
+    effectiveUserText: OMNI_MEDIA_PLACEHOLDER_TEXT,
     inputTranscriptSource: null,
     emittedTranscript: null,
+  }
+}
+
+/** Minimum PCM duration for a transcript-less voice turn to be transcribed/sent. */
+export const MIN_OMNI_INPUT_AUDIO_DURATION_MS = 400
+/** RMS (full scale = 1.0) below which a clip is treated as digital silence (~ -56 dBFS). */
+export const SILENT_OMNI_INPUT_AUDIO_RMS = 0.0015
+/** Content of the (non-persisted) user record returned for a discarded clip. */
+export const OMNI_DISCARDED_SHORT_AUDIO_TEXT = '🎤 (áudio curto ignorado)'
+
+export interface OmniInputAudioAssessment {
+  durationMs: number
+  rms: number
+  tooShort: boolean
+  silent: boolean
+}
+
+/**
+ * Decodes the WAV payload of a voice turn and measures real PCM duration and
+ * RMS. Returns null for non-WAV formats or undecodable payloads, in which case
+ * callers must not block the turn (the legacy fallback path handles them).
+ */
+export function assessOmniInputAudio(inputAudio: {
+  dataBase64: string
+  format: 'wav' | 'pcm16' | 'mp3'
+}): OmniInputAudioAssessment | null {
+  if (inputAudio.format !== 'wav') return null
+  try {
+    const cleanB64 = inputAudio.dataBase64.replace(/^data:audio\/[\w+-]+;base64,/i, '').trim()
+    if (!cleanB64) return null
+    const wavBytes = Buffer.from(cleanB64, 'base64')
+    const decoded = decodeWavToPcmBlocks(
+      wavBytes.buffer.slice(wavBytes.byteOffset, wavBytes.byteOffset + wavBytes.byteLength),
+    )
+    const samples = decoded.samples
+    const durationMs =
+      decoded.sampleRate > 0 ? (samples.length / decoded.sampleRate) * 1000 : decoded.totalDurationMs
+    let sumSquares = 0
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i] ?? 0
+      sumSquares += s * s
+    }
+    const rms = samples.length > 0 ? Math.sqrt(sumSquares / samples.length) : 0
+    return {
+      durationMs,
+      rms,
+      tooShort: durationMs < MIN_OMNI_INPUT_AUDIO_DURATION_MS,
+      silent: rms < SILENT_OMNI_INPUT_AUDIO_RMS,
+    }
+  } catch {
+    return null
   }
 }
 
@@ -388,6 +445,44 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
   }> {
     const input = v.parse(SendTurnInputSchema, rawInput)
 
+    // 0. Phase 10.0 ASR guard: a voice turn without any transcript whose WAV
+    // holds < 400 ms of PCM (or is digitally silent) is discarded before it can
+    // barge-in the current reply, be persisted, or reach ASR/LLM (sub-second
+    // clips made LFM3 hallucinate words like "Tchevin").
+    const preResolved = resolveOmniTurnUserText(input)
+    if (
+      input.inputAudio &&
+      preResolved.inputTranscriptSource === null &&
+      preResolved.effectiveUserText === OMNI_VOICE_PLACEHOLDER_TEXT &&
+      !(input.attachments && input.attachments.length > 0)
+    ) {
+      const assessment = assessOmniInputAudio(input.inputAudio)
+      if (assessment && (assessment.tooShort || assessment.silent)) {
+        turnSequence += 1
+        const now = Date.now()
+        const turnId = `turn-${now}-${turnSequence}`
+        const discardedUserMessage: ChatMessageRecord = {
+          id: `msg-user-${turnId}`,
+          sessionId: input.sessionId,
+          role: 'user',
+          content: OMNI_DISCARDED_SHORT_AUDIO_TEXT,
+          rawContent: OMNI_DISCARDED_SHORT_AUDIO_TEXT,
+          emotion: 'neutral',
+          markersJson: '[]',
+          createdAt: now,
+        }
+        queueMicrotask(() => {
+          emit({
+            type: 'turn:aborted',
+            turnId,
+            sessionId: input.sessionId,
+            partialText: '',
+          })
+        })
+        return { turnId, userMessage: discardedUserMessage }
+      }
+    }
+
     // 1. If an active turn is already running on input.sessionId, abort it first
     const existingTurn = activeTurnsBySession.get(input.sessionId)
     if (existingTurn) {
@@ -407,7 +502,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     const turnId = `turn-${now}-${turnSequence}`
 
     // 3. Append the user message via cortex.appendChatMessage
-    const { effectiveUserText, inputTranscriptSource } = resolveOmniTurnUserText(input)
+    const { effectiveUserText, inputTranscriptSource } = preResolved
     const userMessage = cortex.appendChatMessage({
       id: `msg-user-${turnId}`,
       sessionId: input.sessionId,
@@ -640,12 +735,19 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
 
     try {
       const historyRecords = cortex.listChatMessages(sessionId, MAX_HISTORY_MESSAGES)
-      const priorConversationHistory = historyRecords
-        .filter((m) => m.id !== userMessage.id)
-        .map((m) => ({
-          role: m.role,
-          content: m.content,
-        }))
+      // Phase 10.0: drop placeholder voice turns (+ the reply that answered
+      // them), collapse near-duplicate assistant replies and cap per provider
+      // (Ollama: 8 msgs / ~6000 chars) so small local models stop parroting a
+      // poisoned history.
+      const priorConversationHistory = sanitizeConversationHistory(
+        historyRecords
+          .filter((m) => m.id !== userMessage.id)
+          .map((m) => ({
+            role: m.role,
+            content: m.content,
+          })),
+        resolveConversationHistoryLimits(providerState.activeProviderId),
+      )
 
       const voiceIdentityMarkdown = voiceStore.read().content
       const activeConfig = providerState.configs[providerState.activeProviderId]
@@ -821,7 +923,7 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
         const effectiveUserTurnText =
           providerState.activeProviderId === 'ollama' &&
           input.inputAudio &&
-          currentEffectiveUserText === '[Mensagem de voz Omni]'
+          currentEffectiveUserText === OMNI_VOICE_PLACEHOLDER_TEXT
             ? 'Responda diretamente em português ao áudio falado pelo usuário.'
             : compiled.userTurnContent
         userParts.push({

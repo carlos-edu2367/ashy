@@ -234,9 +234,13 @@ describe('AshyHostKernel & TurnOrchestrator', () => {
     const snap = await kernel.completeOnboarding({
       userName: 'Carlos',
       providerConfig: {
-        providerId: 'ollama',
-        baseUrl: 'http://127.0.0.1:11434/v1',
+        // Phase 10.0: the 'ollama' provider now uses the native /api/chat adapter (no audio-out
+        // over SSE). This scenario exercises an OpenAI-compatible omni server (e.g. llama-server)
+        // that streams `delta.audio`, so it runs on the OpenAI-compatible provider path.
+        providerId: 'openai',
+        baseUrl: 'http://127.0.0.1:8080/v1',
         modelId: 'lfm3-omni:2b',
+        apiKey: 'sk-local-omni-test',
         omniExecutionMode: 'native-omni',
         omniVoiceId: 'female',
       },

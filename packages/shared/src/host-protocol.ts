@@ -60,6 +60,7 @@ export const STT_PROVIDER_IDS = [
   'local-whisper-http',
   'web-speech-stt',
   'deterministic-wav-stt',
+  'ollama-transcriptions',
 ] as const
 
 export type SttProviderId = (typeof STT_PROVIDER_IDS)[number]
@@ -75,6 +76,30 @@ export const TTS_PROVIDER_IDS = [
 
 export type TtsProviderId = (typeof TTS_PROVIDER_IDS)[number]
 export const TtsProviderIdSchema = v.picklist(TTS_PROVIDER_IDS)
+
+/**
+ * Phase 10.0: diagnostic-only providers. They stay registered so fixtures and
+ * scenario tests can force them explicitly, but they are never production
+ * defaults and are not offered in the voice settings UI.
+ * - `deterministic-wav-stt` classifies audio by pitch into canned phrases.
+ * - `local-synth-fallback` is a 185 Hz harmonic buzz tone.
+ */
+export const DIAGNOSTIC_STT_PROVIDER_IDS: readonly SttProviderId[] = ['deterministic-wav-stt']
+export const DIAGNOSTIC_TTS_PROVIDER_IDS: readonly TtsProviderId[] = ['local-synth-fallback']
+
+export const USER_SELECTABLE_STT_PROVIDER_IDS: readonly SttProviderId[] =
+  STT_PROVIDER_IDS.filter((id) => !DIAGNOSTIC_STT_PROVIDER_IDS.includes(id))
+export const USER_SELECTABLE_TTS_PROVIDER_IDS: readonly TtsProviderId[] =
+  TTS_PROVIDER_IDS.filter((id) => !DIAGNOSTIC_TTS_PROVIDER_IDS.includes(id))
+
+/**
+ * Code the host uses when the requested TTS provider must run in the renderer
+ * (`window.speechSynthesis`). The host never synthesizes audio for
+ * `web-speech-tts`: it returns a `VoiceSynthesizeSpeechResult` with
+ * `delivery: 'use-browser-tts'` and an empty `audioBase64`.
+ */
+export const USE_BROWSER_TTS_CODE = 'use-browser-tts' as const
+export type UseBrowserTtsCode = typeof USE_BROWSER_TTS_CODE
 
 export const VOICE_FIXTURE_IDS = [
   'thinking-pause-cas',
@@ -425,16 +450,54 @@ export const VoiceRuntimeSettingsSchema = v.object({
   maskedElevenLabsApiKey: v.optional(v.nullable(v.string())),
 })
 
+/**
+ * Phase 10.0 defaults. `ollama-transcriptions` (Ollama `/v1/audio/transcriptions`)
+ * is the static STT default; the host resolves it at runtime and falls back to
+ * `local-whisper-http` when the active chat provider is not Ollama and Ollama is
+ * unreachable. TTS defaults to the browser's `speechSynthesis` (`web-speech-tts`).
+ * Wake word is off by default: in continuous mode it re-locked the conversation
+ * after every turn. Explicitly persisted user values are respected.
+ */
 export const DEFAULT_VOICE_RUNTIME_SETTINGS: VoiceRuntimeSettings = {
-  activeSttProviderId: 'deterministic-wav-stt',
-  activeTtsProviderId: 'local-synth-fallback',
+  activeSttProviderId: 'ollama-transcriptions',
+  activeTtsProviderId: 'web-speech-tts',
   sttBaseUrl: 'http://127.0.0.1:8080',
   sttModelId: 'whisper-1',
   ttsBaseUrl: 'http://127.0.0.1:8880',
   ttsModelId: 'kokoro-v1',
   ttsVoiceId: 'ashy-pt-br',
-  wakeWordEnabled: true,
+  wakeWordEnabled: false,
   wakeWordPhrases: ['ashy', 'ei ashy', 'oi ashy'],
+}
+
+/**
+ * Heals a persisted STT provider id: unknown values and the diagnostic fake
+ * (`deterministic-wav-stt`) become the production default.
+ */
+export function migrateStoredSttProviderId(raw: unknown): SttProviderId {
+  if (
+    typeof raw === 'string' &&
+    (STT_PROVIDER_IDS as readonly string[]).includes(raw) &&
+    !(DIAGNOSTIC_STT_PROVIDER_IDS as readonly string[]).includes(raw)
+  ) {
+    return raw as SttProviderId
+  }
+  return DEFAULT_VOICE_RUNTIME_SETTINGS.activeSttProviderId
+}
+
+/**
+ * Heals a persisted TTS provider id: unknown values and the diagnostic buzz
+ * tone (`local-synth-fallback`) become the production default.
+ */
+export function migrateStoredTtsProviderId(raw: unknown): TtsProviderId {
+  if (
+    typeof raw === 'string' &&
+    (TTS_PROVIDER_IDS as readonly string[]).includes(raw) &&
+    !(DIAGNOSTIC_TTS_PROVIDER_IDS as readonly string[]).includes(raw)
+  ) {
+    return raw as TtsProviderId
+  }
+  return DEFAULT_VOICE_RUNTIME_SETTINGS.activeTtsProviderId
 }
 
 export const SaveVoiceRuntimeSettingsInputSchema = v.object({
@@ -558,6 +621,13 @@ export interface VoiceSynthesizedVowelFrame {
 
 export interface VoiceSynthesizeSpeechResult {
   providerId: TtsProviderId
+  /**
+   * `'audio'` (or absent): `audioBase64` carries playable audio.
+   * `'use-browser-tts'`: the host produced no audio (`audioBase64 === ''`,
+   * `vowelFrames === []`); the renderer must speak the text itself via
+   * `window.speechSynthesis`.
+   */
+  delivery?: 'audio' | UseBrowserTtsCode
   audioBase64: string
   mimeType: string
   sampleRate: number

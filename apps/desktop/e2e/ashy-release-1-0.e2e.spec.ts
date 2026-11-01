@@ -251,7 +251,9 @@ test.describe.serial('Ashy Release 1.0 — Full E2E Suite', () => {
     expect(ttsRequests.length).toBeGreaterThanOrEqual(1)
 
     // 2. Run Thinking Pause CAS, Click Noise & Barge-In hardware-free voice fixtures
-    await page.getByTestId('select-tts-provider').selectOption('local-synth-fallback')
+    // Fixtures always run on the deterministic offline fakes (forced by the store);
+    // go back to the default browser TTS so later turns don't hit the mock Kokoro server.
+    await page.getByTestId('select-tts-provider').selectOption('web-speech-tts')
     const directOmniSwitch = page.getByTestId('toggle-direct-omni-audio')
     const wasDirectOmni = await directOmniSwitch.getAttribute('aria-checked')
     if (wasDirectOmni === 'true') {

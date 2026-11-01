@@ -375,12 +375,33 @@ describe('Phase 5 Realtime Voice — Incremental turn:delta TTS, Barge-In Abort 
     expect(ttsSelect).toBeTruthy()
     expect(wakeToggle).toBeTruthy()
 
+    // Phase 10.0: real providers are user-selectable; the diagnostic fakes are not.
+    const sttOptionValues = Array.from(sttSelect.options).map((o) => o.value)
+    const ttsOptionValues = Array.from(ttsSelect.options).map((o) => o.value)
+    expect(sttOptionValues).toContain('ollama-transcriptions')
+    expect(ttsOptionValues).toContain('web-speech-tts')
+    if (useAshyStore.getState().voiceSettings.activeSttProviderId !== 'deterministic-wav-stt') {
+      expect(sttOptionValues).not.toContain('deterministic-wav-stt')
+    }
+    if (useAshyStore.getState().voiceSettings.activeTtsProviderId !== 'local-synth-fallback') {
+      expect(ttsOptionValues).not.toContain('local-synth-fallback')
+    }
+
+    const wakeBeforeClick = useAshyStore.getState().voiceSettings.wakeWordEnabled
     await act(async () => {
-      setNativeInputValue(sttSelect, 'deterministic-wav-stt')
-      setNativeInputValue(ttsSelect, 'local-synth-fallback')
+      setNativeInputValue(sttSelect, 'local-whisper-http')
+      setNativeInputValue(ttsSelect, 'local-kokoro-http')
       clickElement(wakeToggle)
     })
-    expect(useAshyStore.getState().voiceSettings.wakeWordEnabled).toBe(false)
+    expect(useAshyStore.getState().voiceSettings.activeSttProviderId).toBe('local-whisper-http')
+    expect(useAshyStore.getState().voiceSettings.activeTtsProviderId).toBe('local-kokoro-http')
+    expect(useAshyStore.getState().voiceSettings.wakeWordEnabled).toBe(!wakeBeforeClick)
+
+    // Hardware-free fixtures force the diagnostic fakes explicitly.
+    await act(async () => {
+      useAshyStore.getState().setActiveSttProvider('deterministic-wav-stt')
+      useAshyStore.getState().setActiveTtsProvider('local-synth-fallback')
+    })
 
     // 1. Click thinking-pause-cas fixture button in UI
     await act(async () => {

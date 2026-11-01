@@ -212,7 +212,9 @@ describe('ProviderVault & SecretProtector', () => {
     const anthropicModel = vault.createLanguageModel('anthropic')
     expect(anthropicModel.provider).toBe('anthropic')
     const ollamaModel = vault.createLanguageModel('ollama')
-    expect(ollamaModel.provider).toBe('openai-compatible')
+    expect(ollamaModel.provider).toBe('ollama-native')
+    const openRouterModel = vault.createLanguageModel('openrouter')
+    expect(openRouterModel.provider).toBe('openai-compatible')
   })
 
   it('[Adversarial] records ok: false and persists lastError when testProviderConnection receives HTTP 401', async () => {

@@ -8,8 +8,8 @@ import {
   M2_GATE_THRESHOLDS,
   MILESTONE_CATEGORIES,
   SEMANTIC_FACT_CATEGORIES,
-  STT_PROVIDER_IDS,
-  TTS_PROVIDER_IDS,
+  USER_SELECTABLE_STT_PROVIDER_IDS,
+  USER_SELECTABLE_TTS_PROVIDER_IDS,
   type ActionRiskTier,
   type ApprovableMemoryKind,
   type AshyEmotion,
@@ -114,6 +114,30 @@ const TRAIT_META: ReadonlyArray<{
     shortAlias: 'protectiveDrive',
   },
 ]
+
+// Phase 10.0: pt-BR labels for the voice provider selects. The diagnostic fakes
+// (deterministic-wav-stt, local-synth-fallback) are not user-selectable; they
+// only show up (marked as diagnostic) while a fixture/test has forced them.
+const STT_PROVIDER_LABELS: Record<SttProviderId, string> = {
+  'ollama-transcriptions': 'Ollama (transcrição local)',
+  'local-whisper-http': 'Whisper local (HTTP)',
+  'openai-whisper': 'OpenAI Whisper',
+  'groq-whisper': 'Groq Whisper',
+  'web-speech-stt': 'Web Speech (navegador)',
+  'deterministic-wav-stt': 'Diagnóstico determinístico (teste)',
+}
+
+const TTS_PROVIDER_LABELS: Record<TtsProviderId, string> = {
+  'web-speech-tts': 'Voz do sistema (navegador)',
+  'local-kokoro-http': 'Kokoro local (HTTP)',
+  'openai-tts': 'OpenAI TTS',
+  elevenlabs: 'ElevenLabs',
+  'local-synth-fallback': 'Sintetizador de diagnóstico (teste)',
+}
+
+function withActiveProviderOption<T extends string>(selectable: readonly T[], active: T): T[] {
+  return selectable.includes(active) ? [...selectable] : [...selectable, active]
+}
 
 const WAVEFORM_BARS: readonly number[] = [
   6, 10, 16, 12, 22, 28, 16, 20, 30, 14, 24, 18, 12, 26, 18, 14, 20, 12, 8,
@@ -4599,9 +4623,12 @@ export function App(): React.ReactElement {
                             state.setActiveSttProvider(e.target.value as SttProviderId)
                           }
                         >
-                          {STT_PROVIDER_IDS.map((id) => (
+                          {withActiveProviderOption(
+                            USER_SELECTABLE_STT_PROVIDER_IDS,
+                            state.voiceSettings.activeSttProviderId,
+                          ).map((id) => (
                             <option key={id} value={id}>
-                              {id}
+                              {STT_PROVIDER_LABELS[id] ?? id}
                             </option>
                           ))}
                         </select>
@@ -4744,9 +4771,12 @@ export function App(): React.ReactElement {
                             state.setActiveTtsProvider(e.target.value as TtsProviderId)
                           }
                         >
-                          {TTS_PROVIDER_IDS.map((id) => (
+                          {withActiveProviderOption(
+                            USER_SELECTABLE_TTS_PROVIDER_IDS,
+                            state.voiceSettings.activeTtsProviderId,
+                          ).map((id) => (
                             <option key={id} value={id}>
-                              {id}
+                              {TTS_PROVIDER_LABELS[id] ?? id}
                             </option>
                           ))}
                         </select>

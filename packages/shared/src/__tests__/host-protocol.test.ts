@@ -697,6 +697,7 @@ describe('@ashy/shared host-protocol', () => {
       'local-whisper-http',
       'web-speech-stt',
       'deterministic-wav-stt',
+      'ollama-transcriptions',
     ])
     for (const id of STT_PROVIDER_IDS) {
       expect(v.safeParse(SttProviderIdSchema, id).success).toBe(true)
@@ -727,14 +728,14 @@ describe('@ashy/shared host-protocol', () => {
     expect(v.safeParse(VoiceFixtureIdSchema, 'invalid-fixture').success).toBe(false)
 
     expect(DEFAULT_VOICE_RUNTIME_SETTINGS).toEqual({
-      activeSttProviderId: 'deterministic-wav-stt',
-      activeTtsProviderId: 'local-synth-fallback',
+      activeSttProviderId: 'ollama-transcriptions',
+      activeTtsProviderId: 'web-speech-tts',
       sttBaseUrl: 'http://127.0.0.1:8080',
       sttModelId: 'whisper-1',
       ttsBaseUrl: 'http://127.0.0.1:8880',
       ttsModelId: 'kokoro-v1',
       ttsVoiceId: 'ashy-pt-br',
-      wakeWordEnabled: true,
+      wakeWordEnabled: false,
       wakeWordPhrases: ['ashy', 'ei ashy', 'oi ashy'],
     })
 

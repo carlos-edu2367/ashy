@@ -27,6 +27,7 @@ import {
 } from '@ashy/shared'
 import {
   createAnthropicMessagesModel,
+  createOllamaNativeModel,
   createOpenAICompatibleModel,
   streamText,
   type LanguageModel,
@@ -563,6 +564,18 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
 
     if (targetProviderId === 'anthropic') {
       return createAnthropicMessagesModel({
+        baseUrl,
+        apiKey,
+        model: modelId,
+        reasoningEffort,
+        fetchImpl: options.fetchImpl,
+      })
+    }
+
+    if (targetProviderId === 'ollama') {
+      // Native /api/chat: the OpenAI-compatible endpoint ignores `top_k`, so GGUF metadata such as
+      // LFM3-Omni's `top_k=1` would force greedy decoding (identical replies every turn).
+      return createOllamaNativeModel({
         baseUrl,
         apiKey,
         model: modelId,

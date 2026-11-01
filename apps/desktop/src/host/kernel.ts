@@ -18,6 +18,9 @@ import {
   ExportSoulInputSchema,
   ImportSoulInputSchema,
   inferModelOmniCapabilities,
+  migrateStoredSttProviderId,
+  migrateStoredTtsProviderId,
+  USE_BROWSER_TTS_CODE,
   ListVoiceProviderModelsInputSchema,
   maskApiKey,
   PersistedStagePreferencesSchema,
@@ -169,6 +172,14 @@ const FALLBACK_VOICE_MODEL_CATALOG: Record<
   'deterministic-wav-stt': {
     models: [{ id: 'deterministic-v1', label: 'Diagnóstico Determinístico (.wav)' }],
   },
+  'ollama-transcriptions': {
+    models: [
+      {
+        id: 'hf.co/LiquidAI/LFM3-Omni-2B-GGUF:Q4_K_M',
+        label: 'LFM3 Omni 2B (Ollama, transcrição local)',
+      },
+    ],
+  },
   elevenlabs: {
     models: [
       { id: 'eleven_flash_v2_5', label: 'Eleven Flash v2.5 (Baixa Latência)' },
@@ -224,6 +235,51 @@ function extractUrlOrigin(rawUrl: string): string | null {
   } catch {
     return null
   }
+}
+
+/** Language sent to Ollama `/v1/audio/transcriptions` (Ashy speaks pt-BR). */
+export const OLLAMA_TRANSCRIPTION_LANGUAGE = 'pt'
+
+/**
+ * Turns an Ollama provider baseUrl (usually `http://127.0.0.1:11434/v1`) into the
+ * server origin + path prefix without the OpenAI-compatible `/v1` suffix.
+ */
+export function deriveOllamaOrigin(rawBaseUrl: string): string {
+  const trimmed = rawBaseUrl.trim().replace(/\/+$/, '')
+  return trimmed.replace(/\/v1$/i, '').replace(/\/+$/, '')
+}
+
+const CHAT_STYLE_NON_TRANSCRIPT_PATTERNS: readonly RegExp[] = [
+  /^a unica palavra\b/,
+  /^o audio\s+(fornecido|enviado|recebido|anexado|contem|nao contem|parece|que voce|esta vazio|e silencioso|consiste)\b/,
+  /^nao ha\s+(nenhuma?\s+)?(fala|falas|audio|voz|palavra|palavras|conteudo|som|transcricao)\b/,
+  /^desculpe[,!.]?\s+(mas\s+)?(eu\s+)?nao\s+(consigo|posso|foi possivel|entendi o audio|ha)\b/,
+  /^desculpe[,!.]?\s+(mas\s+)?(como|sou)\s+(um|uma)\s+(modelo|assistente|ia)\b/,
+  /^(como|sou)\s+(um|uma)\s+(modelo|assistente)\s+de\s+(linguagem|ia)\b/,
+  /^(the audio|there is no|i'?m sorry|sorry, i)\b/,
+]
+
+/**
+ * Detects chat-style answers that an omni model sometimes returns instead of a
+ * transcript ("O áudio contém...", "A única palavra é...", "Não há fala...").
+ */
+export function isChatStyleNonTranscript(rawText: string): boolean {
+  const normalized = rawText
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/^[\s"'“”‘’«»*_-]+/, '')
+    .toLowerCase()
+  return CHAT_STYLE_NON_TRANSCRIPT_PATTERNS.some((pattern) => pattern.test(normalized))
+}
+
+/** Model ids that belong to other STT engines and must never be sent to Ollama. */
+function isForeignOllamaSttModelId(modelId: string): boolean {
+  if (/whisper/i.test(modelId)) return true
+  for (const [providerId, catalog] of Object.entries(FALLBACK_VOICE_MODEL_CATALOG)) {
+    if (providerId === 'ollama-transcriptions') continue
+    if (catalog.models.some((m) => m.id === modelId)) return true
+  }
+  return false
 }
 
 export function validateVoiceEndpointUrl(rawUrl: string, providerId?: string): URL {
@@ -285,6 +341,8 @@ export interface AshyHostKernelOptions {
   userDataDir: string
   secretProtector?: SecretProtector
   fetchImpl?: typeof fetch
+  /** Upper bound for every host-side voice HTTP call (STT/TTS). Default 15 s. */
+  voiceHttpTimeoutMs?: number
   keepaliveIntervalMs?: number
   dreamIdleTimeoutMs?: number
   localRuntimeOptions?: Partial<LocalRuntimeManagerOptions>
@@ -424,11 +482,14 @@ export async function createAshyHostKernel(
       }
       return {
         ...defaults,
+        // Phase 10.0 migration: the diagnostic fakes (`deterministic-wav-stt`,
+        // `local-synth-fallback`) and unknown ids heal to the real defaults.
+        // `wakeWordEnabled` is NOT migrated: an explicitly persisted value wins.
         ...(typeof parsed.activeSttProviderId === 'string'
-          ? { activeSttProviderId: parsed.activeSttProviderId as SttProviderId }
+          ? { activeSttProviderId: migrateStoredSttProviderId(parsed.activeSttProviderId) }
           : {}),
         ...(typeof parsed.activeTtsProviderId === 'string'
-          ? { activeTtsProviderId: parsed.activeTtsProviderId as TtsProviderId }
+          ? { activeTtsProviderId: migrateStoredTtsProviderId(parsed.activeTtsProviderId) }
           : {}),
         ...(typeof parsed.sttBaseUrl === 'string' && parsed.sttBaseUrl.trim()
           ? { sttBaseUrl: parsed.sttBaseUrl.trim() }
@@ -666,6 +727,96 @@ export async function createAshyHostKernel(
     return undefined
   }
 
+  function readOllamaProviderConfig(): {
+    isActiveChatProvider: boolean
+    baseUrl: string
+    modelId: string
+  } {
+    const fallbackBaseUrl = 'http://127.0.0.1:11434/v1'
+    try {
+      const state = providerVaultInstance?.getPublicState()
+      const config = state?.configs?.ollama
+      return {
+        isActiveChatProvider: state?.activeProviderId === 'ollama',
+        baseUrl: config?.baseUrl?.trim() || fallbackBaseUrl,
+        modelId: config?.modelId?.trim() || '',
+      }
+    } catch {
+      return { isActiveChatProvider: false, baseUrl: fallbackBaseUrl, modelId: '' }
+    }
+  }
+
+  function resolveOllamaTranscriptionModelId(requestedModelId?: string): string {
+    const candidates = [requestedModelId, currentVoiceSettings.sttModelId]
+    for (const candidate of candidates) {
+      const trimmed = candidate?.trim()
+      if (trimmed && !isForeignOllamaSttModelId(trimmed)) {
+        return trimmed
+      }
+    }
+    const activeOllamaModel = readOllamaProviderConfig().modelId
+    if (activeOllamaModel) return activeOllamaModel
+    throw new Error(
+      'ollama-transcriptions: no Ollama model configured (set the Ollama provider model or a non-whisper STT model id)',
+    )
+  }
+
+  /**
+   * Phase 10.0: real local STT through Ollama's official
+   * `POST {origin}/v1/audio/transcriptions` (multipart: model, language, file).
+   * Bounded by the voice HTTP timeout; chat-style non-transcripts are rejected.
+   */
+  async function transcribeWithOllama(params: {
+    wavBytes: Uint8Array
+    mimeType?: string
+    modelId?: string
+  }): Promise<VoiceTranscribeAudioResult> {
+    const startedAt = performance.now()
+    const ollama = readOllamaProviderConfig()
+    const origin = deriveOllamaOrigin(ollama.baseUrl)
+    const endpoint = `${origin}/v1/audio/transcriptions`
+    validateVoiceEndpointUrl(endpoint, 'ollama-transcriptions')
+    const modelId = resolveOllamaTranscriptionModelId(params.modelId)
+    const safeFetch = createSafeVoiceFetch('ollama-transcriptions')
+
+    const mimeType = params.mimeType?.trim() || 'audio/wav'
+    const extension = /webm/i.test(mimeType) ? 'webm' : /ogg/i.test(mimeType) ? 'ogg' : 'wav'
+    const form = new FormData()
+    form.append('model', modelId)
+    form.append('language', OLLAMA_TRANSCRIPTION_LANGUAGE)
+    form.append(
+      'file',
+      new Blob([params.wavBytes as unknown as BlobPart], { type: mimeType }),
+      `audio.${extension}`,
+    )
+
+    const res = await safeFetch(endpoint, { method: 'POST', body: form })
+    if (!res.ok) {
+      let detail = ''
+      try {
+        detail = (await res.text()).slice(0, 200)
+      } catch {
+        detail = ''
+      }
+      throw new Error(
+        `ollama-transcriptions failed with HTTP ${res.status}${detail ? `: ${detail}` : ''}`,
+      )
+    }
+    const json = (await res.json()) as { text?: unknown }
+    const text = typeof json?.text === 'string' ? json.text.trim() : ''
+    if (text && isChatStyleNonTranscript(text)) {
+      throw new Error(
+        `ollama-transcriptions returned a chat-style answer instead of a transcript: "${text.slice(0, 80)}"`,
+      )
+    }
+    return {
+      providerId: 'ollama-transcriptions',
+      text,
+      latencyMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      confidence: text ? 0.9 : 0,
+    }
+  }
+
   function createSafeVoiceFetch(expectedProviderId: string): typeof fetch {
     const baseFetch: typeof fetch =
       options.fetchImpl ?? ((...args) => globalThis.fetch(...args))
@@ -674,7 +825,9 @@ export async function createAshyHostKernel(
       const targetUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
       validateVoiceEndpointUrl(targetUrl, expectedProviderId)
 
-      const timeoutSignal = AbortSignal.timeout(VOICE_HTTP_TIMEOUT_MS)
+      const timeoutSignal = AbortSignal.timeout(
+        options.voiceHttpTimeoutMs ?? VOICE_HTTP_TIMEOUT_MS,
+      )
       const signal = init?.signal
         ? AbortSignal.any([init.signal, timeoutSignal])
         : timeoutSignal
@@ -2110,6 +2263,22 @@ export async function createAshyHostKernel(
         }
       }
 
+      if (input.providerId === 'ollama-transcriptions') {
+        const activeOllamaModel = readOllamaProviderConfig().modelId
+        const models: VoiceProviderModelOption[] = activeOllamaModel
+          ? [{ id: activeOllamaModel, label: `${activeOllamaModel} (modelo ativo do Ollama)` }]
+          : []
+        for (const m of fallbackCatalog.models) {
+          if (!models.some((existing) => existing.id === m.id)) models.push(m)
+        }
+        return {
+          kind: input.kind,
+          providerId: input.providerId,
+          models,
+          source: 'fallback',
+        }
+      }
+
       const effectiveBaseUrl = resolveEffectiveVoiceBaseUrl(input.providerId, input.baseUrl)
       const apiKey = resolvePinnedVoiceApiKey(input.providerId, effectiveBaseUrl, input.apiKey)
       const safeFetch = createSafeVoiceFetch(input.providerId)
@@ -2249,7 +2418,55 @@ export async function createAshyHostKernel(
         input.providerId ?? currentVoiceSettings.activeSttProviderId
       const language = input.language ?? currentVoiceSettings.webSpeechLang ?? 'pt'
 
-      if (providerId === 'deterministic-wav-stt' || providerId === 'web-speech-stt') {
+      if (providerId === 'ollama-transcriptions' || providerId === 'web-speech-stt') {
+        // `web-speech-stt` runs in the renderer; when the host is asked for it
+        // (omni preflight without a browser transcript) it uses the real Ollama
+        // transcription instead of the old deterministic fake phrases.
+        const ollama = readOllamaProviderConfig()
+        try {
+          return await transcribeWithOllama({
+            wavBytes,
+            mimeType: input.mimeType,
+            modelId: input.modelId,
+          })
+        } catch (err) {
+          const isTransportFailure =
+            err instanceof Error &&
+            !/HTTP \d{3}|chat-style|no Ollama model configured/.test(err.message)
+          // Runtime fallback (Phase 10.0): when Ollama is NOT the active chat
+          // provider and it is unreachable, use the local Whisper HTTP server.
+          if (
+            providerId !== 'ollama-transcriptions' ||
+            ollama.isActiveChatProvider ||
+            !isTransportFailure
+          ) {
+            throw err
+          }
+        }
+        const fallbackBaseUrl = resolveEffectiveVoiceBaseUrl('local-whisper-http')
+        const fallbackApiKey = resolvePinnedVoiceApiKey('local-whisper-http', fallbackBaseUrl)
+        const fallbackModelId = isForeignOllamaSttModelId(currentVoiceSettings.sttModelId)
+          ? currentVoiceSettings.sttModelId
+          : 'whisper-1'
+        const fallbackProvider = createLocalWhisperHttpSttProvider({
+          baseUrl: fallbackBaseUrl,
+          apiKey: fallbackApiKey,
+          modelId: fallbackModelId,
+          language,
+          allowOfflineFallback: false,
+          fetchImpl: createSafeVoiceFetch('local-whisper-http'),
+        })
+        const fallbackRes = await fallbackProvider.transcribe({ blocks: decoded.blocks, language })
+        return {
+          providerId: 'local-whisper-http',
+          text: fallbackRes.text,
+          latencyMs: fallbackRes.latencyMs,
+          confidence: fallbackRes.confidence,
+        }
+      }
+
+      if (providerId === 'deterministic-wav-stt') {
+        // Diagnostic-only fake (fixtures/scenario tests force it explicitly).
         const det = createDeterministicWavSttProvider()
         const res = await det.transcribe({
           blocks: decoded.blocks,
@@ -2387,8 +2604,27 @@ export async function createAshyHostKernel(
         }
       }
 
-      // Red-Team C2: local-synth-fallback (and host fallback for web-speech-tts) never calls fetchImpl
-      if (providerId === 'local-synth-fallback' || providerId === 'web-speech-tts') {
+      // Phase 10.0: `web-speech-tts` is spoken by the renderer through
+      // `window.speechSynthesis`. The host never synthesizes (no buzz tone, no
+      // fetch); it returns the `use-browser-tts` delivery signal with no audio.
+      if (providerId === 'web-speech-tts') {
+        const wordCount = Math.max(1, input.text.trim().split(/\s+/).length)
+        const estimatedMs = Math.max(350, wordCount * 330)
+        return {
+          providerId: 'web-speech-tts',
+          delivery: USE_BROWSER_TTS_CODE,
+          audioBase64: '',
+          mimeType: '',
+          sampleRate: 0,
+          durationMs: estimatedMs,
+          durationSec: estimatedMs / 1000,
+          synthesisLatencyMs: 0,
+          vowelFrames: [],
+        }
+      }
+
+      // Red-Team C2: local-synth-fallback (diagnostic only) never calls fetchImpl
+      if (providerId === 'local-synth-fallback') {
         const localSynth = createLocalSynthFallbackTtsProvider()
         const synth = await localSynth.synthesize({
           text: input.text,

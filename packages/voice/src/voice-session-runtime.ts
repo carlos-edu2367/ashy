@@ -1,6 +1,5 @@
 import { CONTROL_SENTINEL, type AshyStageSignal } from '@ashy/llm'
 import {
-  DEFAULT_VOICE_RUNTIME_SETTINGS,
   TTS_PROVIDER_IDS,
   type SttProviderId,
   type TtfaTelemetryRecord,
@@ -614,11 +613,20 @@ export interface WebAudioContextLike {
   currentTime: number
   sampleRate?: number
   destination?: unknown
+  state?: string
+  resume?: () => Promise<void>
+  decodeAudioData?: (data: ArrayBuffer) => Promise<{
+    sampleRate: number
+    duration?: number
+    numberOfChannels?: number
+    getChannelData: (channel: number) => Float32Array
+  }>
   createGain?: () => {
     gain: {
       value: number
       setValueAtTime?: (value: number, startTime: number) => void
       linearRampToValueAtTime?: (value: number, endTime: number) => void
+      cancelScheduledValues?: (startTime: number) => void
     }
     connect?: (dest: unknown) => void
     disconnect?: () => void
@@ -657,6 +665,13 @@ export interface ScheduledPlaybackItem {
   sampleRate: number
   samples: Float32Array
   vowelFrames: ReadonlyArray<VowelFrameEnvelope>
+  /** True when an AudioBufferSourceNode was actually started on a real AudioContext. */
+  playedOnAudioOutput?: boolean
+}
+
+export interface ScheduleChunkOptions {
+  /** Schedule on the virtual clock only, never on the attached AudioContext. */
+  virtualOnly?: boolean
 }
 
 export interface GaplessAudioPlayer {
@@ -675,7 +690,16 @@ export interface GaplessAudioPlayer {
           vowelFrames?: ReadonlyArray<VowelFrameEnvelope>
           synthesisOutput?: TtsSynthesisOutput
         },
+    scheduleOptions?: ScheduleChunkOptions,
   ): ScheduledPlaybackItem
+  /**
+   * (Re)binds the player to a real AudioContext (output via a GainNode).
+   * Passing null detaches it and falls back to the virtual clock.
+   */
+  attachAudioContext(audioContext: WebAudioContextLike | null): void
+  hasAudioOutput(): boolean
+  /** Seconds until the last scheduled chunk finishes (0 when idle). */
+  getRemainingPlaybackSec(): number
   markStreamComplete(complete?: boolean): void
   isStreamComplete(): boolean
   getCurrentTimeSec(): number
@@ -699,10 +723,51 @@ export function createGaplessAudioPlayer(
   options: GaplessAudioPlayerOptions = {},
 ): GaplessAudioPlayer {
   const defaultFadeOutMs = Math.max(0, options.defaultFadeOutMs ?? 100)
-  const ctx = options.audioContext
-  const gainNode = ctx?.createGain ? ctx.createGain() : null
-  if (gainNode && ctx?.destination !== undefined) {
-    gainNode.connect?.(ctx.destination)
+  let ctx: WebAudioContextLike | undefined = options.audioContext
+  let gainNode: ReturnType<NonNullable<WebAudioContextLike['createGain']>> | null = null
+
+  function bindGainNode(): void {
+    gainNode = ctx?.createGain ? ctx.createGain() : null
+    if (gainNode && ctx?.destination !== undefined) {
+      gainNode.connect?.(ctx.destination)
+    }
+  }
+  bindGainNode()
+
+  // Continuous lip-sync ticker while real audio is playing on an AudioContext.
+  const LIP_SYNC_TICK_MS = 33
+  let lipSyncTimer: ReturnType<typeof setInterval> | null = null
+
+  function stopLipSyncTicker(): void {
+    if (lipSyncTimer !== null) {
+      clearInterval(lipSyncTimer)
+      lipSyncTimer = null
+    }
+  }
+
+  function startLipSyncTicker(): void {
+    if (lipSyncTimer !== null || !options.onVowelFrame) return
+    if (typeof setInterval !== 'function') return
+    lipSyncTimer = setInterval(() => {
+      if (!playing || activeSourceNodes.length === 0) {
+        stopLipSyncTicker()
+        return
+      }
+      const now = getCurrentTimeSec()
+      const inside = scheduledItems.some(
+        (item) => now >= item.startTimeSec - 1e-6 && now <= item.endTimeSec + 1e-6,
+      )
+      options.onVowelFrame?.(inside ? getActiveVowelFrame(now) : { ...ZERO_VOWELS })
+    }, LIP_SYNC_TICK_MS)
+  }
+
+  function canPlayOnAudioOutput(): boolean {
+    return Boolean(
+      ctx &&
+        typeof ctx.createBuffer === 'function' &&
+        typeof ctx.createBufferSource === 'function' &&
+        ctx.state !== 'closed',
+    )
   }
 
   const scheduledItems: ScheduledPlaybackItem[] = []
@@ -723,6 +788,7 @@ export function createGaplessAudioPlayer(
   }
 
   function handleQueueDrained(): void {
+    stopLipSyncTicker()
     if (!queueDrained) {
       queueDrained = true
       options.onQueueDrained?.()
@@ -788,6 +854,7 @@ export function createGaplessAudioPlayer(
           vowelFrames?: ReadonlyArray<VowelFrameEnvelope>
           synthesisOutput?: TtsSynthesisOutput
         },
+    scheduleOptions: ScheduleChunkOptions = {},
   ): ScheduledPlaybackItem {
     const synth = chunk.synthesisOutput
     const sampleRate =
@@ -837,6 +904,9 @@ export function createGaplessAudioPlayer(
 
     if (gainNode && gainValue === 0) {
       gainValue = 1
+      const nowSec = ctx && Number.isFinite(ctx.currentTime) ? ctx.currentTime : 0
+      gainNode.gain.cancelScheduledValues?.(nowSec)
+      gainNode.gain.setValueAtTime?.(1, nowSec)
       gainNode.gain.value = 1
     } else if (gainValue === 0) {
       gainValue = 1
@@ -848,7 +918,14 @@ export function createGaplessAudioPlayer(
     nextScheduledTimeSec = Math.max(nextScheduledTimeSec, endTimeSec)
     scheduledItems.push(item)
 
-    if (ctx?.createBuffer && ctx?.createBufferSource && samples.length > 0) {
+    if (
+      !scheduleOptions.virtualOnly &&
+      ctx &&
+      ctx.createBuffer &&
+      ctx.createBufferSource &&
+      canPlayOnAudioOutput() &&
+      samples.length > 0
+    ) {
       const audioBuffer = ctx.createBuffer(1, samples.length, sampleRate)
       const channelData = audioBuffer.getChannelData(0)
       if (channelData.length >= samples.length) {
@@ -876,6 +953,8 @@ export function createGaplessAudioPlayer(
       }
       source.start?.(startTimeSec)
       activeSourceNodes.push(source)
+      item.playedOnAudioOutput = true
+      startLipSyncTicker()
     }
 
     options.onVowelFrame?.(getActiveVowelFrame(startTimeSec))
@@ -887,7 +966,13 @@ export function createGaplessAudioPlayer(
     virtualClockSec = timeSec
     if (playing) {
       options.onVowelFrame?.(getActiveVowelFrame(getCurrentTimeSec()))
-      if (virtualClockSec >= nextScheduledTimeSec && nextScheduledTimeSec > 0) {
+      // When real AudioBufferSourceNodes are in flight, the queue drain is driven by
+      // their `onended` events (the real end of audio), not by the virtual clock.
+      if (
+        activeSourceNodes.length === 0 &&
+        virtualClockSec >= nextScheduledTimeSec &&
+        nextScheduledTimeSec > 0
+      ) {
         handleQueueDrained()
       }
     }
@@ -903,6 +988,7 @@ export function createGaplessAudioPlayer(
     fadeMs: number
     gainValueAfterFade: number
   } {
+    stopLipSyncTicker()
     const effectiveFadeMs = Math.max(0, Number.isFinite(fadeMs) ? fadeMs : defaultFadeOutMs)
     const stoppedAtSec = getCurrentTimeSec()
     const fadeEndTimeSec = stoppedAtSec + effectiveFadeMs / 1000
@@ -936,6 +1022,7 @@ export function createGaplessAudioPlayer(
   }
 
   function reset(): void {
+    stopLipSyncTicker()
     for (const src of activeSourceNodes) {
       try {
         src.onended = null
@@ -956,8 +1043,48 @@ export function createGaplessAudioPlayer(
     nextFallbackSeq = 0
   }
 
+  function attachAudioContext(next: WebAudioContextLike | null): void {
+    const normalized = next ?? undefined
+    if (normalized === ctx) return
+    stopLipSyncTicker()
+    for (const src of activeSourceNodes) {
+      try {
+        src.onended = null
+        src.stop?.(0)
+      } catch {
+        // Ignore already-stopped source nodes
+      }
+    }
+    activeSourceNodes.length = 0
+    try {
+      gainNode?.disconnect?.()
+    } catch {
+      // Ignore
+    }
+    ctx = normalized
+    bindGainNode()
+    gainValue = 1
+    // The new context has its own clock: realign the virtual timeline so the next
+    // chunk starts "now" on the real context instead of far in the future.
+    virtualClockSec = 0
+    nextScheduledTimeSec = 0
+    if (playing) {
+      playing = false
+      queueDrained = true
+      options.onVowelFrame?.({ ...ZERO_VOWELS })
+    }
+  }
+
+  function getRemainingPlaybackSec(): number {
+    if (!playing) return 0
+    return Math.max(0, nextScheduledTimeSec - getCurrentTimeSec())
+  }
+
   return {
     scheduleChunk,
+    attachAudioContext,
+    hasAudioOutput: canPlayOnAudioOutput,
+    getRemainingPlaybackSec,
     markStreamComplete,
     isStreamComplete: () => streamComplete,
     getCurrentTimeSec,
@@ -1016,6 +1143,21 @@ export interface VoiceSessionRuntimeOptions {
   ) => void
   onStageSignal?: (signal: AshyStageSignal, afterChunkSeq: number) => void
   onVowelFrame?: (frame: VowelFrameEnvelope) => void
+  /** Fired when the gapless player really finishes (queue drained + stream complete). */
+  onPlaybackEnded?: () => void
+  /**
+   * When false, audio synthesized by the runtime's own TTS registry is only scheduled
+   * on the virtual clock (never sent to the attached AudioContext). Default true.
+   */
+  playRuntimeTtsAudio?: boolean
+}
+
+export interface OmniAudioDeltaIngestResult {
+  /** True when the chunk was started on a real AudioContext output. */
+  played: boolean
+  durationMs: number
+  startTimeSec: number
+  endTimeSec: number
 }
 
 export interface VoiceSessionRuntimeSnapshot {
@@ -1078,7 +1220,9 @@ export interface VoiceSessionRuntime {
     durationMs: number
     transcriptDelta?: string
     vowelFrames?: ReadonlyArray<TtsVowelLipSyncFrame>
-  }): void
+  }): OmniAudioDeltaIngestResult
+  /** (Re)binds the gapless player to a real AudioContext; null detaches it. */
+  attachAudioContext(audioContext: WebAudioContextLike | null): void
   interruptOmniPlayback(turnId: string, cause?: string): PlaybackReceipt | null
   computeOmniPlaybackReceipt(turnId: string, stoppedAtSec?: number): PlaybackReceipt | null
   getTtfaTelemetry(): Record<TtsProviderId, TtfaTelemetryRecord>
@@ -1108,6 +1252,9 @@ function createInitialTtfaMap(): Record<TtsProviderId, TtfaTelemetryRecord> {
   return map
 }
 
+const STANDALONE_RUNTIME_DEFAULT_STT_PROVIDER_ID: SttProviderId = 'deterministic-wav-stt'
+const STANDALONE_RUNTIME_DEFAULT_TTS_PROVIDER_ID: TtsProviderId = 'local-synth-fallback'
+
 export function createVoiceSessionRuntime(
   options: VoiceSessionRuntimeOptions = {},
 ): VoiceSessionRuntime {
@@ -1120,9 +1267,11 @@ export function createVoiceSessionRuntime(
   const wakeWordPhrases = options.wakeWordPhrases ?? DEFAULT_WAKE_WORD_PHRASES
 
   let activeSttProviderId: SttProviderId =
-    options.activeSttProviderId ?? DEFAULT_VOICE_RUNTIME_SETTINGS.activeSttProviderId
+    // Standalone runtimes (tests/fixtures) default to the deterministic offline providers;
+    // the app always passes the user's configured ids explicitly.
+    options.activeSttProviderId ?? STANDALONE_RUNTIME_DEFAULT_STT_PROVIDER_ID
   let activeTtsProviderId: TtsProviderId =
-    options.activeTtsProviderId ?? DEFAULT_VOICE_RUNTIME_SETTINGS.activeTtsProviderId
+    options.activeTtsProviderId ?? STANDALONE_RUNTIME_DEFAULT_TTS_PROVIDER_ID
 
   const preRollMs = options.preRollMs ?? 360
   const bargeInMinSpeechMs = options.bargeInMinSpeechMs ?? 300
@@ -1213,7 +1362,11 @@ export function createVoiceSessionRuntime(
       activeVowelFrame = frame
       options.onVowelFrame?.(frame)
     },
+    onPlaybackEnded: () => {
+      options.onPlaybackEnded?.()
+    },
   })
+  const playRuntimeTtsAudio = options.playRuntimeTtsAudio !== false
 
   // Track in-flight TTS synthesis tasks and per-turn TTFA timing
   let currentReplyFirstEnqueueAtMs: number | null = null
@@ -1256,7 +1409,7 @@ export function createVoiceSessionRuntime(
       }
     },
     onAudioScheduled: (chunk) => {
-      player.scheduleChunk(chunk)
+      player.scheduleChunk(chunk, { virtualOnly: !playRuntimeTtsAudio })
       if (!currentReplyFirstAudioRecorded && currentReplyFirstEnqueueAtMs !== null) {
         currentReplyFirstAudioRecorded = true
         const measuredMs = Math.max(
@@ -1425,7 +1578,7 @@ export function createVoiceSessionRuntime(
     durationMs: number
     transcriptDelta?: string
     vowelFrames?: ReadonlyArray<TtsVowelLipSyncFrame>
-  }): void {
+  }): OmniAudioDeltaIngestResult {
     if (activeOmniPlaybackTurnId !== delta.turnId) {
       activeOmniPlaybackTurnId = delta.turnId
       omniScheduledEntries.length = 0
@@ -1480,6 +1633,13 @@ export function createVoiceSessionRuntime(
       endTimeSec: scheduledItem.endTimeSec,
       durationMs,
     })
+
+    return {
+      played: scheduledItem.playedOnAudioOutput === true,
+      durationMs,
+      startTimeSec: scheduledItem.startTimeSec,
+      endTimeSec: scheduledItem.endTimeSec,
+    }
   }
 
   function computeOmniPlaybackReceipt(
@@ -2032,6 +2192,7 @@ export function createVoiceSessionRuntime(
     setDirectOmniAudio,
     getDirectOmniAudio: () => directOmniAudio,
     ingestOmniAudioDelta,
+    attachAudioContext: (audioContext) => player.attachAudioContext(audioContext),
     interruptOmniPlayback,
     computeOmniPlaybackReceipt,
     getTtfaTelemetry,

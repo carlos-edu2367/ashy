@@ -26,3 +26,4 @@ export {
   type ScriptedAudioChunkInput,
 } from './adapters'
 export * from './embeddings'
+export * from './ollama-native'

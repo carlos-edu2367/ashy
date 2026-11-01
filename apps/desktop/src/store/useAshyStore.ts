@@ -146,10 +146,18 @@ import {
   type Live2DModelControls,
 } from '@ashy/stage'
 import {
+  base64ToUint8Array,
   createRealtimeSpeechPipeline,
+  createSttProviderRegistry,
   createVoiceSessionRuntime,
+  decodeOmniAudioDeltaToPcm,
+  encodeWavPcm16,
+  uint8ArrayToBase64,
+  type SttProvider,
   isWhisperSilenceHallucination,
   type PlaybackReceipt,
+  type TtsSynthesisOutput,
+  type WebAudioContextLike,
   type RealtimeSpeechPipeline,
   type ScheduledAudioChunk,
   type SealedOmniAudioTurn,
@@ -1279,9 +1287,173 @@ function clearActivePlaybackEndTimer(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 10.0 (T3): real, audible playback in the renderer.
+// One shared AudioContext is created lazily (on a user gesture when possible:
+// toggleVoiceConversation / sendUserMessage / sendOmniAudioTurn) and handed to the
+// voice runtime's GaplessAudioPlayer. Without it (jsdom/tests) the player keeps
+// running on its virtual clock exactly as before.
+// ---------------------------------------------------------------------------
+type PlaybackAudioContext = WebAudioContextLike & {
+  state?: string
+  resume?: () => Promise<void>
+}
+
+let sharedPlaybackAudioContext: PlaybackAudioContext | null = null
+/** True while the end of "speaking" is driven by the player's real queue drain. */
+let playerDrivesSpeakingEnd = false
+/** Last turn whose native omni audio was scheduled on the player (for late barge-in). */
+let lastOmniPlaybackTurnId: string | null = null
+
+function getSharedPlaybackAudioContext(): PlaybackAudioContext | null {
+  if (sharedPlaybackAudioContext && sharedPlaybackAudioContext.state === 'closed') {
+    sharedPlaybackAudioContext = null
+  }
+  return sharedPlaybackAudioContext
+}
+
+function ensureSharedPlaybackAudioContext(): PlaybackAudioContext | null {
+  try {
+    let ctx = getSharedPlaybackAudioContext()
+    if (!ctx) {
+      if (typeof window === 'undefined') return null
+      const w = window as unknown as {
+        AudioContext?: new () => PlaybackAudioContext
+        webkitAudioContext?: new () => PlaybackAudioContext
+      }
+      const Ctor = w.AudioContext ?? w.webkitAudioContext
+      if (typeof Ctor !== 'function') return null
+      ctx = new Ctor()
+      sharedPlaybackAudioContext = ctx
+    }
+    if (ctx.state === 'suspended' && typeof ctx.resume === 'function') {
+      void ctx.resume().catch(() => {})
+    }
+    voiceRuntime.attachAudioContext(ctx)
+    return ctx
+  } catch {
+    return null
+  }
+}
+
+function isSharedPlaybackContextRunning(): boolean {
+  const ctx = getSharedPlaybackAudioContext()
+  return Boolean(ctx && (ctx.state === undefined || ctx.state === 'running'))
+}
+
+/** Remaining real playback (ms) on the gapless player, 0 when nothing audible is queued. */
+function getRealPlaybackRemainingMs(): number {
+  try {
+    const player = voiceRuntime.getPlayer()
+    if (!player.hasAudioOutput() || !player.isPlaying()) return 0
+    return Math.max(0, Math.round(player.getRemainingPlaybackSec() * 1000))
+  } catch {
+    return 0
+  }
+}
+
+async function decodeBase64AudioForPlayer(
+  ctx: PlaybackAudioContext,
+  audioBase64: string,
+  mimeType?: string,
+): Promise<{ samples: Float32Array; sampleRate: number } | null> {
+  const raw = audioBase64.startsWith('data:')
+    ? audioBase64.slice(audioBase64.indexOf(',') + 1)
+    : audioBase64
+  if (typeof ctx.decodeAudioData === 'function') {
+    try {
+      const bytes = base64ToUint8Array(raw)
+      const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+      const decoded = await ctx.decodeAudioData(copy as ArrayBuffer)
+      const samples = decoded.getChannelData(0)
+      if (samples.length > 0) {
+        return { samples, sampleRate: decoded.sampleRate }
+      }
+    } catch {
+      // fall through to the WAV/PCM decoder below
+    }
+  }
+  if (!mimeType || /wav/i.test(mimeType)) {
+    try {
+      const decoded = decodeOmniAudioDeltaToPcm(raw, 'wav')
+      if (decoded.samples.length > 0) {
+        return { samples: decoded.samples, sampleRate: decoded.sampleRate }
+      }
+    } catch {
+      // undecodable
+    }
+  }
+  return null
+}
+
+function closeMouthAfterRealPlayback(): void {
+  playerDrivesSpeakingEnd = false
+  clearActivePlaybackEndTimer()
+  const store = useAshyStore?.getState?.()
+  if (!store || store.isStreamingTurn) return
+  useAshyStore.setState((s) => ({
+    isSpeaking: false,
+    presenceStatus: s.isVoiceListening ? 'Listening' : 'Idle',
+    activeViseme: 'closed',
+    simulatedVowels: { A: 0, E: 0, I: 0, O: 0, U: 0 },
+    rawVolume: 0,
+  }))
+}
+
+/**
+ * Phase 10.0: 'ollama-transcriptions' runs in the host (Ollama /v1/audio/transcriptions).
+ * The renderer cascade STT WAV-encodes the sealed PCM blocks and asks the host bridge.
+ */
+function createHostBridgeOllamaSttProvider(): SttProvider {
+  return {
+    id: 'ollama-transcriptions',
+    async transcribe(request) {
+      const startedAt = performance.now()
+      const bridge = getAshyHostBridge()
+      if (typeof bridge.transcribeVoiceAudio !== 'function') {
+        throw new Error('STT "ollama-transcriptions" requires the Ashy host bridge.')
+      }
+      const blocks = request.blocks
+      const sampleRate = blocks[0]?.sampleRate ?? 16000
+      const total = blocks.reduce((acc, b) => acc + b.samples.length, 0)
+      const merged = new Float32Array(total)
+      let offset = 0
+      for (const block of blocks) {
+        merged.set(block.samples, offset)
+        offset += block.samples.length
+      }
+      const settings = useAshyStore?.getState?.()?.voiceSettings
+      const res = await bridge.transcribeVoiceAudio({
+        audioBase64: uint8ArrayToBase64(encodeWavPcm16(merged, sampleRate)),
+        mimeType: 'audio/wav',
+        providerId: 'ollama-transcriptions',
+        ...(settings?.sttBaseUrl ? { baseUrl: settings.sttBaseUrl } : {}),
+        ...(settings?.sttModelId ? { modelId: settings.sttModelId } : {}),
+      })
+      return {
+        providerId: 'ollama-transcriptions',
+        text: res?.text ?? '',
+        latencyMs: res?.latencyMs ?? Math.round(performance.now() - startedAt),
+        confidence: res?.confidence ?? 0.8,
+      }
+    },
+  }
+}
+
 function createStoreVoiceRuntime(): VoiceSessionRuntime {
-  return createVoiceSessionRuntime({
+  const runtime = createVoiceSessionRuntime({
     micMode: 'continuous',
+    sttRegistry: createSttProviderRegistry({
+      customProviders: { 'ollama-transcriptions': createHostBridgeOllamaSttProvider() },
+    }),
+    // Audio from the runtime's own TTS registry stays virtual: the store plays
+    // host/browser TTS itself, so it must never double up on the AudioContext.
+    playRuntimeTtsAudio: false,
+    onPlaybackEnded: () => {
+      if (isRunningFixtureScenario) return
+      if (!playerDrivesSpeakingEnd) return
+      closeMouthAfterRealPlayback()
+    },
     wakeWordEnabled: DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordEnabled,
     wakeWordPhrases: DEFAULT_VOICE_RUNTIME_SETTINGS.wakeWordPhrases,
     activeSttProviderId: DEFAULT_VOICE_RUNTIME_SETTINGS.activeSttProviderId,
@@ -1335,6 +1507,11 @@ function createStoreVoiceRuntime(): VoiceSessionRuntime {
       })
     },
   })
+  const sharedCtx = getSharedPlaybackAudioContext()
+  if (sharedCtx) {
+    runtime.attachAudioContext(sharedCtx)
+  }
+  return runtime
 }
 
 let agency = createAgencyRuntime()
@@ -1439,8 +1616,13 @@ const streamedDeltaTurnIds = new Set<string>()
 const enqueuedSpeechDeltaTurnIds = new Set<string>()
 const bargeInTurnIds = new Set<string>()
 const omniAudioReceivedTurnIds = new Set<string>()
+/** Turns whose native omni audio actually started on a real AudioContext. */
+const omniAudioPlayedTurnIds = new Set<string>()
 
 const SYNTHETIC_OMNI_REV_REGEX = /^ashy-omni-turn-rev-\d+$/i
+/** Mirrors the host's OMNI_DISCARDED_SHORT_AUDIO_TEXT (host/turn-orchestrator.ts). */
+const OMNI_DISCARDED_SHORT_AUDIO_TEXT = '🎤 (áudio curto ignorado)'
+const MIN_OMNI_AUDIO_TURN_MS = 400
 let latestBrowserSpeechTranscript = ''
 let activeSpeechRecognition: { stop: () => void } | null = null
 
@@ -1502,6 +1684,56 @@ function speakBrowserTextOutLoud(rawText: string): void {
   }
 }
 
+// HTMLAudio fallback (no AudioContext): clips are serialized so they never overlap
+// and are tracked so barge-in can stop them.
+const inFlightHtmlAudioElements = new Set<HTMLAudioElement>()
+let htmlAudioChain: Promise<void> = Promise.resolve()
+let htmlAudioGeneration = 0
+const HTML_AUDIO_MAX_CLIP_MS = 60_000
+
+function stopInFlightHtmlAudio(): void {
+  htmlAudioGeneration += 1
+  for (const audio of inFlightHtmlAudioElements) {
+    try {
+      audio.pause()
+      audio.dispatchEvent?.(new Event('ended'))
+    } catch {
+      // Ignore
+    }
+  }
+  inFlightHtmlAudioElements.clear()
+  htmlAudioChain = Promise.resolve()
+}
+
+function playOneHtmlAudioClip(src: string, generation: number): Promise<void> {
+  if (generation !== htmlAudioGeneration) return Promise.resolve()
+  return new Promise<void>((resolve) => {
+    let settled = false
+    let audio: HTMLAudioElement | null = null
+    let safety: ReturnType<typeof setTimeout> | null = null
+    const done = () => {
+      if (settled) return
+      settled = true
+      if (safety !== null) clearTimeout(safety)
+      if (audio) inFlightHtmlAudioElements.delete(audio)
+      resolve()
+    }
+    try {
+      audio = new window.Audio(src)
+      inFlightHtmlAudioElements.add(audio)
+      audio.addEventListener?.('ended', done)
+      audio.addEventListener?.('error', done)
+      safety = setTimeout(done, HTML_AUDIO_MAX_CLIP_MS)
+      const playPromise = audio.play()
+      if (playPromise && typeof playPromise.catch === 'function') {
+        void playPromise.catch(() => done())
+      }
+    } catch {
+      done()
+    }
+  })
+}
+
 function playBase64AudioInBrowser(audioBase64?: string, mimeType = 'audio/wav'): void {
   if (!audioBase64) return
   try {
@@ -1511,15 +1743,20 @@ function playBase64AudioInBrowser(audioBase64?: string, mimeType = 'audio/wav'):
     const src = audioBase64.startsWith('data:')
       ? audioBase64
       : `data:${mimeType};base64,${audioBase64}`
-    const audio = new window.Audio(src)
-    const playPromise = audio.play()
-    if (playPromise && typeof playPromise.catch === 'function') {
-      void playPromise.catch(() => {})
-    }
+    const generation = htmlAudioGeneration
+    htmlAudioChain = htmlAudioChain
+      .catch(() => {})
+      .then(() => playOneHtmlAudioClip(src, generation))
   } catch {
     // Ignore HTMLAudioElement playback errors in headless environments
   }
 }
+
+/** Per-chunk playback plan resolved during synthesis, executed in order when scheduled. */
+type CascadeChunkPlayback =
+  | { kind: 'player'; samples: Float32Array; sampleRate: number }
+  | { kind: 'html'; audioBase64: string; mimeType?: string }
+const cascadeChunkPlayback = new WeakMap<object, CascadeChunkPlayback>()
 
 function startBrowserSpeechRecognition(): void {
   stopBrowserSpeechRecognition()
@@ -1734,6 +1971,14 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     const safeDelayMs = Math.max(150, Math.round(Number.isFinite(delayMs) ? delayMs : 350))
     activePlaybackEndTimer = setTimeout(() => {
       activePlaybackEndTimer = null
+      // Real audio still playing on a running AudioContext: wait for it instead of
+      // cutting the mouth off on an estimate.
+      const realRemainingMs = isSharedPlaybackContextRunning() ? getRealPlaybackRemainingMs() : 0
+      if (realRemainingMs > 50) {
+        schedulePlaybackCompletionReset(realRemainingMs + 120)
+        return
+      }
+      playerDrivesSpeakingEnd = false
       const current = useAshyStore.getState()
       if (!current.isStreamingTurn) {
         useAshyStore.setState((s) => ({
@@ -1757,8 +2002,10 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         const wordCount = Math.max(1, text.trim().split(/\s+/).length)
         const durationMs = Math.max(350, wordCount * 55)
 
+        // web-speech-tts is rendered by the browser itself (speechSynthesis); never ask the host.
         if (
           activeTts !== 'local-synth-fallback' &&
+          activeTts !== 'web-speech-tts' &&
           state.isBootstrapped &&
           state.autoSpeakReplies !== false
         ) {
@@ -1788,10 +2035,35 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
                 })
               }
               if (res.audioBase64) {
-                playBase64AudioInBrowser(res.audioBase64, res.mimeType)
-              } else {
-                speakBrowserTextOutLoud(text)
+                const output: TtsSynthesisOutput = {
+                  providerId: activeTts,
+                  durationMs: res.durationMs,
+                  durationSec: res.durationSec,
+                  vowelFrames: res.vowelFrames,
+                }
+                const ctx = getSharedPlaybackAudioContext()
+                const decoded = ctx
+                  ? await decodeBase64AudioForPlayer(ctx, res.audioBase64, res.mimeType)
+                  : null
+                if (decoded) {
+                  const realDurationSec = decoded.samples.length / decoded.sampleRate
+                  output.durationSec = realDurationSec
+                  output.durationMs = Math.round(realDurationSec * 1000)
+                  cascadeChunkPlayback.set(output, {
+                    kind: 'player',
+                    samples: decoded.samples,
+                    sampleRate: decoded.sampleRate,
+                  })
+                } else {
+                  cascadeChunkPlayback.set(output, {
+                    kind: 'html',
+                    audioBase64: res.audioBase64,
+                    mimeType: res.mimeType,
+                  })
+                }
+                return output
               }
+              speakBrowserTextOutLoud(text)
               return {
                 providerId: activeTts,
                 durationMs: res.durationMs,
@@ -1826,7 +2098,30 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           const providerId = get().voiceSettings.activeTtsProviderId
           voiceRuntime.recordTtfaSample(providerId, ttfaMs)
         }
-        schedulePlaybackCompletionReset(Math.max(150, Math.round(chunk.endTimeSec * 1000)))
+        // Play host TTS audio in pipeline order (onAudioScheduled is head-of-line ordered).
+        const playback = chunk.synthesisOutput
+          ? cascadeChunkPlayback.get(chunk.synthesisOutput)
+          : undefined
+        if (playback?.kind === 'player') {
+          cascadeChunkPlayback.delete(chunk.synthesisOutput)
+          const item = voiceRuntime.getPlayer().scheduleChunk({
+            seq: chunk.seq,
+            text: chunk.text,
+            samples: playback.samples,
+            sampleRate: playback.sampleRate,
+            vowelFrames: chunk.synthesisOutput.vowelFrames,
+          })
+          if (!item.playedOnAudioOutput) {
+            // Context vanished between synthesis and scheduling: speak the text instead.
+            speakBrowserTextOutLoud(chunk.text)
+          }
+        } else if (playback?.kind === 'html') {
+          cascadeChunkPlayback.delete(chunk.synthesisOutput)
+          playBase64AudioInBrowser(playback.audioBase64, playback.mimeType)
+        }
+        schedulePlaybackCompletionReset(
+          Math.max(150, Math.round(chunk.endTimeSec * 1000), getRealPlaybackRemainingMs() + 120),
+        )
         set({
           scheduledAudioChunks: chunks,
           ttfaByProvider: voiceRuntime.getTtfaTelemetry(),
@@ -1943,17 +2238,42 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     }
 
     if (event.type === 'turn:audio-delta') {
+      if (enqueuedSpeechDeltaTurnIds.has(event.turnId)) {
+        // Text deltas of this turn are already being spoken by the cascade TTS:
+        // playing the native omni WAV on top would make Ashy talk twice.
+        return
+      }
       omniAudioReceivedTurnIds.add(event.turnId)
-      voiceRuntime.ingestOmniAudioDelta({
-        turnId: event.turnId,
-        seq: event.seq,
-        audioBase64: event.audioBase64,
-        format: event.format,
-        sampleRate: event.sampleRate,
-        durationMs: event.durationMs,
-        transcriptDelta: event.transcriptDelta,
-        vowelFrames: event.vowelFrames,
-      })
+      lastOmniPlaybackTurnId = event.turnId
+      // Lazily bind the shared AudioContext (Electron allows autoplay without a gesture).
+      ensureSharedPlaybackAudioContext()
+      try {
+        const ingest = voiceRuntime.ingestOmniAudioDelta({
+          turnId: event.turnId,
+          seq: event.seq,
+          audioBase64: event.audioBase64,
+          format: event.format,
+          sampleRate: event.sampleRate,
+          durationMs: event.durationMs,
+          transcriptDelta: event.transcriptDelta,
+          vowelFrames: event.vowelFrames,
+        })
+        if (ingest?.played) {
+          omniAudioPlayedTurnIds.add(event.turnId)
+          if (completedTurnEvents.has(event.turnId)) {
+            // Late audio (turn already completed): close the stream so the real drain ends speech.
+            const latePlayer = voiceRuntime.getPlayer()
+            playerDrivesSpeakingEnd = true
+            latePlayer.markStreamComplete(true)
+            schedulePlaybackCompletionReset(
+              Math.round(latePlayer.getRemainingPlaybackSec() * 1000) + 1500,
+            )
+          }
+        }
+      } catch (err) {
+        // Undecodable chunk: turn:completed will fall back to text TTS.
+        set({ voiceRuntimeError: err instanceof Error ? err.message : String(err) })
+      }
       const vf = event.vowelFrames?.[0] ?? voiceRuntime.getState().activeVowelFrame
       const entries: Array<[Exclude<AshyVisemeKey, 'closed'>, number]> = [
         ['A', vf.A],
@@ -1982,6 +2302,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       streamedDeltaTurnIds.delete(event.turnId)
       bargeInTurnIds.delete(event.turnId)
       omniAudioReceivedTurnIds.delete(event.turnId)
+      omniAudioPlayedTurnIds.delete(event.turnId)
       createPipelineForTurn()
       set((state) => {
         const hasAssistantMsg = state.chatMessages.some((m) => m.id === assistantMsgId)
@@ -2179,6 +2500,10 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         const hadStreamedDeltas = streamedDeltaTurnIds.delete(event.turnId)
         const hadEnqueuedSpeechDeltas = enqueuedSpeechDeltaTurnIds.delete(event.turnId)
         const hadNativeOmniAudio = omniAudioReceivedTurnIds.delete(event.turnId)
+        // Omni audio that arrived but never reached a real output (no AudioContext,
+        // decode error) must not suppress the text-TTS fallback.
+        const nativeOmniAudioPlayed =
+          omniAudioPlayedTurnIds.delete(event.turnId) && hadNativeOmniAudio
         const pipeline =
           hadStreamedDeltas && activeSpeechPipeline
             ? activeSpeechPipeline
@@ -2188,11 +2513,15 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           firstDeltaEnqueuedAtMs = performance.now()
         }
 
-        if (hadNativeOmniAudio) {
-          voiceRuntime.getPlayer().markStreamComplete(true)
+        if (nativeOmniAudioPlayed) {
+          // markStreamComplete(true) happens after the state update below so the real
+          // drain (onPlaybackEnded) can close the mouth.
         } else if (hadEnqueuedSpeechDeltas && pipeline.getScheduledChunks().length > 0) {
           pipeline.flush()
         } else {
+          if (hadNativeOmniAudio) {
+            voiceRuntime.getPlayer().markStreamComplete(true)
+          }
           pipeline.enqueue(
             parsed.textWithSentinels || event.assistantMessage.content,
             parsed.signals,
@@ -2269,8 +2598,22 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
               ],
         }))
 
-        const lastEndSec = scheduledChunks.at(-1)?.endTimeSec ?? 0.35
-        schedulePlaybackCompletionReset(Math.max(150, Math.round(lastEndSec * 1000)))
+        if (nativeOmniAudioPlayed) {
+          const omniPlayer = voiceRuntime.getPlayer()
+          playerDrivesSpeakingEnd = true
+          omniPlayer.markStreamComplete(true)
+          if (playerDrivesSpeakingEnd) {
+            // Safety net only (e.g. suspended context); the real end comes from onPlaybackEnded.
+            schedulePlaybackCompletionReset(
+              Math.round(omniPlayer.getRemainingPlaybackSec() * 1000) + 1500,
+            )
+          }
+        } else {
+          const lastEndSec = scheduledChunks.at(-1)?.endTimeSec ?? 0.35
+          schedulePlaybackCompletionReset(
+            Math.max(150, Math.round(lastEndSec * 1000), getRealPlaybackRemainingMs() + 120),
+          )
+        }
 
         completedTurnEvents.set(event.turnId, event)
         const resolver = pendingTurnResolvers.get(event.turnId)
@@ -3334,6 +3677,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       const trimmed = userMessage.trim()
       if (!trimmed) return
 
+      ensureSharedPlaybackAudioContext()
       clearActivePlaybackEndTimer()
       const bridge = ensureHostSubscription()
       const current = get()
@@ -3451,16 +3795,27 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     triggerBargeIn(interruptAtMs = 600) {
       clearActivePlaybackEndTimer()
       cancelBrowserSpeechSynthesis()
+      stopInFlightHtmlAudio()
+      playerDrivesSpeakingEnd = false
       const activeTurnId = get().activeTurnId ?? get().activeStreamingTurnId ?? null
       if (activeTurnId !== null) {
         bargeInTurnIds.add(activeTurnId)
         void get().abortActiveTurn()
       }
 
-      if (activeTurnId && omniAudioReceivedTurnIds.has(activeTurnId)) {
+      // Omni audio keeps playing after turn:completed (activeTurnId is null by then),
+      // so also interrupt the last omni turn while the player is still audible.
+      const omniTurnId =
+        activeTurnId && omniAudioReceivedTurnIds.has(activeTurnId)
+          ? activeTurnId
+          : lastOmniPlaybackTurnId && voiceRuntime.getPlayer().isPlaying()
+            ? lastOmniPlaybackTurnId
+            : null
+
+      if (omniTurnId) {
         const interruptSec = Math.max(0.05, interruptAtMs / 1000)
         voiceRuntime.getPlayer().setVirtualClockSec(interruptSec)
-        const omniReceipt = voiceRuntime.interruptOmniPlayback(activeTurnId, 'user_barge_in')
+        const omniReceipt = voiceRuntime.interruptOmniPlayback(omniTurnId, 'user_barge_in')
         if (omniReceipt) {
           set({
             isSpeaking: false,
@@ -3475,6 +3830,11 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           })
           return omniReceipt
         }
+      }
+
+      // Cascade host-TTS audio on the shared player: fade it out too.
+      if (voiceRuntime.getPlayer().isPlaying()) {
+        voiceRuntime.getPlayer().stopWithFade(100)
       }
 
       let pipeline = activeSpeechPipeline
@@ -4875,6 +5235,10 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
     async toggleVoiceConversation(active) {
       const shouldActivate = active !== undefined ? Boolean(active) : !get().isVoiceListening
+      if (shouldActivate) {
+        // User gesture: create/resume the shared playback AudioContext before any await.
+        ensureSharedPlaybackAudioContext()
+      }
       if (!shouldActivate) {
         stopBrowserSpeechRecognition()
         await voiceRuntime.stopMicrophoneCapture()
@@ -5169,6 +5533,7 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
 
         if (
           activeTts !== 'local-synth-fallback' &&
+          activeTts !== 'web-speech-tts' &&
           typeof bridge.synthesizeVoiceSpeech === 'function'
         ) {
           const res = await bridge.synthesizeVoiceSpeech({
@@ -5242,8 +5607,13 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     async runAudioFixtureSimulation(fixtureId) {
       const prevWake = get().voiceSettings.wakeWordEnabled
       const prevMic = get().privacyState.micMode
+      const prevStt = get().voiceSettings.activeSttProviderId
+      const prevTts = get().voiceSettings.activeTtsProviderId
       isRunningFixtureScenario = true
       try {
+        // Fixtures are deterministic by design: always run them on the offline fakes.
+        voiceRuntime.setActiveSttProvider('deterministic-wav-stt')
+        voiceRuntime.setActiveTtsProvider('local-synth-fallback')
         const result = await voiceRuntime.runFixtureScenario(fixtureId)
         voiceRuntime.setWakeWordEnabled(prevWake)
         voiceRuntime.setMicMode(prevMic)
@@ -5259,6 +5629,12 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
         }))
         return result
       } finally {
+        try {
+          voiceRuntime.setActiveSttProvider(prevStt)
+          voiceRuntime.setActiveTtsProvider(prevTts)
+        } catch {
+          // Ignore unknown provider ids from stale settings
+        }
         isRunningFixtureScenario = false
       }
     },
@@ -5785,6 +6161,17 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
     },
 
     async sendOmniAudioTurn(turn) {
+      ensureSharedPlaybackAudioContext()
+      // Phase 10.0: clips shorter than 400 ms are noise/hallucination bait; drop them here
+      // (the host applies the same guard and returns a non-persisted placeholder).
+      if (
+        typeof turn.durationMs === 'number' &&
+        Number.isFinite(turn.durationMs) &&
+        turn.durationMs > 0 &&
+        turn.durationMs < MIN_OMNI_AUDIO_TURN_MS
+      ) {
+        return
+      }
       const s = get()
       const videoFrames =
         s.pendingVideoFrames.length > 0 ? [...s.pendingVideoFrames] : undefined
@@ -5851,6 +6238,10 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
           omniExecutionModeOverride: 'native-omni',
         })
 
+        if (res?.userMessage && res.userMessage.content === OMNI_DISCARDED_SHORT_AUDIO_TEXT) {
+          // Host discarded a too-short/near-silent clip (turn:aborted follows): not a chat message.
+          return
+        }
         if (res?.userMessage && res?.turnId) {
           const userTurn: ChatTurnMessage = {
             id: res.userMessage.id,
@@ -6115,9 +6506,13 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       enqueuedSpeechDeltaTurnIds.clear()
       bargeInTurnIds.clear()
       omniAudioReceivedTurnIds.clear()
+      omniAudioPlayedTurnIds.clear()
       latestBrowserSpeechTranscript = ''
       stopBrowserSpeechRecognition()
       cancelBrowserSpeechSynthesis()
+      stopInFlightHtmlAudio()
+      playerDrivesSpeakingEnd = false
+      lastOmniPlaybackTurnId = null
       agency = createAgencyRuntime()
       voiceRuntime = createStoreVoiceRuntime()
 
@@ -6346,9 +6741,15 @@ export const useAshyStore = create<AshyDesktopState>((set, get) => {
       enqueuedSpeechDeltaTurnIds.clear()
       bargeInTurnIds.clear()
       omniAudioReceivedTurnIds.clear()
+      omniAudioPlayedTurnIds.clear()
       latestBrowserSpeechTranscript = ''
       stopBrowserSpeechRecognition()
       cancelBrowserSpeechSynthesis()
+      stopInFlightHtmlAudio()
+      playerDrivesSpeakingEnd = false
+      lastOmniPlaybackTurnId = null
+      // Tests install/uninstall fake AudioContexts: never leak one across resets.
+      sharedPlaybackAudioContext = null
       webcamSampler.stop()
       webcamSampler.clearFrames()
       agency = createAgencyRuntime()

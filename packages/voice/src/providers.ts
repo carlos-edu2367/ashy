@@ -737,6 +737,18 @@ export interface SttProviderRegistry {
   listIds(): readonly SttProviderId[]
 }
 
+/** STT provider that only works when the host bridge is injected; fails loudly otherwise. */
+export function createHostBridgeRequiredSttProvider(id: SttProviderId): SttProvider {
+  return {
+    id,
+    async transcribe(): Promise<SttTranscriptionResult> {
+      throw new Error(
+        `STT provider "${id}" requires the Ashy host bridge (inject it via customProviders).`,
+      )
+    },
+  }
+}
+
 export function createSttProviderRegistry(
   options: SttProviderRegistryOptions = {},
 ): SttProviderRegistry {
@@ -770,6 +782,11 @@ export function createSttProviderRegistry(
         ...options.webSpeechStt,
       }),
     'deterministic-wav-stt': deterministicProvider,
+    // Phase 10.0: transcription happens in the host (Ollama /v1/audio/transcriptions).
+    // The renderer must inject a host-bridge-backed provider via customProviders.
+    'ollama-transcriptions':
+      options.customProviders?.['ollama-transcriptions'] ??
+      createHostBridgeRequiredSttProvider('ollama-transcriptions'),
   }
 
   return {
