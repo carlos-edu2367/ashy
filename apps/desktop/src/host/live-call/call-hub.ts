@@ -50,6 +50,21 @@ export interface CallHubDeps {
   createCallId?: () => string
   /** Minimum interval between re-emitted viseme frames (default 1000/30 ms → ≤ 30 Hz). */
   visemeMinIntervalMs?: number
+  /**
+   * Phase 10.4 — cloud speech-to-speech backends ('openai-realtime', 'gemini-live'): start validation
+   * (key present, endpoint sane, relay listening) and the runtime `cloud` block. Absent = those
+   * backends end with `backend_unavailable`.
+   */
+  cloud?: CallHubCloud
+}
+
+/** Narrow view of `LiveCloud` (cloud.ts). */
+export interface CallHubCloud {
+  prepareStart(
+    settings: LiveModeSettings,
+    backend: LiveBackendId,
+  ): Promise<{ ok: true } | { ok: false; reason: CallEndReason; detail: string }>
+  runtimeConfig(callId: string, settings: LiveModeSettings, backend: LiveBackendId): CallRuntimeConfig['cloud']
 }
 
 export interface CallRecord {
@@ -109,6 +124,10 @@ const DEFAULT_CONTEXT_SIZE = 8192
 
 function isLlamaCppBackend(backend: LiveBackendId): boolean {
   return backend === 'llamacpp-realtime' || backend === 'llamacpp-hybrid'
+}
+
+function isCloudBackend(backend: LiveBackendId): boolean {
+  return backend === 'openai-realtime' || backend === 'gemini-live'
 }
 
 export function createCallHub(deps: CallHubDeps): CallHub {
@@ -211,6 +230,20 @@ export function createCallHub(deps: CallHubDeps): CallHub {
       if (!engineCheck.ok) {
         return endWith(engineCheck.reason, engineCheck.detail, { backend })
       }
+    }
+
+    if (isCloudBackend(backend)) {
+      if (!deps.cloud) {
+        return endWith('backend_unavailable', `${backend}: cloud backends are not available in this host`, { backend })
+      }
+      let check: Awaited<ReturnType<CallHubCloud['prepareStart']>>
+      try {
+        check = await deps.cloud.prepareStart(settings, backend)
+      } catch (err) {
+        check = { ok: false, reason: 'backend_unavailable', detail: errorMessage(err) }
+      }
+      if (generation !== myGeneration) return { ...state }
+      if (!check.ok) return endWith(check.reason, check.detail, { backend })
     }
 
     const sessionId = await deps.resolveSessionId()
@@ -330,12 +363,16 @@ export function createCallHub(deps: CallHubDeps): CallHub {
           }
         }
       }
+      const cloud = isCloudBackend(active.backend)
+        ? (deps.cloud?.runtimeConfig(active.callId, settings, active.backend) ?? null)
+        : null
       return {
         callId: active.callId,
         backend: active.backend,
         sessionId: active.sessionId,
         settings,
         llamacpp,
+        ...(cloud ? { cloud } : {}),
       }
     },
 

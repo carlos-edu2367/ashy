@@ -375,6 +375,11 @@ export interface AshyHostLiveCallApi {
   getCallWindowController(): CallWindowController | null
   /** Phase 10.2: managed llama-server origin + auth headers (SECRET: Electron main/e2e only). */
   getEngineAuth(): LlamaCppEngineAuth | null
+  /**
+   * Phase 10.4: loopback cloud relay origin + token header (SECRET: Electron main only — injected into
+   * the call window's requests to the relay port). null until a cloud call started the relay.
+   */
+  getCloudRelayAuth?(): LlamaCppEngineAuth | null
 }
 
 export interface AshyHostKernel extends AshyHostBridge {
@@ -924,6 +929,7 @@ export async function createAshyHostKernel(
       return callWindowController
     },
     getEngineAuth: () => llamaCppEngine.getAuth(),
+    getCloudRelayAuth: () => callHost.cloud?.getRelayAuth() ?? null,
   }
 
   const liveModeSettingsStore = createLiveModeSettingsStore({ userDataDir: options.userDataDir })
@@ -953,6 +959,9 @@ export async function createAshyHostKernel(
     },
     // Same host STT path as Phase 10.0 (`ollama-transcriptions` + chat-style heuristic).
     transcribe: (input) => kernel.transcribeVoiceAudio!(input),
+    // Phase 10.4: cloud speech-to-speech API keys (encrypted like the provider keys).
+    cloudSecretProtector: voiceSecretProtector,
+    cloudFallbackKey: (provider) => (provider === 'openai' ? resolveDecryptedOpenAiVoiceKey() : null),
   })
 
   let kernelEpoch = 0

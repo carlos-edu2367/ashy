@@ -62,6 +62,17 @@ import { createAgencyEventBridge, createCallApprovals, type AgencyEventBridge } 
 import { buildCallToolDefinitions, executeCallTool } from './tools'
 import { createVisionDescriber, hasVisualIntent, type ScreenCaptureProvider, type VisionDescriber } from './vision'
 import { createCallInitiative } from './initiative'
+import {
+  buildCloudSessionInstructions,
+  createLiveCloud,
+  createLiveCloudKeyStore,
+  isCloudBackend,
+  type CloudContextCortex,
+  type LiveCloud,
+} from './cloud'
+import type { ConnectUpstream } from './cloud-relay'
+import type { SecretProtector } from '../secret-protector'
+import { LiveSetApiKeyInputSchema, type LiveKeyProvider } from '@ashy/shared'
 
 export type CallHostCortex = CallRecorderCortex &
   Pick<AshyCortex, 'compileTurnPrompt' | 'db' | 'evaluateAttentionInitiative'>
@@ -103,6 +114,16 @@ export interface CallHostDeps {
   evaluateInitiative?: (input: EvaluateInitiativeInput) => ProactiveInitiativeRecord
   visionTimeoutMs?: number
   visionCacheTtlMs?: number
+  /**
+   * Phase 10.4 — cloud speech-to-speech backends: the secret protector that encrypts their API keys
+   * (`<userDataDir>/live-cloud-keys.json`). Without it (or without `userDataDir`) the cloud backends
+   * end with `backend_unavailable` and `liveMode:setApiKey` is not registered.
+   */
+  cloudSecretProtector?: Pick<SecretProtector, 'encryptEnvelope' | 'decryptEnvelope'>
+  /** Phase 10.4 — key fallback per provider (e.g. the OpenAI key already configured for chat/voice). */
+  cloudFallbackKey?: (provider: LiveKeyProvider) => string | null
+  /** Phase 10.4 — tests: fake upstream connector for the loopback relay. */
+  cloudConnectUpstream?: ConnectUpstream
 }
 
 export interface CallHostHandlers {
@@ -114,6 +135,8 @@ export interface CallHostHandlers {
   /** Phase 10.3 — Electron main's desktopCapturer provider (`kernel.setScreenCaptureProvider`). */
   setScreenCaptureProvider(provider: ScreenCaptureProvider | null): void
   vision: VisionDescriber
+  /** Phase 10.4 — cloud backends (keys + loopback relay); null when not configured. */
+  cloud: LiveCloud | null
   unregister(): void
 }
 
@@ -146,6 +169,22 @@ export class CallUnknownError extends Error {
 /** Registers every `call:*` method. Returns the hub plus an unregister function. */
 export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): CallHostHandlers {
   const nowMs = deps.now ?? (() => Date.now())
+  // Phase 10.4 — cloud backends: the relay serves only the hub's active call (late-bound).
+  let hubRef: CallHub | null = null
+  const cloud: LiveCloud | null =
+    deps.userDataDir && deps.cloudSecretProtector
+      ? createLiveCloud({
+          keys: createLiveCloudKeyStore({
+            userDataDir: deps.userDataDir,
+            protector: deps.cloudSecretProtector,
+            ...(deps.cloudFallbackKey ? { fallbackKey: deps.cloudFallbackKey } : {}),
+          }),
+          getSettings: () => deps.settings.get(),
+          getActiveCall: () => hubRef?.getActiveCall() ?? null,
+          ...(deps.cloudConnectUpstream ? { connectUpstream: deps.cloudConnectUpstream } : {}),
+          ...(deps.onWarning ? { log: (m: string) => deps.onWarning!(m) } : {}),
+        })
+      : null
   const hub = createCallHub({
     emit: (event) => api.emit(event),
     settings: deps.settings,
@@ -157,7 +196,9 @@ export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): 
     ...(deps.visemeMinIntervalMs !== undefined
       ? { visemeMinIntervalMs: deps.visemeMinIntervalMs }
       : {}),
+    ...(cloud ? { cloud } : {}),
   })
+  hubRef = hub
   const contextBuilder = createCallContextBuilder({
     retrieveMemories: deps.retrieveMemories ?? createCortexMemoryRetriever(deps.getCortex),
     getMood: createCortexMoodReader(deps.getCortex, nowMs),
@@ -271,7 +312,9 @@ export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): 
       const call = requireKnownCall(input.callId)
       // Phase 10.3 — tools / voice approval / screen context (never in a test call).
       const features = agency.features()
-      const toolsOn = !call.test && features.toolsInCall && agency.modelSupportsTools()
+      // Phase 10.4: cloud models always get the call tools when `features.toolsInCall`.
+      const cloudCall = isCloudBackend(call.backend)
+      const toolsOn = !call.test && features.toolsInCall && (cloudCall || agency.modelSupportsTools())
       const userText = (input.userText ?? '').trim()
       let approval: { handled: boolean; contextLine?: string } | null = null
       let screen: string | null = null
@@ -291,12 +334,38 @@ export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): 
         ...(input.interruptedAfterText !== undefined
           ? { interruptedAfterText: input.interruptedAfterText }
           : {}),
-        ...(toolsOn ? { tools: buildCallToolDefinitions() } : {}),
+        // Cloud models call tools inside their spoken answers: no per-turn tool policy / context drop.
+        ...(toolsOn && !cloudCall ? { tools: buildCallToolDefinitions() } : {}),
         ...(approval ? { approval } : {}),
         ...(screen ? { screen } : {}),
       })
       if (built.retrieval && !call.test) {
         lastRetrievalByCall.set(input.callId, built.retrieval)
+      }
+      if (cloudCall) {
+        const sessionLevel = input.userText === undefined
+        let cortex: CloudContextCortex | null = null
+        try {
+          cortex = deps.getCortex() as unknown as CloudContextCortex
+        } catch {
+          cortex = null
+        }
+        return {
+          sessionId: built.sessionId,
+          instructions: sessionLevel
+            ? buildCloudSessionInstructions({
+                cortex,
+                sessionId: call.sessionId,
+                settings: deps.settings.get(),
+                userName: built.userLabel && built.userLabel !== 'Usuário' ? built.userLabel : null,
+                tools: toolsOn,
+              })
+            : '',
+          perTurnContext: built.perTurnContext,
+          ...(built.userLabel ? { userLabel: built.userLabel } : {}),
+          ...(sessionLevel && toolsOn ? { tools: buildCallToolDefinitions() } : {}),
+          ...(built.approvalHandled ? { approvalHandled: true } : {}),
+        }
       }
       return {
         sessionId: built.sessionId,
@@ -378,6 +447,16 @@ export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): 
   ]
 
   const quality = registerCallQualityHandlers(api, deps, hub, requireKnownCall)
+  // Phase 10.4 — cloud API keys (masked status only ever leaves the host).
+  if (cloud) {
+    unregisterFns.push(
+      api.registry.register('liveMode:setApiKey', (payload) => {
+        const input = parseOrThrow(LiveSetApiKeyInputSchema, payload, 'liveMode:setApiKey')
+        return cloud.keys.set(input.provider, input.apiKey)
+      }),
+      api.registry.register('liveMode:getKeyStatus', () => cloud.keys.status()),
+    )
+  }
 
   return {
     hub,
@@ -388,7 +467,9 @@ export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): 
       vision.clearCache()
     },
     vision,
+    cloud,
     unregister() {
+      void cloud?.close().catch(() => undefined)
       for (const fn of unregisterFns) fn()
       quality.unregister()
       lastRetrievalByCall.clear()

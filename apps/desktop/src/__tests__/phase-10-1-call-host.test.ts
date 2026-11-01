@@ -184,7 +184,7 @@ describe('Phase 10.1 — call host services (hub, context, transcribe, recorder)
       callId: 'call-test-1',
       backend: 'llamacpp-realtime',
       sessionId: h.session.id,
-      llamacpp: { baseUrl: 'http://127.0.0.1:39123', modelId: MODEL_ID, contextSize: 8192 },
+      llamacpp: { baseUrl: 'http://127.0.0.1:39123', modelId: MODEL_ID, contextSize: 16384 },
     })
     expect(cfg.settings.llamacpp.inputMode).toBe('transcribed')
     await expect(h.invoke('call:getRuntimeConfig', { callId: 'nope' })).rejects.toThrow(/CALL_NOT_ACTIVE/)
@@ -289,10 +289,12 @@ describe('Phase 10.1 — call host services (hub, context, transcribe, recorder)
       reason: 'engine_not_installed',
     })
 
+    // Phase 10.4: gemini-live is implemented; without its API key (cloud deps absent here) the call
+    // ends backend_unavailable before touching the llama.cpp engine.
     const notImpl = await makeHarness()
     await expect(notImpl.invoke('call:start', { backend: 'gemini-live' })).resolves.toMatchObject({
       status: 'ended',
-      reason: 'backend_not_implemented',
+      reason: 'backend_unavailable',
       backend: 'gemini-live',
     })
     expect(notImpl.engine.getStatus).not.toHaveBeenCalled()

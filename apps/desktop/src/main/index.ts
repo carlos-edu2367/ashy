@@ -540,6 +540,26 @@ export function engineAuthUrlPatterns(auth: EngineAuthLike | null): string[] {
   return [`http://127.0.0.1:${auth.port}/*`, `ws://127.0.0.1:${auth.port}/*`]
 }
 
+/**
+ * Phase 10.4: URL patterns for the loopback cloud relay (WebSocket only — the relay serves nothing
+ * else). The relay checks the injected token header; the key itself never leaves the host.
+ */
+export function cloudRelayUrlPatterns(auth: EngineAuthLike | null): string[] {
+  if (!auth || !Number.isInteger(auth.port) || auth.port <= 0 || auth.port > 65535) return []
+  return [`ws://127.0.0.1:${auth.port}/*`]
+}
+
+/** True when `rawUrl` is a ws:// request to exactly the relay's loopback port. */
+export function isCloudRelayRequestUrl(rawUrl: string, auth: EngineAuthLike | null): boolean {
+  if (!auth) return false
+  try {
+    const u = new URL(rawUrl)
+    return u.protocol === 'ws:' && u.hostname === '127.0.0.1' && Number(u.port) === auth.port
+  } catch {
+    return false
+  }
+}
+
 /** True when `rawUrl` targets exactly the engine's loopback port over http/ws. */
 export function isEngineRequestUrl(rawUrl: string, auth: EngineAuthLike | null): boolean {
   if (!auth) return false
@@ -577,6 +597,11 @@ export interface CreateCallWindowControllerOptions {
    * requests to that engine port.
    */
   getEngineAuth?: () => EngineAuthLike | null
+  /**
+   * Phase 10.4: loopback cloud relay auth (`kernel.liveCall.getCloudRelayAuth()`): its token header is
+   * injected (main only) into the call window's WebSocket requests to the relay port.
+   */
+  getCloudRelayAuth?: () => EngineAuthLike | null
 }
 
 export interface ElectronCallWindowController {
@@ -610,6 +635,14 @@ export function createCallWindowController(
   let idleTimer: unknown = null
   let releasePermission: (() => void) | null = null
   let headerScope: RequestHeaderScopeHandle | null = null
+  let relayHeaderScope: RequestHeaderScopeHandle | null = null
+  const readRelayAuth = (): EngineAuthLike | null => {
+    try {
+      return options.getCloudRelayAuth?.() ?? null
+    } catch {
+      return null
+    }
+  }
   const readEngineAuth = (): EngineAuthLike | null => {
     try {
       return options.getEngineAuth?.() ?? null
@@ -634,6 +667,8 @@ export function createCallWindowController(
     releasePermission = null
     headerScope?.dispose()
     headerScope = null
+    relayHeaderScope?.dispose()
+    relayHeaderScope = null
     options.onWindowGone?.(target)
   }
 
@@ -670,6 +705,19 @@ export function createCallWindowController(
           }
           const auth = readEngineAuth()
           return auth && isEngineRequestUrl(details.url, auth) ? auth.headers : null
+        },
+      })
+    }
+    if (options.getCloudRelayAuth) {
+      relayHeaderScope = installScopedRequestHeaders(wc.session ?? options.session ?? null, {
+        urls: () => (win === created ? cloudRelayUrlPatterns(readRelayAuth()) : []),
+        headersFor: (details) => {
+          // Only the call-engine window, only ws:// to the relay's loopback port.
+          if (win !== created || typeof wc.id !== 'number' || details.webContentsId !== wc.id) {
+            return null
+          }
+          const auth = readRelayAuth()
+          return auth && isCloudRelayRequestUrl(details.url, auth) ? auth.headers : null
         },
       })
     }
@@ -758,6 +806,7 @@ export function createCallWindowController(
 
     refreshEngineAuth() {
       headerScope?.refresh()
+      relayHeaderScope?.refresh()
     },
   }
   return controller
@@ -1276,6 +1325,9 @@ export async function bootAshyElectronMain(
     // Phase 10.2: the llama-server API key stays in the main process; only the call window's
     // requests to the engine port get `Authorization` injected (see installScopedRequestHeaders).
     getEngineAuth: () => kernel.liveCall?.getEngineAuth?.() ?? null,
+    // Phase 10.4: cloud speech-to-speech — the call window reaches the cloud through the host's
+    // loopback relay; only its requests to the relay port carry the relay token.
+    getCloudRelayAuth: () => kernel.liveCall?.getCloudRelayAuth?.() ?? null,
     ...(deps.callWindowIdleDestroyMs !== undefined
       ? { idleDestroyMs: deps.callWindowIdleDestroyMs }
       : {}),
@@ -1297,6 +1349,9 @@ export async function bootAshyElectronMain(
   const unsubscribeCallState = kernel.onHostEvent((evt) => {
     if (evt.type === 'call:state') {
       callWindowController.handleCallState(evt.state.status)
+      // Phase 10.4: the relay starts listening during call:start → pick its port up before the
+      // renderer connects (the call window gets the start command right before this snapshot).
+      if (evt.state.status === 'connecting') callWindowController.refreshEngineAuth()
     } else if (evt.type === 'engine:status') {
       callWindowController.refreshEngineAuth()
     }
