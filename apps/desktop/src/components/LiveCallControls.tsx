@@ -306,19 +306,24 @@ export function OverlayCallButtons(): React.ReactElement {
   )
 }
 
-/** State dot: always visible during a call, otherwise follows the hover like the other islands. */
+/**
+ * State dot: always visible during a call, otherwise follows the hover like the other islands.
+ * It is a pure indicator, NOT a UI island: it floats over the transparent top-left corner of the
+ * stage canvas, so it must let the pointer through (`pointer-events: none`). Otherwise it eats
+ * the canvas `mousemove` there and the alpha click-through hit-test freezes in that spot.
+ */
 export function OverlayCallStateDot({ hovering }: { hovering: boolean }): React.ReactElement {
   const { callState, active, ring } = useCallView()
   const visible = active || hovering
   return (
     <div
       data-testid="call-state-dot"
-      data-ui-island="true"
       data-call-status={callState.status}
       data-visible={visible ? 'true' : 'false'}
-      title={CALL_STATUS_LABELS[callState.status]}
+      role="status"
+      aria-label={CALL_STATUS_LABELS[callState.status]}
       className={`ashy-call-dot ashy-call-ring--${ring}`}
-      style={{ opacity: visible ? 1 : 0 }}
+      style={{ opacity: visible ? 1 : 0, pointerEvents: 'none' }}
     />
   )
 }

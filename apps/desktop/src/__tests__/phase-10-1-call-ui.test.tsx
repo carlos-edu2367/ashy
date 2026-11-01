@@ -256,7 +256,10 @@ describe('Phase 10.1 — Live Call UI (hub orb, overlay, Live Mode settings, sta
     const island = getByTestId('stage-quick-controls')
     expect(island.getAttribute('data-ui-island')).toBe('true')
     expect(island.contains(getByTestId('btn-call-toggle'))).toBe(true)
-    expect(dot.getAttribute('data-ui-island')).toBe('true')
+    // The dot overlaps the transparent top-left of the stage canvas: it must be pointer-transparent
+    // and not an island, or it would swallow the canvas click-through hit-test there.
+    expect(dot.getAttribute('data-ui-island')).toBeNull()
+    expect(dot.style.pointerEvents).toBe('none')
 
     await act(async () => click(getByTestId('btn-call-toggle')))
     await flush()
