@@ -959,6 +959,8 @@ export async function createAshyHostKernel(
     },
     // Same host STT path as Phase 10.0 (`ollama-transcriptions` + chat-style heuristic).
     transcribe: (input) => kernel.transcribeVoiceAudio!(input),
+    getTurnOrchestrator: () => turnOrchestratorInstance ?? null, // Phase 10.5 cascade LLM turns
+    synthesizeSpeech: (input) => kernel.synthesizeVoiceSpeech!(input), // Phase 10.5 cascade TTS
     // Phase 10.4: cloud speech-to-speech API keys (encrypted like the provider keys).
     cloudSecretProtector: voiceSecretProtector,
     cloudFallbackKey: (provider) => (provider === 'openai' ? resolveDecryptedOpenAiVoiceKey() : null),

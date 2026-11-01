@@ -88,6 +88,8 @@ export function normalizeVoicePhrase(text: string): string {
     .replace(/\s+/g, ' ')
     .trim()
   t = t.replace(/^ashy\s+/, '').replace(/\s+ashy$/, '').replace(/\s+por favor$/, '').trim()
+  // Phase 10.5: common STT spellings of "pode" (LFM3 ASR wrote "Podi sim, por favor." in the real run).
+  t = t.replace(/\bpod[iy]\b/g, 'pode')
   return t
 }
 

@@ -5,7 +5,7 @@
  * function — no HTTP code here. Audio shorter than 300 ms is not sent.
  */
 import { decodeWavToPcmBlocks } from '@ashy/voice'
-import type { CallTranscribeResult } from '@ashy/shared'
+import type { CallTranscribeResult, SttProviderId } from '@ashy/shared'
 
 export const CALL_TRANSCRIBE_MIN_AUDIO_MS = 300
 /** providerId reported when the audio was too short to be worth transcribing. */
@@ -16,6 +16,8 @@ export interface HostTranscribeFn {
     audioBase64: string
     mimeType: string
     language?: string
+    /** Phase 10.5: explicit STT provider (cascade calls); default = the voice settings' provider. */
+    providerId?: SttProviderId
   }): Promise<{ text: string; providerId: string; latencyMs: number }>
 }
 
@@ -26,7 +28,7 @@ export interface CallTranscribeDeps {
 }
 
 export async function transcribeCallAudio(
-  input: { audioWavBase64: string; language?: string },
+  input: { audioWavBase64: string; language?: string; providerId?: SttProviderId },
   deps: CallTranscribeDeps,
 ): Promise<CallTranscribeResult> {
   const minAudioMs = deps.minAudioMs ?? CALL_TRANSCRIBE_MIN_AUDIO_MS
@@ -50,6 +52,7 @@ export async function transcribeCallAudio(
     audioBase64: input.audioWavBase64,
     mimeType: 'audio/wav',
     ...(input.language ? { language: input.language } : {}),
+    ...(input.providerId ? { providerId: input.providerId } : {}),
   })
   return {
     text: typeof res.text === 'string' ? res.text.trim() : '',

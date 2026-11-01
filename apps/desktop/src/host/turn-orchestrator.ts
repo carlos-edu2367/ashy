@@ -28,6 +28,7 @@ import {
   type AshyEmotion,
   type AshyHostStreamEvent,
   type ChatMessageRecord,
+  type LlmProviderId,
   type SendTurnInput,
   type SeriousnessAssessment,
   type UserAffectReaction,
@@ -41,6 +42,7 @@ import {
   sanitizeConversationHistory,
 } from './conversation-history'
 import { runPostTurnMemoryPipeline } from './post-turn-memory'
+import { buildVoiceCallPrompt, createVoiceStreamGuard, stripVoiceEmojis } from './voice-call-prompt'
 import {
   buildCompactLocalOmniSystemPrompt,
   synthesizeNativeOllamaOmniSpeech,
@@ -61,7 +63,36 @@ interface ActiveTurnEntry {
   controller: AbortController
   getPartialText: () => string
   abortedEmitted: boolean
+  /** Phase 10.5 voice-call turns: abort goes to the turn's own sink, never to the chat listeners. */
+  onAborted?: () => void
 }
+
+/** Phase 10.5 — one voice-call (cascade) turn: generation only, nothing persisted. */
+export interface VoiceCallTurnInput {
+  sessionId: string
+  /** Transcribed user speech ('' = proactive turn driven by `callContext`). */
+  userText: string
+  /** Per-turn call context (approval line, screen, interruption note, memories…). */
+  callContext?: string
+  userName?: string | null
+  /** LLM provider override (default: the active chat provider). */
+  providerId?: LlmProviderId
+  /** Model override for that provider ('' / undefined = its configured model). */
+  modelId?: string
+  /** Tools for this turn (cascade: the lean call tools, only when the host tool policy says 'auto'). */
+  tools?: ToolDefinition[]
+  /** Spoken answers are short (default 260 tokens). */
+  maxTokens?: number
+}
+
+export type VoiceCallTurnEvent =
+  | { kind: 'delta'; delta: string }
+  | { kind: 'tool'; name: string }
+  | { kind: 'done'; text: string; providerId: string; modelId: string | null; latencyMs: number }
+  | { kind: 'error'; message: string }
+  | { kind: 'aborted' }
+
+export const VOICE_CALL_DEFAULT_MAX_TOKENS = 260
 
 export interface TurnOrchestratorOptions {
   cortex: AshyCortex
@@ -89,6 +120,13 @@ export interface TurnOrchestrator {
   onEvent(listener: (event: AshyHostStreamEvent) => void): () => void
   getDominantEmotion(): AshyEmotion
   getLastPersistenceWarning(): string | null
+  /**
+   * Phase 10.5 — voice-call (cascade) turn: same history, persona, memory retrieval and tool loop as
+   * a chat turn, with a voice directive (short spoken answers, no markdown) and an optional
+   * provider/model override. Events go ONLY to `onEvent` (never to the chat listeners) and nothing
+   * is persisted — the call recorder stores what was actually spoken. Abort with `abortTurn(turnId)`.
+   */
+  runVoiceCallTurn(input: VoiceCallTurnInput, onEvent: (event: VoiceCallTurnEvent) => void): { turnId: string }
 }
 
 async function executeGatekeptMcpTool(
@@ -410,6 +448,15 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     }
     if (!entry.controller.signal.aborted) {
       entry.controller.abort()
+    }
+    if (!entry.abortedEmitted && entry.onAborted) {
+      entry.abortedEmitted = true
+      try {
+        entry.onAborted()
+      } catch {
+        // sink errors never break the orchestrator
+      }
+      return
     }
     if (!entry.abortedEmitted) {
       entry.abortedEmitted = true
@@ -1458,6 +1505,217 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     }
   }
 
+  function runVoiceCallTurn(
+    input: VoiceCallTurnInput,
+    onVoiceEvent: (event: VoiceCallTurnEvent) => void,
+  ): { turnId: string } {
+    turnSequence += 1
+    const turnId = `voice-turn-${Date.now()}-${turnSequence}`
+    let spokenAccum = ''
+    let finished = false
+    const send = (event: VoiceCallTurnEvent): void => {
+      if (finished) return
+      if (event.kind === 'done' || event.kind === 'error' || event.kind === 'aborted') finished = true
+      try {
+        onVoiceEvent(event)
+      } catch {
+        // sink errors never break the turn
+      }
+    }
+    const controller = new AbortController()
+    const entry: ActiveTurnEntry = {
+      turnId,
+      sessionId: input.sessionId,
+      controller,
+      getPartialText: () => spokenAccum.trim(),
+      abortedEmitted: false,
+      onAborted: () => send({ kind: 'aborted' }),
+    }
+    // Not registered per session: a chat turn and a call turn never abort each other.
+    activeTurnsById.set(turnId, entry)
+    queueMicrotask(() => {
+      void runVoiceCallPipeline(input, entry, send, (text) => {
+        spokenAccum += text
+      })
+    })
+    return { turnId }
+  }
+
+  async function runVoiceCallPipeline(
+    input: VoiceCallTurnInput,
+    entry: ActiveTurnEntry,
+    send: (event: VoiceCallTurnEvent) => void,
+    noteSpoken: (text: string) => void,
+  ): Promise<void> {
+    const { controller, turnId } = entry
+    const epochAtStart = options.getKernelEpoch?.() ?? 0
+    const dead = () =>
+      controller.signal.aborted || entry.abortedEmitted || (options.getKernelEpoch?.() ?? 0) !== epochAtStart
+    const startedAt = Date.now()
+    try {
+      if (dead()) {
+        finalizeAbortEntry(entry)
+        return
+      }
+      const providerState = providerVault.getPublicState()
+      const providerId: LlmProviderId = input.providerId ?? providerState.activeProviderId
+      const config = providerState.configs[providerId]
+      const modelOverride = (input.modelId ?? '').trim()
+      const modelId = modelOverride || config?.modelId || ''
+      const ready =
+        Boolean(config) &&
+        config!.baseUrl.trim().length > 0 &&
+        modelId.length > 0 &&
+        (!config!.requiresApiKey || config!.hasApiKey)
+      if (!ready) {
+        send({
+          kind: 'error',
+          message: `PROVIDER_NOT_CONFIGURED: o provedor ${providerId} não está pronto (URL, modelo ou chave).`,
+        })
+        return
+      }
+
+      const userText = input.userText.trim()
+      const historyRecords = cortex.listChatMessages(input.sessionId, MAX_HISTORY_MESSAGES)
+      const history = sanitizeConversationHistory(
+        historyRecords.map((m) => ({
+          role: m.role,
+          content: m.content,
+          ...(m.interrupted ? { interrupted: true } : {}),
+        })),
+        resolveConversationHistoryLimits(providerId),
+      )
+      const retrievalText = userText || (input.callContext ?? '').slice(0, 500) || 'chamada de voz'
+      // Side effects (affect, FSRS review, memory indexing) belong to the call recorder.
+      const compiled = cortex.compileTurnPrompt(
+        {
+          userMessage: retrievalText,
+          modelId,
+          stage: cortex.deriveRelationshipStage(),
+          queryEmbedding: embedTextSync128(retrievalText),
+          voiceIdentityMarkdown: voiceStore.read().content,
+          conversationHistory: history,
+        },
+        { sideEffects: false },
+      )
+      const prompt = buildVoiceCallPrompt({
+        compiledSystemPrompt: compiled.systemPrompt,
+        compiledUserTurn: compiled.userTurnContent,
+        userText,
+        ...(input.callContext ? { callContext: input.callContext } : {}),
+        userName: input.userName ?? null,
+        compact: providerId === 'ollama',
+        toolsAvailable: Boolean(input.tools && input.tools.length > 0),
+      })
+
+      const model = providerVault.createLanguageModel(
+        providerId,
+        modelOverride ? { modelId: modelOverride } : undefined,
+      )
+      const label = createVoiceStreamGuard((raw) => {
+        // Emojis are never spoken and never belong in the transcript of a call.
+        const text = stripVoiceEmojis(raw)
+        if (!text) return
+        noteSpoken(text)
+        send({ kind: 'delta', delta: text })
+      })
+      let rawAccum = ''
+      const parser = createTailSafeMarkerParser({
+        onLiteral(text) {
+          if (dead() || text.length === 0) return
+          label.write(text)
+        },
+        onSpecial(signal) {
+          if (dead() || signal.type !== 'act') return
+          // Re-emitted inline: the call engine maps `<|ACT {json}|>` to the avatar at the right moment.
+          const marker = {
+            ...(signal.emotion !== undefined ? { emotion: signal.emotion } : {}),
+            ...(signal.intensity !== undefined ? { intensity: signal.intensity } : {}),
+            ...(signal.motion !== undefined ? { motion: signal.motion } : {}),
+          }
+          if (marker.emotion) {
+            label.flush()
+            send({ kind: 'delta', delta: `<|ACT ${JSON.stringify(marker)}|>` })
+          }
+        },
+      })
+
+      // Own controller for the model stream: the voice guard can stop generation (note / speaker turn)
+      // without the turn counting as aborted.
+      const streamController = new AbortController()
+      if (controller.signal.aborted) streamController.abort()
+      else controller.signal.addEventListener('abort', () => streamController.abort(), { once: true })
+      const stream = streamText(model, {
+        system: prompt.system,
+        messages: [...history, { role: 'user', content: prompt.userTurn }],
+        ...(input.tools && input.tools.length > 0 ? { tools: input.tools, maxSteps: 3 } : {}),
+        maxTokens: input.maxTokens ?? VOICE_CALL_DEFAULT_MAX_TOKENS,
+        // Voice turns never think: first-audio latency matters more than reasoning depth.
+        reasoningEffort: 'none',
+        signal: streamController.signal,
+      })
+      const reader = stream.getReader()
+      const abortPromise = new Promise<{ done: true; value: undefined }>((resolve) => {
+        if (controller.signal.aborted) {
+          resolve({ done: true, value: undefined })
+          return
+        }
+        controller.signal.addEventListener('abort', () => resolve({ done: true, value: undefined }), { once: true })
+      })
+      try {
+        while (true) {
+          const { done, value } = await Promise.race([reader.read(), abortPromise])
+          if (dead()) {
+            finalizeAbortEntry(entry)
+            return
+          }
+          if (done) break
+          if (!value) continue
+          if (value.type === 'text-delta') {
+            rawAccum += value.text
+            parser.write(value.text)
+            if (label.cut) {
+              streamController.abort()
+              break
+            }
+          } else if (value.type === 'tool-call') {
+            send({ kind: 'tool', name: value.toolName })
+          } else if (value.type === 'error') {
+            throw new Error(value.error)
+          }
+        }
+      } finally {
+        try {
+          reader.releaseLock()
+        } catch {
+          // pending read after abort
+        }
+      }
+      if (dead()) {
+        finalizeAbortEntry(entry)
+        return
+      }
+      parser.flush()
+      label.flush()
+      const clean = entry.getPartialText() || stripResidualStageMarkers(rawAccum).trim()
+      send({
+        kind: 'done',
+        text: clean,
+        providerId,
+        modelId: modelId || null,
+        latencyMs: Math.max(0, Date.now() - startedAt),
+      })
+    } catch (err) {
+      if (dead()) {
+        finalizeAbortEntry(entry)
+        return
+      }
+      send({ kind: 'error', message: err instanceof Error ? err.message : String(err) })
+    } finally {
+      activeTurnsById.delete(turnId)
+    }
+  }
+
   function onEvent(listener: (event: AshyHostStreamEvent) => void): () => void {
     listeners.add(listener)
     return () => {
@@ -1474,5 +1732,6 @@ export function createTurnOrchestrator(options: TurnOrchestratorOptions): TurnOr
     onEvent,
     getDominantEmotion: () => currentDominantEmotion,
     getLastPersistenceWarning: () => lastPersistenceWarning,
+    runVoiceCallTurn,
   }
 }
