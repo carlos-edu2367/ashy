@@ -137,6 +137,9 @@ import { createProviderVault, type ProviderVault } from './provider-vault'
 import { createNodeAesSecretProtector, type SecretProtector } from './secret-protector'
 import { createTurnOrchestrator, type TurnOrchestrator } from './turn-orchestrator'
 import { createVoiceIdentityStore, type VoiceIdentityStore } from './voice-identity-store'
+import { isChatStyleNonTranscript } from './stt-chat-style'
+
+export { isChatStyleNonTranscript }
 
 export const DEFAULT_DREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000
 const MAX_TTS_BINARY_RESPONSE_BYTES = 15 * 1024 * 1024
@@ -260,29 +263,6 @@ export const OLLAMA_TRANSCRIPTION_LANGUAGE = 'pt'
 export function deriveOllamaOrigin(rawBaseUrl: string): string {
   const trimmed = rawBaseUrl.trim().replace(/\/+$/, '')
   return trimmed.replace(/\/v1$/i, '').replace(/\/+$/, '')
-}
-
-const CHAT_STYLE_NON_TRANSCRIPT_PATTERNS: readonly RegExp[] = [
-  /^a unica palavra\b/,
-  /^o audio\s+(fornecido|enviado|recebido|anexado|contem|nao contem|parece|que voce|esta vazio|e silencioso|consiste)\b/,
-  /^nao ha\s+(nenhuma?\s+)?(fala|falas|audio|voz|palavra|palavras|conteudo|som|transcricao)\b/,
-  /^desculpe[,!.]?\s+(mas\s+)?(eu\s+)?nao\s+(consigo|posso|foi possivel|entendi o audio|ha)\b/,
-  /^desculpe[,!.]?\s+(mas\s+)?(como|sou)\s+(um|uma)\s+(modelo|assistente|ia)\b/,
-  /^(como|sou)\s+(um|uma)\s+(modelo|assistente)\s+de\s+(linguagem|ia)\b/,
-  /^(the audio|there is no|i'?m sorry|sorry, i)\b/,
-]
-
-/**
- * Detects chat-style answers that an omni model sometimes returns instead of a
- * transcript ("O áudio contém...", "A única palavra é...", "Não há fala...").
- */
-export function isChatStyleNonTranscript(rawText: string): boolean {
-  const normalized = rawText
-    .normalize('NFD')
-    .replace(/[̀-ͯ]/g, '')
-    .replace(/^[\s"'“”‘’«»*_-]+/, '')
-    .toLowerCase()
-  return CHAT_STYLE_NON_TRANSCRIPT_PATTERNS.some((pattern) => pattern.test(normalized))
 }
 
 /** Model ids that belong to other STT engines and must never be sent to Ollama. */
