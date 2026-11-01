@@ -285,6 +285,6 @@ export function removeSelfVocative(text: string, assistantName = 'Ashy'): string
   const greet = '(oi|ol[aá]|ei|e a[ií]|bom dia|boa tarde|boa noite|tchau|valeu|obrigad[oa]|tudo bem|beleza)'
   return text
     .replace(new RegExp(`(^|[^\\p{L}])${greet},?\\s+${name}(?=[\\s!?.,…]|$)`, 'giu'), '$1$2')
-    .replace(new RegExp(`,\\s*${name}(?=\\s*[!?.…]|\\s*$)`, 'gu'), '')
+    .replace(new RegExp(`,\\s*${name}(?=\\s*[!?.…,]|\\s*$)`, 'gu'), '')
     .replace(new RegExp(`^\\s*${name}\\s*[,!]\\s*`, 'u'), '')
 }

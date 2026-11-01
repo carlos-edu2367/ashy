@@ -39,6 +39,7 @@ describe('conversation guard helpers', () => {
     expect(removeSelfVocative('Vai ser um desafio, mas não se desanime, Ashy.')).toBe('Vai ser um desafio, mas não se desanime.')
     expect(removeSelfVocative('Eu sou a Ashy, sua companheira.')).toBe('Eu sou a Ashy, sua companheira.')
     expect(removeSelfVocative('Tudo bem, Carlos!')).toBe('Tudo bem, Carlos!')
+    expect(removeSelfVocative('Eu não tenho medo, Ashy, mas entendo você.')).toBe('Eu não tenho medo, mas entendo você.')
   })
 })
 

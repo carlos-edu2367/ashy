@@ -88,8 +88,8 @@ export const LIVE_EVAL_SCENARIOS: LiveEvalScenario[] = [
     title: 'Small talk',
     turns: [
       { user: 'Oi Ashy, tudo bem?', greetingOk: true },
-      { user: 'Eu tô meio cansado hoje, trabalhei o dia inteiro.', expectAny: ['cansad', 'descans', 'dia', 'trabalh', 'puxado', 'longo', 'dormir', 'relaxar', 'pausa'] },
-      { user: 'Pois é, fiquei programando até tarde.', expectAny: ['program', 'código', 'codigo', 'tarde', 'projeto', 'dormir', 'descans', 'bug', 'pausa', 'noite'] },
+      { user: 'Eu tô meio cansado hoje, trabalhei o dia inteiro.', expectAny: ['cansa', 'descans', 'dia', 'trabalh', 'puxado', 'pesado', 'longo', 'dormir', 'relaxar', 'pausa'] },
+      { user: 'Pois é, fiquei programando até tarde.', expectAny: ['program', 'código', 'codigo', 'tarde', 'projeto', 'dormir', 'descans', 'bug', 'pausa', 'noite', 'ocupad', 'cansa'] },
       { user: 'Você gosta de música?', expectAny: ['música', 'musica', 'gosto', 'adoro', 'ouvir', 'som', 'banda', 'estilo', 'canção', 'ritmo', 'curto'] },
       { user: 'Eu curto rock dos anos oitenta.', expectAny: ['rock', '80', 'oitenta', 'banda', 'queen', 'guitarra', 'clássico', 'classico', 'legal', 'bom gosto', 'época'] },
       { user: 'Valeu, Ashy, foi bom conversar.', greetingOk: true },
