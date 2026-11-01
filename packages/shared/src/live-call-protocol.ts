@@ -83,6 +83,16 @@ export interface LiveModeSettings {
     model: string
     voice: string
   }
+  /**
+   * Phase 10.4 — how much of Ashy goes into a cloud realtime session (big models handle it).
+   * Optional; host defaults: persona on, 12 recent messages, 4 memories per turn, 16000 chars.
+   */
+  cloudContext?: {
+    includePersona?: boolean
+    recentMessages?: number
+    memoryTopK?: number
+    maxInstructionsChars?: number
+  }
   /** Phase 10.4 — Google Gemini Live (native audio). */
   gemini: {
     model: string
@@ -129,7 +139,7 @@ export const LIVE_KEY_PROVIDERS = ['openai', 'qwen', 'custom', 'gemini'] as cons
 export type LiveKeyProvider = (typeof LIVE_KEY_PROVIDERS)[number]
 
 export const DEFAULT_LIVE_MODE_SETTINGS: LiveModeSettings = {
-  backend: 'llamacpp-realtime',
+  backend: 'llamacpp-hybrid',
   llamacpp: {
     modelId: 'lfm3-omni-2b-q4km',
     voice: 'female',
@@ -229,9 +239,17 @@ export const SaveLiveModeSettingsInputSchema = v.object({
   realtimeCloud: v.optional(
     v.object({
       provider: v.optional(v.picklist(CLOUD_REALTIME_PROVIDERS)),
-      url: v.optional(v.union([v.literal(''), v.pipe(v.string(), v.trim(), v.regex(/^wss:\/\/[^\s]+$/), v.maxLength(512))])),
+      url: v.optional(v.union([v.literal(''), v.pipe(v.string(), v.trim(), v.regex(/^(wss:\/\/[^\s]+|ws:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/[^\s]*)?)$/), v.maxLength(512))])),
       model: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(128))),
       voice: v.optional(v.pipe(v.string(), v.trim(), v.maxLength(64))),
+    }),
+  ),
+  cloudContext: v.optional(
+    v.object({
+      includePersona: v.optional(v.boolean()),
+      recentMessages: v.optional(v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(60))),
+      memoryTopK: v.optional(v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(12))),
+      maxInstructionsChars: v.optional(v.pipe(v.number(), v.integer(), v.minValue(2000), v.maxValue(60000))),
     }),
   ),
   gemini: v.optional(

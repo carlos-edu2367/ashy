@@ -113,7 +113,7 @@ async function makeHarness(
     latencyMs: 42,
   }))
   const clock = { t: 1_800_000_000_000 }
-  const settings = opts.settings ?? structuredClone(DEFAULT_LIVE_MODE_SETTINGS)
+  const settings = opts.settings ?? { ...structuredClone(DEFAULT_LIVE_MODE_SETTINGS), backend: 'llamacpp-realtime' as const }
   let seq = 0
   registerCallHostHandlers(kernel.liveCall, {
     settings: { get: () => settings },

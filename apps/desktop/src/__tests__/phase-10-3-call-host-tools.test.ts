@@ -113,7 +113,8 @@ async function makeHarness(
   }
   kernel.setCallWindowController({ ensure: vi.fn(async () => undefined), destroy: vi.fn() })
   const settings = createLiveModeSettingsStore({ userDataDir: dir })
-  settings.save({ ...(opts.backend ? { backend: opts.backend } : {}), features: opts.features ?? {} })
+  // These tests describe the realtime instruction format; pin it (the app default is hybrid since 10.5).
+  settings.save({ backend: opts.backend ?? 'llamacpp-realtime', features: opts.features ?? {} })
   const fake = createFakeFetch({ hang: opts.hang })
   const clock = { t: 1_800_000_000_000 }
   let seq = 0

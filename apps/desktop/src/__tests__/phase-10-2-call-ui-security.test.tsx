@@ -60,6 +60,9 @@ import {
   useCallStore,
 } from '../store/useCallStore'
 
+// These tests describe the llama.cpp realtime UI; the app default is hybrid since 10.5.
+const REALTIME_DEFAULTS: LiveModeSettings = { ...DEFAULT_LIVE_MODE_SETTINGS, backend: 'llamacpp-realtime' }
+
 ;(globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
 
 const tempDirs: string[] = []
@@ -511,7 +514,7 @@ const ENGINE_STATUS: LlamaCppEngineStatus = {
 type Handler = (payload: unknown) => unknown
 
 function hybridSettings(referenceVoiceId: string | null = null): LiveModeSettings {
-  const s = structuredClone(DEFAULT_LIVE_MODE_SETTINGS)
+  const s = structuredClone(REALTIME_DEFAULTS)
   s.backend = 'llamacpp-hybrid'
   s.hybrid.referenceVoiceId = referenceVoiceId
   return s
@@ -522,7 +525,7 @@ function createFakeBridge(overrides: Partial<Record<LiveCallMethod, Handler>> = 
   const handlers: Partial<Record<LiveCallMethod, Handler>> = {
     'call:getState': () => callState({}),
     'engines:getStatus': () => ({ ...ENGINE_STATUS }),
-    'liveMode:getSettings': () => structuredClone(DEFAULT_LIVE_MODE_SETTINGS),
+    'liveMode:getSettings': () => structuredClone(REALTIME_DEFAULTS),
     'liveVoice:list': () => [],
     ...overrides,
   }
@@ -734,7 +737,7 @@ describe('Phase 10.2 — voice reference normalization (unit)', () => {
 describe('Phase 10.2 — Live Mode UI', () => {
   it('9. hybrid card is enabled and selecting it saves the backend; voice section only for hybrid', async () => {
     const saved: unknown[] = []
-    let settings = structuredClone(DEFAULT_LIVE_MODE_SETTINGS)
+    let settings = structuredClone(REALTIME_DEFAULTS)
     const fake = createFakeBridge({
       'liveMode:getSettings': () => structuredClone(settings),
       'liveMode:saveSettings': (p) => {

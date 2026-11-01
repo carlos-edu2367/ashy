@@ -12,10 +12,14 @@ import {
   type LiveCallMethod,
   type LlamaCppEngineStatus,
 } from '@ashy/shared'
+import type { LiveModeSettings } from '@ashy/shared'
 import { App } from '../App'
 import { setAshyHostBridgeForTesting } from '../services/ashy-host-client'
 import { resetAshyStore, useAshyStore } from '../store/useAshyStore'
 import { resetCallStoreForTesting, useCallStore } from '../store/useCallStore'
+
+// These tests describe the llama.cpp realtime UI; the app default is hybrid since 10.5.
+const REALTIME_DEFAULTS: LiveModeSettings = { ...DEFAULT_LIVE_MODE_SETTINGS, backend: 'llamacpp-realtime' }
 
 ;(globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -57,7 +61,7 @@ function createFakeBridge(overrides: Partial<Record<LiveCallMethod, Handler>> = 
   const handlers: Partial<Record<LiveCallMethod, Handler>> = {
     'call:getState': () => callState({}),
     'engines:getStatus': () => ({ ...BASE_ENGINE_STATUS }),
-    'liveMode:getSettings': () => structuredClone(DEFAULT_LIVE_MODE_SETTINGS),
+    'liveMode:getSettings': () => structuredClone(REALTIME_DEFAULTS),
     ...overrides,
   }
   const invokeLiveCall = vi.fn(async (input: LiveCallInvokeInput) => {
@@ -285,7 +289,7 @@ describe('Phase 10.1 — Live Call UI (hub orb, overlay, Live Mode settings, sta
         savedPayloads.push(payload)
         const p = payload as { llamacpp?: { voice?: 'female' | 'male' } }
         return {
-          ...structuredClone(DEFAULT_LIVE_MODE_SETTINGS),
+          ...structuredClone(REALTIME_DEFAULTS),
           llamacpp: { ...DEFAULT_LIVE_MODE_SETTINGS.llamacpp, voice: p.llamacpp?.voice ?? 'female' },
         }
       },

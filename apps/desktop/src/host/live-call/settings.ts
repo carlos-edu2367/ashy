@@ -61,6 +61,26 @@ function readPersisted(filePath: string): LiveModeSettings {
     if (loaded.session.rotateAfterTurns === 6) {
       loaded.session = { ...loaded.session, rotateAfterTurns: DEFAULT_LIVE_MODE_SETTINGS.session.rotateAfterTurns }
     }
+    // One-time 10.5 migration: 'llamacpp-realtime' was the only choice in 10.1, never a real user
+    // pick. The 2026-11-01 eval showed the hybrid backend is far better with the 2B model
+    // (45/49 vs 36/49 clean, 15/15 vs 8/11 on a poisoned store), so move once to hybrid. A later
+    // explicit choice of realtime is kept (the marker file prevents re-migrating).
+    const marker = `${filePath}.migrated-hybrid-default`
+    if (loaded.backend === 'llamacpp-realtime' && !fs.existsSync(marker)) {
+      loaded.backend = 'llamacpp-hybrid'
+      try {
+        fs.writeFileSync(filePath, JSON.stringify(loaded, null, 2))
+        fs.writeFileSync(marker, new Date().toISOString())
+      } catch {
+        // best effort; next load retries
+      }
+    } else if (!fs.existsSync(marker)) {
+      try {
+        fs.writeFileSync(marker, new Date().toISOString())
+      } catch {
+        // ignore
+      }
+    }
     return loaded
   } catch {
     // Corrupt JSON: keep a forensic copy and fall back to defaults.
@@ -93,6 +113,12 @@ export function createLiveModeSettingsStore(opts: { userDataDir: string }): Live
       const next = mergeSettings(current, parsed.output)
       writeAtomicWithBackup(filePath, `${JSON.stringify(next, null, 2)}\n`, { rotateBackup: false })
       current = next
+      try {
+        // An explicit save is a user choice: never re-run the one-time hybrid migration over it.
+        fs.writeFileSync(`${filePath}.migrated-hybrid-default`, new Date().toISOString())
+      } catch {
+        // ignore
+      }
       return structuredClone(current)
     },
   }

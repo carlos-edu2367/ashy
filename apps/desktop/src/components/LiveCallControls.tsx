@@ -418,7 +418,7 @@ export function LiveModeSettingsPanel(): React.ReactElement {
   const [endpointUrl, setEndpointUrl] = useState('')
   const [vadThreshold, setVadThreshold] = useState(0.5)
   const [endpointMs, setEndpointMs] = useState(700)
-  const [rotateAfterTurns, setRotateAfterTurns] = useState(6)
+  const [rotateAfterTurns, setRotateAfterTurns] = useState(40)
   const [inputDeviceId, setInputDeviceId] = useState('')
   const [devices, setDevices] = useState<Array<{ deviceId: string; label: string }>>([])
   const [savedNotice, setSavedNotice] = useState<string | null>(null)
