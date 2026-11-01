@@ -612,6 +612,10 @@ export const LIVE_CALL_METHODS = [
   // Phase 10.5 — classic cascade (STT → text LLM through the turn orchestrator → chunked TTS)
   'call:cascadeTurn',
   'call:cascadeAbort',
+  // Phase 10.5 latency: warm the cascade LLM at connect; streamed TTS (PCM as `call:ttsChunk` events)
+  'call:cascadeWarmup',
+  'call:synthesizeStream',
+  'call:synthesizeAbort',
 ] as const
 export type LiveCallMethod = (typeof LIVE_CALL_METHODS)[number]
 export const LiveCallMethodSchema = v.picklist(LIVE_CALL_METHODS)
@@ -897,6 +901,52 @@ export type CallCascadeEvent =
   | { kind: 'error'; message: string }
   | { kind: 'aborted' }
 
+/** Warms the cascade LLM (loads a local model) at call connect. Nothing is persisted or emitted. */
+export const CallCascadeWarmupInputSchema = v.object({
+  callId: v.string(),
+})
+export interface CallCascadeWarmupResult {
+  warmed: boolean
+  providerId: string | null
+  modelId: string | null
+  latencyMs: number
+}
+
+/**
+ * Streamed synthesis of one phrase: PCM arrives as `call:ttsChunk` host events (`seq` 0..n-1, same
+ * `streamId`); the invoke resolves once synthesis finished, with the chunk count, so the caller can
+ * wait for events still in transit. Providers without streaming deliver the phrase as one chunk.
+ */
+export const CallSynthesizeStreamInputSchema = v.object({
+  callId: v.string(),
+  streamId: v.pipe(v.string(), v.regex(/^[A-Za-z0-9_.:-]{1,96}$/)),
+  text: v.pipe(v.string(), v.minLength(1), v.maxLength(1000)),
+})
+export interface CallSynthesizeStreamResult {
+  streamId: string
+  /** Number of `call:ttsChunk` events emitted for this stream. */
+  chunks: number
+  sampleRate: number
+  durationMs: number
+  /** Request → end of synthesis. */
+  latencyMs: number
+  /** Request → first chunk (null when no audio). */
+  firstChunkMs: number | null
+  /** True when the stream was aborted (`call:synthesizeAbort`) before the end. */
+  aborted?: boolean
+}
+export const CallSynthesizeAbortInputSchema = v.object({
+  callId: v.string(),
+  streamId: v.pipe(v.string(), v.maxLength(96)),
+})
+export interface CallTtsChunk {
+  streamId: string
+  seq: number
+  /** Mono PCM16 little-endian, base64. */
+  pcmBase64: string
+  sampleRate: number
+}
+
 // ───────────────────────────── Host → renderer events ─────────────────────────────
 
 export type LiveCallHostEvent =
@@ -911,6 +961,7 @@ export type LiveCallHostEvent =
   | { type: 'agency:resolved'; cardId: string; status: 'approved' | 'denied' | 'failed'; output?: string }
   | { type: 'vision:capture'; active: boolean; source: 'screen' | 'window' }
   | ({ type: 'call:cascade'; callId: string; turnId: string } & CallCascadeEvent)
+  | ({ type: 'call:ttsChunk'; callId: string } & CallTtsChunk)
 
 export const LIVE_CALL_EVENT_TYPES = [
   'call:state',
@@ -924,6 +975,7 @@ export const LIVE_CALL_EVENT_TYPES = [
   'agency:resolved',
   'vision:capture',
   'call:cascade',
+  'call:ttsChunk',
 ] as const
 
 export function isLiveCallHostEvent(e: { type: string }): e is LiveCallHostEvent {
