@@ -1908,6 +1908,47 @@ input[type='range'] {
   border-radius: 12px;
   border: 1px solid var(--border-soft);
 }
+/* Phase 10.4/10.5 — Live Mode cloud / cascade panels */
+.ashy-live-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ashy-live-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+}
+.ashy-live-grid .ashy-input,
+.ashy-live-grid .ashy-select {
+  width: 100%;
+  box-sizing: border-box;
+}
+.ashy-live-hint {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+.ashy-live-hint--warn {
+  color: #f2be79;
+  margin: 0;
+}
+.ashy-live-key {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.ashy-live-key-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.ashy-live-key-row .ashy-input {
+  flex: 1 1 220px;
+  min-width: 0;
+}
 .ashy-call-progress {
   display: flex;
   flex-direction: column;

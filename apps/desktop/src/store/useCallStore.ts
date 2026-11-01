@@ -12,11 +12,15 @@
  *
  * Phase 10.3: push approval cards (`agency:pending` / `agency:resolved`, also outside calls),
  * the "vendo a tela" flag (`vision:capture`, auto-off after 5 s) and `agency:approve|deny`.
+ *
+ * Phase 10.4: cloud API keys (`liveMode:setApiKey` / `liveMode:getKeyStatus`). Only the host's
+ * masked status is kept here — the key itself never lives in the store.
  */
 import { create } from 'zustand'
 import {
   ASHY_EMOTIONS,
   IDLE_CALL_STATE,
+  LIVE_KEY_PROVIDERS,
   type AgencyPendingCardView,
   type AshyEmotion,
   type AshyHostBridge,
@@ -28,6 +32,8 @@ import {
   type CallTestResult,
   type CallVisemeFrame,
   type LiveCallMethod,
+  type LiveKeyProvider,
+  type LiveKeyStatus,
   type LiveModeSettings,
   type LiveVoicePreviewResult,
   type LlamaCppEngineStatus,
@@ -131,6 +137,7 @@ export type CallStoreBusyAction =
   | 'voicePreview'
   | 'voiceDelete'
   | 'testCall'
+  | 'apiKey'
 
 /** Phase 10.3: the "👁 vendo a tela" flag turns itself off after this long without a closing event. */
 export const VISION_CAPTURE_AUTO_OFF_MS = 5_000
@@ -199,6 +206,8 @@ export interface CallStoreState {
   /** Phase 10.3: true while the host is capturing the screen for the call's vision. */
   capturingScreen: boolean
   capturingSource: 'screen' | 'window' | null
+  /** Phase 10.4: masked cloud key status per provider (`liveMode:getKeyStatus`); never the key. */
+  keyStatus: LiveKeyStatus | null
 
   /** Subscribes to host events and bootstraps state (idempotent). */
   init(): Promise<void>
@@ -228,6 +237,10 @@ export interface CallStoreState {
   approveCard(cardId: string, scope?: AgencyApprovalScope): Promise<void>
   /** Phase 10.3: `agency:deny`. */
   denyCard(cardId: string): Promise<void>
+  /** Phase 10.4: `liveMode:getKeyStatus`. */
+  loadKeyStatus(): Promise<void>
+  /** Phase 10.4: `liveMode:setApiKey` ('' removes the key); true on success. */
+  setApiKey(provider: LiveKeyProvider, apiKey: string): Promise<boolean>
 }
 
 let unsubscribeHost: (() => void) | null = null
@@ -333,7 +346,24 @@ const initialCallStoreState = () => ({
   resolvingCardIds: [] as string[],
   capturingScreen: false,
   capturingSource: null as 'screen' | 'window' | null,
+  keyStatus: null as LiveKeyStatus | null,
 })
+
+/** Keeps only the masked shape of a `LiveKeyStatus` (drops anything else the host might send). */
+export function normalizeKeyStatus(value: unknown): LiveKeyStatus | null {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  if (!LIVE_KEY_PROVIDERS.some((p) => raw[p] && typeof raw[p] === 'object')) return null
+  const out = {} as LiveKeyStatus
+  for (const provider of LIVE_KEY_PROVIDERS) {
+    const entry = raw[provider] as { hasKey?: unknown; masked?: unknown } | undefined
+    out[provider] = {
+      hasKey: entry?.hasKey === true,
+      masked: typeof entry?.masked === 'string' && entry.masked.length > 0 ? entry.masked.slice(0, 64) : null,
+    }
+  }
+  return out
+}
 
 function isPendingCardView(value: unknown): value is AgencyPendingCardView {
   if (!value || typeof value !== 'object') return false
@@ -477,16 +507,21 @@ export const useCallStore = create<CallStoreState>()((set, get) => {
       }
       if (get().initialized) return
       set({ initialized: true })
-      const [state, engine, settings, voices] = await Promise.allSettled([
+      const [state, engine, settings, voices, keys] = await Promise.allSettled([
         invoke<CallStateSnapshot>('call:getState'),
         invoke<LlamaCppEngineStatus>('engines:getStatus'),
         invoke<LiveModeSettings>('liveMode:getSettings'),
         invoke<VoiceReference[]>('liveVoice:list'),
+        invoke<LiveKeyStatus>('liveMode:getKeyStatus'),
       ])
       if (state.status === 'fulfilled') applyCallState(state.value)
       if (engine.status === 'fulfilled') applyEngineStatus(engine.value)
       if (settings.status === 'fulfilled' && settings.value) set({ liveSettings: settings.value })
       if (voices.status === 'fulfilled') applyVoices(voices.value)
+      if (keys.status === 'fulfilled') {
+        const status = normalizeKeyStatus(keys.value)
+        if (status) set({ keyStatus: status })
+      }
     },
 
     dispose() {
@@ -757,6 +792,26 @@ export const useCallStore = create<CallStoreState>()((set, get) => {
 
     async denyCard(cardId) {
       await resolveCard(cardId, 'agency:deny', { cardId })
+    },
+
+    async loadKeyStatus() {
+      try {
+        const status = normalizeKeyStatus(await invoke<LiveKeyStatus>('liveMode:getKeyStatus'))
+        if (status) set({ keyStatus: status })
+      } catch {
+        // keep the current snapshot (older host without cloud keys)
+      }
+    },
+
+    async setApiKey(provider, apiKey) {
+      const res = await withBusy('apiKey', () =>
+        invoke<LiveKeyStatus>('liveMode:setApiKey', { provider, apiKey: apiKey.trim() }),
+      )
+      if (res === null) return false
+      const status = normalizeKeyStatus(res)
+      if (status) set({ keyStatus: status })
+      else await get().loadKeyStatus()
+      return true
     },
   }
 

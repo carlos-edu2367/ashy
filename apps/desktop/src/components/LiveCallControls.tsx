@@ -4,20 +4,37 @@
  *
  * Phase 10.3: push approval cards (hub strip + overlay bubble), the "👁 vendo a tela" indicator
  * and Live Mode › "Recursos na chamada" (tools / vision / initiative).
+ *
+ * Phase 10.4/10.5: cloud realtime backends (OpenAI-compatible / Gemini Live + API keys + "Contexto da
+ * Ashy na nuvem") and the classic cascade (STT → text LLM → TTS) panels.
  */
 import React, { useEffect, useRef, useState } from 'react'
 import {
+  CASCADE_TTS_PROVIDER_IDS,
+  CLOUD_REALTIME_PRESETS,
+  CLOUD_REALTIME_PROVIDERS,
+  GEMINI_LIVE_DEFAULTS,
   LIVE_BACKENDS_IMPLEMENTED,
   LIVE_LOCAL_MODELS,
   LLAMACPP_VARIANTS,
+  LLM_PROVIDER_IDS,
+  USER_SELECTABLE_STT_PROVIDER_IDS,
   type AgencyPendingCardView,
+  type CascadeTtsProviderId,
+  type CloudRealtimeProvider,
   type LiveBackendId,
   type LiveInputMode,
+  type LiveKeyProvider,
+  type LiveModeSettings,
   type LlamaCppVariant,
+  type SaveLiveModeSettingsInput,
 } from '@ashy/shared'
 import {
   Check,
+  Cloud,
   Cpu,
+  KeyRound,
+  Workflow,
   FlaskConical,
   Mic,
   MicOff,
@@ -308,23 +325,62 @@ export function OverlayCallStateDot({ hovering }: { hovering: boolean }): React.
 
 // ───────────────────────────── Settings › Live Mode ─────────────────────────────
 
-const BACKEND_CARDS: ReadonlyArray<{ id: LiveBackendId; label: string; desc: string; enabled: boolean }> = [
+const BACKEND_CARDS: ReadonlyArray<{
+  id: LiveBackendId
+  label: string
+  desc: string
+  enabled: boolean
+  testId: string
+}> = [
   {
     id: 'llamacpp-realtime',
     label: 'Local omni (LFM3 via llama.cpp)',
     desc: 'Tudo no seu PC: voz entra e sai do modelo local.',
     enabled: true,
+    testId: 'live-backend-card-llamacpp-realtime',
   },
   {
     id: 'llamacpp-hybrid',
     label: 'Local omni + minha voz (híbrido)',
     desc: 'O modelo local pensa em texto e o /tts do llama.cpp fala — com a sua voz de referência.',
     enabled: true,
+    testId: 'live-backend-hybrid',
   },
-  { id: 'gemini-live', label: 'Gemini Live', desc: 'Nuvem realtime (Google).', enabled: false },
-  { id: 'openai-realtime', label: 'OpenAI Realtime', desc: 'Nuvem realtime (OpenAI).', enabled: false },
-  { id: 'cascade', label: 'Cascata (STT → LLM → TTS)', desc: 'Cada etapa com o seu provedor.', enabled: false },
+  {
+    id: 'openai-realtime',
+    label: 'OpenAI Realtime / compatível',
+    desc: 'Fala→fala na nuvem; requer chave; o áudio vai para o provedor.',
+    enabled: true,
+    testId: 'live-backend-openai-realtime',
+  },
+  {
+    id: 'gemini-live',
+    label: 'Gemini Live',
+    desc: 'Fala→fala na nuvem; requer chave; o áudio vai para o provedor.',
+    enabled: true,
+    testId: 'live-backend-gemini-live',
+  },
+  {
+    id: 'cascade',
+    label: 'Pipeline clássica (STT → modelo de texto → voz)',
+    desc: 'Usa qualquer modelo de texto (local ou nuvem) com memória e ferramentas da Ashy.',
+    enabled: true,
+    testId: 'live-backend-cascade',
+  },
 ]
+
+export function isLlamaCppBackend(backend: LiveBackendId): boolean {
+  return backend === 'llamacpp-realtime' || backend === 'llamacpp-hybrid'
+}
+
+export function isCloudLiveBackend(backend: LiveBackendId): boolean {
+  return backend === 'openai-realtime' || backend === 'gemini-live'
+}
+
+/** True when the backend needs the local llama.cpp engine (cascade only with the llama.cpp voice). */
+export function backendNeedsLocalEngine(backend: LiveBackendId, cascadeTts: CascadeTtsProviderId): boolean {
+  return isLlamaCppBackend(backend) || (backend === 'cascade' && cascadeTts === 'llamacpp-tts')
+}
 
 const VARIANT_LABELS: Record<LlamaCppVariant, string> = {
   'cuda-12.4': 'CUDA 12.4 (NVIDIA)',
@@ -366,6 +422,10 @@ export function LiveModeSettingsPanel(): React.ReactElement {
   const [inputDeviceId, setInputDeviceId] = useState('')
   const [devices, setDevices] = useState<Array<{ deviceId: string; label: string }>>([])
   const [savedNotice, setSavedNotice] = useState<string | null>(null)
+  const [cloudDraft, setCloudDraft] = useState<CloudRealtimeDraft>(() => cloudDraftFrom(null))
+  const [geminiDraft, setGeminiDraft] = useState<GeminiDraft>(() => geminiDraftFrom(null))
+  const [contextDraft, setContextDraft] = useState<CloudContextDraft>(() => cloudContextDraftFrom(null))
+  const [cascadeDraft, setCascadeDraft] = useState<CascadeDraft>(() => cascadeDraftFrom(null))
 
   useEffect(() => {
     void useCallStore.getState().init()
@@ -387,6 +447,10 @@ export function LiveModeSettingsPanel(): React.ReactElement {
       setRotateAfterTurns(liveSettings.session.rotateAfterTurns)
     }
     setInputDeviceId(liveSettings.devices.inputDeviceId ?? '')
+    setCloudDraft(cloudDraftFrom(liveSettings))
+    setGeminiDraft(geminiDraftFrom(liveSettings))
+    setContextDraft(cloudContextDraftFrom(liveSettings))
+    setCascadeDraft(cascadeDraftFrom(liveSettings))
   }, [liveSettings])
 
   useEffect(() => {
@@ -419,24 +483,56 @@ export function LiveModeSettingsPanel(): React.ReactElement {
   const vcMissing = isVcRuntimeMissing(engineStatus, lastError)
   const vcInstall = engineStatus?.vcRuntimeInstall ?? null
   const vcRebootRequired = vcInstall?.rebootRequired === true
+  const llamaBackend = isLlamaCppBackend(selectedBackend)
+  const showEngine = backendNeedsLocalEngine(selectedBackend, cascadeDraft.ttsProviderId)
 
   const handleSave = async () => {
     const trimmedUrl = endpointUrl.trim()
-    if (endpointMode === 'url' && !trimmedUrl) {
+    if (showEngine && endpointMode === 'url' && !trimmedUrl) {
       setSavedNotice('Informe a URL do servidor (ex.: http://127.0.0.1:8080).')
       return
     }
-    const saved = await saveLiveSettings({
+    const endpoint = endpointMode === 'managed' ? ('managed' as const) : { url: trimmedUrl }
+    const partial: SaveLiveModeSettingsInput = {
       backend: LIVE_BACKENDS_IMPLEMENTED.includes(selectedBackend) ? selectedBackend : 'llamacpp-realtime',
-      llamacpp: {
-        voice,
-        inputMode,
-        endpoint: endpointMode === 'managed' ? 'managed' : { url: trimmedUrl },
-      },
       turn: { vadThreshold, endpointMs },
-      session: { rotateAfterTurns: Math.min(50, Math.max(2, Math.round(rotateAfterTurns))) },
       devices: { inputDeviceId },
-    })
+    }
+    if (llamaBackend) {
+      partial.llamacpp = { voice, inputMode, endpoint }
+      partial.session = { rotateAfterTurns: Math.min(50, Math.max(2, Math.round(rotateAfterTurns))) }
+    } else if (showEngine) {
+      // Cascade with the llama.cpp voice: only the engine endpoint matters.
+      partial.llamacpp = { endpoint }
+    }
+    if (selectedBackend === 'openai-realtime') {
+      const url = cloudDraft.url.trim()
+      if (url && !CLOUD_URL_PATTERN.test(url)) {
+        setSavedNotice(CLOUD_URL_ERROR)
+        return
+      }
+      partial.realtimeCloud = {
+        provider: cloudDraft.provider,
+        url,
+        model: cloudDraft.model.trim(),
+        voice: cloudDraft.voice.trim(),
+      }
+      partial.cloudContext = clampCloudContext(contextDraft)
+    } else if (selectedBackend === 'gemini-live') {
+      partial.gemini = { model: geminiDraft.model.trim(), voice: geminiDraft.voice.trim() }
+      partial.cloudContext = clampCloudContext(contextDraft)
+    } else if (selectedBackend === 'cascade') {
+      partial.cascade = {
+        sttProviderId: cascadeDraft.sttProviderId,
+        llmProviderId: cascadeDraft.llmProviderId,
+        llmModelId: cascadeDraft.llmModelId.trim(),
+        ttsProviderId: cascadeDraft.ttsProviderId,
+        ttsVoice: cascadeDraft.ttsVoice.trim(),
+        referenceVoiceId:
+          cascadeDraft.ttsProviderId === 'llamacpp-tts' ? cascadeDraft.referenceVoiceId : null,
+      }
+    }
+    const saved = await saveLiveSettings(partial)
     setSavedNotice(saved ? 'Configurações do Live Mode salvas.' : null)
   }
 
@@ -467,7 +563,7 @@ export function LiveModeSettingsPanel(): React.ReactElement {
           <button
             key={card.id}
             type="button"
-            data-testid={card.id === 'llamacpp-hybrid' ? 'live-backend-hybrid' : `live-backend-card-${card.id}`}
+            data-testid={card.testId}
             disabled={!card.enabled}
             aria-pressed={card.enabled && selectedBackend === card.id}
             className={`ashy-call-backend-card ${card.enabled && selectedBackend === card.id ? 'active' : ''}`}
@@ -482,8 +578,24 @@ export function LiveModeSettingsPanel(): React.ReactElement {
         ))}
       </div>
 
+      {selectedBackend === 'openai-realtime' && (
+        <CloudRealtimePanel draft={cloudDraft} onChange={setCloudDraft} />
+      )}
+      {selectedBackend === 'gemini-live' && <GeminiLivePanel draft={geminiDraft} onChange={setGeminiDraft} />}
+      {isCloudLiveBackend(selectedBackend) && (
+        <CloudContextPanel draft={contextDraft} onChange={setContextDraft} />
+      )}
+      {selectedBackend === 'cascade' && <CascadePanel draft={cascadeDraft} onChange={setCascadeDraft} />}
+
       {/* Engine panel */}
+      {showEngine && (
       <div className="ashy-call-engine-panel" data-testid="live-engine-panel">
+        {selectedBackend === 'cascade' && (
+          <p className="ashy-live-hint" data-testid="live-engine-cascade-hint">
+            A voz local do llama.cpp (LFM3) usa este motor: instale-o e inicie-o para a pipeline
+            clássica falar.
+          </p>
+        )}
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
           <Cpu size={16} />
           <strong style={{ fontSize: '13px' }}>Motor local (llama.cpp)</strong>
@@ -704,6 +816,7 @@ export function LiveModeSettingsPanel(): React.ReactElement {
           )}
         </div>
       </div>
+      )}
 
       {/* Voice, input mode, turns */}
       <div
@@ -714,6 +827,7 @@ export function LiveModeSettingsPanel(): React.ReactElement {
           marginTop: '12px',
         }}
       >
+        {llamaBackend && (
         <div>
           <label htmlFor="select-live-voice" style={fieldLabel}>
             Voz:
@@ -729,6 +843,8 @@ export function LiveModeSettingsPanel(): React.ReactElement {
             <option value="male">Masculina</option>
           </select>
         </div>
+        )}
+        {llamaBackend && (
         <div>
           <label htmlFor="select-live-input-mode" style={fieldLabel}>
             Modo de entrada:
@@ -744,6 +860,7 @@ export function LiveModeSettingsPanel(): React.ReactElement {
             <option value="audio-direct">Áudio direto (experimental)</option>
           </select>
         </div>
+        )}
         <div>
           <label htmlFor="input-live-vad-threshold" style={fieldLabel}>
             Sensibilidade do VAD (limiar): {vadThreshold.toFixed(2)}
@@ -798,6 +915,7 @@ export function LiveModeSettingsPanel(): React.ReactElement {
             ))}
           </select>
         </div>
+        {llamaBackend && (
         <div>
           <label htmlFor="input-live-rotate-turns" style={fieldLabel}>
             Rotação de sessão (turnos):
@@ -818,6 +936,7 @@ export function LiveModeSettingsPanel(): React.ReactElement {
             }}
           />
         </div>
+        )}
       </div>
 
       <CallFeaturesSection />
@@ -843,6 +962,573 @@ export function LiveModeSettingsPanel(): React.ReactElement {
         )}
       </div>
     </section>
+  )
+}
+
+// ───────────────────────────── Phase 10.4: cloud realtime ─────────────────────────────
+
+/** Same rule as `SaveLiveModeSettingsInputSchema.realtimeCloud.url` (wss://, or a local ws:// server). */
+export const CLOUD_URL_PATTERN = /^(wss:\/\/[^\s]+|ws:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/[^\s]*)?)$/
+const CLOUD_URL_ERROR =
+  'A URL precisa começar com wss:// (ou ws://127.0.0.1 / ws://localhost para um servidor local).'
+
+/** Host defaults when `settings.cloudContext` is absent (see live-call-protocol.ts). */
+export const CLOUD_CONTEXT_DEFAULTS = {
+  includePersona: true,
+  recentMessages: 12,
+  memoryTopK: 4,
+  maxInstructionsChars: 16000,
+} as const
+
+type CloudRealtimeDraft = LiveModeSettings['realtimeCloud']
+type GeminiDraft = LiveModeSettings['gemini']
+type CloudContextDraft = {
+  includePersona: boolean
+  recentMessages: number
+  memoryTopK: number
+  maxInstructionsChars: number
+}
+type CascadeDraft = LiveModeSettings['cascade']
+
+const DEFAULT_CASCADE_DRAFT: CascadeDraft = {
+  sttProviderId: 'ollama-transcriptions',
+  llmProviderId: 'chat-default',
+  llmModelId: '',
+  ttsProviderId: 'llamacpp-tts',
+  ttsVoice: 'female',
+  referenceVoiceId: null,
+}
+
+function cloudDraftFrom(settings: LiveModeSettings | null): CloudRealtimeDraft {
+  const rc = settings?.realtimeCloud
+  const provider: CloudRealtimeProvider =
+    rc && (CLOUD_REALTIME_PROVIDERS as readonly string[]).includes(rc.provider) ? rc.provider : 'openai'
+  return { provider, url: rc?.url ?? '', model: rc?.model ?? '', voice: rc?.voice ?? '' }
+}
+
+function geminiDraftFrom(settings: LiveModeSettings | null): GeminiDraft {
+  return { model: settings?.gemini?.model ?? '', voice: settings?.gemini?.voice ?? '' }
+}
+
+function cloudContextDraftFrom(settings: LiveModeSettings | null): CloudContextDraft {
+  const c = settings?.cloudContext ?? {}
+  return {
+    includePersona: typeof c.includePersona === 'boolean' ? c.includePersona : CLOUD_CONTEXT_DEFAULTS.includePersona,
+    recentMessages: typeof c.recentMessages === 'number' ? c.recentMessages : CLOUD_CONTEXT_DEFAULTS.recentMessages,
+    memoryTopK: typeof c.memoryTopK === 'number' ? c.memoryTopK : CLOUD_CONTEXT_DEFAULTS.memoryTopK,
+    maxInstructionsChars:
+      typeof c.maxInstructionsChars === 'number' ? c.maxInstructionsChars : CLOUD_CONTEXT_DEFAULTS.maxInstructionsChars,
+  }
+}
+
+function cascadeDraftFrom(settings: LiveModeSettings | null): CascadeDraft {
+  return { ...DEFAULT_CASCADE_DRAFT, ...(settings?.cascade ?? {}) }
+}
+
+function clampInt(value: number, min: number, max: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback
+  return Math.min(max, Math.max(min, Math.round(value)))
+}
+
+export function clampCloudContext(draft: CloudContextDraft): Required<NonNullable<LiveModeSettings['cloudContext']>> {
+  return {
+    includePersona: draft.includePersona,
+    recentMessages: clampInt(draft.recentMessages, 0, 60, CLOUD_CONTEXT_DEFAULTS.recentMessages),
+    memoryTopK: clampInt(draft.memoryTopK, 0, 12, CLOUD_CONTEXT_DEFAULTS.memoryTopK),
+    maxInstructionsChars: clampInt(draft.maxInstructionsChars, 2000, 60000, CLOUD_CONTEXT_DEFAULTS.maxInstructionsChars),
+  }
+}
+
+/** API key for one cloud provider: write-only input; only the host's masked status is displayed. */
+export function CloudKeyField(props: {
+  provider: LiveKeyProvider
+  label: string
+  optional?: boolean
+}): React.ReactElement {
+  const { provider, label, optional } = props
+  const status = useCallStore((s) => s.keyStatus?.[provider] ?? null)
+  const busy = useCallStore((s) => s.busy.apiKey === true)
+  const setApiKey = useCallStore((s) => s.setApiKey)
+  const [value, setValue] = useState('')
+  const [message, setMessage] = useState<string | null>(null)
+  const inputId = `cloud-key-input-${provider}`
+
+  const save = async () => {
+    const key = value.trim()
+    if (!key) return
+    const ok = await setApiKey(provider, key)
+    if (ok) setValue('')
+    setMessage(ok ? 'Chave salva.' : 'Não foi possível salvar a chave.')
+  }
+  const remove = async () => {
+    const ok = await setApiKey(provider, '')
+    setMessage(ok ? 'Chave removida.' : 'Não foi possível remover a chave.')
+  }
+
+  return (
+    <div className="ashy-live-key" data-testid={`cloud-key-${provider}`}>
+      <label htmlFor={inputId} style={fieldLabel}>
+        <KeyRound size={12} style={{ verticalAlign: '-2px' }} /> Chave de API — {label}
+        {optional ? ' (opcional)' : ''}:
+      </label>
+      <div className="ashy-live-key-row">
+        <input
+          id={inputId}
+          type="password"
+          className="ashy-input"
+          data-testid={inputId}
+          autoComplete="off"
+          spellCheck={false}
+          placeholder={status?.hasKey ? 'Cole uma nova chave para trocar' : 'Cole a chave aqui'}
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') void save()
+          }}
+        />
+        <button
+          type="button"
+          className="ashy-peach-btn"
+          data-testid={`btn-cloud-key-save-${provider}`}
+          disabled={busy || value.trim().length === 0}
+          onClick={() => void save()}
+        >
+          Salvar chave
+        </button>
+        {status?.hasKey && (
+          <button
+            type="button"
+            className="ashy-outline-btn"
+            data-testid={`btn-cloud-key-remove-${provider}`}
+            disabled={busy}
+            onClick={() => void remove()}
+          >
+            <Trash2 size={12} /> Remover
+          </button>
+        )}
+      </div>
+      <div className="ashy-live-hint" data-testid={`cloud-key-status-${provider}`} role="status">
+        {status?.hasKey
+          ? `Chave salva: ${status.masked ?? '••••'}`
+          : optional
+            ? 'Nenhuma chave salva (opcional para servidor próprio).'
+            : 'Nenhuma chave salva.'}
+        {message ? ` · ${message}` : ''}
+      </div>
+    </div>
+  )
+}
+
+/** OpenAI-Realtime-compatible provider (OpenAI / Qwen-Omni / custom URL) + its API key. */
+export function CloudRealtimePanel(props: {
+  draft: CloudRealtimeDraft
+  onChange: (next: CloudRealtimeDraft) => void
+}): React.ReactElement {
+  const { draft, onChange } = props
+  const preset = CLOUD_REALTIME_PRESETS[draft.provider] ?? CLOUD_REALTIME_PRESETS.openai
+  const urlInvalid = draft.url.trim().length > 0 && !CLOUD_URL_PATTERN.test(draft.url.trim())
+
+  const changeProvider = (provider: CloudRealtimeProvider) => {
+    const prev = CLOUD_REALTIME_PRESETS[draft.provider]
+    // A field still holding the previous provider's preset would be wrong for the new one: clear it.
+    const keep = (value: string, presetValue: string | undefined) => (value === presetValue ? '' : value)
+    onChange({
+      provider,
+      url: keep(draft.url, prev?.url),
+      model: keep(draft.model, prev?.model),
+      voice: keep(draft.voice, prev?.voice),
+    })
+  }
+
+  return (
+    <div className="ashy-call-engine-panel" data-testid="cloud-realtime-panel">
+      <div className="ashy-live-panel-head">
+        <Cloud size={16} />
+        <strong style={{ fontSize: '13px' }}>Provedor realtime (compatível com OpenAI)</strong>
+      </div>
+      <div className="ashy-live-grid">
+        <div>
+          <label htmlFor="cloud-provider-select" style={fieldLabel}>
+            Provedor:
+          </label>
+          <select
+            id="cloud-provider-select"
+            data-testid="cloud-provider-select"
+            className="ashy-select"
+            value={draft.provider}
+            onChange={(e) => changeProvider(e.target.value as CloudRealtimeProvider)}
+          >
+            {CLOUD_REALTIME_PROVIDERS.map((p) => (
+              <option key={p} value={p}>
+                {CLOUD_REALTIME_PRESETS[p].label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label htmlFor="cloud-model-input" style={fieldLabel}>
+            Modelo:
+          </label>
+          <input
+            id="cloud-model-input"
+            data-testid="cloud-model-input"
+            className="ashy-input"
+            placeholder={preset.model || 'nome do modelo'}
+            value={draft.model}
+            onChange={(e) => onChange({ ...draft, model: e.target.value })}
+          />
+        </div>
+        <div>
+          <label htmlFor="cloud-voice-input" style={fieldLabel}>
+            Voz:
+          </label>
+          <input
+            id="cloud-voice-input"
+            data-testid="cloud-voice-input"
+            className="ashy-input"
+            placeholder={preset.voice || 'voz do provedor'}
+            value={draft.voice}
+            onChange={(e) => onChange({ ...draft, voice: e.target.value })}
+          />
+        </div>
+      </div>
+      <div>
+        <label htmlFor="cloud-url-input" style={fieldLabel}>
+          URL do WebSocket:
+        </label>
+        <input
+          id="cloud-url-input"
+          data-testid="cloud-url-input"
+          className="ashy-input"
+          style={{ width: '100%' }}
+          placeholder={preset.url || 'wss://… ou ws://127.0.0.1:porta/…'}
+          value={draft.url}
+          aria-invalid={urlInvalid}
+          onChange={(e) => onChange({ ...draft, url: e.target.value })}
+        />
+        <div
+          className="ashy-live-hint"
+          data-testid="cloud-url-hint"
+          style={urlInvalid ? { color: 'var(--status-danger)' } : undefined}
+        >
+          {urlInvalid
+            ? CLOUD_URL_ERROR
+            : 'Vazio = padrão do provedor. Aceita wss://… ou um servidor local ws://127.0.0.1 / ws://localhost.'}
+        </div>
+      </div>
+      <CloudKeyField
+        provider={draft.provider}
+        label={CLOUD_REALTIME_PRESETS[draft.provider]?.label ?? draft.provider}
+        optional={draft.provider === 'custom'}
+      />
+    </div>
+  )
+}
+
+/** Google Gemini Live (native audio): model / voice + API key. */
+export function GeminiLivePanel(props: {
+  draft: GeminiDraft
+  onChange: (next: GeminiDraft) => void
+}): React.ReactElement {
+  const { draft, onChange } = props
+  return (
+    <div className="ashy-call-engine-panel" data-testid="gemini-live-panel">
+      <div className="ashy-live-panel-head">
+        <Cloud size={16} />
+        <strong style={{ fontSize: '13px' }}>Gemini Live</strong>
+      </div>
+      <div className="ashy-live-grid">
+        <div>
+          <label htmlFor="gemini-model-input" style={fieldLabel}>
+            Modelo:
+          </label>
+          <input
+            id="gemini-model-input"
+            data-testid="gemini-model-input"
+            className="ashy-input"
+            placeholder={GEMINI_LIVE_DEFAULTS.model}
+            value={draft.model}
+            onChange={(e) => onChange({ ...draft, model: e.target.value })}
+          />
+        </div>
+        <div>
+          <label htmlFor="gemini-voice-input" style={fieldLabel}>
+            Voz:
+          </label>
+          <input
+            id="gemini-voice-input"
+            data-testid="gemini-voice-input"
+            className="ashy-input"
+            placeholder={GEMINI_LIVE_DEFAULTS.voice}
+            value={draft.voice}
+            onChange={(e) => onChange({ ...draft, voice: e.target.value })}
+          />
+        </div>
+      </div>
+      <CloudKeyField provider="gemini" label="Google AI Studio (Gemini)" />
+    </div>
+  )
+}
+
+/** "Contexto da Ashy na nuvem": how much persona / history / memory goes into a cloud session. */
+export function CloudContextPanel(props: {
+  draft: CloudContextDraft
+  onChange: (next: CloudContextDraft) => void
+}): React.ReactElement {
+  const { draft, onChange } = props
+  const numberField = (
+    key: 'recentMessages' | 'memoryTopK' | 'maxInstructionsChars',
+    testId: string,
+    label: string,
+    min: number,
+    max: number,
+    step: number,
+  ) => (
+    <div>
+      <label htmlFor={testId} style={fieldLabel}>
+        {label} ({min}–{max}):
+      </label>
+      <input
+        id={testId}
+        data-testid={testId}
+        type="number"
+        className="ashy-input"
+        min={min}
+        max={max}
+        step={step}
+        value={draft[key]}
+        onChange={(e) => {
+          const n = Number(e.target.value)
+          if (Number.isFinite(n)) onChange({ ...draft, [key]: n })
+        }}
+      />
+    </div>
+  )
+  return (
+    <div className="ashy-call-engine-panel" data-testid="cloud-context-panel">
+      <div className="ashy-live-panel-head">
+        <Cloud size={16} />
+        <strong style={{ fontSize: '13px' }}>Contexto da Ashy na nuvem</strong>
+      </div>
+      <p className="ashy-live-hint" style={{ margin: 0 }}>
+        O que vai para o provedor junto com o áudio. Modelos grandes aguentam mais contexto.
+      </p>
+      <label className="ashy-call-feature-row">
+        <input
+          type="checkbox"
+          data-testid="cloud-context-persona"
+          checked={draft.includePersona}
+          onChange={(e) => onChange({ ...draft, includePersona: e.target.checked })}
+        />
+        <span>
+          <span style={{ fontWeight: 500 }}>Personalidade completa</span>
+          <span className="ashy-call-feature-desc"> — envia a persona da Ashy nas instruções.</span>
+        </span>
+      </label>
+      <div className="ashy-live-grid">
+        {numberField('recentMessages', 'cloud-context-recent', 'Mensagens recentes', 0, 60, 1)}
+        {numberField('memoryTopK', 'cloud-context-memory', 'Memórias por turno', 0, 12, 1)}
+        {numberField(
+          'maxInstructionsChars',
+          'cloud-context-max-chars',
+          'Tamanho máx. das instruções (caracteres)',
+          2000,
+          60000,
+          500,
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ───────────────────────────── Phase 10.5: cascade ─────────────────────────────
+
+const STT_LABELS: Record<string, string> = {
+  'ollama-transcriptions': 'Ollama (transcrição local)',
+  'local-whisper-http': 'Whisper local (servidor HTTP)',
+  'openai-whisper': 'OpenAI Whisper',
+  'groq-whisper': 'Groq Whisper',
+  'web-speech-stt': 'Web Speech (navegador)',
+}
+/** Host-side STT only: the browser Web Speech recognizer can't transcribe the call's WAV turns. */
+const CASCADE_STT_IDS: readonly string[] = USER_SELECTABLE_STT_PROVIDER_IDS.filter((id) => id !== 'web-speech-stt')
+
+const LLM_LABELS: Record<string, string> = {
+  openrouter: 'OpenRouter',
+  anthropic: 'Anthropic',
+  openai: 'OpenAI',
+  'nvidia-nim': 'NVIDIA NIM',
+  ollama: 'Ollama (local)',
+}
+
+export const CASCADE_TTS_LABELS: Record<CascadeTtsProviderId, string> = {
+  'llamacpp-tts': 'Voz local do llama.cpp (LFM3)',
+  'local-kokoro-http': 'Kokoro (servidor local)',
+  'openai-tts': 'OpenAI TTS',
+  elevenlabs: 'ElevenLabs',
+}
+
+/** Cascade: STT provider → text LLM (chat default or a provider/model) → TTS provider/voice. */
+export function CascadePanel(props: {
+  draft: CascadeDraft
+  onChange: (next: CascadeDraft) => void
+}): React.ReactElement {
+  const { draft, onChange } = props
+  const voices = useCallStore((s) => s.voices)
+  const llamaTts = draft.ttsProviderId === 'llamacpp-tts'
+
+  useEffect(() => {
+    if (llamaTts) void useCallStore.getState().loadVoices()
+  }, [llamaTts])
+
+  const changeTts = (ttsProviderId: CascadeTtsProviderId) => {
+    const genderVoice = draft.ttsVoice === 'female' || draft.ttsVoice === 'male'
+    let ttsVoice = draft.ttsVoice
+    if (ttsProviderId === 'llamacpp-tts' && !genderVoice) ttsVoice = 'female'
+    if (ttsProviderId !== 'llamacpp-tts' && genderVoice) ttsVoice = ''
+    onChange({
+      ...draft,
+      ttsProviderId,
+      ttsVoice,
+      referenceVoiceId: ttsProviderId === 'llamacpp-tts' ? draft.referenceVoiceId : null,
+    })
+  }
+
+  return (
+    <div className="ashy-call-engine-panel" data-testid="cascade-panel">
+      <div className="ashy-live-panel-head">
+        <Workflow size={16} />
+        <strong style={{ fontSize: '13px' }}>Pipeline clássica</strong>
+      </div>
+      <div className="ashy-live-grid">
+        <div>
+          <label htmlFor="cascade-stt-provider" style={fieldLabel}>
+            Transcrição (STT):
+          </label>
+          <select
+            id="cascade-stt-provider"
+            data-testid="cascade-stt-provider"
+            className="ashy-select"
+            value={draft.sttProviderId}
+            onChange={(e) => onChange({ ...draft, sttProviderId: e.target.value })}
+          >
+            {!CASCADE_STT_IDS.includes(draft.sttProviderId) && (
+              <option value={draft.sttProviderId}>{STT_LABELS[draft.sttProviderId] ?? draft.sttProviderId}</option>
+            )}
+            {CASCADE_STT_IDS.map((id) => (
+              <option key={id} value={id}>
+                {STT_LABELS[id] ?? id}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label htmlFor="cascade-llm-provider" style={fieldLabel}>
+            Modelo de texto (provedor):
+          </label>
+          <select
+            id="cascade-llm-provider"
+            data-testid="cascade-llm-provider"
+            className="ashy-select"
+            value={draft.llmProviderId}
+            onChange={(e) => onChange({ ...draft, llmProviderId: e.target.value })}
+          >
+            <option value="chat-default">Mesmo modelo do chat</option>
+            {LLM_PROVIDER_IDS.map((id) => (
+              <option key={id} value={id}>
+                {LLM_LABELS[id] ?? id}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label htmlFor="cascade-llm-model" style={fieldLabel}>
+            Modelo (opcional):
+          </label>
+          <input
+            id="cascade-llm-model"
+            data-testid="cascade-llm-model"
+            className="ashy-input"
+            placeholder="qwen3:4b-instruct"
+            value={draft.llmModelId}
+            onChange={(e) => onChange({ ...draft, llmModelId: e.target.value })}
+          />
+          <div className="ashy-live-hint">
+            Vazio = modelo configurado do provedor. Modelos pequenos recomendados: qwen3:4b-instruct (Ollama).
+          </div>
+        </div>
+        <div>
+          <label htmlFor="cascade-tts-provider" style={fieldLabel}>
+            Voz (TTS):
+          </label>
+          <select
+            id="cascade-tts-provider"
+            data-testid="cascade-tts-provider"
+            className="ashy-select"
+            value={draft.ttsProviderId}
+            onChange={(e) => changeTts(e.target.value as CascadeTtsProviderId)}
+          >
+            {CASCADE_TTS_PROVIDER_IDS.map((id) => (
+              <option key={id} value={id}>
+                {CASCADE_TTS_LABELS[id]}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label htmlFor="cascade-tts-voice" style={fieldLabel}>
+            {llamaTts ? 'Timbre:' : 'Voz do provedor:'}
+          </label>
+          {llamaTts ? (
+            <select
+              id="cascade-tts-voice"
+              data-testid="cascade-tts-voice"
+              className="ashy-select"
+              value={draft.ttsVoice === 'male' ? 'male' : 'female'}
+              onChange={(e) => onChange({ ...draft, ttsVoice: e.target.value })}
+            >
+              <option value="female">Feminina</option>
+              <option value="male">Masculina</option>
+            </select>
+          ) : (
+            <input
+              id="cascade-tts-voice"
+              data-testid="cascade-tts-voice"
+              className="ashy-input"
+              placeholder="vazio = voz das configurações de voz"
+              value={draft.ttsVoice}
+              onChange={(e) => onChange({ ...draft, ttsVoice: e.target.value })}
+            />
+          )}
+        </div>
+        {llamaTts && (
+          <div>
+            <label htmlFor="cascade-reference-voice" style={fieldLabel}>
+              Voz de referência:
+            </label>
+            <select
+              id="cascade-reference-voice"
+              data-testid="cascade-reference-voice"
+              className="ashy-select"
+              value={draft.referenceVoiceId ?? ''}
+              onChange={(e) => onChange({ ...draft, referenceVoiceId: e.target.value || null })}
+            >
+              <option value="">Sem referência</option>
+              {voices.map((v) => (
+                <option key={v.id} value={v.id}>
+                  {v.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+      </div>
+      {!llamaTts && (
+        <p className="ashy-live-hint" style={{ margin: 0 }}>
+          Usa a URL, a chave e a voz definidas em Configurações › Voz para esse provedor.
+        </p>
+      )}
+    </div>
   )
 }
 
@@ -1121,6 +1807,10 @@ export function TestCallSection(): React.ReactElement {
   const busy = useCallStore((s) => s.busy.testCall === true)
   const callActive = useCallStore((s) => isCallActiveStatus(s.callState.status))
   const startTestCall = useCallStore((s) => s.startTestCall)
+  const backend = useCallStore((s) => s.liveSettings?.backend ?? 'llamacpp-realtime')
+  const engineInstalled = useCallStore((s) => s.engineStatus?.installed === true)
+  // Known limit: the synthetic question is always spoken by llama.cpp /tts (also for cloud/cascade).
+  const testNeedsEngine = !isLlamaCppBackend(backend) && !engineInstalled
   const running = testCall.status === 'running'
   const result = testCall.result
   const metrics = result?.metrics ?? null
@@ -1142,7 +1832,7 @@ export function TestCallSection(): React.ReactElement {
           className="ashy-peach-btn"
           data-testid="btn-live-test-call"
           data-test-status={testCall.status}
-          disabled={running || busy || callActive}
+          disabled={running || busy || callActive || testNeedsEngine}
           onClick={() => void startTestCall()}
           title="A Ashy ouve uma pergunta sintetizada no lugar do microfone e responde; cada etapa é medida."
         >
@@ -1152,6 +1842,12 @@ export function TestCallSection(): React.ReactElement {
       <p style={{ fontSize: '11px', color: 'var(--text-secondary)', margin: 0 }}>
         Uma pergunta sintetizada substitui o microfone por um turno. Nada disso vai para a memória.
       </p>
+      {testNeedsEngine && (
+        <p className="ashy-live-hint ashy-live-hint--warn" data-testid="live-test-engine-hint" role="note">
+          O teste sintetiza a pergunta com a voz local do llama.cpp, que não está instalada. Instale o
+          motor local (em um backend local) para testar; a chamada normal funciona sem ele.
+        </p>
+      )}
       {running && (
         <div data-testid="live-test-running" role="status" style={{ fontSize: '12px' }}>
           Teste em andamento…

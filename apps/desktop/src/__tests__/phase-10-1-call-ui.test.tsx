@@ -296,10 +296,11 @@ describe('Phase 10.1 — Live Call UI (hub orb, overlay, Live Mode settings, sta
 
     expect(getByTestId('live-mode-panel')).toBeTruthy()
     expect(getByTestId<HTMLButtonElement>('live-backend-card-llamacpp-realtime').disabled).toBe(false)
+    // Phase 10.4/10.5: the cloud and cascade backends are enabled too.
     for (const id of ['gemini-live', 'openai-realtime', 'cascade']) {
-      const card = getByTestId<HTMLButtonElement>(`live-backend-card-${id}`)
-      expect(card.disabled).toBe(true)
-      expect(card.textContent).toContain('em breve')
+      const card = getByTestId<HTMLButtonElement>(`live-backend-${id}`)
+      expect(card.disabled).toBe(false)
+      expect(card.textContent).not.toContain('em breve')
     }
     expect(getByTestId('live-engine-gpu').textContent).toContain('RTX 4060')
     expect(getByTestId('live-engine-gpu').textContent).toContain('CUDA 12.4')
