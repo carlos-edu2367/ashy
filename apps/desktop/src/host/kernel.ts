@@ -125,6 +125,7 @@ import {
   type LlamaCppEngineAuth,
 } from './engines/llamacpp-engine'
 import { registerCallHostHandlers } from './live-call/handlers'
+import { createCascadeLlmWarmup } from './live-call/cascade'
 import { createLiveCallRegistry, type LiveCallRegistry } from './live-call/registry'
 import { createLiveModeSettingsStore } from './live-call/settings'
 import {
@@ -961,6 +962,11 @@ export async function createAshyHostKernel(
     transcribe: (input) => kernel.transcribeVoiceAudio!(input),
     getTurnOrchestrator: () => turnOrchestratorInstance ?? null, // Phase 10.5 cascade LLM turns
     synthesizeSpeech: (input) => kernel.synthesizeVoiceSpeech!(input), // Phase 10.5 cascade TTS
+    // Phase 10.5: load the cascade LLM at call connect (same adapter as the turn; nothing persisted).
+    warmupLlm: createCascadeLlmWarmup({
+      getProviderState: () => providerVaultInstance.getPublicState(),
+      createLanguageModel: (providerId, overrides) => providerVaultInstance.createLanguageModel(providerId, overrides),
+    }),
     // Phase 10.4: cloud speech-to-speech API keys (encrypted like the provider keys).
     cloudSecretProtector: voiceSecretProtector,
     cloudFallbackKey: (provider) => (provider === 'openai' ? resolveDecryptedOpenAiVoiceKey() : null),

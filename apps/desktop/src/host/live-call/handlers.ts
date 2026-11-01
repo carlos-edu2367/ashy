@@ -18,6 +18,8 @@ import {
   CallReportStageInputSchema,
   CallReportTestResultInputSchema,
   CallSynthesizeInputSchema,
+  CallSynthesizeStreamInputSchema,
+  CallSynthesizeAbortInputSchema,
   LiveVoiceIdInputSchema,
   LiveVoiceImportInputSchema,
   LiveVoicePreviewInputSchema,
@@ -75,8 +77,10 @@ import type { SecretProtector } from '../secret-protector'
 import { LiveSetApiKeyInputSchema, type LiveKeyProvider } from '@ashy/shared'
 import {
   createCascadeTtsRouter,
+  createTtsStreamRunner,
   registerCascadeHandlers,
   resolveCascadeLlm,
+  type CascadeHandlerDeps,
   type CascadeOrchestrator,
   type HostSpeechSynthesizer,
 } from './cascade'
@@ -126,6 +130,8 @@ export interface CallHostDeps {
   getTurnOrchestrator?: () => CascadeOrchestrator | null
   /** Phase 10.5 — cascade TTS through the kernel voice providers (Kokoro / OpenAI / ElevenLabs). */
   synthesizeSpeech?: HostSpeechSynthesizer
+  /** Phase 10.5 — warms the cascade LLM at call connect (`call:cascadeWarmup`; `createCascadeLlmWarmup`). */
+  warmupLlm?: CascadeHandlerDeps['warmupLlm']
   /**
    * Phase 10.4 — cloud speech-to-speech backends: the secret protector that encrypts their API keys
    * (`<userDataDir>/live-cloud-keys.json`). Without it (or without `userDataDir`) the cloud backends
@@ -492,6 +498,7 @@ export function registerCallHostHandlers(api: CallHostApi, deps: CallHostDeps): 
       if (!card) return null
       return `[Contexto] Ação pendente, AINDA NÃO feita: ${describePendingActionPt(card)}. Só acontece quando o usuário disser "pode" ou clicar em aprovar; nunca diga que já fez.`
     },
+    ...(deps.warmupLlm ? { warmupLlm: deps.warmupLlm } : {}),
     ...(deps.onWarning ? { onWarning: deps.onWarning } : {}),
   })
 
@@ -565,6 +572,8 @@ export function registerCallQualityHandlers(
     ...(deps.synthesizeSpeech ? { synthesizeSpeech: deps.synthesizeSpeech } : {}),
   })
 
+  const ttsStreams = createTtsStreamRunner({ emit: (event) => api.emit(event) })
+
   const unregisterFns = [
     api.registry.register('call:classifyAffect', (payload): CallStageSignal | null => {
       const input = parseOrThrow(CallClassifyAffectInputSchema, payload, 'call:classifyAffect')
@@ -586,6 +595,20 @@ export function registerCallQualityHandlers(
       // Phase 10.5: cascade calls speak through `settings.cascade.ttsProviderId`.
       if (call?.backend === 'cascade') return cascadeTts.synthesize({ text: input.text })
       return synthesizer.synthesize({ text: input.text })
+    }),
+    // Streamed TTS: PCM as `call:ttsChunk` events while the phrase is generated (time-to-first-audio).
+    api.registry.register('call:synthesizeStream', (payload) => {
+      const input = parseOrThrow(CallSynthesizeStreamInputSchema, payload, 'call:synthesizeStream')
+      const call = requireKnownCall(input.callId) as { backend?: string } | null
+      return ttsStreams.run(input, (stream) =>
+        call?.backend === 'cascade'
+          ? cascadeTts.synthesizeStream({ text: input.text, ...stream })
+          : synthesizer.synthesizeStream({ text: input.text, ...stream }),
+      )
+    }),
+    api.registry.register('call:synthesizeAbort', (payload) => {
+      const input = parseOrThrow(CallSynthesizeAbortInputSchema, payload, 'call:synthesizeAbort')
+      return { aborted: ttsStreams.abort(input.callId, input.streamId) }
     }),
     api.registry.register('call:startTest', (payload) => {
       const input = parseOrThrow(CallStartInputSchema, payload, 'call:startTest')
@@ -648,6 +671,7 @@ export function registerCallQualityHandlers(
     voices,
     unregister() {
       for (const fn of unregisterFns) fn()
+      ttsStreams.abortAll()
     },
   }
 }
