@@ -63,6 +63,18 @@ export interface VoiceSessionCapabilities {
   voices: string[]
   inputSampleRate: number
   outputSampleRate: number
+  /**
+   * Phase 10.4 (cloud speech-to-speech, with `serverTurnDetection`): the server starts every response
+   * by itself when its VAD ends the user turn (Gemini Live, Qwen-Omni). Per-turn context is then
+   * injected one turn lagged (`injectContext` after the user transcript). false/absent with server
+   * VAD = the session emits `user_turn_committed` and waits for `respond()` (OpenAI
+   * `create_response:false`), so the context of THIS turn rides in the response.
+   */
+  serverAutoResponse?: boolean
+  /** Phase 10.4 — the model calls tools inside its normal spoken responses (no text-only tool step). */
+  inlineToolCalls?: boolean
+  /** Phase 10.4 — the server manages the context window itself: the engine never rotates the session. */
+  managesContext?: boolean
 }
 
 export interface VoiceSessionInit {
@@ -109,7 +121,13 @@ export type VoiceSessionCancelReason = 'client' | 'watchdog' | 'server'
 export interface VoiceSessionEventMap {
   user_speech_started: Record<string, never>
   user_speech_stopped: Record<string, never>
-  user_transcript: { text: string; final: boolean }
+  /** Server-VAD sessions: `itemId` = the backend's user item (OpenAI) when known. */
+  user_transcript: { text: string; final: boolean; itemId?: string }
+  /**
+   * Phase 10.4 — server VAD committed a user audio turn and (no `serverAutoResponse`) the session
+   * waits for `respond()` so the engine can inject this turn's context first.
+   */
+  user_turn_committed: { itemId?: string }
   response_started: { responseId: string }
   response_text: { responseId: string; delta: string; text: string }
   /** PCM16 mono at `sampleRate` (llama.cpp: session.created.session.audio.output.format.rate, 24 kHz). */
@@ -173,6 +191,11 @@ export interface VoiceSession {
   injectContext(text: string): Promise<void>
   sendToolResult(callId: string, output: string): void
   sendImage?(jpegBase64: string): void
+  /**
+   * Phase 10.4 — server-VAD sessions: the mic stream paused (mute) — drop/flush what the server
+   * buffered (`input_audio_buffer.clear` / Gemini `audioStreamEnd`).
+   */
+  endAudioStream?(): void
   close(): Promise<void>
   on<E extends VoiceSessionEvent>(event: E, cb: (payload: VoiceSessionEventMap[E]) => void): () => void
 }

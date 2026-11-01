@@ -147,6 +147,14 @@ export interface CallEngineOptions {
   testInput?: CallTestInput
   /** Test call overall timeout (default 45 s). */
   testTimeoutMs?: number
+  /**
+   * Phase 10.4 server-VAD backends without `serverAutoResponse` (OpenAI): how long the engine waits for
+   * the backend's user transcript before building this turn's context and asking for the response
+   * (the transcript drives memory retrieval). Default 1500 ms.
+   */
+  serverTranscriptWaitMs?: number
+  /** Phase 10.4 server-VAD: back to listening when no response starts this long after the turn ended. Default 12 s. */
+  serverResponseTimeoutMs?: number
   onSnapshot?: (snapshot: CallEngineSnapshot) => void
   onLog?: (message: string, data?: unknown) => void
 }
@@ -219,12 +227,28 @@ interface ResponseLedger {
   tool: { rounds: number; fallbackUsed: boolean } | null
   /** Phase 10.3: proactive turn (no user speech). */
   injectReason: CallInjectReason | null
+  /**
+   * Phase 10.4 inline tools: text already spoken by earlier responses of this turn (a cloud model
+   * may say "vou olhar" and call a tool in the same response); the next response's text appends.
+   */
+  textBase: string
 }
 
 interface ActiveTurn {
   seq: number
   onsetFrame: number
   lease: HistoryLease | null
+}
+
+/** Phase 10.4 — a user turn detected by the backend (server VAD); its transcript comes from the backend. */
+interface ServerUserTurn {
+  seq: number
+  text: string
+  final: boolean
+  speechEndAt: number
+  /** Context already injected for this turn (lagged mode). */
+  contextSent: boolean
+  waiters: Array<(text: string) => void>
 }
 
 /** Markers (`<|ACT …|>`, `<|ACT …}>`, control tokens) never reach the caption or the ledger. */
@@ -354,6 +378,15 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
   let initiativeTimer: unknown = null
   let initiativeInFlight = false
   let listeningSince = 0
+
+  // ── server-side VAD backends (Phase 10.4: OpenAI Realtime, Qwen-Omni, Gemini Live) ──
+  /** The current session detects turns itself (`caps.serverTurnDetection`): mic streams continuously. */
+  let serverVad = false
+  const serverTranscriptWaitMs = Math.max(0, options.serverTranscriptWaitMs ?? 1500)
+  const serverResponseTimeoutMs = Math.max(1000, options.serverResponseTimeoutMs ?? 12000)
+  /** The user turn the server is hearing / just committed (transcript arrives asynchronously). */
+  let serverTurn: ServerUserTurn | null = null
+  let serverResponseTimer: unknown = null
 
   // ── test mode (Phase 10.2) ──
   const testInput = options.testInput ?? null
@@ -683,8 +716,10 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       recentReplies.push(fullText)
       if (recentReplies.length > NEAR_REPEAT_WINDOW) recentReplies.splice(0, recentReplies.length - NEAR_REPEAT_WINDOW)
     }
-    if (rotationDue === null && sessionTurns >= rotateAfterTurns) rotationDue = 'turns'
-    if (rotationDue === null && sessionTokens >= contextSize * CONTEXT_ROTATE_RATIO) rotationDue = 'context'
+    // Phase 10.4: cloud backends manage their own context window (compression / truncation): never rotate.
+    const managed = session?.caps.managesContext === true
+    if (!managed && rotationDue === null && sessionTurns >= rotateAfterTurns) rotationDue = 'turns'
+    if (!managed && rotationDue === null && sessionTokens >= contextSize * CONTEXT_ROTATE_RATIO) rotationDue = 'context'
     return exchange
   }
 
@@ -714,6 +749,11 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
   async function rotateSession(reason: string): Promise<void> {
     const old = session
     if (stopped || !old) return
+    if (old.caps.managesContext) {
+      // Phase 10.4: a server-managed session (cloud) keeps its own history — never rotate it.
+      rotationDue = null
+      return
+    }
     log(`rotating session (${reason})`, { turns: sessionTurns, tokens: sessionTokens })
     let next: VoiceSession
     try {
@@ -860,6 +900,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       noted: false,
       tool: null,
       injectReason: null,
+      textBase: '',
     }
   }
 
@@ -1088,7 +1129,8 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     if (stopped || ledger !== l || l.finalized || !s || session !== s || typeof s.submitToolResults !== 'function') return
     sessionTokens += results.reduce((acc, r) => acc + tokensOf(r.output), 0)
     l.itemId = null
-    s.submitToolResults(results, { toolChoice: 'none' })
+    // Inline-tool (cloud) models may chain another call; llama.cpp gets the spoken answer only.
+    s.submitToolResults(results, { toolChoice: s.caps.inlineToolCalls ? 'auto' : 'none' })
   }
 
   /** A tool step that called nothing: speak its text instead of generating again. */
@@ -1277,13 +1319,18 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     clearFalseInterruptTimer()
     const l = ledger
     ledger = null
-    session?.cancelResponse('client')
+    const s = session
+    s?.cancelResponse('client')
     let spoken = ''
     if (l) {
       const playedMs = playedMsOf(l)
       player.stopWithFade(BARGE_IN_FADE_MS)
       const fullText = stripMarkers(l.text).trim()
       spoken = sliceSpokenText(fullText, playedMs, l.totalAudioMs)
+      // Phase 10.4: tell the server what was actually heard (OpenAI conversation.item.truncate).
+      if (s && s.caps.messageTruncation && typeof s.truncate === 'function' && l.itemId && l.chunks.length > 0) {
+        void s.truncate(l.itemId, playedMs).catch((err) => log('truncate failed', err))
+      }
       void finalizeLedger(l, { interrupted: true, playedMs, spokenOverride: spoken })
     } else {
       player.stopWithFade(BARGE_IN_FADE_MS)
@@ -1293,7 +1340,271 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     playbackSpeechOnsetFrame = null
     caption = null
     dispatch({ type: 'barge_in_confirmed' })
+    if (serverVad) {
+      // The backend owns the user turn (its VAD already started it); no local capture turn.
+      beginServerTurn()
+      return
+    }
     beginTurn(onsetFrame)
+  }
+
+  // ───────────────────────── server-side VAD (Phase 10.4) ─────────────────────────
+  //
+  // Cloud speech-to-speech backends (OpenAI Realtime, Qwen-Omni, Gemini Live) detect turns themselves:
+  // the mic streams continuously, the backend's VAD events (or, when it sends none — Gemini — the local
+  // detector) drive user_speaking/thinking, the local detector still drives ducking (interrupt_pending)
+  // and the user transcript comes from the backend. Per-turn context: `serverAutoResponse` false
+  // (OpenAI) → wait the transcript, build THIS turn's context, `respond({contextText})`; true
+  // (Gemini/Qwen) → the server answers by itself, the context is injected lagged via `injectContext`.
+
+  const serverTurnsByItem = new Map<string, ServerUserTurn>()
+
+  function clearServerResponseTimer(): void {
+    if (serverResponseTimer !== null) {
+      timers.clearTimeout(serverResponseTimer)
+      serverResponseTimer = null
+    }
+  }
+
+  function armServerResponseTimer(): void {
+    clearServerResponseTimer()
+    serverResponseTimer = timers.setTimeout(() => {
+      serverResponseTimer = null
+      if (stopped || machine.status !== 'thinking') return
+      const l = ledger
+      if (l && (l.itemId !== null || l.chunks.length > 0)) return
+      if (l) {
+        ledger = null
+        l.finalized = true
+        session?.cancelResponse('client')
+      }
+      detail = 'no response from the backend'
+      if (test) test.playbackDetail = detail
+      dispatch({ type: 'response_failed' })
+    }, serverResponseTimeoutMs)
+  }
+
+  function resolveServerTurnWaiters(t: ServerUserTurn): void {
+    const waiters = t.waiters.splice(0)
+    for (const w of waiters) w(t.text)
+  }
+
+  function beginServerTurn(): ServerUserTurn {
+    const prev = serverTurn
+    if (prev && !prev.final) resolveServerTurnWaiters(prev)
+    const t: ServerUserTurn = { seq: ++turnSeq, text: '', final: false, speechEndAt: now(), contextSent: false, waiters: [] }
+    serverTurn = t
+    return t
+  }
+
+  /** Resolves with the backend's final transcript of `t`, or what it has after `ms`. */
+  function waitServerTranscript(t: ServerUserTurn, ms: number): Promise<string> {
+    if (t.final || ms <= 0) return Promise.resolve(t.text)
+    return new Promise<string>((resolve) => {
+      let done = false
+      let timer: unknown = null
+      const finish = () => {
+        if (done) return
+        done = true
+        if (timer !== null) timers.clearTimeout(timer)
+        resolve(t.text)
+      }
+      timer = timers.setTimeout(finish, ms)
+      t.waiters.push(finish)
+    })
+  }
+
+  /** user_speaking → thinking (backend VAD stop, or the local detector when the backend sends none). */
+  function markServerTurnEnded(): void {
+    if (machine.status !== 'user_speaking') return
+    const t = serverTurn ?? beginServerTurn()
+    t.speechEndAt = now()
+    caption = null
+    metrics = null
+    dispatch({ type: 'turn_end' })
+    if (test) {
+      test.committed = true
+      if (test.speechEndAt === null) test.speechEndAt = now()
+    }
+    armServerResponseTimer()
+  }
+
+  /** Local barge-in is only acted on when the client can keep the server's history right (truncate). */
+  function clientCanBargeIn(): boolean {
+    return session?.caps.messageTruncation === true
+  }
+
+  function handleDetectorEventServerVad(ev: TurnDetectorEvent, status: CallStatus): void {
+    switch (ev.type) {
+      case 'speech_start': {
+        if (status === 'listening') {
+          clearServerResponseTimer()
+          dispatch({ type: 'speech_confirmed' })
+          if (!serverTurn || serverTurn.final || serverTurn.text) beginServerTurn()
+        } else if (status === 'speaking' || status === 'interrupt_pending') {
+          playbackSpeechOnsetFrame = ev.onsetFrame
+          if (!interruptCfg.enabled) return
+          if (status === 'speaking') enterInterruptPending()
+          if (machine.status === 'interrupt_pending' && ev.speechMs >= requiredBargeInMs() && clientCanBargeIn()) {
+            bargeIn(ev.onsetFrame)
+          }
+        }
+        // thinking: the backend decides whether this is a new turn (its speech_started cancels).
+        return
+      }
+      case 'speech_during_playback': {
+        playbackSpeechOnsetFrame = ev.onsetFrame
+        if (!interruptCfg.enabled) return
+        if (status === 'speaking') enterInterruptPending()
+        if (machine.status === 'interrupt_pending' && ev.confirmed && ev.speechMs >= requiredBargeInMs() && clientCanBargeIn()) {
+          bargeIn(ev.onsetFrame)
+        }
+        return
+      }
+      case 'speech_cancel': {
+        playbackSpeechOnsetFrame = null
+        if (status === 'interrupt_pending') {
+          clearFalseInterruptTimer()
+          dispatch({ type: 'false_interruption' })
+        } else if (status === 'user_speaking' && !(serverTurn && serverTurn.text)) {
+          // A blip: back to listening (if the backend answers anyway, its response is adopted).
+          dispatch({ type: 'turn_incomplete' })
+        }
+        return
+      }
+      case 'speech_end': {
+        playbackSpeechOnsetFrame = null
+        if (status === 'user_speaking') {
+          markServerTurnEnded()
+        } else if (status === 'interrupt_pending') {
+          clearFalseInterruptTimer()
+          dispatch({ type: 'false_interruption' })
+        }
+        return
+      }
+      default:
+        return
+    }
+  }
+
+  function onServerSpeechStarted(): void {
+    if (stopped) return
+    const status = machine.status
+    clearServerResponseTimer()
+    if (status === 'listening') {
+      dispatch({ type: 'speech_confirmed' })
+      beginServerTurn()
+    } else if (status === 'user_speaking') {
+      if (!serverTurn || serverTurn.final) beginServerTurn()
+    } else if (status === 'speaking' || status === 'interrupt_pending') {
+      // The backend heard the user over Ashy (OpenAI interrupt_response / Gemini `interrupted`).
+      if (interruptCfg.enabled) bargeIn(playbackSpeechOnsetFrame ?? latestFrame())
+    } else if (status === 'thinking') {
+      // User resumed before any audio: the pending response is dropped (the server cancels it too).
+      cancelInFlightResponse()
+      dispatch({ type: 'user_resumed' })
+      beginServerTurn()
+    }
+  }
+
+  function onServerSpeechStopped(): void {
+    if (!stopped) markServerTurnEnded()
+  }
+
+  function onServerTurnCommitted(e: VoiceSessionEventMap['user_turn_committed']): void {
+    if (stopped) return
+    if (machine.status === 'user_speaking') markServerTurnEnded()
+    else if (machine.status === 'listening') {
+      // The backend heard a turn the local detector missed.
+      if (!serverTurn || serverTurn.final) beginServerTurn()
+      dispatch({ type: 'proactive_response' })
+      armServerResponseTimer()
+    }
+    const t = serverTurn
+    if (!t || machine.status !== 'thinking') return
+    if (e.itemId) {
+      serverTurnsByItem.set(e.itemId, t)
+      while (serverTurnsByItem.size > 16) {
+        const first = serverTurnsByItem.keys().next().value
+        if (first === undefined) break
+        serverTurnsByItem.delete(first)
+      }
+    }
+    if (session?.caps.serverAutoResponse) return
+    void respondToServerTurn(t).catch((err) => log('server turn failed', err))
+  }
+
+  /** `create_response:false` backends: this turn's context (from its transcript) rides in the response. */
+  async function respondToServerTurn(t: ServerUserTurn): Promise<void> {
+    const superseded = () => stopped || serverTurn !== t || machine.status !== 'thinking' || ledger !== null
+    const text = (await waitServerTranscript(t, serverTranscriptWaitMs)).trim()
+    if (superseded()) return
+    const turnContext = await buildTurnContext(text || undefined)
+    if (superseded()) return
+    const s = session
+    if (!s) return
+    if (turnContext.userLabel) lastUserLabel = turnContext.userLabel
+    interruptedAfterText = undefined
+    t.contextSent = true
+    const l = newLedger(text, t.speechEndAt, {})
+    if (!t.final) l.userTranscriptPromise = waitServerTranscript(t, 8000)
+    if (sessionTools.length > 0 && s.caps.toolCalls && s.caps.inlineToolCalls) l.tool = { rounds: 0, fallbackUsed: true }
+    const contextText = takeTurnContext(turnContext.context)
+    sessionTurns += 1
+    sessionTokens += tokensOf(contextText) + tokensOf(text)
+    s.respond({ contextText, ...(turnContext.approvalHandled ? { toolChoice: 'none' as const } : {}) })
+    ledger = l
+  }
+
+  function onServerUserTranscript(e: VoiceSessionEventMap['user_transcript']): void {
+    if (stopped) return
+    let t = (e.itemId ? serverTurnsByItem.get(e.itemId) : undefined) ?? serverTurn
+    if (!t || (t.final && !e.itemId)) t = beginServerTurn()
+    const text = (e.text ?? '').trim()
+    if (text || e.final) t.text = text
+    const status = machine.status
+    if (text && t === serverTurn && (status === 'user_speaking' || status === 'thinking' || status === 'listening')) {
+      caption = { role: 'user', text: text.slice(0, 4000), final: e.final }
+      if (e.final) report()
+      else reportCaptionThrottled()
+    }
+    if (!e.final) return
+    t.final = true
+    resolveServerTurnWaiters(t)
+    if (test && test.transcript === null && text) test.transcript = text
+    if (text && session?.caps.serverAutoResponse) void injectLaggedContext(t)
+  }
+
+  /** `serverAutoResponse` backends: the context of this utterance is injected for the next responses. */
+  async function injectLaggedContext(t: ServerUserTurn): Promise<void> {
+    if (t.contextSent || !t.text || test) return
+    t.contextSent = true
+    const turnContext = await buildTurnContext(t.text)
+    if (stopped) return
+    if (turnContext.userLabel) lastUserLabel = turnContext.userLabel
+    interruptedAfterText = undefined
+    const ctx = takeTurnContext(turnContext.context)
+    const s = session
+    if (!ctx || !s) return
+    sessionTokens += tokensOf(ctx)
+    await s.injectContext(ctx).catch((err) => log('injectContext failed', err))
+  }
+
+  /** A response the backend started by itself (server VAD auto response, Gemini tool continuation). */
+  function adoptServerResponse(responseId: string): void {
+    const status = machine.status
+    if (status === 'listening') dispatch({ type: 'proactive_response' })
+    else if (status === 'user_speaking') markServerTurnEnded()
+    if (machine.status !== 'thinking') return
+    clearServerResponseTimer()
+    const t = serverTurn
+    const l = newLedger(t?.text ?? '', t?.speechEndAt ?? now(), {})
+    if (t && !t.final) l.userTranscriptPromise = waitServerTranscript(t, 8000)
+    const s = session
+    if (sessionTools.length > 0 && s?.caps.inlineToolCalls) l.tool = { rounds: 0, fallbackUsed: true }
+    l.itemId = responseId
+    sessionTurns += 1
+    ledger = l
   }
 
   // ───────────────────────── detector events ─────────────────────────
@@ -1303,6 +1614,10 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     if (test && !test.committed) {
       if (ev.type === 'speech_start' && test.speechStartAt === null) test.speechStartAt = now()
       if (ev.type === 'speech_end' && status === 'user_speaking') test.speechEndAt = now()
+    }
+    if (serverVad) {
+      handleDetectorEventServerVad(ev, status)
+      return
     }
     switch (ev.type) {
       case 'speech_start': {
@@ -1361,7 +1676,8 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     if (stopped || muted) return
     const status = machine.status
     if (status === 'idle' || status === 'connecting' || status === 'ended' || status === 'reconnecting') return
-    if (streamingAudioDirect && status === 'user_speaking') pushAudioDirect(block)
+    // Phase 10.4: server-VAD backends hear the mic continuously (their VAD and barge-in need it).
+    if (serverVad || (streamingAudioDirect && status === 'user_speaking')) pushAudioDirect(block)
     const events = await detector.processBlock(block, {
       assistantSpeaking: status === 'speaking' || status === 'interrupt_pending',
     })
@@ -1376,7 +1692,12 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
   // ───────────────────────── session events ─────────────────────────
 
   function onResponseStarted(e: VoiceSessionEventMap['response_started']): void {
-    if (ledger && ledger.itemId === null) ledger.itemId = e.responseId
+    if (ledger && ledger.itemId === null) {
+      ledger.itemId = e.responseId
+      clearServerResponseTimer()
+      return
+    }
+    if (!ledger && serverVad && !stopped) adoptServerResponse(e.responseId)
   }
 
   function ledgerFor(responseId: string): ResponseLedger | null {
@@ -1388,7 +1709,7 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
   function onResponseText(e: VoiceSessionEventMap['response_text']): void {
     const l = ledgerFor(e.responseId)
     if (!l) return
-    l.text = e.text
+    l.text = l.textBase + e.text
     caption = { role: 'assistant', text: stripMarkers(l.text).trim().slice(0, 4000), final: false }
     reportCaptionThrottled()
     processStage(l, false)
@@ -1440,7 +1761,23 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     const l = ledgerFor(e.responseId)
     if (!l) return
     l.done = true
-    if (e.text) l.text = e.text
+    if (e.text) l.text = l.textBase + e.text
+    if (
+      l.tool &&
+      !e.cancelled &&
+      l.chunks.length > 0 &&
+      (e.toolCalls?.length ?? 0) > 0 &&
+      session?.caps.inlineToolCalls &&
+      l.tool.rounds < MAX_TOOL_ROUNDS
+    ) {
+      // Phase 10.4: a cloud model spoke ("vou dar uma olhada") AND called a tool in the same response:
+      // the audio keeps playing, the tool runs, the follow-up response appends to this same turn.
+      const spokenSoFar = stripMarkers(l.text).trim()
+      l.textBase = spokenSoFar ? `${spokenSoFar} ` : ''
+      l.text = l.textBase
+      void runToolRound(l, e.toolCalls!)
+      return
+    }
     if (e.cancelled && e.cancelReason === 'watchdog') {
       // Runaway speech: cut playback now, keep only what was actually heard.
       detail = `watchdog: ${e.detail ?? 'runaway audio'}`
@@ -1515,7 +1852,13 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
       s.on('tool_step_done', (e) => s === session && onToolStepDone(e)),
       s.on('closed', (e) => s === session && onSessionClosed(e)),
       s.on('error', (e) => s === session && onSessionError(e)),
+      // Phase 10.4 — server-VAD backends.
+      s.on('user_speech_started', () => s === session && serverVad && onServerSpeechStarted()),
+      s.on('user_speech_stopped', () => s === session && serverVad && onServerSpeechStopped()),
+      s.on('user_turn_committed', (e) => s === session && serverVad && onServerTurnCommitted(e)),
+      s.on('user_transcript', (e) => s === session && serverVad && onServerUserTranscript(e)),
     ]
+    serverVad = s.caps.serverTurnDetection === true
   }
 
   async function openSession(): Promise<void> {
@@ -1596,6 +1939,8 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     clearTestTimers()
     clearInitiativeTimer()
     clearQueuedInject()
+    clearServerResponseTimer()
+    if (serverTurn) resolveServerTurnWaiters(serverTurn)
     if (reconnectTimer !== null) {
       timers.clearTimeout(reconnectTimer)
       reconnectTimer = null
@@ -1873,6 +2218,8 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     if (muted === next) return
     muted = next
     detector.reset()
+    // Phase 10.4: the server VAD must not keep a half-heard utterance while the mic is muted.
+    if (muted && serverVad) session?.endAudioStream?.()
     if (muted) {
       if (machine.status === 'user_speaking') {
         abandonTurn()
