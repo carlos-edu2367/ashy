@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react'
 import {
   FALLBACK_PROVIDER_MODELS,
   LLM_PROVIDER_IDS,
+  matchesModelSearch,
   type LlmProviderId,
   type ProviderHealthResult,
   type ReasoningEffort,
@@ -69,16 +70,9 @@ export function ModelsSettingsPanel(): React.ReactElement {
   const catalogModels =
     providerModelCatalog[selectedProvider] ?? FALLBACK_PROVIDER_MODELS[selectedProvider] ?? []
   const catalogSource = providerModelCatalogSource[selectedProvider] ?? 'fallback'
-  const normalizedSearch = modelSearchQuery.trim().toLowerCase()
-  const filteredCatalogModels = (
-    normalizedSearch
-      ? catalogModels.filter(
-          (m) =>
-            m.id.toLowerCase().includes(normalizedSearch) ||
-            m.name.toLowerCase().includes(normalizedSearch),
-        )
-      : catalogModels
-  ).slice(0, 60)
+  const filteredCatalogModels = catalogModels
+    .filter((m) => matchesModelSearch(m, modelSearchQuery))
+    .slice(0, 60)
 
   const handleRefreshCatalog = async () => {
     const trimmedKey = apiKey.trim()
@@ -539,8 +533,9 @@ export function ModelsSettingsPanel(): React.ReactElement {
           >
             {filteredCatalogModels.length === 0 ? (
               <span style={{ fontSize: '11.5px', color: 'var(--text-muted)' }}>
-                Nenhum modelo encontrado no catálogo para &ldquo;{modelSearchQuery}&rdquo;. Você pode
-                digitar qualquer Model ID manualmente no campo acima.
+                Nenhum modelo encontrado no catálogo para &ldquo;{modelSearchQuery}&rdquo;.
+                {catalogSource !== 'remote' && ' Clique em “Buscar Modelos na API” para ver a lista completa.'}{' '}
+                Você também pode digitar qualquer Model ID manualmente no campo acima.
               </span>
             ) : (
               filteredCatalogModels.map((m) => {
@@ -562,6 +557,15 @@ export function ModelsSettingsPanel(): React.ReactElement {
                     title={`${m.name} (${m.id})`}
                   >
                     <span>{m.id}</span>
+                    {m.isOmniModel && (
+                      <span
+                        data-testid={`provider-model-omni-${m.id}`}
+                        style={{ fontSize: '9.5px', opacity: 0.85, color: 'var(--accent-mint, #7fd6b0)' }}
+                        title="Aceita áudio de entrada (omni)"
+                      >
+                        • Omni
+                      </span>
+                    )}
                     {m.supportsReasoning && (
                       <span
                         style={{

@@ -219,7 +219,7 @@ describe('Phase 8.2 — Provider Models Catalog Discovery & Fallback Resilience'
       fetchImpl: failingFetch,
     })
 
-    // 1. Missing API key on provider that requires one -> returns fallback without throwing
+    // 1. No API key (OpenRouter's catalog is public, so it is fetched) + HTTP 500 -> fallback, no throw
     const noKeyRes = await vault.listProviderModels({ providerId: 'openrouter' })
     expect(noKeyRes.providerId).toBe('openrouter')
     expect(noKeyRes.source).toBe('fallback')
@@ -412,7 +412,7 @@ describe('Phase 8.2 — Provider Models Catalog Discovery & Fallback Resilience'
     expect(fileProtoRes.error).toMatch(/protocol|URL/i)
   })
 
-  it('[Red-Team #4] truncates model name to <= 256 chars, skips id > 256 chars, caps catalog at 500 items, and deduplicates concurrent in-flight requests', async () => {
+  it('[Red-Team #4] truncates model name to <= 256 chars, skips id > 256 chars, caps catalog at 2000 items, and deduplicates concurrent in-flight requests', async () => {
     const userDataDir = makeTempDir()
     let fetchCount = 0
 
@@ -429,7 +429,7 @@ describe('Phase 8.2 — Provider Models Catalog Discovery & Fallback Resilience'
           name: 'X'.repeat(350),
           context_length: 64000,
         },
-        ...Array.from({ length: 550 }, (_, i) => ({
+        ...Array.from({ length: 2050 }, (_, i) => ({
           id: `provider/model-${i}`,
           name: `Model ${i}`,
         })),
@@ -459,12 +459,51 @@ describe('Phase 8.2 — Provider Models Catalog Discovery & Fallback Resilience'
     expect(fetchCount).toBe(1)
     expect(resA.source).toBe('remote')
     expect(resB.source).toBe('remote')
-    expect(resA.models.length).toBe(500)
+    expect(resA.models.length).toBe(2000)
     expect(resA.models[0]?.id).toBe('valid/long-name-model')
     expect(resA.models[0]?.name.length).toBe(256)
 
     // Must pass Valibot schema validation without throwing!
     const parsed = v.parse(ListProviderModelsResultSchema, resA)
-    expect(parsed.models.length).toBe(500)
+    expect(parsed.models.length).toBe(2000)
+  })
+
+  it('[10.6] lists the public OpenRouter catalog without a key and flags omni models from declared modalities', async () => {
+    const userDataDir = makeTempDir()
+    const seenAuth: Array<string | null> = []
+    const vault = createProviderVault({
+      userDataDir,
+      fetchImpl: async (_url, init) => {
+        const h = (init?.headers ?? {}) as Record<string, string>
+        seenAuth.push(h.Authorization ?? null)
+        return new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: 'qwen/qwen3.8-omni-flash',
+                name: 'Qwen: Qwen3.8 Omni Flash',
+                architecture: { input_modalities: ['text', 'image', 'audio', 'video'], output_modalities: ['text'] },
+              },
+              {
+                id: 'vendor/new-audio-model',
+                name: 'Unknown name, audio declared',
+                architecture: { input_modalities: ['text', 'audio'], output_modalities: ['text'] },
+              },
+              { id: 'qwen/qwen3.8-flash', name: 'Qwen 3.8 Flash', architecture: { input_modalities: ['text'] } },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      },
+    })
+    const res = await vault.listProviderModels({ providerId: 'openrouter' })
+    expect(res.source).toBe('remote')
+    expect(seenAuth).toEqual([null])
+    const byId = Object.fromEntries(res.models.map((m) => [m.id, m]))
+    expect(byId['qwen/qwen3.8-omni-flash']?.isOmniModel).toBe(true)
+    expect(byId['qwen/qwen3.8-omni-flash']?.supportsOmniVideoIn).toBe(true)
+    expect(byId['vendor/new-audio-model']?.isOmniModel).toBe(true)
+    expect(byId['qwen/qwen3.8-flash']?.isOmniModel).toBe(false)
+    v.parse(ListProviderModelsResultSchema, res)
   })
 })

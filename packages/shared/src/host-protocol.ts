@@ -2674,11 +2674,13 @@ export function inferModelOmniCapabilities(
     }
   }
 
-  // Full Native Omni models (LFM3-Omni, Qwen 2.5 Omni, GPT-4o Audio / Realtime)
+  // Full Native Omni models (LFM-Omni, any Qwen*-Omni, GPT-* Audio / Realtime, MiniCPM-o)
   if (
-    /lfm3[-_]?omni/i.test(lower) ||
-    /qwen(?:2\.5)?[-_]?omni/i.test(lower) ||
-    /gpt-4o(?:-\d{4}-\d{2}-\d{2})?-(?:mini-)?(?:audio|realtime)/i.test(lower)
+    /lfm\d*[-_.]?omni/i.test(lower) ||
+    /qwen[\d.]*[-_]?omni/i.test(lower) ||
+    /minicpm[-_]?o\b/i.test(lower) ||
+    /gpt-[\w.]+-(?:audio|realtime)/i.test(lower) ||
+    /gpt-(?:audio|realtime)/i.test(lower)
   ) {
     return {
       isOmniModel: true,
@@ -2690,8 +2692,8 @@ export function inferModelOmniCapabilities(
     }
   }
 
-  // Gemini 2.0 / 2.5 models (Multimodal Audio+Video+Image+Text In -> Text Out via REST)
-  if (/gemini-2\.[05]/i.test(lower)) {
+  // Gemini 2.x and later (Multimodal Audio+Video+Image+Text In -> Text Out via REST)
+  if (/gemini-(?:[2-9]|\d{2,})(?:\.\d+)?/i.test(lower)) {
     return {
       isOmniModel: true,
       supportsOmniAudioIn: true,
@@ -2712,6 +2714,61 @@ export function inferModelOmniCapabilities(
   }
 }
 
+/**
+ * Capabilities declared by the provider's own catalog (e.g. OpenRouter `architecture.input_modalities`
+ * / `output_modalities`). Returns null when the API declares nothing usable, so callers fall back to
+ * {@link inferModelOmniCapabilities}. Audio in → omni.
+ */
+export function omniCapabilitiesFromModalities(
+  rawInput: unknown,
+  rawOutput: unknown,
+): ModelOmniCapabilities | null {
+  const pick = (raw: unknown): OmniModalityKind[] | null => {
+    if (!Array.isArray(raw)) return null
+    const out = new Set<OmniModalityKind>()
+    for (const item of raw) {
+      if (typeof item !== 'string') continue
+      const k = item.trim().toLowerCase()
+      if (k === 'text' || k === 'audio' || k === 'image' || k === 'video') out.add(k)
+    }
+    return out.size > 0 ? [...out] : null
+  }
+  const input = pick(rawInput)
+  if (!input) return null
+  const output = pick(rawOutput) ?? ['text']
+  if (!input.includes('text')) input.unshift('text')
+  if (!output.includes('text')) output.unshift('text')
+  const audioIn = input.includes('audio')
+  return {
+    isOmniModel: audioIn,
+    supportsOmniAudioIn: audioIn,
+    supportsOmniAudioOut: output.includes('audio'),
+    supportsOmniVideoIn: input.includes('video'),
+    inputModalities: input,
+    outputModalities: output,
+  }
+}
+
+/**
+ * Catalog search used by Settings › Modelos: every whitespace-separated term must appear in the
+ * id or name, ignoring case and punctuation ("qwen 3.8 omni" matches `qwen/qwen3.8-omni-flash`).
+ * The term "omni" also matches any model flagged as omni by capabilities.
+ */
+export function matchesModelSearch(
+  model: { id: string; name: string; isOmniModel?: boolean },
+  query: string,
+): boolean {
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9.]+/g, '')
+  const terms = query
+    .toLowerCase()
+    .split(/[\s/:_-]+/)
+    .map(norm)
+    .filter((t) => t.length > 0)
+  if (terms.length === 0) return true
+  const hay = `${norm(model.id)} ${norm(model.name)}`
+  return terms.every((t) => hay.includes(t) || (t === 'omni' && model.isOmniModel === true))
+}
+
 export const FALLBACK_PROVIDER_MODELS: Record<LlmProviderId, ProviderModelCatalogItem[]> = {
   openrouter: [
     {
@@ -2721,6 +2778,21 @@ export const FALLBACK_PROVIDER_MODELS: Record<LlmProviderId, ProviderModelCatalo
       contextLength: 131072,
       supportsTools: true,
       supportsReasoning: true,
+    },
+    {
+      id: 'qwen/qwen3.8-omni-flash',
+      name: 'Qwen 3.8 Omni Flash',
+      providerId: 'openrouter',
+      contextLength: null,
+      ...inferModelOmniCapabilities('openrouter', 'qwen/qwen3.8-omni-flash'),
+    },
+    {
+      id: 'google/gemini-3.8-flash',
+      name: 'Gemini 3.8 Flash',
+      providerId: 'openrouter',
+      contextLength: null,
+      supportsTools: true,
+      ...inferModelOmniCapabilities('openrouter', 'google/gemini-3.8-flash'),
     },
     {
       id: 'anthropic/claude-3.7-sonnet',

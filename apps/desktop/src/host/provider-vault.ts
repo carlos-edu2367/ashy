@@ -5,6 +5,7 @@ import * as v from 'valibot'
 import {
   FALLBACK_PROVIDER_MODELS,
   inferModelOmniCapabilities,
+  omniCapabilitiesFromModalities,
   OMNI_EXECUTION_MODES,
   type OmniExecutionMode,
   ListProviderModelsInputSchema,
@@ -748,9 +749,13 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
       const seen = new Set<string>()
       const items: ProviderModelCatalogItem[] = []
       for (const rawItem of rawList) {
-        if (items.length >= 500) break
+        if (items.length >= 2000) break
         if (typeof rawItem !== 'object' || rawItem === null) continue
         const obj = rawItem as Record<string, unknown>
+        const arch =
+          typeof obj.architecture === 'object' && obj.architecture !== null
+            ? (obj.architecture as Record<string, unknown>)
+            : null
         const id = typeof obj.id === 'string' ? obj.id.trim() : ''
         if (!id || id.length > 256 || seen.has(id)) continue
         seen.add(id)
@@ -777,7 +782,8 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
           name,
           providerId,
           contextLength,
-          ...inferModelOmniCapabilities(providerId, id),
+          ...(omniCapabilitiesFromModalities(arch?.input_modalities, arch?.output_modalities) ??
+            inferModelOmniCapabilities(providerId, id)),
           ...(supportedParams
             ? {
                 supportsTools: supportedParams.includes('tools'),
@@ -794,7 +800,11 @@ export function createProviderVault(options: ProviderVaultOptions): ProviderVaul
     const catalogPromise = (async (): Promise<ListProviderModelsResult> => {
       try {
         validateHttpBaseUrl(baseUrl)
-        if (stored.requiresApiKey && !effectiveApiKey) {
+        // OpenRouter's /models catalog is public: browsing it must not require a key. Only the
+        // official origin: an overridden baseUrl still needs an explicit key (anti-SSRF).
+        const isPublicOpenRouterCatalog =
+          input.providerId === 'openrouter' && new URL(baseUrl).origin === 'https://openrouter.ai'
+        if (stored.requiresApiKey && !effectiveApiKey && !isPublicOpenRouterCatalog) {
           throw new Error(`API key is required for provider ${stored.label}`)
         }
 
