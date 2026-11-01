@@ -102,6 +102,16 @@ export interface VoiceSubmitOptions {
   toolChoice?: VoiceToolChoice
 }
 
+/** Phase 10.5 — a transcribed user turn handed to a host-LLM session (see `submitTranscribedTurn`). */
+export interface VoiceTranscribedTurn {
+  text: string
+  /** Per-turn context (host `perTurnContext` + a pending recap), '' when none. */
+  context: string
+  userLabel?: string
+  toolChoice?: VoiceToolChoice
+  approvalHandled?: boolean
+}
+
 /** One completed function call of a response. */
 export interface VoiceToolCall {
   callId: string
@@ -174,6 +184,12 @@ export interface VoiceSession {
    * Phase 10.3: the second argument may be the options instead of a context string.
    */
   submitUserText?(text: string, contextOrOptions?: string | VoiceSubmitOptions, options?: VoiceSubmitOptions): void
+  /**
+   * Phase 10.5 — sessions whose LLM runs host-side with its own prompt (cascade) take the transcribed
+   * turn as structured data instead of one formatted `input_text` item. When present the engine
+   * prefers it over `submitUserText` and never runs its own tool step (tools run inside the host turn).
+   */
+  submitTranscribedTurn?(turn: VoiceTranscribedTurn): void
   /**
    * Phase 10.3 — one `function_call_output` item per result, then `response.create` (default
    * `tool_choice:'none'` with the session's output modalities = the spoken answer; 'auto' = another

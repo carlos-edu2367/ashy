@@ -1038,6 +1038,22 @@ export function createCallEngine(options: CallEngineOptions): CallEngine {
     if (turnContext.userLabel) lastUserLabel = turnContext.userLabel
     interruptedAfterText = undefined
     const s = session
+    if (s && typeof s.submitTranscribedTurn === 'function') {
+      // Phase 10.5 cascade: the host LLM gets the raw turn (its own prompt/history/tools).
+      const l = newLedger(text, speechEndAt, turnMetrics)
+      const context = takeTurnContext(turnContext.context)
+      sessionTurns += 1
+      sessionTokens += tokensOf(text) + tokensOf(context)
+      s.submitTranscribedTurn({
+        text,
+        context,
+        ...(turnContext.userLabel ? { userLabel: turnContext.userLabel } : {}),
+        ...(turnContext.toolChoice ? { toolChoice: turnContext.toolChoice } : {}),
+        ...(turnContext.approvalHandled ? { approvalHandled: true } : {}),
+      })
+      ledger = l
+      return
+    }
     if (!s?.submitUserText) {
       detail = 'session does not support transcribed input'
       abandonTurn()
