@@ -11,13 +11,20 @@ Local usage:
     .\install.ps1 -Version "1.0.0"
     .\install.ps1 -NoDesktopShortcut
     .\install.ps1 -NoLaunch
+    .\install.ps1 -SkipBuild      # repo checkout: reuse apps\desktop\release\AshySetup.exe as-is
     .\install.ps1 -Uninstall
+
+When run from a git checkout (apps\desktop\package.json present), the installer is ALWAYS rebuilt
+from the current sources (pnpm install + pnpm dist:win) before installing, so `git pull` followed by
+`.\install.ps1` installs exactly what was pulled. (Before 2026-11-01 a stale release\AshySetup.exe
+was silently reused after pulls.)
 #>
 [CmdletBinding()]
 param(
     [string]$Version = 'latest',
     [switch]$NoDesktopShortcut,
     [switch]$NoLaunch,
+    [switch]$SkipBuild,
     [switch]$Uninstall
 )
 
@@ -67,6 +74,30 @@ try {
     Write-Host "[Ashy] Cozy Night Studio Installer" -ForegroundColor Magenta
     $localReleaseSetup = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'apps\desktop\release\AshySetup.exe' } else { $null }
     $localDesktopPkg = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'apps\desktop\package.json' } else { $null }
+
+    $isRepoCheckout = $localDesktopPkg -and (Test-Path -LiteralPath $localDesktopPkg) -and -not $env:ASHY_RELEASE_BASE_URL
+    if ($isRepoCheckout -and -not $SkipBuild) {
+        Write-Host "[Ashy] Repository checkout detected: building AshySetup.exe from current sources ..." -ForegroundColor Cyan
+        Push-Location $PSScriptRoot
+        try {
+            & pnpm install --frozen-lockfile
+            if ($LASTEXITCODE -ne 0) {
+                throw "'pnpm install' failed with exit code $LASTEXITCODE."
+            }
+            if ($localReleaseSetup -and (Test-Path -LiteralPath $localReleaseSetup)) {
+                Remove-Item -LiteralPath $localReleaseSetup -Force
+            }
+            & pnpm dist:win
+            if ($LASTEXITCODE -ne 0) {
+                throw "Local build 'pnpm dist:win' failed with exit code $LASTEXITCODE."
+            }
+        } finally {
+            Pop-Location
+        }
+        if (-not (Test-Path -LiteralPath $localReleaseSetup)) {
+            throw "Build finished but '$localReleaseSetup' was not produced."
+        }
+    }
 
     if ($localReleaseSetup -and (Test-Path -LiteralPath $localReleaseSetup) -and -not $env:ASHY_RELEASE_BASE_URL) {
         Write-Host "[Ashy] Using local compiled installer: $localReleaseSetup" -ForegroundColor Cyan
